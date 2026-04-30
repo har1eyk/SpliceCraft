@@ -34,7 +34,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 
 # ── User data directory ────────────────────────────────────────────────────────
 # All user-writable state (library, parts bin, primers, .bak files) lives in
@@ -7957,11 +7957,21 @@ class AddFeatureModal(ModalScreen):
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
-    def __init__(self, prefill: "dict | None" = None,
-                 have_cursor: bool = False) -> None:
+    def __init__(
+        self,
+        prefill: "dict | None" = None,
+        selection_range: "tuple[int, int] | None" = None,
+    ) -> None:
         super().__init__()
         self._prefill = dict(prefill) if prefill else {}
-        self._have_cursor = have_cursor
+        # `selection_range` is the seq-panel highlight at the moment
+        # the modal opened, captured so the "Insert feature" action
+        # always knows the user-intended span even if the seq panel's
+        # selection is later cleared. `None` → no selection; the
+        # button is disabled. (start, end) is half-open; `end < start`
+        # marks an origin-spanning wrap that becomes a CompoundLocation
+        # at insert time.
+        self._selection_range = selection_range
         # Current color override for this entry. None = Auto (type default).
         self._color: "str | None" = self._prefill.get("color") or None
 
@@ -8028,10 +8038,21 @@ class AddFeatureModal(ModalScreen):
                 yield Button("Save to Library",
                              id="btn-addfeat-save",
                              variant="primary")
-                yield Button("Insert at cursor",
+                # "Insert feature" annotates the highlighted selection
+                # range with a new SeqFeature — does NOT splice new
+                # bases. Disabled when there's no selection (the
+                # button needs a span to act on).
+                yield Button("Insert feature",
                              id="btn-addfeat-insert",
                              variant="success",
-                             disabled=not self._have_cursor)
+                             disabled=self._selection_range is None,
+                             tooltip=(
+                                 "Annotate the highlighted region "
+                                 "with this feature (no DNA inserted)."
+                                 if self._selection_range is not None
+                                 else "Highlight a region in the seq panel "
+                                      "first to enable."
+                             ))
                 yield Button("Cancel", id="btn-addfeat-cancel")
 
     def on_mount(self) -> None:
@@ -8139,10 +8160,21 @@ class AddFeatureModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-addfeat-insert")
     def _insert(self, _) -> None:
+        """Annotate the captured selection range with this entry's
+        feature definition. The button is disabled when there's no
+        selection, so `_selection_range` is guaranteed non-None
+        when we reach here — the assertion guards against a future
+        refactor enabling the button without setting the range."""
+        if self._selection_range is None:
+            return
         entry = self._gather()
         if entry is None:
             return
-        self.dismiss({"action": "insert", "entry": entry})
+        self.dismiss({
+            "action": "annotate",
+            "entry":  entry,
+            "range":  self._selection_range,
+        })
 
     @on(Button.Pressed, "#btn-addfeat-cancel")
     def _cancel_btn(self, _) -> None:
@@ -9056,7 +9088,7 @@ class FeatureLibraryScreen(Screen):
             if not entry:
                 return
             self._upsert_entry(entry, notice="Added")
-        self.app.push_screen(AddFeatureModal(have_cursor=False), callback=_cb)
+        self.app.push_screen(AddFeatureModal(), callback=_cb)
 
     @on(Button.Pressed, "#btn-flib-edit")
     def _edit_btn(self, _) -> None: self.action_edit()
@@ -9087,7 +9119,7 @@ class FeatureLibraryScreen(Screen):
             self._replace_entry(target_idx, new_entry)
 
         self.app.push_screen(
-            AddFeatureModal(prefill=entry, have_cursor=False),
+            AddFeatureModal(prefill=entry),
             callback=_cb,
         )
 
@@ -10157,7 +10189,7 @@ class PartsBinModal(Screen):
             self._populate()
 
         self.app.push_screen(
-            AddFeatureModal(prefill=prefill, have_cursor=False),
+            AddFeatureModal(prefill=prefill),
             callback=_on_done,
         )
 
@@ -15038,7 +15070,9 @@ def _h_load_entry(app, payload):
 def _h_add_feature(app, payload):
     """Add a feature. Body: `{start, end, label?, type?, strand?}`.
     Coordinates are 0-based half-open `[start, end)`. Wrap features
-    (`end < start`) are supported via CompoundLocation."""
+    (`end < start`) are supported via CompoundLocation. Single
+    source of truth (with the AddFeatureModal "Insert feature"
+    button) is `PlasmidApp._annotate_with_feature`."""
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
@@ -15048,13 +15082,6 @@ def _h_add_feature(app, payload):
     except (KeyError, ValueError, TypeError):
         return ({"error": "missing or invalid 'start'/'end' (must be int)"},
                 400)
-    n = len(rec.seq)
-    if not (0 <= start < n):
-        return ({"error": f"start {start} out of range [0, {n})"}, 400)
-    if not (0 <= end <= n):
-        return ({"error": f"end {end} out of range [0, {n}]"}, 400)
-    if end == start:
-        return ({"error": "zero-length feature (end == start)"}, 400)
     label = (payload.get("label") or "").strip()
     feat_type = (payload.get("type") or "misc_feature").strip()
     try:
@@ -15064,62 +15091,29 @@ def _h_add_feature(app, payload):
     if strand not in (-1, 0, 1):
         return ({"error": "'strand' must be -1, 0, or 1"}, 400)
 
-    from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
-    from copy import deepcopy
-    qualifiers = {"label": [label]} if label else {}
-    biop_strand = strand if strand in (-1, 1) else None
-    if end > start:
-        loc = FeatureLocation(start, end, strand=biop_strand)
-    else:
-        # Wrap feature: split into compound [start, n) + [0, end).
-        loc = CompoundLocation([
-            FeatureLocation(start, n, strand=biop_strand),
-            FeatureLocation(0, end, strand=biop_strand),
-        ])
-    new_feat = SeqFeature(loc, type=feat_type, qualifiers=qualifiers)
+    entry = {
+        "name":         label,
+        "feature_type": feat_type,
+        "strand":       strand,
+        "qualifiers":   {},
+    }
 
     def _apply():
         guard = _agent_dirty_guard(app, payload)
         if guard is not None:
             return guard
-        # Snapshot pre-edit so the user can Ctrl+Z the agent's change.
-        app._push_undo()
-        new_rec = deepcopy(app._current_record)
-        new_rec.features.append(new_feat)
-        app._current_record = new_rec
-        # Mirrors the panel-refresh block in `_handle_pasted_part` —
-        # don't go through `_apply_record` because that path marks
-        # the record CLEAN and shows a "Loaded …" toast, which would
-        # be wrong semantics for an in-place agent edit.
-        pm      = app.query_one("#plasmid-map", PlasmidMap)
-        sidebar = app.query_one("#sidebar",     FeatureSidebar)
-        sp      = app.query_one("#seq-panel",   SequencePanel)
-        pm.load_record(new_rec)
-        seq_str = str(new_rec.seq)
-        app._restr_cache = _scan_restriction_sites(
-            seq_str,
-            min_recognition_len=app._restr_min_len,
-            unique_only=app._restr_unique_only,
-        )
-        displayed = app._restr_cache if app._show_restr else []
-        pm._restr_feats = displayed
-        pm.refresh()
-        sidebar.populate(pm._feats)
-        sp.update_seq(seq_str, pm._feats + displayed)
-        app._mark_dirty()
-        # Show the agent's edit in the toast stream so the user sees
-        # what just happened on screen — same channel as menu actions.
-        coord_str = (f"{start + 1}..{end}" if end > start
-                     else f"{start + 1}..{n},1..{end}")
-        app._notify_success(
-            f"Agent added {feat_type} '{label or '(unlabeled)'}' "
-            f"at {coord_str}"
-        )
-        return new_rec.id
+        try:
+            app._annotate_with_feature(start, end, entry)
+        except (ValueError, RuntimeError) as exc:
+            # Range / domain validation lives in the helper; surface
+            # its message verbatim so the agent gets actionable error
+            # text instead of a generic 500.
+            return ({"error": str(exc)}, 400)
+        return app._current_record.id
 
     result = app.call_from_thread(_apply)
     if isinstance(result, tuple):
-        return result   # error tuple from the dirty guard
+        return result   # error tuple (dirty guard or validation)
     return {"ok": True, "label": label or "(unlabeled)",
             "start": start, "end": end, "strand": strand,
             "type": feat_type, "record_id": result}
@@ -17861,7 +17855,7 @@ SpeciesPickerModal { align: center middle; }
             return
 
         self.push_screen(
-            AddFeatureModal(prefill=prefill, have_cursor=False),
+            AddFeatureModal(prefill=prefill),
             callback=self._capture_feature_result,
         )
 
@@ -17919,41 +17913,48 @@ SpeciesPickerModal { align: center middle; }
             self.push_screen(FeatureLibraryScreen())
 
     def action_add_feature(self) -> None:
-        """Open the AddFeatureModal. If the sequence panel has an active
-        cursor, the Insert button is enabled; otherwise only Save is.
+        """Open the AddFeatureModal.
+
         If the user has a multi-bp selection (drag, Shift+click, or
-        feature-pick), pre-fill the modal's Sequence body with the
-        highlighted bases verbatim — saves the typical "select →
-        Ctrl+C → paste into modal" round-trip."""
+        feature-pick), the modal opens with two affordances populated:
+
+          1. Sequence body pre-filled with the highlighted bases
+             verbatim — saves the typical "select → Ctrl+C → paste
+             into modal" round-trip when only saving to the library.
+          2. "Insert feature" button enabled, capturing the exact
+             (start, end) range so the click annotates the existing
+             bases base-perfect (no DNA spliced in).
+
+        Without a selection, only "Save to Library" is functional —
+        "Insert feature" is disabled with a tooltip explaining why.
+        """
         sp = None
-        cursor_pos = -1
         try:
             sp = self.query_one("#seq-panel", SequencePanel)
-            cursor_pos = getattr(sp, "_cursor_pos", -1)
         except NoMatches:
-            cursor_pos = -1
-        have_cursor = (self._current_record is not None and cursor_pos >= 0)
+            sp = None
         prefill: "dict | None" = None
-        if sp is not None and sp._seq:
+        sel_range: "tuple[int, int] | None" = None
+        if sp is not None and sp._seq and self._current_record is not None:
             sel = sp._user_sel or sp._sel_range
             if sel is not None:
                 s, e = sel
                 n = len(sp._seq)
-                # Wrap-aware span; only pre-fill when more than 1 bp is
-                # highlighted (single-base "selections" come from a
-                # plain click and aren't really a selection the user
-                # would expect to copy).
+                # Wrap-aware span; only treat as a selection when more
+                # than 1 bp is highlighted (single-base "selections"
+                # come from a plain click and aren't really a region
+                # the user would expect to annotate).
                 span = _feat_len(s, e, n) if n else 0
                 if span > 1:
                     if e >= s:
                         highlighted = sp._seq[s:e]
                     else:
-                        # Wrap: tail [s, n) + head [0, e), both
-                        # already in the underlying seq order.
+                        # Wrap: tail [s, n) + head [0, e).
                         highlighted = sp._seq[s:] + sp._seq[:e]
                     prefill = {"sequence": highlighted.upper()}
+                    sel_range = (s, e)
         self.push_screen(
-            AddFeatureModal(prefill=prefill, have_cursor=have_cursor),
+            AddFeatureModal(prefill=prefill, selection_range=sel_range),
             callback=self._add_feature_result,
         )
 
@@ -17976,7 +17977,14 @@ SpeciesPickerModal { align: center middle; }
 
     def _add_feature_result(self, result) -> None:
         """Callback for AddFeatureModal. `result` is either None (cancel) or
-        ``{"action": "save"|"insert", "entry": {...}}``."""
+        ``{"action": "save"|"annotate", "entry": {...}, "range": (s, e)?}``.
+
+        - ``save``: persist the feature dict to the user's feature library.
+        - ``annotate``: add a SeqFeature to the loaded record, spanning the
+          (start, end) range from the modal's captured selection. Does NOT
+          modify the underlying DNA — the new feature annotates existing
+          bases base-perfect.
+        """
         if not result:
             return
         action = result.get("action")
@@ -17985,78 +17993,113 @@ SpeciesPickerModal { align: center middle; }
             if self._persist_feature_entry(entry):
                 self._notify_success(f"Saved '{entry.get('name')}' to feature library.")
             return
-        if action == "insert":
+        if action == "annotate":
+            sel_range = result.get("range")
+            if not sel_range or len(sel_range) != 2:
+                self.notify("No selection to annotate.", severity="warning")
+                return
             try:
-                self._insert_feature_at_cursor(entry)
+                start, end = int(sel_range[0]), int(sel_range[1])
+                self._annotate_with_feature(start, end, entry)
             except (ValueError, RuntimeError) as exc:
-                _log.exception("Failed to insert feature")
-                self.notify(f"Insert failed: {exc}", severity="error")
+                _log.exception("Failed to annotate selection with feature")
+                self.notify(f"Annotate failed: {exc}", severity="error")
 
-    def _insert_feature_at_cursor(self, entry: dict) -> None:
-        """Insert the feature's DNA at the current sequence-panel cursor,
-        shift existing feature coords via `_rebuild_record_with_edit`, and
-        append a new SeqFeature spanning the inserted region.
+    def _annotate_with_feature(
+        self, start: int, end: int, entry: dict,
+    ) -> None:
+        """Add a SeqFeature spanning ``[start, end)`` to the loaded
+        record without modifying the underlying DNA.
 
-        Reverse-strand entries have their `sequence` interpreted as the 5'→3'
-        of the feature as read, so the genomic bases inserted are the RC.
+        Wrap-aware: when ``end < start``, the location becomes a
+        CompoundLocation with two parts (tail [start, n) + head
+        [0, end)) so origin-spanning annotations land correctly. The
+        new feature joins ``record.features`` and goes through the
+        same lane-packing pipeline as every other feature, so it
+        stacks with normal priority in the lane art.
+
+        Used by both the AddFeatureModal "Insert feature" button and
+        the agent-API ``add-feature`` endpoint — single source of
+        truth for "annotate existing bases".
         """
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        from copy import deepcopy
 
         if self._current_record is None:
             raise RuntimeError("Load a plasmid first.")
-        sp = self.query_one("#seq-panel", SequencePanel)
-        pm = self.query_one("#plasmid-map", PlasmidMap)
-        pos = getattr(sp, "_cursor_pos", -1)
-        if pos < 0:
-            raise RuntimeError(
-                "Click on the sequence to place a cursor before inserting.")
-        strand = -1 if entry.get("strand") == -1 else 1
-        feat_seq = (entry.get("sequence") or "").upper()
-        if not feat_seq:
-            raise ValueError("Feature has no sequence.")
-        # Genomic bases inserted are the forward-strand; reverse-strand
-        # entries store the revcomp, so flip them back.
-        if strand == -1:
-            genomic = _rc(feat_seq)
+        n = len(self._current_record.seq)
+        if not (0 <= start < n):
+            raise ValueError(f"start {start} out of range [0, {n})")
+        if not (0 <= end <= n):
+            raise ValueError(f"end {end} out of range [0, {n}]")
+        if end == start:
+            raise ValueError("zero-length feature (end == start)")
+
+        raw_strand = entry.get("strand", 1)
+        try:
+            strand = int(raw_strand)
+        except (TypeError, ValueError):
+            strand = 1
+        if strand not in (-1, 0, 1, 2):
+            strand = 1
+        # `2` (double-stranded) is a SpliceCraft-only convention; map
+        # to None on the BioPython side since CompoundLocation parts
+        # require ±1 / 0 / None.
+        biop_strand = strand if strand in (-1, 1) else None
+        if end > start:
+            loc = FeatureLocation(start, end, strand=biop_strand)
         else:
-            genomic = feat_seq
+            loc = CompoundLocation([
+                FeatureLocation(start, n, strand=biop_strand),
+                FeatureLocation(0, end, strand=biop_strand),
+            ])
+        feat_type = entry.get("feature_type") or "misc_feature"
+        qualifiers: dict = {
+            k: list(v) if isinstance(v, (list, tuple)) else [v]
+            for k, v in (entry.get("qualifiers") or {}).items()
+        }
+        label = (entry.get("name") or "").strip()
+        if label and "label" not in qualifiers:
+            qualifiers["label"] = [label]
+        new_feat = SeqFeature(loc, type=feat_type, qualifiers=qualifiers)
 
-        old_seq = str(self._current_record.seq)
-        new_seq = old_seq[:pos] + genomic + old_seq[pos:]
+        # Snapshot pre-edit so the user can Ctrl+Z. Then mutate a
+        # deep copy so existing references (undo stack, agent reads)
+        # don't see torn state.
         self._push_undo()
-        new_record = self._rebuild_record_with_edit(
-            new_seq, "insert", pos, pos, genomic,
-        )
-        new_feat = SeqFeature(
-            FeatureLocation(pos, pos + len(genomic), strand=strand),
-            type=entry.get("feature_type") or "misc_feature",
-            qualifiers={k: list(v) if isinstance(v, (list, tuple)) else [v]
-                        for k, v in (entry.get("qualifiers") or {}).items()},
-        )
-        label = entry.get("name") or ""
-        if label and "label" not in new_feat.qualifiers:
-            new_feat.qualifiers["label"] = [label]
+        new_record = deepcopy(self._current_record)
         new_record.features.append(new_feat)
-
         self._current_record = new_record
+
+        # Mirror the panel-refresh block used by other in-place edits
+        # (avoids `_apply_record`'s "Loaded …" toast + mark-clean).
+        pm      = self.query_one("#plasmid-map", PlasmidMap)
+        sidebar = self.query_one("#sidebar",     FeatureSidebar)
+        sp      = self.query_one("#seq-panel",   SequencePanel)
         pm.load_record(new_record)
+        seq_str = str(new_record.seq)
         self._restr_cache = _scan_restriction_sites(
-            new_seq,
+            seq_str,
             min_recognition_len=self._restr_min_len,
             unique_only=self._restr_unique_only,
         )
         displayed = self._restr_cache if self._show_restr else []
         pm._restr_feats = displayed
         pm.refresh()
-        self.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
-        sp.update_seq(new_seq, pm._feats + displayed)
-        sp._cursor_pos = pos + len(genomic)
-        sp._user_sel   = None
+        sidebar.populate(pm._feats)
+        sp.update_seq(seq_str, pm._feats + displayed)
+        # Keep the user's selection alive on screen so they can see
+        # the annotation overlay the bases they highlighted; the
+        # cursor / sel_anchor already match.
         sp._refresh_view()
         self._mark_dirty()
-        self.notify(
-            f"Inserted '{label or entry.get('feature_type')}' "
-            f"({len(genomic)} bp) at {pos + 1}."
+
+        coord_str = (f"{start + 1}..{end}" if end > start
+                     else f"{start + 1}..{n},1..{end}")
+        span = (end - start) if end > start else (n - start) + end
+        self._notify_success(
+            f"Annotated {feat_type} "
+            f"'{label or '(unlabeled)'}' at {coord_str} ({span} bp)."
         )
 
     def action_open_parts_bin(self) -> None:
