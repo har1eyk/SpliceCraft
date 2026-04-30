@@ -4131,6 +4131,13 @@ class SequencePanel(Widget):
         self._mouse_button_held: bool = False
         self._drag_was_shift:   bool = False
         self._last_was_drag:    bool = False
+        # Snapshot of the lane feat clicked at mouse_down (if any)
+        # so `on_mouse_up` can demote a tiny jiggle inside the same
+        # feature back to a click. Without this, a 1-bp wobble
+        # between press and release converts a feature-bar click
+        # into a microscopic drag selection and the `on_click`
+        # full-feature highlight never fires.
+        self._mouse_down_lane_feat: "dict | None" = None
         # Set by _click_to_bp when the click lands on a resite bar row
         self._last_resite_click: "dict | None" = None
         # Set by `_click_to_bp` when the click lands on the AA-letter
@@ -4264,6 +4271,9 @@ class SequencePanel(Widget):
         self._drag_start_bp     = bp
         self._has_dragged       = False
         self._drag_was_shift    = event.shift
+        # Snapshot the lane feat clicked at mouse_down so on_mouse_up
+        # can demote a tiny in-feature jiggle back to a click.
+        self._mouse_down_lane_feat = self._last_lane_feat
         if event.shift and self._cursor_pos >= 0:
             # Shift+click: extend selection from anchor (or cursor) to here
             anchor = self._sel_anchor if self._sel_anchor >= 0 else self._cursor_pos
@@ -4307,6 +4317,30 @@ class SequencePanel(Widget):
     def on_mouse_up(self, event: MouseUp) -> None:
         if event.button != 1:
             return
+        # Tiny-jiggle absorption: if mouse_down landed on a feature
+        # lane and the release point is still inside that same
+        # feature's bp range, demote the drag to a click. Without
+        # this guard, a 1-bp wobble between press and release
+        # converts a feature-bar click into a microscopic drag
+        # selection and `on_click`'s full-feature-highlight branch
+        # never fires (it bails on `_last_was_drag`). The user sees
+        # a 1-3 bp highlight where they expected the whole feature.
+        # Genuine drags (release outside the original feature) keep
+        # their drag-built selection.
+        down_feat = self._mouse_down_lane_feat
+        self._mouse_down_lane_feat = None
+        if (self._has_dragged and down_feat is not None and self._seq):
+            cur_bp = self._click_to_bp(event.screen_x, event.screen_y)
+            if cur_bp >= 0:
+                fs, fe = down_feat["start"], down_feat["end"]
+                in_feat = ((fs <= cur_bp < fe) if fe >= fs
+                            else (cur_bp >= fs or cur_bp < fe))
+                if in_feat:
+                    # Promote to click — clear the drag-built
+                    # selection so on_click's `select_feature_range`
+                    # can replace it cleanly.
+                    self._has_dragged = False
+                    self._user_sel    = None
         self._last_was_drag     = self._has_dragged
         self._mouse_button_held = False
         self._drag_start_bp     = -1
