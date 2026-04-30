@@ -158,6 +158,36 @@ if not _log.handlers:
         # Last-resort no-op handler if the log dir is read-only.
         _log.addHandler(logging.NullHandler())
 
+# ── Hang-debug helper: SIGUSR1 → Python stack dump ──────────────────────────
+# When the user reports "the app is hung", running `kill -USR1 <pid>`
+# in another shell now dumps every thread's Python stack to a sibling
+# log file (`splicecraft.stacks.log`). The output identifies which
+# function is wedged and at what line, removing the guesswork that
+# event-level logging alone can't resolve when the hang is inside a
+# render or a deadlock between threads.
+#
+# Implementation note: stdlib's `faulthandler.register(signum, file)`
+# captures a snapshot at signal time, including ALL threads. We open
+# the stacks log in append mode and keep the FD alive for the
+# session — `register` accepts a file object but holds it open via a
+# borrowed reference, so the FD must outlive every signal that could
+# arrive. POSIX-only (Windows lacks SIGUSR1).
+try:
+    import faulthandler as _faulthandler
+    import signal as _signal
+    _STACKS_LOG_PATH = str(Path(_LOG_PATH).with_name("splicecraft.stacks.log"))
+    _STACKS_LOG_FD = open(_STACKS_LOG_PATH, "a", buffering=1, encoding="utf-8")
+    if hasattr(_signal, "SIGUSR1"):
+        _faulthandler.register(_signal.SIGUSR1, file=_STACKS_LOG_FD,
+                                all_threads=True, chain=False)
+except OSError:
+    _log.exception("Failed to install SIGUSR1 stack-dump handler")
+except (AttributeError, ValueError):
+    # AttributeError: SIGUSR1 not present (Windows).
+    # ValueError: signal already in use by something else.
+    pass
+
+
 def _log_startup_banner() -> None:
     def _ver(import_name: str) -> str:
         try:
@@ -172,6 +202,11 @@ def _log_startup_banner() -> None:
     _log.info("textual   : %s", _ver("textual"))
     _log.info("biopython : %s", _ver("Bio"))
     _log.info("log path  : %s", _LOG_PATH)
+    try:
+        _log.info("stacks    : %s  (kill -USR1 <pid> on hang)",
+                  _STACKS_LOG_PATH)
+    except NameError:
+        pass
     _log.info("=" * 60)
 
 
