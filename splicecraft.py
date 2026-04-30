@@ -1389,10 +1389,13 @@ def _pack_features_2d(feats: list[dict], chunk_start: int,
     rectangle starting from `bottom_row` (0 = closest to DNA). Returns
     a list of (feat, bottom_row) pairs.
 
-    Sort order picks placement priority on collision: CDS comes first
-    so a CDS that overlaps a non-CDS gets the lower (closer-to-DNA)
-    slot. Within the same type, longer features sort first so they
-    win lane[0] when starts tie.
+    Pack order is `feats` order = insertion order from
+    `record.features`. Older features pack first and land at the
+    bottom of the stack (closest to DNA); newer features pack later
+    and stack on top of any older features whose column range they
+    overlap. This is the v0.4 default — "most recently added is most
+    visible" — pending a per-feature priority rotation feature
+    planned post-0.5. Stable sort preserves order within tiers.
 
     Algorithm: track per-column the highest occupied row index
     (`col_top`). The new feature's bottom_row is one above the max
@@ -1400,22 +1403,13 @@ def _pack_features_2d(feats: list[dict], chunk_start: int,
     rows are free. If nothing overlaps the feature, max_top is -1
     and the feature lands at row 0 (bar adjacent to DNA).
     """
-    # Sort key uses the in-chunk visible span (bar_e - bar_s) rather
-    # than the raw `end - start`. `_feats_in_chunk` always splits
-    # wrap features before they reach this function, but if a future
-    # refactor ever lets a wrap feature through (`end < start`), the
-    # raw subtraction goes negative and a tie-breaker that's supposed
-    # to favour longer features starts favouring shorter ones. The
-    # in-chunk span is always non-negative.
-    def _sort_key(f):
-        bar_s = max(f["start"], chunk_start)
-        bar_e = min(f["end"],   chunk_end)
-        return (
-            0 if f.get("type") == "CDS" else 1,
-            bar_s,
-            -(bar_e - bar_s),
-        )
-    sorted_f = sorted(feats, key=_sort_key)
+    # Stable sort by feature-type tier only: CDS still gets the
+    # AA-row-included height (3 vs 2), but no longer pre-empts other
+    # features for lane 0 — that lets a freshly added non-CDS pin a
+    # CDS up by one row, matching the user-facing rule "new on top".
+    # Within each tier insertion order is preserved by Python's
+    # stable sort, so older features pack first.
+    sorted_f = list(feats)
     placements: list[tuple[dict, int]] = []
     col_top: dict[int, int] = {}
     for f in sorted_f:
@@ -1553,10 +1547,11 @@ def _build_seq_inputs(seq: str, feats: list[dict]) -> tuple[list[str], list[dict
                 styles[i] = col
             for i in range(0, min(f["end"], n)):
                 styles[i] = col
-    annot_feats = sorted(
-        [f for f in feats if f.get("type") not in ("site", "recut")],
-        key=lambda f: -_feat_len(f["start"], f["end"], max(n, 1)),
-    )
+    # Filter out scan-derived restriction-site overlays (they're
+    # painted via `pm._restr_feats`, not the lane art). Preserve the
+    # caller's insertion order so `_pack_features_2d` can pack
+    # newest-on-top by walking the list in order.
+    annot_feats = [f for f in feats if f.get("type") not in ("site", "recut")]
     # Cap the cache at 4 entries (one active + a few stale) — we're keying
     # on id() so size stays tiny; this is just belt-and-braces.
     if len(_BUILD_SEQ_CACHE) >= 4:
@@ -8170,6 +8165,31 @@ class AddFeatureModal(ModalScreen):
         entry = self._gather()
         if entry is None:
             return
+        # CDS divisible-by-3 gate: the highlighted region's length must
+        # be a whole number of codons or the resulting CDS would have
+        # a partial codon at the end (silent translation bug). The
+        # check uses the SELECTION SPAN, not the typed-sequence length
+        # — agents and humans can edit the textarea, but the feature
+        # is anchored to the bp range. Wrap-aware via `_feat_len`.
+        if entry.get("feature_type") == "CDS":
+            try:
+                sp = self.app.query_one("#seq-panel", SequencePanel)
+                total = len(sp._seq) if sp._seq else 0
+            except (NoMatches, AttributeError):
+                total = 0
+            s, e = self._selection_range
+            span = _feat_len(s, e, total) if total else 0
+            if span > 0 and span % 3 != 0:
+                try:
+                    self.query_one("#addfeat-status", Static).update(
+                        f"[red]CDS must span a whole number of codons "
+                        f"(highlighted {span} bp; need a multiple of 3). "
+                        f"Adjust the selection or pick a different "
+                        f"feature type.[/red]"
+                    )
+                except NoMatches:
+                    pass
+                return
         self.dismiss({
             "action": "annotate",
             "entry":  entry,
@@ -18035,6 +18055,19 @@ SpeciesPickerModal { align: center middle; }
         if end == start:
             raise ValueError("zero-length feature (end == start)")
 
+        # CDS divisible-by-3 gate. The modal blocks this earlier with
+        # an inline error; the helper repeats the check so direct
+        # callers (agent-API `add-feature`, future programmatic
+        # entry points) can't bypass it. Wrap-aware via `_feat_len`.
+        feat_type = entry.get("feature_type") or "misc_feature"
+        if feat_type == "CDS":
+            span = _feat_len(start, end, n)
+            if span % 3 != 0:
+                raise ValueError(
+                    f"CDS must span a whole number of codons "
+                    f"({span} bp is not divisible by 3)."
+                )
+
         raw_strand = entry.get("strand", 1)
         try:
             strand = int(raw_strand)
@@ -18053,7 +18086,6 @@ SpeciesPickerModal { align: center middle; }
                 FeatureLocation(start, n, strand=biop_strand),
                 FeatureLocation(0, end, strand=biop_strand),
             ])
-        feat_type = entry.get("feature_type") or "misc_feature"
         qualifiers: dict = {
             k: list(v) if isinstance(v, (list, tuple)) else [v]
             for k, v in (entry.get("qualifiers") or {}).items()

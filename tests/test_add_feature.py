@@ -325,6 +325,177 @@ class TestAnnotateWithFeature:
             assert new.qualifiers.get("label") == ["marked"]
 
 
+class TestCDSDivisibleByThreeGate:
+    """A CDS feature must span a whole number of codons. The modal
+    blocks a non-divisible-by-3 selection inline (so the user fixes
+    the highlight), and `_annotate_with_feature` repeats the check
+    so direct callers (agent-API) get the same gate. The check uses
+    the SELECTION SPAN, wrap-aware, not the typed-sequence length —
+    the feature is anchored to the bp range, not whatever's in the
+    Sequence textarea."""
+
+    async def test_helper_rejects_non_divisible_cds(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            with pytest.raises(ValueError, match="multiple of 3|divisible by 3"):
+                app._annotate_with_feature(0, 10, {   # 10 bp — not %3
+                    "name": "x", "feature_type": "CDS",
+                    "strand": 1, "qualifiers": {},
+                })
+
+    async def test_helper_accepts_divisible_cds(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._annotate_with_feature(0, 9, {   # 9 bp — passes
+                "name": "x", "feature_type": "CDS",
+                "strand": 1, "qualifiers": {},
+            })
+            assert app._current_record.features[-1].type == "CDS"
+
+    async def test_helper_rejects_wrap_cds_when_total_span_indivisible(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="wrap_cds", name="wrap_cds",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Wrap span = (100 - 95) + 5 = 10, not %3.
+            with pytest.raises(ValueError, match="divisible by 3"):
+                app._annotate_with_feature(95, 5, {
+                    "name": "wcds", "feature_type": "CDS",
+                    "strand": 1, "qualifiers": {},
+                })
+
+    async def test_helper_accepts_wrap_cds_when_total_span_divisible(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="wrap_ok", name="wrap_ok",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Wrap span = (100 - 94) + 3 = 9, %3 == 0 → accept.
+            app._annotate_with_feature(94, 3, {
+                "name": "wcds", "feature_type": "CDS",
+                "strand": 1, "qualifiers": {},
+            })
+            assert app._current_record.features[-1].type == "CDS"
+
+    async def test_non_cds_unchecked_even_when_indivisible(
+        self, tiny_record, isolated_library,
+    ):
+        """The gate applies ONLY to CDS — promoter / misc_feature / etc.
+        accept any span length, including non-multiples of 3."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._annotate_with_feature(0, 10, {
+                "name": "p", "feature_type": "promoter",
+                "strand": 1, "qualifiers": {},
+            })
+            last = app._current_record.features[-1]
+            assert last.type == "promoter"
+            assert int(last.location.end) - int(last.location.start) == 10
+
+    async def test_modal_blocks_indivisible_cds_inline(
+        self, tiny_record, isolated_library,
+    ):
+        """Open the modal with a 10-bp selection, set type=CDS, click
+        Insert. The button handler should NOT dismiss — the inline
+        status box shows the divisible-by-3 error instead."""
+        from textual.widgets import Static
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (0, 10)   # 10 bp — not %3
+            app.action_add_feature()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.AddFeatureModal)
+            modal.query_one("#addfeat-name").value = "bad-cds"
+            # Type already defaults to "CDS"; force it explicitly.
+            modal.query_one("#addfeat-type").value = "CDS"
+            await pilot.pause(0.05)
+            # Click Insert → still on the modal, status box flagged.
+            await pilot.click("#btn-addfeat-insert")
+            await pilot.pause(0.2)
+            # Modal still on screen (not dismissed).
+            assert isinstance(app.screen, sc.AddFeatureModal)
+            status_text = str(modal.query_one("#addfeat-status", Static)
+                                  .render())
+            assert "multiple of 3" in status_text
+
+
+class TestPackerNewOnTop:
+    """Newly added features stack on top of older overlapping features.
+    The packer iterates `feats` in insertion order; older features pack
+    first and land at the bottom (closest to DNA), newer features get
+    pushed to higher rows wherever their column range overlaps an
+    older feature. Per-feature priority rotation will land in a future
+    release; until then, recency is the rule."""
+
+    def test_overlapping_new_feature_lands_above_old(self):
+        old = {"start": 0, "end": 30, "type": "misc_feature",
+                "label": "old", "strand": 1, "color": "white"}
+        new = {"start": 10, "end": 20, "type": "misc_feature",
+                "label": "new", "strand": 1, "color": "white"}
+        placements = sc._pack_features_2d([old, new], 0, 30)
+        rows = {p[0]["label"]: p[1] for p in placements}
+        assert rows["old"] < rows["new"], (
+            f"new feature should land above old; got rows={rows}"
+        )
+
+    def test_new_cds_pushed_above_existing_non_cds(self):
+        """Pre-fix, CDS features pre-empted lane 0 over non-CDS.
+        Post-fix, insertion order rules: an existing non-CDS keeps
+        lane 0 and a newly added CDS lands above it."""
+        old_promoter = {"start": 0, "end": 30, "type": "promoter",
+                          "label": "p", "strand": 1, "color": "white"}
+        new_cds = {"start": 10, "end": 22, "type": "CDS",
+                     "label": "c", "strand": 1, "color": "white"}
+        placements = sc._pack_features_2d(
+            [old_promoter, new_cds], 0, 30,
+        )
+        rows = {p[0]["label"]: p[1] for p in placements}
+        assert rows["p"] == 0
+        assert rows["c"] > 0
+
+    def test_non_overlapping_features_share_lane(self):
+        """Features that don't overlap pack into the same row regardless
+        of insertion order — recency only kicks in on collisions."""
+        a = {"start": 0,  "end": 10, "type": "misc_feature",
+              "label": "a", "strand": 1, "color": "white"}
+        b = {"start": 20, "end": 30, "type": "misc_feature",
+              "label": "b", "strand": 1, "color": "white"}
+        placements = sc._pack_features_2d([a, b], 0, 30)
+        rows = {p[0]["label"]: p[1] for p in placements}
+        assert rows["a"] == 0
+        assert rows["b"] == 0
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Modal surface — mount + gather
 # ═══════════════════════════════════════════════════════════════════════════════
