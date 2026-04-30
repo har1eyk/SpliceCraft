@@ -2569,6 +2569,13 @@ class PlasmidMap(Widget):
         self.selected_idx = -1
         self._feats       = self._parse(record)
         self._restr_feats = []
+        # Click-target bboxes for feature labels — rebuilt every
+        # `_draw` / `_draw_linear` call. Each entry is
+        # `(x0, x1, y, feat_idx)`. `_feat_at` / `_feat_at_linear`
+        # check this list before falling through to the arc / bar
+        # geometry so a click on a label routes to the same feature
+        # the label points at.
+        self._label_bboxes: list = []
         self.refresh()
 
     def _parse(self, record) -> list[dict]:
@@ -2728,10 +2735,28 @@ class PlasmidMap(Widget):
     def on_mouse_scroll_down(self, _: MouseScrollDown):
         self.action_rotate_ccw()
 
+    def _label_at(self, x: int, y: int) -> int:
+        """Return the feature index whose label bbox covers the
+        click cell (x, y), or -1 if no label was hit. Bboxes are
+        populated in `_draw` / `_draw_linear` per render pass."""
+        for x0, x1, ly, idx in getattr(self, "_label_bboxes", ()):
+            if y == ly and x0 <= x <= x1:
+                return idx
+        return -1
+
     def _feat_at(self, x: int, y: int) -> tuple[int, int]:
         """Return (feature_idx, click_bp) at terminal cell (x, y), or (-1, -1)."""
         if not self.record or not self._total:
             return -1, -1
+        # Label-first: a click that hits a feature's text label
+        # routes to that exact feature, with `bp` set to its 5' end
+        # so the App's seq-panel scroll lands at the feature's start.
+        # Without this, label clicks would fall outside the arc-
+        # detection radius and resolve as a backbone click.
+        idx = self._label_at(x, y)
+        if idx >= 0:
+            f = self._feats[idx]
+            return idx, int(f["start"])
         w, h = self.size.width, self.size.height
         cx, cy, rx, ry = self._geometry(w, h)
         if rx == 0 or ry == 0:
@@ -2929,7 +2954,14 @@ class PlasmidMap(Widget):
             enumerate(self._feats),
             key=lambda iv: -_feat_len(iv[1]["start"], iv[1]["end"], total),
         )
-        label_slots: list[tuple[float, str, str]] = []
+        # Reset click-target bboxes for this draw pass. Filled below
+        # as labels get placed; `_feat_at` reads it when the user
+        # clicks anywhere outside the arc itself.
+        self._label_bboxes = []
+        # `(angle, label_text, color, feat_idx_or_minus_one)`. -1 idx
+        # marks restriction-site labels — those don't correspond to a
+        # `self._feats` entry and shouldn't be click-targets here.
+        label_slots: list[tuple[float, str, str, int]] = []
         N_DR = 4   # radial samples per arc (was 6; 4 is visually identical)
 
         for orig_idx, f in feats_sorted:
@@ -2982,11 +3014,12 @@ class PlasmidMap(Widget):
             # wrap-around (end < start) without putting the label opposite the arc.
             arc_len = (end_bp - start_bp) % total
             mid_bp  = (start_bp + arc_len // 2) % total
-            label_slots.append((bp2a(mid_bp), f["label"], color))
+            label_slots.append((bp2a(mid_bp), f["label"], color, orig_idx))
 
-        # Add restriction site labels (from resite entries only)
+        # Add restriction site labels (from resite entries only) —
+        # tagged with idx=-1 so they don't appear in click bboxes.
         for angle, lbl, color in restr_labels:
-            label_slots.append((angle, lbl, color))
+            label_slots.append((angle, lbl, color, -1))
 
         # ── Labels: place each as close to the arc as possible ───────────────
         # Greedily try increasing dr until the label's bounding box doesn't
@@ -2998,10 +3031,10 @@ class PlasmidMap(Widget):
 
         # placed: dict keyed by row → list of (x0, x1) bounding boxes
         placed_by_row: dict[int, list] = {}
-        final_labels: list[tuple[float, str, str, int, int, int]] = []
-        # angle, lbl, color, chosen_dr, lx, ly
+        final_labels: list[tuple] = []
+        # (angle, lbl, color, chosen_dr, lx, ly, lbl_x0, lbl_x1, feat_idx)
 
-        for angle, lbl, color in label_slots:
+        for angle, lbl, color, feat_idx in label_slots:
             on_right = math.cos(angle) >= 0
             chosen = None
             for dr in range(dr_min, dr_max + 1):
@@ -3027,10 +3060,12 @@ class PlasmidMap(Widget):
                 chosen = (dr_max, lx, ly, lbl_x0, lbl_x1)
             dr_c, lx, ly, lbl_x0, lbl_x1 = chosen
             placed_by_row.setdefault(ly, []).append((lbl_x0, lbl_x1))
-            final_labels.append((angle, lbl, color, dr_c, lx, ly))
+            final_labels.append(
+                (angle, lbl, color, dr_c, lx, ly, lbl_x0, lbl_x1, feat_idx)
+            )
 
         # Render
-        for angle, lbl, color, dr_c, lx, ly in final_labels:
+        for angle, lbl, color, dr_c, lx, ly, lbl_x0, lbl_x1, feat_idx in final_labels:
             on_right = math.cos(angle) >= 0
 
             # Dot just outside the arc
@@ -3051,6 +3086,12 @@ class PlasmidMap(Widget):
                 canvas.put_text(lx, ly, lbl, color)
             else:
                 canvas.put_text(max(0, lx - len(lbl) + 1), ly, lbl, color)
+            # Stash the painted bbox so a click on this label routes
+            # to the same feature the label points at. Restriction
+            # labels (feat_idx == -1) are skipped — they don't have
+            # a `self._feats` entry to focus.
+            if feat_idx >= 0:
+                self._label_bboxes.append((lbl_x0, lbl_x1, ly, feat_idx))
 
         # ── Center info ───────────────────────────────────────────────────────
         name     = (self.record.name or self.record.id or "?")[:w // 3]
@@ -3072,6 +3113,13 @@ class PlasmidMap(Widget):
         or (-1, -1) if outside the map region / no feature matched."""
         if not self._total:
             return -1, -1
+        # Label-first: same logic as the circular path. A click on a
+        # feature's text label routes to that feature with bp set
+        # to its 5' end so the seq panel scrolls to the start.
+        idx = self._label_at(x, y)
+        if idx >= 0:
+            f = self._feats[idx]
+            return idx, int(f["start"])
         w, h      = self.size.width, self.size.height
         margin_l  = 5
         margin_r  = 2
@@ -3099,6 +3147,10 @@ class PlasmidMap(Widget):
         canvas = _Canvas(w, h)
         bc     = _BrailleCanvas(w, h)
         total  = self._total
+
+        # Reset click-target bboxes for this draw pass; populated as
+        # feature labels are painted below.
+        self._label_bboxes = []
 
         if not total:
             canvas.put_text(w // 2 - 9, h // 2, "No record loaded", "dim")
@@ -3259,6 +3311,11 @@ class PlasmidMap(Widget):
                     lbl = label[:max_lbl_w]
                     lx  = x0c + (max_lbl_w - len(lbl)) // 2
                     canvas.put_text(lx, label_ty, lbl, style)
+                    # Click-target: linear-map labels route a click
+                    # to the same feature the label belongs to.
+                    self._label_bboxes.append(
+                        (lx, lx + len(lbl) - 1, label_ty, i)
+                    )
 
         # ── Header ──
         name = (self.record.name or self.record.id or "?")[:w // 3]

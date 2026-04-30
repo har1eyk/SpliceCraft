@@ -1007,6 +1007,119 @@ class TestCursorReachesEndOfSequence:
             assert sp._cursor_pos == n - 1
 
 
+class TestPlasmidMapLabelClick:
+    """Clicking on a feature's text label in the plasmid map should
+    route to that feature — same outcome as clicking its arc, the
+    sidebar row, or the seq-panel lane art. Pre-fix the label fell
+    outside the arc-detection radius and resolved as a backbone
+    click (cleared all highlights instead of selecting the feature).
+
+    `_draw` / `_draw_linear` populate `pm._label_bboxes` with
+    `(x0, x1, y, feat_idx)` for each painted label; `_feat_at` /
+    `_feat_at_linear` check the list before falling through to the
+    geometry-based hit test.
+    """
+
+    async def test_circular_label_click_selects_feature(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # Force a render so `_label_bboxes` is populated.
+            pm.render()
+            assert pm._label_bboxes, "expected at least one label bbox"
+            x0, x1, ly, idx = pm._label_bboxes[0]
+            mid_x = (x0 + x1) // 2
+            result = pm._feat_at(mid_x, ly)
+            assert result == (idx, int(pm._feats[idx]["start"])), (
+                f"label click should resolve to feature idx={idx} at "
+                f"its 5' end; got {result}"
+            )
+
+    async def test_circular_label_click_outside_arc_still_selects(
+        self, tiny_record, isolated_library,
+    ):
+        """Labels are placed outside the arc's 75-135% radial band,
+        which used to hard-reject in `_feat_at`. Verify a click in
+        that band on a label still resolves correctly."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.render()
+            # Find a label whose y row puts it outside the arc band.
+            import math
+            w, h = pm.size.width, pm.size.height
+            cx, cy, rx, ry = pm._geometry(w, h)
+            for x0, x1, ly, idx in pm._label_bboxes:
+                mid_x = (x0 + x1) // 2
+                dc = (mid_x - cx) / max(rx, 1)
+                dr = (ly    - cy) / max(ry, 1)
+                r_norm = math.sqrt(dc * dc + dr * dr)
+                if r_norm > 1.35 or r_norm < 0.75:
+                    out_idx, _bp = pm._feat_at(mid_x, ly)
+                    assert out_idx == idx, (
+                        f"label outside arc band should still hit-test "
+                        f"to its feature; got idx={out_idx} expected={idx}"
+                    )
+                    return
+            # If no label happened to be outside the band in this
+            # tiny_record render, the test is moot but not wrong.
+
+    async def test_linear_label_click_selects_feature(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # Switch to linear view and force a render.
+            pm._map_mode = "linear"
+            pm.refresh()
+            pm.render()
+            assert pm._label_bboxes
+            x0, x1, ly, idx = pm._label_bboxes[0]
+            result = pm._feat_at_linear((x0 + x1) // 2, ly)
+            assert result == (idx, int(pm._feats[idx]["start"]))
+
+    async def test_label_click_emits_feature_selected_via_app(
+        self, tiny_record, isolated_library,
+    ):
+        """End-to-end through the App: post `FeatureSelected` (the
+        message `pm.on_click` posts after a label hit) and verify
+        the App's `_map_feat_selected` handler highlights the
+        feature span in the seq panel. Pre-fix a label-on-arc click
+        returned (-1, -1) and the message routed to the backbone-
+        click branch, clearing all highlights."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel",   sc.SequencePanel)
+            pm.render()
+            assert pm._label_bboxes
+            _x0, _x1, _ly, idx = pm._label_bboxes[0]
+            f = pm._feats[idx]
+            pm.post_message(sc.PlasmidMap.FeatureSelected(
+                idx, f, int(f["start"]),
+            ))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # `select_feature_range` sets `_user_sel = (start, end)`
+            # via the App's `_focus_feature` chain — same outcome
+            # as a sidebar / seq-panel feature pick.
+            assert sp._user_sel == (int(f["start"]), int(f["end"])), (
+                f"label click should highlight the feature span; "
+                f"sp._user_sel={sp._user_sel}"
+            )
+
+
 class TestSeqHomeEndAndCtrlArrow:
     """The seq panel's keyboard surface gained three extras (2026-04-30+):
 
