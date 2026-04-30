@@ -174,6 +174,82 @@ def _log_startup_banner() -> None:
     _log.info("log path  : %s", _LOG_PATH)
     _log.info("=" * 60)
 
+
+def _log_event(event: str, **fields) -> None:
+    """One-line structured log entry for user-facing events.
+
+    Use this at click handlers, key actions, save / load / annotate
+    boundaries — anywhere a user-visible state change happens. The
+    output goes to the rotating log file at INFO level so a user
+    pasting their log into a bug report shows what they were doing
+    when the symptom appeared:
+
+        12:34:56 [a3f2c1d8] INFO  splicecraft.on_click:4243
+            event seq.click bp=120 lane=True feat=lacZ
+
+    Keep the field list short — long values blow up the log line.
+    Strings get repr'd to show whitespace / control chars (helpful
+    when a label contains odd characters that break rendering).
+
+    Performance: short-circuits to a no-op when the logger isn't
+    INFO-enabled, so the field-formatting cost only happens when the
+    message would actually be written. Per-call overhead in the
+    happy path is one method call + an `isEnabledFor` check (~100 ns).
+    Even at 100 events per second the framework throughput is well
+    below 0.01 % CPU.
+    """
+    if not _log.isEnabledFor(logging.INFO):
+        return
+    if not fields:
+        _log.info("event %s", event)
+        return
+    parts = []
+    for k, v in fields.items():
+        if isinstance(v, str) and any(c in v for c in "\n\r\t"):
+            parts.append(f"{k}={v!r}")
+        else:
+            parts.append(f"{k}={v}")
+    _log.info("event %s %s", event, " ".join(parts))
+
+
+import time as _time
+from contextlib import contextmanager
+
+# Threshold above which a wrapped block emits a `slow` event.
+# 50 ms is roughly 3 frames at 60 fps — anything beyond that is
+# "the user can perceive a stutter". Tune up for known-slow paths
+# (NCBI fetch, pytest-driven cosmid renders) by passing an explicit
+# `threshold_ms`.
+_SLOW_THRESHOLD_MS = 50.0
+
+
+@contextmanager
+def _log_timing(path: str, threshold_ms: float = _SLOW_THRESHOLD_MS):
+    """Time the wrapped block and emit a `slow` event when it
+    exceeds `threshold_ms`. Use as a `with` statement around hot
+    paths; the no-event happy case has near-zero overhead (just
+    two `perf_counter` calls). When a user pastes their log into
+    a bug report after a "the app hangs" complaint, the slow
+    events pinpoint which routine is the bottleneck.
+
+    Example::
+
+        with _log_timing("seq.refresh_view"):
+            sp._refresh_view()
+
+    Logs:
+
+        slow path=seq.refresh_view elapsed_ms=183.2
+    """
+    t0 = _time.perf_counter()
+    try:
+        yield
+    finally:
+        dt_ms = (_time.perf_counter() - t0) * 1000
+        if dt_ms >= threshold_ms:
+            _log_event("slow", path=path, elapsed_ms=round(dt_ms, 1))
+
+
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -2783,6 +2859,13 @@ class PlasmidMap(Widget):
             idx, bp = self._feat_at(event.x, event.y)
         self.selected_idx = idx
         f = self._feats[idx] if idx >= 0 else None
+        _log_event(
+            "map.click", mode=self._map_mode,
+            x=event.x, y=event.y,
+            idx=idx, bp=bp,
+            feat=(f or {}).get("label") if f else None,
+            label_hit=(idx >= 0 and self._label_at(event.x, event.y) == idx),
+        )
         self.post_message(self.FeatureSelected(idx, f, bp))
 
     def _bp_in(self, bp: int, f: dict) -> bool:
@@ -4274,6 +4357,13 @@ class SequencePanel(Widget):
         # Snapshot the lane feat clicked at mouse_down so on_mouse_up
         # can demote a tiny in-feature jiggle back to a click.
         self._mouse_down_lane_feat = self._last_lane_feat
+        _log_event(
+            "seq.mouse_down", bp=bp,
+            lane=self._last_lane_click,
+            feat=(self._last_lane_feat or {}).get("label") if self._last_lane_feat else None,
+            shift=event.shift,
+            codon=self._last_aa_codon_click,
+        )
         if event.shift and self._cursor_pos >= 0:
             # Shift+click: extend selection from anchor (or cursor) to here
             anchor = self._sel_anchor if self._sel_anchor >= 0 else self._cursor_pos
@@ -4341,6 +4431,11 @@ class SequencePanel(Widget):
                     # can replace it cleanly.
                     self._has_dragged = False
                     self._user_sel    = None
+                    _log_event(
+                        "seq.jiggle_absorbed",
+                        bp_release=cur_bp,
+                        feat=down_feat.get("label"),
+                    )
         self._last_was_drag     = self._has_dragged
         self._mouse_button_held = False
         self._drag_start_bp     = -1
@@ -4435,6 +4530,12 @@ class SequencePanel(Widget):
         self._re_highlight = None
         self._aa_highlight = None
         double = event.chain >= 2
+        _log_event(
+            "seq.click", bp=bp, lane=self._last_lane_click,
+            feat=(self._last_lane_feat or {}).get("label")
+                  if self._last_lane_feat else None,
+            double=double,
+        )
         self.post_message(self.SequenceClick(
             bp, double=double, from_lane=self._last_lane_click,
             feat=self._last_lane_feat,
@@ -4857,16 +4958,17 @@ class SequencePanel(Widget):
                self._sel_range, self._user_sel, self._cursor_pos,
                self._show_connectors, reh_key, aa_key)
         if key != self._view_cache_key:
-            self._view_cache_txt = _build_seq_text(
-                self._seq, self._feats,
-                line_width      = line_width,
-                sel_range       = self._sel_range,
-                user_sel        = self._user_sel,
-                cursor_pos      = self._cursor_pos,
-                show_connectors = self._show_connectors,
-                re_highlight    = self._re_highlight,
-                aa_highlight    = self._aa_highlight,
-            )
+            with _log_timing("seq.build_text"):
+                self._view_cache_txt = _build_seq_text(
+                    self._seq, self._feats,
+                    line_width      = line_width,
+                    sel_range       = self._sel_range,
+                    user_sel        = self._user_sel,
+                    cursor_pos      = self._cursor_pos,
+                    show_connectors = self._show_connectors,
+                    re_highlight    = self._re_highlight,
+                    aa_highlight    = self._aa_highlight,
+                )
             self._view_cache_key = key
 
         # Don't try to "preserve scroll across content update" here. An
@@ -17236,6 +17338,7 @@ SpeciesPickerModal { align: center middle; }
     def _action_undo(self) -> None:
         if not self._undo_stack:
             self.notify("Nothing to undo", severity="information")
+            _log_event("undo.empty")
             return
         from copy import deepcopy
         sp = self.query_one("#seq-panel", SequencePanel)
@@ -17247,11 +17350,13 @@ SpeciesPickerModal { align: center middle; }
         seq, cursor_pos, record = self._undo_stack.pop()
         self._apply_snapshot(seq, cursor_pos, record)
         remaining = len(self._undo_stack)
+        _log_event("undo", remaining=remaining)
         self.notify(f"Undo  ({remaining} left)")
 
     def _action_redo(self) -> None:
         if not self._redo_stack:
             self.notify("Nothing to redo", severity="information")
+            _log_event("redo.empty")
             return
         from copy import deepcopy
         sp = self.query_one("#seq-panel", SequencePanel)
@@ -17261,6 +17366,7 @@ SpeciesPickerModal { align: center middle; }
         seq, cursor_pos, record = self._redo_stack.pop()
         self._apply_snapshot(seq, cursor_pos, record)
         remaining = len(self._redo_stack)
+        _log_event("redo", remaining=remaining)
         self.notify(f"Redo  ({remaining} left)")
 
     # ── Dirty-state helpers ────────────────────────────────────────────────────
@@ -17356,7 +17462,15 @@ SpeciesPickerModal { align: center middle; }
         """Save current record to its source file and/or library. Returns True on success."""
         if self._current_record is None:
             self.notify("Nothing to save.", severity="warning")
+            _log_event("save.no_record")
             return False
+        _log_event(
+            "save.start",
+            name=self._current_record.name,
+            source_path=self._source_path,
+            length=len(self._current_record.seq),
+            n_features=len(self._current_record.features),
+        )
 
         # Write to source file if one is known
         if self._source_path:
@@ -17368,6 +17482,8 @@ SpeciesPickerModal { align: center middle; }
             except Exception as exc:
                 _log.exception("Save to %s failed", self._source_path)
                 self.notify(f"Save failed: {exc}", severity="error")
+                _log_event("save.failed", target="source",
+                            error=str(exc))
                 return False
 
         # Always update the library entry (add or overwrite)
@@ -17377,9 +17493,12 @@ SpeciesPickerModal { align: center middle; }
         except Exception as exc:
             _log.exception("Library update failed during save")
             self.notify(f"Library update failed: {exc}", severity="error")
+            _log_event("save.failed", target="library",
+                        error=str(exc))
             return False
 
         self._mark_clean()
+        _log_event("save.ok", source_path=self._source_path)
         if self._source_path:
             self._notify_success(f"Saved → {self._source_path}")
         else:
@@ -17659,6 +17778,10 @@ SpeciesPickerModal { align: center middle; }
           highlight. The base may live inside a feature, but the user
           asked for a single-base operation, not a feature pick.
         """
+        with _log_timing("app.seq_click"):
+            self._seq_click_impl(event)
+
+    def _seq_click_impl(self, event: SequencePanel.SequenceClick) -> None:
         pm      = self.query_one("#plasmid-map", PlasmidMap)
         sidebar = self.query_one("#sidebar",     FeatureSidebar)
         seq_pnl = self.query_one("#seq-panel",   SequencePanel)
@@ -17697,7 +17820,9 @@ SpeciesPickerModal { align: center middle; }
                 if f is event.feat:
                     best_idx = i
                     break
+        used_fallback = False
         if best_idx < 0:
+            used_fallback = True
             total = len(seq_pnl._seq)
             best_span = float("inf")
             for i, f in enumerate(pm._feats):
@@ -17709,6 +17834,11 @@ SpeciesPickerModal { align: center middle; }
                     best_idx  = i
         if best_idx >= 0:
             f = pm._feats[best_idx]
+            _log_event(
+                "app.seq_click_pick", bp=bp, idx=best_idx,
+                feat=f.get("label"),
+                via=("event_feat" if not used_fallback else "bp_search_fallback"),
+            )
             pm.select_feature(best_idx)
             sidebar.show_detail(f)
             sidebar.highlight_row(best_idx)
@@ -17727,6 +17857,16 @@ SpeciesPickerModal { align: center middle; }
 
     @on(PlasmidMap.FeatureSelected)
     def _map_feat_selected(self, event: PlasmidMap.FeatureSelected):
+        with _log_timing("app.map_feat_selected"):
+            self._map_feat_selected_impl(event)
+
+    def _map_feat_selected_impl(self, event: PlasmidMap.FeatureSelected):
+        _log_event(
+            "app.map_feat_selected",
+            idx=event.idx, bp=event.bp,
+            feat=(event.feat_dict or {}).get("label")
+                  if event.feat_dict else None,
+        )
         sidebar = self.query_one("#sidebar", FeatureSidebar)
         # Backbone click (idx == -1, feat_dict is None): treat as a
         # neutral click and wipe every panel's highlight, including
@@ -18287,6 +18427,22 @@ SpeciesPickerModal { align: center middle; }
         the agent-API ``add-feature`` endpoint — single source of
         truth for "annotate existing bases".
         """
+        _log_event(
+            "annotate.start", start=start, end=end,
+            type=entry.get("feature_type"),
+            label=entry.get("name"),
+            strand=entry.get("strand"),
+        )
+        with _log_timing("app.annotate_with_feature"):
+            self._annotate_with_feature_impl(start, end, entry)
+        _log_event(
+            "annotate.done", n_feats=len(self._current_record.features)
+                              if self._current_record else 0,
+        )
+
+    def _annotate_with_feature_impl(
+        self, start: int, end: int, entry: dict,
+    ) -> None:
         from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
         from copy import deepcopy
 
