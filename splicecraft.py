@@ -4014,12 +4014,21 @@ class SequencePanel(Widget):
         whole feature. DNA-row clicks → just place the cursor on `bp`,
         no feature-wide highlight even if `bp` happens to fall inside
         a feature's range.
+
+        `feat` is the actual feature dict whose lane art the user
+        clicked, set when `from_lane=True` so the receiver can pick
+        the right feature directly. Without it, the App would have
+        to guess via "smallest enclosing feature at bp" — which
+        mis-picks when a small inner feature shares the click bp
+        with the larger feature whose bar was actually clicked.
         """
         def __init__(self, bp: int, double: bool = False,
-                     from_lane: bool = False):
+                     from_lane: bool = False,
+                     feat: "dict | None" = None):
             self.bp        = bp
             self.double    = double
             self.from_lane = from_lane
+            self.feat      = feat
             super().__init__()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -4061,6 +4070,13 @@ class SequencePanel(Widget):
         # Reset before every `_click_to_bp` call (see on_mouse_down /
         # on_click) since the setter is asymmetric — never clears.
         self._last_lane_click: bool = False
+        # Set by `_click_to_bp` to the actual feature dict whose lane art
+        # was clicked, so the App's `_seq_click` can highlight that exact
+        # feature instead of falling back to "smallest enclosing feature
+        # at this bp" — which would mis-pick a tiny inner feature when
+        # the user clicked on top of a larger overlapping feature's bar.
+        # Reset alongside `_last_lane_click`.
+        self._last_lane_feat: "dict | None" = None
         self._sorted_feats_cache: "list | None" = None
 
     def compose(self) -> ComposeResult:
@@ -4155,6 +4171,7 @@ class SequencePanel(Widget):
         # (e.g. lane→DNA-row sequence wrongly skipping auto-scroll, or
         # mid-drag mouse_up bypassing on_click and leaving them set).
         self._last_lane_click     = False
+        self._last_lane_feat      = None
         self._last_aa_codon_click = None
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
@@ -4233,7 +4250,10 @@ class SequencePanel(Widget):
         # the click lands on a feature lane (the bar/arrow art) rather
         # than the DNA strand. Sequence-row clicks intentionally do NOT
         # trigger a whole-feature highlight — only the lane art does.
+        # `_last_lane_feat` carries the actual feature dict whose lane
+        # was clicked so the receiver can pick that exact feature.
         self._last_lane_click = False
+        self._last_lane_feat  = None
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
             return
@@ -4309,6 +4329,7 @@ class SequencePanel(Widget):
         double = event.chain >= 2
         self.post_message(self.SequenceClick(
             bp, double=double, from_lane=self._last_lane_click,
+            feat=self._last_lane_feat,
         ))
 
     def _seq_render_width(self) -> int:
@@ -4442,12 +4463,19 @@ class SequencePanel(Widget):
                                 if 0 <= cs and ce <= n:
                                     self._last_aa_codon_click = (cs, ce)
                                 self._last_lane_click = True
+                                self._last_lane_feat  = f
                                 return click_bp
                             # Click landed in an empty cell of the AA
                             # row — do nothing.
                             return -1
                         else:
                             self._last_lane_click = True
+                        # Stash the actual feature dict so the App
+                        # routes to THIS feature, not "smallest
+                        # enclosing at midpoint" (which would mis-pick
+                        # a small inner feature when the user's click
+                        # landed on a larger overlapping bar).
+                        self._last_lane_feat = f
                         return (f["start"] + f["end"]) // 2
                 return -1
 
@@ -17449,19 +17477,32 @@ SpeciesPickerModal { align: center middle; }
                 seq_pnl._refresh_view()
             return
 
-        # Route through PlasmidMap._bp_in + _feat_len so wrap features
-        # (end < start) are honoured. A naive `s <= bp < e` misses every
-        # origin-spanning feature; `e - s` is also negative for them.
-        total = len(seq_pnl._seq)
-        best_idx  = -1
-        best_span = float("inf")
-        for i, f in enumerate(pm._feats):
-            if not pm._bp_in(bp, f):
-                continue
-            span = _feat_len(f["start"], f["end"], total) if total else 0
-            if span < best_span:
-                best_span = span
-                best_idx  = i
+        # Prefer the feature dict the panel actually clicked
+        # (`event.feat` set by `_check_packed`) over a bp-based
+        # search. Without this, two features overlapping at the
+        # click bp would let the "smallest enclosing" rule mis-pick
+        # the smaller — e.g. a tiny inner annotation steals focus
+        # when the user clearly clicked the larger feature's bar.
+        # Match by identity to find its index in `pm._feats` for
+        # the map-side select; fall back to bp search if for any
+        # reason the panel didn't carry a feat (older message
+        # senders, programmatic posts).
+        best_idx = -1
+        if event.feat is not None:
+            for i, f in enumerate(pm._feats):
+                if f is event.feat:
+                    best_idx = i
+                    break
+        if best_idx < 0:
+            total = len(seq_pnl._seq)
+            best_span = float("inf")
+            for i, f in enumerate(pm._feats):
+                if not pm._bp_in(bp, f):
+                    continue
+                span = _feat_len(f["start"], f["end"], total) if total else 0
+                if span < best_span:
+                    best_span = span
+                    best_idx  = i
         if best_idx >= 0:
             f = pm._feats[best_idx]
             pm.select_feature(best_idx)

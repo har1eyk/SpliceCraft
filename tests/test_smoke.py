@@ -1830,6 +1830,97 @@ class TestSeqClickWrapFeature:
                 f"feature; got selected_idx={pm.selected_idx}"
             )
 
+    async def test_lane_click_picks_clicked_feature_not_smallest(
+        self, isolated_library,
+    ):
+        """Regression guard for 2026-04-30: when a click bp falls inside
+        BOTH a small inner feature and a larger overlapping feature whose
+        bar was actually clicked, the panel-side `_check_packed` stashes
+        the clicked feat dict on the SequenceClick message so the App
+        picks THAT feature directly. Pre-fix the App fell back to
+        "smallest enclosing at bp" and mis-picked the tiny inner
+        feature even when the user clearly clicked the larger one's
+        bar — same bug the user hit when annotating a region that
+        overlapped existing features."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="overlap_click",
+                        annotations={"molecule_type": "DNA"})
+        # Larger outer feature [50, 150]. A small inner annotation
+        # [98, 102] sits at the outer's midpoint (=100). Pre-fix the
+        # bp=100 click would always select the inner.
+        rec.features.append(SeqFeature(
+            FeatureLocation(50, 150, strand=1), type="misc_feature",
+            qualifiers={"label": ["outer"]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(98, 102, strand=1), type="misc_feature",
+            qualifiers={"label": ["inner"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel",   sc.SequencePanel)
+            outer_idx = next(i for i, f in enumerate(pm._feats)
+                              if f.get("label") == "outer")
+            outer = pm._feats[outer_idx]
+            # Click sent with the ACTUAL feat dict (as `_check_packed`
+            # would set) — should select the outer despite bp=100
+            # also being inside the inner feature.
+            sp.post_message(sc.SequencePanel.SequenceClick(
+                bp=100, from_lane=True, feat=outer,
+            ))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert pm.selected_idx == outer_idx, (
+                f"lane-click on outer's bar should select outer; "
+                f"got selected_idx={pm.selected_idx}"
+            )
+            assert sp._user_sel == (50, 150), (
+                f"user_sel should span the outer feature; "
+                f"got {sp._user_sel}"
+            )
+
+    async def test_lane_click_falls_back_to_bp_search_without_feat(
+        self, isolated_library,
+    ):
+        """Back-compat: if a SequenceClick arrives with `feat=None`
+        (older callers / programmatic posts), the App falls back to
+        the original "smallest enclosing at bp" search."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="bp_fallback",
+                        annotations={"molecule_type": "DNA"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(50, 150, strand=1), type="misc_feature",
+            qualifiers={"label": ["outer"]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(98, 102, strand=1), type="misc_feature",
+            qualifiers={"label": ["inner"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel",   sc.SequencePanel)
+            inner_idx = next(i for i, f in enumerate(pm._feats)
+                              if f.get("label") == "inner")
+            # No feat passed → bp search → smallest enclosing → inner.
+            sp.post_message(sc.SequencePanel.SequenceClick(
+                bp=100, from_lane=True,
+            ))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert pm.selected_idx == inner_idx
+
     async def test_base_click_does_not_select_feature(
         self, isolated_library,
     ):
