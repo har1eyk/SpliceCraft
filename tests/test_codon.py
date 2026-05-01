@@ -1,8 +1,8 @@
 """
-test_codon — codon usage registry + harmonization pipeline.
+test_codon — codon usage registry + optimization pipeline.
 
 Covers the persistent _codon_tables_* registry, the pure-function
-_codon_harmonize / _codon_fix_sites / _codon_cai / _codon_gc helpers, and
+_codon_optimize / _codon_fix_sites / _codon_cai / _codon_gc helpers, and
 the Kazusa HTML parser. The Kazusa HTTP fetch itself is not exercised (no
 network in tests) — we test the parser on a synthetic HTML fixture.
 """
@@ -108,32 +108,32 @@ class TestRegistry:
         assert names.index("Escherichia coli A") < names.index("Notesch species")
 
 
-# ── Harmonization ─────────────────────────────────────────────────────────────
+# ── Optimization ─────────────────────────────────────────────────────────────
 
-class TestHarmonize:
-    def test_translate_of_harmonize_is_original(self):
+class TestOptimize:
+    def test_translate_of_optimize_is_original(self):
         aa = "MAEVKLAGHIKQRSTVWYFND"
-        dna = sc._codon_harmonize(aa, sc._CODON_BUILTIN_K12)
+        dna = sc._codon_optimize(aa, sc._CODON_BUILTIN_K12)
         assert sc._mut_translate(dna) == aa
         assert dna.endswith("TAA")
 
-    def test_harmonize_met_trp_use_only_codon(self):
-        dna = sc._codon_harmonize("MWMW", sc._CODON_BUILTIN_K12)
+    def test_optimize_met_trp_use_only_codon(self):
+        dna = sc._codon_optimize("MWMW", sc._CODON_BUILTIN_K12)
         # Met → ATG, Trp → TGG
         assert dna[:3]  == "ATG"
         assert dna[3:6] == "TGG"
         assert dna[6:9] == "ATG"
         assert dna[9:12] == "TGG"
 
-    def test_harmonize_rejects_unknown_aa(self):
+    def test_optimize_rejects_unknown_aa(self):
         with pytest.raises(ValueError, match="No codons"):
-            sc._codon_harmonize("MAXA", sc._CODON_BUILTIN_K12)
+            sc._codon_optimize("MAXA", sc._CODON_BUILTIN_K12)
 
     def test_distribution_matches_target(self):
         """For a leucine-heavy protein, CTG (K12's dominant Leu codon, ~49%)
         should be used most often."""
         aa = "L" * 100
-        dna = sc._codon_harmonize(aa, sc._CODON_BUILTIN_K12)
+        dna = sc._codon_optimize(aa, sc._CODON_BUILTIN_K12)
         codons = [dna[i:i+3] for i in range(0, len(aa) * 3, 3)]
         from collections import Counter
         counts = Counter(codons)
@@ -156,9 +156,9 @@ class TestFixSites:
 
     def test_removes_bsai_both_strands(self):
         # GGTCTC forward or GAGACC (rc) inside the CDS
-        dna = sc._codon_harmonize("MASGGTCTCREEEE", sc._CODON_BUILTIN_K12)
+        dna = sc._codon_optimize("MASGGTCTCREEEE", sc._CODON_BUILTIN_K12)
         # Synthesize a CDS that deliberately contains a BsaI site by hand
-        # (harmonize won't produce one on K12 typically). Easier: seed manually.
+        # (optimize won't produce one on K12 typically). Easier: seed manually.
         seed = "ATGGCGAGTGGTCTCCGTGAGGAGGAGGAGTAA"
         assert "GGTCTC" in seed
         fixed, fixes = sc._codon_fix_sites(
@@ -175,7 +175,7 @@ class TestFixSites:
 class TestMetrics:
     def test_cai_in_unit_range(self):
         aa = "MAEVKLAGHIKQR"
-        dna = sc._codon_harmonize(aa, sc._CODON_BUILTIN_K12)
+        dna = sc._codon_optimize(aa, sc._CODON_BUILTIN_K12)
         cai = sc._codon_cai(dna, sc._CODON_BUILTIN_K12)
         assert 0.0 < cai <= 1.0
 
@@ -454,7 +454,7 @@ class TestMutInnerWithTable:
         custom = {
             "ATG": ("M", 1), "GCT": ("A", 1), "GCC": ("A", 1),
             "TTT": ("F", 1), "TAA": ("*", 1),
-            # Fill out only what the harmonizer/inner design needs
+            # Fill out only what the optimizer/inner design needs
         }
         # Design A→F at position 2 — mut_codon must be TTT (only F codon)
         inner = sc._mut_design_inner(cds, 2, "F", "A", codon_table=custom)
@@ -515,7 +515,7 @@ class TestMutagenizeModalSources:
             app.exit()
 
     async def test_protein_input_path(self):
-        """Harmonize-from-protein must produce a valid CDS and enable
+        """Optimize-from-protein must produce a valid CDS and enable
         mutation design."""
         app = sc.PlasmidApp()
         async with app.run_test(size=(140, 50)) as pilot:
@@ -529,7 +529,7 @@ class TestMutagenizeModalSources:
             await pilot.pause(0.1)
             ta = modal.query_one("#mut-prot-aa")
             ta.text = "MAEVKLAGHIKQRSTVWY"
-            modal.query_one("#btn-mut-harmonize").action_press()
+            modal.query_one("#btn-mut-optimize").action_press()
             await pilot.pause(0.2)
             assert modal._cds_dna != ""
             assert sc._mut_translate(modal._cds_dna) == "MAEVKLAGHIKQRSTVWY"
@@ -547,14 +547,14 @@ class TestMutagenizeModalSources:
             modal.query_one("#mut-source").value = "prot"
             await pilot.pause(0.1)
             modal.query_one("#mut-prot-aa").text = "MA*EF"
-            modal.query_one("#btn-mut-harmonize").action_press()
+            modal.query_one("#btn-mut-optimize").action_press()
             await pilot.pause(0.1)
             assert modal._cds_dna == ""
             app.exit()
 
     async def test_protein_input_allows_trailing_stop(self):
         """A single trailing '*' should be treated as an explicit stop and
-        stripped silently before harmonization."""
+        stripped silently before optimization."""
         app = sc.PlasmidApp()
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
@@ -564,7 +564,7 @@ class TestMutagenizeModalSources:
             modal.query_one("#mut-source").value = "prot"
             await pilot.pause(0.1)
             modal.query_one("#mut-prot-aa").text = "MAEVK*"
-            modal.query_one("#btn-mut-harmonize").action_press()
+            modal.query_one("#btn-mut-optimize").action_press()
             await pilot.pause(0.1)
             assert modal._cds_dna != ""
             assert sc._mut_translate(modal._cds_dna) == "MAEVK"
@@ -579,7 +579,7 @@ class TestMutagenizeModalSources:
             modal.query_one("#mut-source").value = "prot"
             await pilot.pause(0.1)
             modal.query_one("#mut-prot-aa").text = "MAEBZJX"
-            modal.query_one("#btn-mut-harmonize").action_press()
+            modal.query_one("#btn-mut-optimize").action_press()
             await pilot.pause(0.1)
             assert modal._cds_dna == ""
 

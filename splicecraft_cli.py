@@ -170,6 +170,14 @@ def cmd_load_entry(args) -> None:
     _emit_json(_request("load-entry", "POST", payload))
 
 
+def cmd_load_file(args) -> None:
+    payload = {"path": args.path}
+    if args.force:
+        payload["force"] = True
+    # Server-side parse on a chromosome can take 10s+; bump timeout.
+    _emit_json(_request("load-file", "POST", payload, timeout=120))
+
+
 def cmd_add_feature(args) -> None:
     payload = {
         "start":  args.start,
@@ -185,6 +193,147 @@ def cmd_add_feature(args) -> None:
 
 def cmd_save(args) -> None:
     _emit_json(_request("save", "POST"))
+
+
+# ── Tier 1: sequence + feature CRUD ────────────────────────────────────────────
+
+
+def cmd_get_sequence(args) -> None:
+    payload = {"start": args.start, "end": args.end, "bottom": args.bottom}
+    result = _request("get-sequence", "POST", payload)
+    if args.json:
+        _emit_json(result)
+        return
+    seq = result.get("seq", "")
+    print(seq)
+
+
+def cmd_replace_sequence(args) -> None:
+    payload = {"start": args.start, "end": args.end, "bases": args.bases}
+    if args.force:
+        payload["force"] = True
+    _emit_json(_request("replace-sequence", "POST", payload))
+
+
+def cmd_delete_feature(args) -> None:
+    payload = {"idx": args.idx}
+    if args.force:
+        payload["force"] = True
+    _emit_json(_request("delete-feature", "POST", payload))
+
+
+def cmd_update_feature(args) -> None:
+    payload = {"idx": args.idx}
+    if args.label  is not None: payload["label"]  = args.label
+    if args.type   is not None: payload["type"]   = args.type
+    if args.strand is not None: payload["strand"] = args.strand
+    if args.force:
+        payload["force"] = True
+    _emit_json(_request("update-feature", "POST", payload))
+
+
+def cmd_get_feature(args) -> None:
+    _emit_json(_request("get-feature", "POST", {"idx": args.idx}))
+
+
+def cmd_export_genbank(args) -> None:
+    payload = {"path": args.path}
+    if args.force:
+        payload["force"] = True
+    _emit_json(_request("export-genbank", "POST", payload))
+
+
+def cmd_export_fasta(args) -> None:
+    payload = {"path": args.path}
+    if args.force:
+        payload["force"] = True
+    _emit_json(_request("export-fasta", "POST", payload))
+
+
+# ── Tier 2: library + collections ──────────────────────────────────────────────
+
+
+def cmd_list_library(args) -> None:
+    result = _request("list-library")
+    if args.json:
+        _emit_json(result)
+        return
+    entries = result.get("library", [])
+    if not entries:
+        print("(empty library)")
+        return
+    for e in entries:
+        print(
+            f"  {e.get('name','?'):24}  {e.get('length',0):>7,} bp  "
+            f"{e.get('n_features',0):>3} feat  {e.get('topology','')}"
+        )
+
+
+def cmd_list_collections(args) -> None:
+    result = _request("list-collections")
+    if args.json:
+        _emit_json(result)
+        return
+    active = result.get("active") or "(none)"
+    print(f"  active: {active}")
+    for c in result.get("collections", []):
+        marker = "*" if c.get("name") == active else " "
+        print(f"  {marker} {c.get('name','?'):24}  "
+              f"{c.get('n_plasmids',0):>3} plasmids")
+
+
+def cmd_delete_from_library(args) -> None:
+    payload = {"name": args.name}
+    if args.force:
+        payload["force"] = True
+    _emit_json(_request("delete-from-library", "POST", payload))
+
+
+# ── Tier 3: cloning / design helpers ───────────────────────────────────────────
+
+
+def cmd_list_restriction_sites(args) -> None:
+    payload: dict = {}
+    if args.enzymes:
+        payload["enzymes"] = args.enzymes
+    if args.min_length is not None:
+        payload["min_length"] = args.min_length
+    if args.unique_only:
+        payload["unique_only"] = True
+    result = _request("list-restriction-sites", "POST", payload)
+    if args.json:
+        _emit_json(result)
+        return
+    sites = result.get("sites", [])
+    if not sites:
+        print("(no sites)")
+        return
+    for s in sites:
+        strand = "+" if s.get("strand", 1) == 1 else "-"
+        print(f"  {s.get('enzyme','?'):14}  "
+              f"{(s.get('start') or 0)+1:>7,}..{s.get('end','?'):<7}  "
+              f"{strand}  cut@{s.get('cut_bp', '?')}")
+
+
+def cmd_list_codon_tables(args) -> None:
+    result = _request("list-codon-tables")
+    if args.json:
+        _emit_json(result)
+        return
+    for t in result.get("tables", []):
+        print(f"  {t.get('taxid',''):>6}  {t.get('source','?'):8}  "
+              f"{t.get('name','?')}")
+
+
+def cmd_optimize_protein(args) -> None:
+    payload = {"protein": args.protein}
+    if args.table:
+        payload["table"] = args.table
+    result = _request("optimize-protein", "POST", payload)
+    if args.json:
+        _emit_json(result)
+        return
+    print(result.get("dna", ""))
 
 
 # ── Argparse wiring ────────────────────────────────────────────────────────────
@@ -228,6 +377,17 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Override unsaved-changes guard.")
     p_load.set_defaults(fn=cmd_load_entry)
 
+    p_loadf = sub.add_parser(
+        "load-file",
+        help="Load a .gb / .gbk / .dna file from a server-side path "
+             "(bypasses the JSON-body size cap; works for chromosome-"
+             "scale files).",
+    )
+    p_loadf.add_argument("path", help="Server-side file path.")
+    p_loadf.add_argument("--force", action="store_true",
+                          help="Override unsaved-changes guard.")
+    p_loadf.set_defaults(fn=cmd_load_file)
+
     p_add = sub.add_parser(
         "add-feature",
         help="Add a feature to the loaded record.",
@@ -250,6 +410,130 @@ def _build_parser() -> argparse.ArgumentParser:
     p_save = sub.add_parser("save",
                               help="Save the loaded record (file + library).")
     p_save.set_defaults(fn=cmd_save)
+
+    # ── Tier 1 ────────────────────────────────────────────────────────────
+
+    p_getseq = sub.add_parser(
+        "get-sequence",
+        help="Extract DNA from a bp range (forward or --bottom strand).",
+    )
+    p_getseq.add_argument("start", type=int, help="0-based start bp.")
+    p_getseq.add_argument("end",   type=int, help="0-based end bp (exclusive).")
+    p_getseq.add_argument("--bottom", action="store_true",
+                            help="Return reverse-complement (bottom strand 5'→3').")
+    p_getseq.add_argument("--json", action="store_true",
+                            help="Emit JSON instead of plain seq.")
+    p_getseq.set_defaults(fn=cmd_get_sequence)
+
+    p_repseq = sub.add_parser(
+        "replace-sequence",
+        help="Replace bp range with new bases (mutagenesis).",
+    )
+    p_repseq.add_argument("start", type=int)
+    p_repseq.add_argument("end",   type=int)
+    p_repseq.add_argument("bases",
+                            help="New bases (IUPAC ACGTNRYWSMKBDHV; will be uppercased).")
+    p_repseq.add_argument("--force", action="store_true",
+                            help="Override unsaved-changes guard.")
+    p_repseq.set_defaults(fn=cmd_replace_sequence)
+
+    p_delfeat = sub.add_parser(
+        "delete-feature", help="Delete the feature at the given index.",
+    )
+    p_delfeat.add_argument("idx", type=int)
+    p_delfeat.add_argument("--force", action="store_true",
+                             help="Override unsaved-changes guard.")
+    p_delfeat.set_defaults(fn=cmd_delete_feature)
+
+    p_updfeat = sub.add_parser(
+        "update-feature",
+        help="Update label / type / strand of the feature at idx.",
+    )
+    p_updfeat.add_argument("idx", type=int)
+    p_updfeat.add_argument("--label", default=None)
+    p_updfeat.add_argument("--type",  default=None,
+                             help="GenBank feature type (CDS, promoter, …).")
+    p_updfeat.add_argument("--strand", type=int, default=None,
+                             choices=[-1, 0, 1])
+    p_updfeat.add_argument("--force", action="store_true")
+    p_updfeat.set_defaults(fn=cmd_update_feature)
+
+    p_getfeat = sub.add_parser(
+        "get-feature", help="Detail of one feature (idx, qualifiers, …).",
+    )
+    p_getfeat.add_argument("idx", type=int)
+    p_getfeat.set_defaults(fn=cmd_get_feature)
+
+    p_expgb = sub.add_parser(
+        "export-genbank", help="Write the loaded record to PATH as GenBank.",
+    )
+    p_expgb.add_argument("path", help="Output path (.gb / .gbk).")
+    p_expgb.add_argument("--force", action="store_true",
+                           help="Override unsaved-changes guard.")
+    p_expgb.set_defaults(fn=cmd_export_genbank)
+
+    p_expfa = sub.add_parser(
+        "export-fasta", help="Write the loaded record's seq to PATH as FASTA.",
+    )
+    p_expfa.add_argument("path", help="Output path (.fa / .fasta / .fna).")
+    p_expfa.add_argument("--force", action="store_true")
+    p_expfa.set_defaults(fn=cmd_export_fasta)
+
+    # ── Tier 2 ────────────────────────────────────────────────────────────
+
+    p_lib = sub.add_parser(
+        "list-library", help="List saved plasmid library entries.",
+    )
+    p_lib.add_argument("--json", action="store_true")
+    p_lib.set_defaults(fn=cmd_list_library)
+
+    p_col = sub.add_parser(
+        "list-collections", help="List collections + active one.",
+    )
+    p_col.add_argument("--json", action="store_true")
+    p_col.set_defaults(fn=cmd_list_collections)
+
+    p_dellib = sub.add_parser(
+        "delete-from-library", help="Remove a plasmid library entry by name.",
+    )
+    p_dellib.add_argument("name")
+    p_dellib.add_argument("--force", action="store_true")
+    p_dellib.set_defaults(fn=cmd_delete_from_library)
+
+    # ── Tier 3 ────────────────────────────────────────────────────────────
+
+    p_re = sub.add_parser(
+        "list-restriction-sites",
+        help="Scan record for restriction sites (default: NEB catalog, "
+             "min recognition 4 bp).",
+    )
+    p_re.add_argument("--enzymes", nargs="*",
+                       help="Limit to these enzyme names.")
+    p_re.add_argument("--min-length", type=int, default=None,
+                       dest="min_length",
+                       help="Minimum recognition site length (default 4).")
+    p_re.add_argument("--unique-only", action="store_true",
+                       dest="unique_only",
+                       help="Only return enzymes that cut once.")
+    p_re.add_argument("--json", action="store_true")
+    p_re.set_defaults(fn=cmd_list_restriction_sites)
+
+    p_codons = sub.add_parser(
+        "list-codon-tables", help="List available codon usage tables.",
+    )
+    p_codons.add_argument("--json", action="store_true")
+    p_codons.set_defaults(fn=cmd_list_codon_tables)
+
+    p_harm = sub.add_parser(
+        "optimize-protein",
+        help="Codon-optimize an AA sequence to DNA "
+             "(default table: E. coli K12, taxid 83333).",
+    )
+    p_harm.add_argument("protein", help="1-letter AA sequence.")
+    p_harm.add_argument("--table", default=None,
+                          help="Codon-table taxid (see list-codon-tables).")
+    p_harm.add_argument("--json", action="store_true")
+    p_harm.set_defaults(fn=cmd_optimize_protein)
 
     return parser
 

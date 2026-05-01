@@ -1611,6 +1611,16 @@ _CHUNK_STATIC_CACHE: dict = {}
 # STATIC_CACHE on the same render pass.
 _CHUNK_OVERLAY_CACHE: dict = {}
 
+# Threshold above which seq-panel rendering should switch to a
+# viewport-aware lazy mode (= only render visible chunks, emit blank
+# placeholders for the rest). Currently a no-op skeleton: we log
+# `seq.large_record_full_render` when this threshold is crossed so we
+# can see in the wild whether anyone hits it. When someone does,
+# wire `_build_seq_text` to take a `viewport_y_range` kwarg and
+# skip out-of-view chunk renders. 1 Mbp ≈ 6 k chunks at line_width
+# 163; a full-stack render of that takes ~5-10 s on typical hardware.
+_LAZY_RENDER_THRESHOLD_BP = 1_000_000
+
 
 def _feats_in_chunk(
     feats: list[dict], chunk_start: int, chunk_end: int, total: int
@@ -1787,6 +1797,30 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
 
     seq_upper = seq.upper()
     result    = Text(no_wrap=True, overflow="crop")
+
+    # ── Future: lazy chunk rendering for chromosome-scale records ─────────
+    # When `len(seq) > _LAZY_RENDER_THRESHOLD_BP`, a first-render of the
+    # seq panel iterates ~30,000+ chunks and can take 30 s+ on a 5 Mb
+    # bacterial chromosome (~minutes for a 250 Mb human chromosome).
+    # Most of that work is wasted because the user only sees a 12-row
+    # viewport at a time. The fix is to render only chunks whose
+    # content_row falls within `[scroll_y, scroll_y + viewport_height)`
+    # and emit blank-line placeholders for the rest.
+    #
+    # When implementing, the changes converge on this function:
+    #   1. Accept `viewport_y_range: tuple[int, int] | None` kwarg.
+    #   2. For each chunk, skip rendering (emit "\n" * chunk_lines)
+    #      when content_row is outside the viewport.
+    #   3. Hook the SequencePanel scroll-changed event to call
+    #      `_refresh_view()` so newly-visible chunks fill in.
+    #   4. Keep the static + overlay caches as-is — they already
+    #      have the right invalidation semantics.
+    #
+    # Skeleton constant + threshold check below; the actual viewport-
+    # aware skip is left for when a user genuinely loads a chromosome.
+    if len(seq) > _LAZY_RENDER_THRESHOLD_BP:
+        _log_event("seq.large_record_full_render",
+                   seq_len=len(seq), threshold=_LAZY_RENDER_THRESHOLD_BP)
 
     # Cached chunk decomposition — eliminates per-chunk _feats_in_chunk +
     # _chunk_lane_groups recomputation on every cursor-move re-render. On a
@@ -5977,6 +6011,21 @@ class OpenFileModal(ModalScreen):
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
+    # Files larger than this trigger a confirmation step before
+    # `load_genbank()` runs. Crosses the threshold where the first
+    # `_build_seq_text` render starts to take >5 s on typical
+    # hardware (~5 Mb genomic = chromosome-scale, vs ~50 kb
+    # cosmid-scale plasmids that load instantly).
+    _LARGE_FILE_MB = 5.0
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Two-state modal: first Open click on a >5 MB file warns;
+        # second click bypasses the size check and proceeds. Resets
+        # if the path field changes (= user picked a different file).
+        self._confirmed_large: bool = False
+        self._last_seen_path: str = ""
+
     def compose(self) -> ComposeResult:
         with Vertical(id="open-box"):
             yield Static(" Open Plasmid File ", id="open-title")
@@ -5990,15 +6039,36 @@ class OpenFileModal(ModalScreen):
     @on(Button.Pressed, "#btn-open")
     def _open(self):
         path = self.query_one("#open-path", Input).value.strip()
+        status = self.query_one("#open-status", Static)
         if not path:
-            self.query_one("#open-status", Static).update("[red]Enter a file path.[/red]")
+            status.update("[red]Enter a file path.[/red]")
+            return
+        # Reset large-file confirmation if the user changed paths
+        # between clicks — otherwise they could confirm File A and
+        # then accidentally load File B without re-confirming.
+        if path != self._last_seen_path:
+            self._confirmed_large = False
+            self._last_seen_path = path
+        # Probe size BEFORE invoking the parser — avoids a 30 s
+        # parse on a 50 MB file the user clicked by accident.
+        try:
+            size_mb = Path(path).expanduser().stat().st_size / (1024 * 1024)
+        except OSError:
+            size_mb = 0.0
+        if size_mb > self._LARGE_FILE_MB and not self._confirmed_large:
+            status.update(
+                f"[yellow]File is {size_mb:.1f} MB — parsing and the first "
+                f"sequence-panel render may take 10s+. "
+                f"Click [b]Open[/b] again to load anyway.[/]"
+            )
+            self._confirmed_large = True
             return
         try:
             record = load_genbank(path)
             record._tui_source = path   # remember where it came from
             self.dismiss(record)
         except Exception as exc:
-            self.query_one("#open-status", Static).update(f"[red]{exc}[/red]")
+            status.update(f"[red]{exc}[/red]")
 
     @on(Input.Submitted)
     def _submitted(self):
@@ -7531,11 +7601,11 @@ def _extract_feature_entries_from_record(record) -> list[dict]:
     return entries
 
 
-# ── Codon usage registry + harmonization (shared across modals) ───────────────
+# ── Codon usage registry + optimization (shared across modals) ───────────────
 #
-# Persistent JSON library of codon usage tables, plus pure-function harmonizer
+# Persistent JSON library of codon usage tables, plus pure-function optimizer
 # and restriction-site fixer. Vendored from superfolder_aeblue/codon_tables.py
-# and codon_harmonize.py (2026-04-13) to keep the single-file convention.
+# and codon_optimize.py (2026-04-13) to keep the single-file convention.
 #
 # Storage schema (one entry per species in codon_tables.json):
 #   {"name": "E. coli K12", "taxid": "83333", "source": "builtin"|"kazusa"|"user",
@@ -7582,7 +7652,7 @@ _CODON_BUILTIN_K12: dict[str, tuple[str, int]] = {
     "TAA": ("*",   9), "TAG": ("*",   0), "TGA": ("*",   5),
 }
 
-# Forbidden sites for the harmonizer's restriction-site fixer. Keys are the
+# Forbidden sites for the optimizer's restriction-site fixer. Keys are the
 # forward site only; the fixer adds the reverse complement automatically if
 # the site is non-palindromic.
 _CODON_DEFAULT_FORBIDDEN: dict[str, str] = {
@@ -7951,10 +8021,18 @@ def _codon_build_aa_map(raw: dict) -> tuple[dict, dict]:
     return dict(aa_codons), codon_frac
 
 
-def _codon_harmonize(protein: str, raw: dict) -> str:
-    """Distribute synonymous codons across the protein so each amino acid's
-    codon distribution matches the target organism (Angov 2011, adapted).
-    Appends a TAA stop. Raises ValueError on unknown amino acids."""
+def _codon_optimize(protein: str, raw: dict) -> str:
+    """Frequency-matching codon optimization: distribute synonymous codons
+    across the protein so each amino acid's codon distribution matches
+    the target organism's overall usage frequencies. Appends a TAA stop.
+    Raises ValueError on unknown amino acids.
+
+    Distinct from Angov-style codon HARMONIZATION (Angov 2011), which
+    requires a SOURCE organism's codon usage to preserve relative
+    rare-codon positions in the target (those positions encode
+    translation pauses important for cotranslational folding). We only
+    consume the target table, so this is pure optimization, not
+    harmonization. Renamed 2026-05-01 to stop misleading users."""
     aa_codons, _ = _codon_build_aa_map(raw)
     aa_positions: dict = {}
     for i, aa in enumerate(protein):
@@ -8478,7 +8556,7 @@ def _mut_build_preview_text(cds_dna: str,
       unlike `_mut_translate`, so the user can see the end of the CDS).
     * **AA only**: `cds_dna` is empty but `protein_override` is set. Used
       while the user is typing a protein in the custom-protein source
-      before harmonization produces any DNA.
+      before optimization produces any DNA.
 
     `mutation` (dict with `wt_codon` / `mut_codon` / `nt_position` 1-based,
     as produced by `_mut_design_inner`) substitutes the mutant codon into
@@ -13170,9 +13248,9 @@ class MutagenizeModal(ModalScreen):
         self._plasmid_name = plasmid_name
         self._outer:  "dict | None" = None
         self._inner:  "dict | None" = None
-        self._cds_dna:   str        = ""   # CDS (5'→3', post-strand, post-harmonize)
+        self._cds_dna:   str        = ""   # CDS (5'→3', post-strand, post-optimize)
         self._cds_meta:  "dict | None" = None
-        # Codon-table for mut_codon picking + harmonization (library entry dict)
+        # Codon-table for mut_codon picking + optimization (library entry dict)
         self._codon_entry: "dict | None" = None
         # For library source — current plasmid's features + template
         self._lib_template: str = ""
@@ -13188,7 +13266,7 @@ class MutagenizeModal(ModalScreen):
         self._src_options.extend([
             ("Plasmid library",              "lib"),
             ("Parts bin",                    "parts"),
-            ("Protein sequence (harmonize)", "prot"),
+            ("Protein sequence (optimize)", "prot"),
         ])
         self._initial_source = self._src_options[0][1]
 
@@ -13228,7 +13306,7 @@ class MutagenizeModal(ModalScreen):
                 yield TextArea("", id="mut-prot-aa")
                 with Horizontal(id="mut-prot-row"):
                     yield Input(placeholder="Name (e.g. aeBlue)", id="mut-prot-name")
-                    yield Button("Harmonize → CDS", id="btn-mut-harmonize",
+                    yield Button("Optimize → CDS", id="btn-mut-optimize",
                                  variant="primary")
 
             yield Static("", id="mut-cds-info", markup=True)
@@ -13526,8 +13604,8 @@ class MutagenizeModal(ModalScreen):
 
     # ── Protein-input source ──────────────────────────────────────────────
 
-    @on(Button.Pressed, "#btn-mut-harmonize")
-    def _harmonize(self, _) -> None:
+    @on(Button.Pressed, "#btn-mut-optimize")
+    def _optimize(self, _) -> None:
         info = self.query_one("#mut-cds-info", Static)
         if self._codon_entry is None:
             info.update("[red]No codon table selected.[/red]")
@@ -13553,21 +13631,21 @@ class MutagenizeModal(ModalScreen):
             info.update(f"[red]Invalid amino-acid letters: {''.join(bad)}[/red]")
             return
         try:
-            cds = _codon_harmonize(aa, self._codon_entry["raw"])
+            cds = _codon_optimize(aa, self._codon_entry["raw"])
             cds, fixes = _codon_fix_sites(
                 cds, aa, self._codon_entry["raw"],
                 sites={"BsaI": "GGTCTC"},  # only guard the tail enzyme
             )
         except Exception as exc:
-            _log.exception("Mutagenize: harmonize failed")
-            info.update(f"[red]Harmonization failed: {exc}[/red]")
+            _log.exception("Mutagenize: optimize failed")
+            info.update(f"[red]Optimization failed: {exc}[/red]")
             return
         name = self.query_one("#mut-prot-name", Input).value.strip() or "protein"
         self._cds_dna  = cds
         self._cds_meta = {"start": 0, "end": len(cds), "strand": 1,
                           "name": name, "origin": "prot"}
         self._plasmid_name = name
-        # Fresh harmonized CDS invalidates any previously designed primers
+        # Fresh optimized CDS invalidates any previously designed primers
         self._outer = None
         self._inner = None
         protein = _mut_translate(cds)
@@ -13577,7 +13655,7 @@ class MutagenizeModal(ModalScreen):
                   else f"[yellow]{stop_tag}[/yellow]")
         fix_note = f" · {len(fixes)} BsaI fix(es)" if fixes else ""
         info.update(
-            f"  [dim]{len(cds)} nt · {len(protein)} aa · harmonized · "
+            f"  [dim]{len(cds)} nt · {len(protein)} aa · optimized · "
             f"CAI {_codon_cai(cds, self._codon_entry['raw']):.2f} · "
             f"GC {_codon_gc(cds):.1f}%{fix_note}[/dim]   "
             f"start {atg}   stop {stop_s}"
@@ -13590,7 +13668,7 @@ class MutagenizeModal(ModalScreen):
         """Refresh the `#mut-preview` pane by handing current state to the
         preview widget, which owns its own rendering + cursor management.
         Called on every state change that could alter what the user sees:
-        source switch, CDS load, harmonize, design, or live typing in
+        source switch, CDS load, optimize, design, or live typing in
         the protein textarea.
         """
         try:
@@ -13616,8 +13694,8 @@ class MutagenizeModal(ModalScreen):
 
     @on(TextArea.Changed, "#mut-prot-aa")
     def _on_prot_aa_changed(self, _event) -> None:
-        # Only live-update while we have no harmonized CDS yet; once the
-        # user harmonizes, self._cds_dna takes over and further edits to
+        # Only live-update while we have no optimized CDS yet; once the
+        # user optimizes, self._cds_dna takes over and further edits to
         # the textarea shouldn't clobber the DNA preview.
         if not self._cds_dna:
             self._update_preview()
@@ -16000,6 +16078,95 @@ _AGENT_TOKEN_FILE = _DATA_DIR / "agent_token"
 # (handler_fn, write_bool) — write endpoints require token + dirty check.
 _AGENT_HANDLERS: "dict[str, tuple]" = {}
 
+# ── Input-sanitization helpers ─────────────────────────────────────────────────
+# Applied at the agent-API boundary (and at modal-input gathers where
+# practical) so user-supplied text can't:
+#   * carry control chars / newlines into Rich Text rendering paths
+#     (would visually corrupt the sidebar / sequence panel),
+#   * blow past reasonable length caps and slow render passes,
+#   * smuggle Bash-style escapes into NCBI accession URLs.
+# Cheap (regex / string ops); never silently fails — callers see a
+# truncated / cleaned value rather than an exception.
+
+# NCBI accession charset: letters, digits, dot, underscore, hyphen.
+# `re.fullmatch` will reject anything else. Cap at 32 chars: the
+# longest real accession (e.g. WGS 6+8 = ~14 chars) plus version
+# suffix is well under that.
+import re as _re_mod  # avoid shadowing local `re` if any
+_NCBI_ACCESSION_RE = _re_mod.compile(r"[A-Za-z0-9._\-]{1,32}")
+
+# Strips ASCII control chars + DEL but keeps printable Unicode (so
+# IUPAC labels and emoji still survive). Drops CR, LF, NUL, etc. that
+# would break a single-row label render.
+_CONTROL_CHARS_RE = _re_mod.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _sanitize_label(s: "str | None", *, max_len: int = 200) -> str:
+    """Clean a feature label / qualifier value: strip control chars,
+    collapse to single line, trim, cap length. Empty input → empty
+    string (callers decide the default). Replaces control chars with
+    nothing rather than spaces so a typo'd `name\\x00bug` becomes
+    `namebug` instead of `name bug`."""
+    if not s:
+        return ""
+    s = _CONTROL_CHARS_RE.sub("", str(s)).strip()
+    return s[:max_len]
+
+
+def _sanitize_feat_type(s: "str | None", *,
+                         max_len: int = 50,
+                         default: str = "misc_feature") -> str:
+    """Clean a GenBank feature-type string. Empty input → ``default``.
+    INSDC types are short alpha words with underscore — non-strict
+    here (we accept anything printable) since users may legitimately
+    add custom types not in the curated list."""
+    if not s:
+        return default
+    s = _CONTROL_CHARS_RE.sub("", str(s)).strip()
+    return (s or default)[:max_len]
+
+
+def _sanitize_accession(s: "str | None") -> "str | None":
+    """Validate an NCBI accession against the allowed charset; return
+    None if it fails so callers can 400 the request. Defends against
+    accessions like ``L09137; rm -rf /`` smuggled into the URL."""
+    if not s:
+        return None
+    s = str(s).strip()
+    if _NCBI_ACCESSION_RE.fullmatch(s):
+        return s
+    return None
+
+
+def _sanitize_path(p: "str | None") -> "Path | None":
+    """Resolve a user-supplied path with `~` expansion. Returns None
+    on empty input. Doesn't reject any specific paths — the user owns
+    their filesystem and the agent runs with their permissions, so
+    OS-level file mode controls trust. We just normalize so a relative
+    path lands at CWD rather than a surprise location."""
+    if not p:
+        return None
+    return Path(str(p)).expanduser()
+
+
+def _sanitize_bases(s: "str | None", *,
+                     max_len: int = 1_000_000) -> "tuple[str, str | None]":
+    """Validate IUPAC DNA. Returns ``(cleaned, error_msg)``;
+    ``error_msg`` is None on success. Caps at 1 MB to keep
+    `_rebuild_record_with_edit` from hanging on adversarial input —
+    matches the agent-API body cap so the whole request would have
+    been rejected upstream anyway, but the cap-check here lets non-
+    HTTP callers (modal `_gather`) reuse the same bound."""
+    if s is None:
+        return "", "missing 'bases'"
+    s = str(s).strip().upper()
+    if len(s) > max_len:
+        return s, f"'bases' too long ({len(s)} > {max_len})"
+    invalid = [c for c in s if c not in "ACGTNRYWSMKBDHV"]
+    if invalid:
+        return s, f"non-IUPAC characters: {''.join(sorted(set(invalid)))!r}"
+    return s, None
+
 
 def _agent_endpoint(name: str, *, write: bool = False):
     """Decorator: register a handler at `/<name>`.
@@ -16089,9 +16256,11 @@ def _h_features(app, payload):
 @_agent_endpoint("fetch", write=True)
 def _h_fetch(app, payload):
     """Fetch a GenBank record from NCBI by accession and load it into the GUI."""
-    accession = (payload.get("accession") or "").strip()
-    if not accession:
-        return ({"error": "missing 'accession'"}, 400)
+    accession = _sanitize_accession(payload.get("accession"))
+    if accession is None:
+        return ({"error":
+                  "missing or invalid 'accession' "
+                  "(expected [A-Za-z0-9._-]{1,32})"}, 400)
     # NCBI roundtrip is slow (1-3s). Run it on the HTTP-handler thread
     # — only the apply step needs the UI thread. The dirty-state guard
     # also runs on the UI thread so it sees the live `_unsaved` value.
@@ -16119,10 +16288,57 @@ def _h_fetch(app, payload):
     }
 
 
+@_agent_endpoint("load-file", write=True)
+def _h_load_file(app, payload):
+    """Load a `.gb` / `.gbk` / `.dna` file from a server-side path.
+    Body: ``{path}``. Bypasses the 1 MiB JSON-body cap by reading the
+    file from disk in-process — same path the GUI's File > Open uses.
+    No size cap on this endpoint (agent runs with the user's
+    permissions; the user owns their filesystem). For interactive
+    safety, the GUI's File > Open does a size confirmation; the
+    agent path is unconditional since automation tooling shouldn't
+    block on UI prompts."""
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if not path.exists():
+        return ({"error": f"file not found: {path}"}, 404)
+    if not path.is_file():
+        return ({"error": f"not a regular file: {path}"}, 400)
+    try:
+        record = load_genbank(str(path))
+    except (ValueError, OSError) as exc:
+        return ({"error": f"parse failed: {exc}"}, 400)
+    record._tui_source = str(path)
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        app._apply_record(record)
+        # Mirror `_import_and_persist`'s source_path preservation so
+        # subsequent `save` writes back to the file the agent loaded.
+        app._source_path = str(path)
+        return None
+
+    err = app.call_from_thread(_apply)
+    if err is not None:
+        return err
+    return {
+        "ok":         True,
+        "name":       record.name,
+        "id":         record.id,
+        "length":     len(record.seq),
+        "n_features": sum(1 for f in record.features if f.type != "source"),
+        "size_bytes": path.stat().st_size,
+    }
+
+
 @_agent_endpoint("load-entry", write=True)
 def _h_load_entry(app, payload):
     """Load a plasmid library entry by name or id."""
-    key = (payload.get("name") or payload.get("id") or "").strip()
+    key = _sanitize_label(payload.get("name") or payload.get("id"),
+                           max_len=200)
     if not key:
         return ({"error": "missing 'name' or 'id'"}, 400)
     entries = _load_library()
@@ -16171,8 +16387,8 @@ def _h_add_feature(app, payload):
     except (KeyError, ValueError, TypeError):
         return ({"error": "missing or invalid 'start'/'end' (must be int)"},
                 400)
-    label = (payload.get("label") or "").strip()
-    feat_type = (payload.get("type") or "misc_feature").strip()
+    label = _sanitize_label(payload.get("label"))
+    feat_type = _sanitize_feat_type(payload.get("type"))
     try:
         strand = int(payload.get("strand", 1))
     except (ValueError, TypeError):
@@ -16216,6 +16432,495 @@ def _h_save(app, payload):
     ok = app.call_from_thread(app._do_save)
     return {"ok": bool(ok),
             "source_path": getattr(app, "_source_path", None)}
+
+
+# ── Sequence + feature CRUD (Tier 1) ──────────────────────────────────────────
+
+
+@_agent_endpoint("get-sequence")
+def _h_get_sequence(app, payload):
+    """Return DNA from `[start, end)`. Body: ``{start, end, bottom?}``.
+    `bottom: true` returns the reverse-complement (5'→3' on the
+    bottom strand). Wrap-aware: `end < start` is interpreted as a
+    span that wraps the origin."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    seq = str(rec.seq).upper()
+    n   = len(seq)
+    try:
+        start = int(payload["start"])
+        end   = int(payload["end"])
+    except (KeyError, ValueError, TypeError):
+        return ({"error": "missing or invalid 'start'/'end'"}, 400)
+    if not (0 <= start <= n) or not (0 <= end <= n):
+        return ({"error": f"start/end out of range [0, {n}]"}, 400)
+    if end >= start:
+        sub = seq[start:end]
+    else:
+        sub = seq[start:] + seq[:end]
+    if bool(payload.get("bottom")):
+        sub = _rc(sub)
+    return {
+        "ok":     True,
+        "start":  start,
+        "end":    end,
+        "bottom": bool(payload.get("bottom")),
+        "length": len(sub),
+        "seq":    sub,
+    }
+
+
+@_agent_endpoint("replace-sequence", write=True)
+def _h_replace_sequence(app, payload):
+    """Replace `[start, end)` with `bases` (mutagenesis / edit).
+    Body: ``{start, end, bases}``. Pass ``{"force": true}`` to bypass
+    the dirty-state guard. Mirrors the EditSeqDialog "replace" mode:
+    rebuilds the SeqRecord with feature coords shifted; features
+    consumed entirely by the replace are dropped."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    try:
+        start = int(payload["start"])
+        end   = int(payload["end"])
+    except (KeyError, ValueError, TypeError):
+        return ({"error": "missing or invalid 'start'/'end'"}, 400)
+    bases, err = _sanitize_bases(payload.get("bases"))
+    if err is not None:
+        return ({"error": err}, 400)
+    n = len(rec.seq)
+    if not (0 <= start <= n) or not (0 <= end <= n) or start > end:
+        return ({"error":
+                  f"need 0 <= start <= end <= {n} (linear replace)"},
+                400)
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        try:
+            old_seq = str(app._current_record.seq)
+            new_seq = old_seq[:start] + bases + old_seq[end:]
+            sp = app.query_one("#seq-panel", SequencePanel)
+            pm = app.query_one("#plasmid-map", PlasmidMap)
+            app._push_undo()
+            new_record = app._rebuild_record_with_edit(
+                new_seq, "replace", start, end, bases,
+            )
+            app._current_record = new_record
+            pm.load_record(new_record)
+            app.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
+            app._restr_cache = _scan_restriction_sites(
+                new_seq,
+                min_recognition_len=app._restr_min_len,
+                unique_only=app._restr_unique_only,
+            )
+            displayed = app._restr_cache if app._show_restr else []
+            pm._restr_feats = displayed
+            pm.refresh()
+            sp.update_seq(new_seq, pm._feats + displayed)
+            app._mark_dirty()
+            return new_record.id
+        except (ValueError, RuntimeError) as exc:
+            return ({"error": str(exc)}, 400)
+
+    result = app.call_from_thread(_apply)
+    if isinstance(result, tuple):
+        return result
+    return {"ok": True, "start": start, "end": end,
+            "ins_len": len(bases), "del_len": end - start,
+            "new_length": n + len(bases) - (end - start),
+            "record_id": result}
+
+
+@_agent_endpoint("delete-feature", write=True)
+def _h_delete_feature(app, payload):
+    """Delete feature at `idx` (= row index in `features`). Body:
+    ``{idx}``. Returns the deleted feature's label + bp range so the
+    agent can undo via its own state if needed (the GUI's Ctrl+Z
+    also still works)."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    try:
+        idx = int(payload["idx"])
+    except (KeyError, ValueError, TypeError):
+        return ({"error": "missing or invalid 'idx'"}, 400)
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        try:
+            pm = app.query_one("#plasmid-map", PlasmidMap)
+        except (NoMatches, AttributeError):
+            return ({"error": "no plasmid panel"}, 500)
+        if not (0 <= idx < len(pm._feats)):
+            return ({"error": f"idx {idx} out of range "
+                              f"[0, {len(pm._feats)})"}, 400)
+        snap = pm._feats[idx]
+        # Map sidebar row → record.features index by start/end/type.
+        # Several ways to do this; we walk the record features list
+        # in order and skip ones we've already matched, mirroring
+        # `_parse`'s indexing modulo the `source` filter.
+        from copy import deepcopy
+        new_record = deepcopy(app._current_record)
+        kept = []
+        seen = 0
+        target_label = snap.get("label", "")
+        for feat in new_record.features:
+            if feat.type == "source":
+                kept.append(feat)
+                continue
+            if seen == idx:
+                seen += 1
+                continue   # skip this one
+            seen += 1
+            kept.append(feat)
+        new_record.features = kept
+        app._push_undo()
+        app._current_record = new_record
+        pm.load_record(new_record)
+        sp = app.query_one("#seq-panel", SequencePanel)
+        app.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
+        displayed = app._restr_cache if app._show_restr else []
+        pm._restr_feats = displayed
+        pm.refresh()
+        sp.update_seq(str(new_record.seq), pm._feats + displayed)
+        app._mark_dirty()
+        return {"label": target_label,
+                "start": snap["start"], "end": snap["end"],
+                "type":  snap.get("type", "misc_feature")}
+
+    result = app.call_from_thread(_apply)
+    if isinstance(result, tuple):
+        return result
+    return {"ok": True, "deleted": result}
+
+
+@_agent_endpoint("update-feature", write=True)
+def _h_update_feature(app, payload):
+    """Update feature at `idx`. Body: ``{idx, label?, type?, strand?}``.
+    Only the supplied fields are changed; others left as-is. Strand
+    must be -1 / 0 / 1 if provided."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    try:
+        idx = int(payload["idx"])
+    except (KeyError, ValueError, TypeError):
+        return ({"error": "missing or invalid 'idx'"}, 400)
+    new_label  = (_sanitize_label(payload["label"])
+                  if "label" in payload else None)
+    new_type   = (_sanitize_feat_type(payload["type"])
+                  if "type" in payload else None)
+    new_strand = payload.get("strand")
+    if new_strand is not None:
+        try:
+            new_strand = int(new_strand)
+        except (TypeError, ValueError):
+            return ({"error": "invalid 'strand'"}, 400)
+        if new_strand not in (-1, 0, 1):
+            return ({"error": "'strand' must be -1, 0, or 1"}, 400)
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        try:
+            pm = app.query_one("#plasmid-map", PlasmidMap)
+        except (NoMatches, AttributeError):
+            return ({"error": "no plasmid panel"}, 500)
+        if not (0 <= idx < len(pm._feats)):
+            return ({"error": f"idx {idx} out of range "
+                              f"[0, {len(pm._feats)})"}, 400)
+        from copy import deepcopy
+        new_record = deepcopy(app._current_record)
+        seen = 0
+        target = None
+        for feat in new_record.features:
+            if feat.type == "source":
+                continue
+            if seen == idx:
+                target = feat
+                break
+            seen += 1
+        if target is None:
+            return ({"error": f"feature idx {idx} not found "
+                              f"in record"}, 500)
+        if new_type is not None:
+            target.type = str(new_type).strip() or "misc_feature"
+        if new_label is not None:
+            target.qualifiers.setdefault("label", [str(new_label)])
+            target.qualifiers["label"] = [str(new_label)]
+        if new_strand is not None:
+            biop_strand = new_strand if new_strand in (-1, 1) else None
+            from Bio.SeqFeature import FeatureLocation, CompoundLocation
+            loc = target.location
+            if isinstance(loc, CompoundLocation):
+                target.location = CompoundLocation([
+                    FeatureLocation(int(p.start), int(p.end),
+                                     strand=biop_strand)
+                    for p in loc.parts
+                ])
+            else:
+                target.location = FeatureLocation(
+                    int(loc.start), int(loc.end), strand=biop_strand,
+                )
+        app._push_undo()
+        app._current_record = new_record
+        pm.load_record(new_record)
+        sp = app.query_one("#seq-panel", SequencePanel)
+        app.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
+        displayed = app._restr_cache if app._show_restr else []
+        pm._restr_feats = displayed
+        pm.refresh()
+        sp.update_seq(str(new_record.seq), pm._feats + displayed)
+        app._mark_dirty()
+        return idx
+
+    result = app.call_from_thread(_apply)
+    if isinstance(result, tuple):
+        return result
+    return {"ok": True, "idx": result}
+
+
+@_agent_endpoint("get-feature")
+def _h_get_feature(app, payload):
+    """Detail for feature at `idx`. Returns label, type, start, end,
+    strand, color, qualifiers (= the full SeqFeature qualifiers dict)."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    try:
+        idx = int(payload["idx"])
+    except (KeyError, ValueError, TypeError):
+        return ({"error": "missing or invalid 'idx'"}, 400)
+    try:
+        pm = app.query_one("#plasmid-map", PlasmidMap)
+    except (NoMatches, AttributeError):
+        return ({"error": "no plasmid panel"}, 500)
+    if not (0 <= idx < len(pm._feats)):
+        return ({"error": f"idx {idx} out of range "
+                          f"[0, {len(pm._feats)})"}, 400)
+    f = pm._feats[idx]
+    # Pull qualifiers from the underlying SeqFeature too.
+    quals: dict = {}
+    seen = 0
+    for feat in rec.features:
+        if feat.type == "source":
+            continue
+        if seen == idx:
+            quals = {k: list(v) if isinstance(v, list) else v
+                     for k, v in (feat.qualifiers or {}).items()}
+            break
+        seen += 1
+    return {
+        "idx":        idx,
+        "label":      f.get("label", ""),
+        "type":       f.get("type", "misc_feature"),
+        "start":      f["start"],
+        "end":        f["end"],
+        "strand":     f.get("strand", 1),
+        "color":      f.get("color"),
+        "qualifiers": quals,
+    }
+
+
+@_agent_endpoint("export-genbank", write=True)
+def _h_export_genbank(app, payload):
+    """Write the current record to `path` as GenBank. Body: ``{path}``.
+    Path may be relative (resolved against $HOME). Doesn't change the
+    record's `_source_path`, so subsequent `save` calls still target
+    the original location."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    try:
+        result = _export_genbank_to_path(rec, path)
+    except (OSError, ValueError) as exc:
+        return ({"error": f"export failed: {exc}"}, 500)
+    return {"ok": True, **result}
+
+
+@_agent_endpoint("export-fasta", write=True)
+def _h_export_fasta(app, payload):
+    """Write the current sequence to `path` as FASTA. Body: ``{path}``.
+    Single-record FASTA with the plasmid name as the header."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    try:
+        result = _export_fasta_to_path(
+            rec.name or rec.id or "plasmid",
+            str(rec.seq),
+            path,
+        )
+    except (OSError, ValueError) as exc:
+        return ({"error": f"export failed: {exc}"}, 500)
+    return {"ok": True, **result}
+
+
+# ── Library + collections (Tier 2) ─────────────────────────────────────────────
+
+
+@_agent_endpoint("list-library")
+def _h_list_library(app, payload):
+    """Plasmid library entries. Returns name, length, n_features,
+    topology, source_path for each. Subset of the on-disk JSON tuned
+    for an agent's "what plasmids do I have" question."""
+    out: list[dict] = []
+    for e in _load_library():
+        seq = e.get("sequence", "") or ""
+        out.append({
+            "name":        e.get("name", ""),
+            "id":          e.get("id", ""),
+            "length":      len(seq),
+            "n_features":  len(e.get("features", []) or []),
+            "topology":    e.get("topology", ""),
+            "source_path": e.get("source_path", "") or "",
+        })
+    return {"library": out, "count": len(out)}
+
+
+@_agent_endpoint("list-collections")
+def _h_list_collections(app, payload):
+    """Plasmid collection buckets. Returns name + plasmid count for
+    each collection, and which one is currently active."""
+    cols = _load_collections()
+    active = _get_active_collection_name()
+    return {
+        "active": active,
+        "collections": [
+            {"name": c.get("name", ""),
+             "n_plasmids": len(c.get("plasmids", []) or [])}
+            for c in cols
+        ],
+    }
+
+
+@_agent_endpoint("delete-from-library", write=True)
+def _h_delete_from_library(app, payload):
+    """Remove a plasmid library entry by `name`. Body: ``{name}``.
+    Mirrors `_save_library`'s sync-to-active-collection so the
+    collection bookkeeping stays consistent."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing 'name'"}, 400)
+
+    def _apply():
+        entries = _load_library()
+        kept = [e for e in entries if e.get("name") != name]
+        if len(kept) == len(entries):
+            return ({"error": f"no entry named {name!r}"}, 404)
+        _save_library(kept)
+        return len(entries) - len(kept)
+
+    result = app.call_from_thread(_apply)
+    if isinstance(result, tuple):
+        return result
+    return {"ok": True, "deleted": result, "name": name}
+
+
+# ── Cloning / design helpers (Tier 3) ──────────────────────────────────────────
+
+
+@_agent_endpoint("list-restriction-sites")
+def _h_list_restriction_sites(app, payload):
+    """Scan the loaded record for restriction sites. Body:
+    ``{enzymes?: [str, ...], min_length?: int, unique_only?: bool}``.
+    Default scans the full NEB curated catalog with `min_length=4`
+    and `unique_only=False`. Returns each hit as
+    ``{enzyme, start, end, strand, cut_bp}``."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    enzymes = payload.get("enzymes")
+    if enzymes is not None and not isinstance(enzymes, list):
+        return ({"error": "'enzymes' must be a list"}, 400)
+    try:
+        min_len = int(payload.get("min_length", 4))
+    except (TypeError, ValueError):
+        return ({"error": "invalid 'min_length'"}, 400)
+    unique = bool(payload.get("unique_only", False))
+    seq = str(rec.seq)
+    is_circular = rec.annotations.get("topology") == "circular"
+    sites = _scan_restriction_sites(
+        seq, min_recognition_len=min_len,
+        unique_only=unique, circular=is_circular,
+    )
+    enzyme_filter = (set(enzymes) if enzymes else None)
+    out = []
+    for s in sites:
+        if s.get("type") != "resite":
+            continue
+        label = s.get("label", "")
+        if enzyme_filter is not None and label not in enzyme_filter:
+            continue
+        out.append({
+            "enzyme":  label,
+            "start":   s.get("start"),
+            "end":     s.get("end"),
+            "strand":  s.get("strand", 1),
+            "cut_bp":  s.get("top_cut_bp", -1),
+        })
+    return {"sites": out, "count": len(out)}
+
+
+@_agent_endpoint("list-codon-tables")
+def _h_list_codon_tables(app, payload):
+    """Available codon usage tables. Returns name, taxid, source
+    (builtin/kazusa/user) and date added for each entry. Use the
+    taxid as the `table` arg to ``optimize-protein``."""
+    return {"tables": [
+        {"name":   e.get("name", "?"),
+         "taxid":  e.get("taxid", ""),
+         "source": e.get("source", "user"),
+         "added":  e.get("added", "")}
+        for e in _codon_tables_load()
+    ]}
+
+
+@_agent_endpoint("optimize-protein")
+def _h_optimize_protein(app, payload):
+    """Codon-optimize a 1-letter AA sequence to DNA using a codon
+    table from the registry. Body: ``{protein, table?}`` where
+    `table` is a taxid (defaults to E. coli K12 = 83333). Appends a
+    TAA stop. Read-only — doesn't touch the loaded record."""
+    protein = _sanitize_label(payload.get("protein"),
+                                max_len=10_000).upper()
+    if not protein:
+        return ({"error": "missing 'protein'"}, 400)
+    invalid_aa = [c for c in protein if c not in "ACDEFGHIKLMNPQRSTVWY*"]
+    if invalid_aa:
+        return ({"error":
+                  f"non-canonical amino acids in 'protein': "
+                  f"{''.join(sorted(set(invalid_aa)))!r}"}, 400)
+    taxid = _sanitize_accession(payload.get("table")) or "83333"
+    entry = _codon_tables_get(taxid)
+    if entry is None:
+        return ({"error": f"no codon table with taxid {taxid!r}; "
+                          f"see list-codon-tables"}, 404)
+    try:
+        dna = _codon_optimize(protein, entry["raw"])
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    return {
+        "ok":     True,
+        "protein":      protein,
+        "table":        taxid,
+        "table_name":   entry.get("name", "?"),
+        "dna":          dna,
+        "length":       len(dna),
+        "n_codons":     len(dna) // 3,
+    }
 
 
 # ── HTTP plumbing ──────────────────────────────────────────────────────────────

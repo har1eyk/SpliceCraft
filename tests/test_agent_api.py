@@ -526,3 +526,122 @@ class TestHTTPRegistration:
         # can't accidentally hit a different process that bound the
         # same port later.
         assert not token_path.exists()
+
+
+# ── Input sanitization (2026-05-01 hardening pass) ────────────────────────────
+
+
+class TestSanitizeLabel:
+    def test_strips_control_chars(self):
+        assert sc._sanitize_label("hello\x00\x01world") == "helloworld"
+
+    def test_collapses_newlines(self):
+        # CR/LF would corrupt the sidebar's single-row label render.
+        assert "\n" not in sc._sanitize_label("a\nb\rc")
+        assert "\r" not in sc._sanitize_label("a\nb\rc")
+
+    def test_caps_length(self):
+        assert len(sc._sanitize_label("a" * 1000)) == 200
+        assert len(sc._sanitize_label("a" * 1000, max_len=10)) == 10
+
+    def test_unicode_survives(self):
+        # Emoji + IUPAC-style ASCII labels both legitimate.
+        assert sc._sanitize_label("test 🧬 lacZ") == "test 🧬 lacZ"
+
+    def test_empty_returns_empty(self):
+        assert sc._sanitize_label(None) == ""
+        assert sc._sanitize_label("") == ""
+        assert sc._sanitize_label("   ") == ""
+
+
+class TestSanitizeFeatType:
+    def test_default_for_empty(self):
+        assert sc._sanitize_feat_type(None) == "misc_feature"
+        assert sc._sanitize_feat_type("") == "misc_feature"
+        assert sc._sanitize_feat_type("  ") == "misc_feature"
+
+    def test_strips_control_chars(self):
+        assert sc._sanitize_feat_type("CDS\x00") == "CDS"
+
+    def test_caps_length(self):
+        assert len(sc._sanitize_feat_type("a" * 100)) == 50
+
+
+class TestSanitizeAccession:
+    def test_valid(self):
+        assert sc._sanitize_accession("L09137") == "L09137"
+        assert sc._sanitize_accession("MW463917.1") == "MW463917.1"
+        assert sc._sanitize_accession("NC_001140") == "NC_001140"
+
+    def test_rejects_shell_metacharacters(self):
+        # Defends against `accession=L09137; rm -rf /` smuggling.
+        assert sc._sanitize_accession("L09137; rm -rf /") is None
+        assert sc._sanitize_accession("L09137|cat /etc/passwd") is None
+        assert sc._sanitize_accession("../../etc/hosts") is None
+
+    def test_rejects_overlong(self):
+        assert sc._sanitize_accession("A" * 33) is None
+
+    def test_empty_returns_none(self):
+        assert sc._sanitize_accession(None) is None
+        assert sc._sanitize_accession("") is None
+
+
+class TestSanitizeBases:
+    def test_valid_iupac(self):
+        s, err = sc._sanitize_bases("acgtnRYWSMKBDHV")
+        assert err is None
+        assert s == "ACGTNRYWSMKBDHV"
+
+    def test_invalid_char(self):
+        s, err = sc._sanitize_bases("ACGZ")
+        assert err is not None
+        assert "Z" in err
+
+    def test_overlong(self):
+        s, err = sc._sanitize_bases("A" * 100, max_len=50)
+        assert err is not None
+        assert "too long" in err
+
+    def test_missing(self):
+        s, err = sc._sanitize_bases(None)
+        assert err is not None and "missing" in err
+
+
+class TestEndpointHardening:
+    """Adversarial-input tests: each endpoint must reject malformed
+    payloads with a clear 400 error rather than crash or silently
+    accept dangerous input."""
+
+    def test_fetch_rejects_shell_meta(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/fetch", method="POST",
+            body={"accession": "L09137; rm -rf /"},
+            token=token,
+        )
+        assert status == 400
+        assert "accession" in payload.get("error", "")
+
+    def test_add_feature_strips_control_chars_in_label(self, http_server,
+                                                        tiny_record):
+        base, token, app = http_server
+        status, payload = _http(
+            f"{base}/add-feature", method="POST",
+            body={"start": 30, "end": 40,
+                  "label": "evil\x00\nlabel", "type": "misc_feature"},
+            token=token,
+        )
+        assert status == 200, payload
+        new = app._current_record.features[-1]
+        assert "\x00" not in new.qualifiers["label"][0]
+        assert "\n" not in new.qualifiers["label"][0]
+
+    def test_add_feature_invalid_strand(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/add-feature", method="POST",
+            body={"start": 30, "end": 40, "strand": 99},
+            token=token,
+        )
+        assert status == 400

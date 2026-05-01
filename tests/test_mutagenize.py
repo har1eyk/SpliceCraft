@@ -234,7 +234,7 @@ class TestPreviewText:
         assert t.plain == ""
 
     def test_aa_only_when_no_dna(self):
-        """Protein-input source before harmonization: AA wraps, no DNA row."""
+        """Protein-input source before optimization: AA wraps, no DNA row."""
         aa = "MALAK" * 4      # 20 aa
         t = sc._mut_build_preview_text("", protein_override=aa, line_width=12)
         lines = [l for l in self._plain_lines(t) if l]

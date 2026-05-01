@@ -99,7 +99,7 @@ Installation section below).
 - **SOE-PCR site-directed mutagenesis** — design 4-primer SOE sets for any
   W140F-style mutation. CDS source can be the loaded plasmid, a library entry,
   a domesticated part from the Parts Bin, or a free-form protein sequence
-  (auto-harmonized to the active codon table). Edge cases (mutation within
+  (auto-optimized to the active codon table). Edge cases (mutation within
   60 nt of a CDS end) auto-fall back to a 2-primer modified-outer PCR.
 
 ### Feature operations
