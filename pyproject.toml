@@ -34,6 +34,11 @@ dependencies = [
     "biopython>=1.87",
     "primer3-py>=2.3.0",
     "platformdirs>=4.2",
+    # pyhmmer powers the BLAST modal's HMMscan tier — pure-Python
+    # bindings to HMMER 3 with no external C-library install required
+    # (the wheels ship the HMMER source compiled in). Optional only in
+    # the sense that BLASTN/BLASTP work without it; HMMscan can't.
+    "pyhmmer>=0.10",
 ]
 
 [project.optional-dependencies]

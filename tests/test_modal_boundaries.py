@@ -173,6 +173,9 @@ _MODAL_CASES = [
                                                   "MyCollection", 12)),
     ("QuitConfirmModal",             lambda: sc.QuitConfirmModal()),
     ("SplashScreen",                 lambda: sc.SplashScreen()),
+    ("HelpModal",                    lambda: sc.HelpModal()),
+    ("NewPlasmidModal",              lambda: sc.NewPlasmidModal()),
+    ("BlastModal",                   lambda: sc.BlastModal()),
 ]
 
 

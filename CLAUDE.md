@@ -11,8 +11,8 @@ A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mut
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs, user ATinyGreenCell). **PyPI:** `splicecraft`. Latest: **v0.4.5**.
 
 - **Single-file architecture:** entire app is `splicecraft.py` (~17,900 lines). Intentional — keeps the codebase greppable. Sibling project ScriptoScope (~8,600 lines) follows the same convention.
-- **Test suite:** 1,009 tests across 17 files in `tests/`. `pytest -n auto` ~2 min on 8 cores; sequential ~11 min. Biology subset (`test_dna_sanity.py`) < 2 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
-- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`. Tests: `pytest`, `pytest-asyncio`, `pytest-xdist`, `hypothesis`. No optional runtime deps — pLannotate integration was removed in 0.4.0.
+- **Test suite:** ~1,200 tests across 19 files in `tests/`. `pytest -n auto` ~2-3 min on 8 cores; sequential ~13 min. Biology subset (`test_dna_sanity.py`) < 2 s. `test_invariants_hypothesis.py` adds property-based fuzzing. New in 0.5.1: `test_blast.py` (BLASTN/BLASTP/HMMscan engines + sanitisation) and `test_new_plasmid.py` (NewPlasmidModal + `_annotate_seq_from_feature_library`).
+- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, `pyhmmer>=0.10` (HMMscan). Tests: `pytest`, `pytest-asyncio`, `pytest-xdist`, `hypothesis`. No optional runtime deps — pLannotate integration was removed in 0.4.0.
 - Releases via `./release.py X.Y.Z` (bumps version, runs tests, builds, tags, pushes; `publish.yml` uploads to PyPI via OIDC). Pure-Python — no bash/sed/grep dependencies.
 
 ## How to run
@@ -185,6 +185,42 @@ Every Type IIS-aware tool reads its overhangs / enzyme / forbidden-sites / codin
 
 **Cache + deepcopy.** `_load_custom_grammars` and `_load_collections` both deepcopy on read so caller-side mutations of returned dicts don't poison the cache.
 
+## BLAST + HMMscan (0.5.1+)
+
+The `BlastModal` (Ctrl+B) gives the user three tiers of similarity search against their plasmid library, all running in a `@work(thread=True)` worker so the UI stays responsive:
+
+* **BLASTN** (DNA → DNA). Default backend: `pyhmmer.hmmer.nhmmer` (HMMER 3 in-process, C-speed). Pure-Python fallback (`_blast_search_pure`) for queries shorter than `_PYHMMER_MIN_QUERY_BLASTN = 20` bp or environments without pyhmmer. The pure path uses a k-mer seed (k=11) + ungapped X-drop extension; defaults match=+1, mismatch=-3, X-drop=20, min-score=30, min-id=70%.
+* **BLASTP** (protein → protein). Default backend: `pyhmmer.hmmer.phmmer`. Pure-Python fallback for queries < `_PYHMMER_MIN_QUERY_BLASTP = 6` aa. Pure path: same algorithm, BLOSUM62 scoring, k=3. Subjects are the annotated CDS features of every plasmid (translated frame-1; non-triple CDSes are skipped). DNA queries auto-translate to frame-1 protein when the heuristic detects ≥95% ACGTN.
+* **HMMscan** via [pyhmmer](https://github.com/althonos/pyhmmer) (added as a hard dep in 0.5.1). Reads any HMMER 3 `.hmm` / `.h3m` / `.h3p` file directly — no pre-build, no caching. Use a `Path Input` field on the modal to point at Pfam-A.hmm or any custom profile DB.
+
+**Backend dispatcher** (`_blast_search`) routes between pyhmmer and pure-Python:
+* `backend="auto"` (default) — pyhmmer when query length ≥ pyhmmer minimum, else pure.
+* `backend="pyhmmer"` — force; raises if pyhmmer isn't importable.
+* `backend="pure"` — force pure-Python.
+
+Output shape is identical for both backends so callers (`BlastModal._format_hits`, `NewPlasmidModal` BLAST annotate) don't branch on engine. **Scoring note**: pyhmmer reports HMMER bit score (~30-50 for a typical good hit) while pure-Python reports NCBI sum-score (~30-100); the `identity_pct` column is computed from the alignment in both cases so it stays comparable.
+
+**Entry points.** `Ctrl+B` from anywhere; the modal is also re-used by `NewPlasmidModal`'s "Annotate via BLAST" button (BLASTN against all collections, ≥90% identity → `misc_feature` annotations).
+
+**Engine internals (`splicecraft.py`):**
+- `_BLOSUM62` — parsed once at import from `_BLOSUM62_RAW` (used only by the pure-Python BLASTP fallback).
+- `_blast_build_db(program, collection_names)` — returns `{"program", "k", "subjects", "kmer_index"}`. `subjects` is per-plasmid (BLASTN) or per-CDS (BLASTP); `kmer_index` maps kmer → list of `(subject_idx, position, strand)`. The k-mer index is built unconditionally (it's fast); pyhmmer ignores it, pure-Python uses it.
+- `_blast_search(query, db, *, backend="auto", max_hits=25)` — top-level dispatcher.
+- `_blast_search_pyhmmer` — wraps `pyhmmer.hmmer.phmmer` / `nhmmer`. Identity computed from `Alignment.hmm_sequence` vs `target_sequence` (case-insensitive equality, gap chars excluded). Reverse-strand BLASTN hits detected via `target_to < target_from` (nhmmer's convention).
+- `_blast_search_pure` — pure-Python: seed → `_ungapped_extend` → filter by min-score / min-id → dedup HSPs by `(sub_idx, strand, q_lo, s_lo, q_hi)` key. Capped at `_BLAST_MAX_EXTENSIONS = 200_000` per search to bound runtime on tandem-repeat queries.
+- `_blast_get_db` — 4-entry LRU cache keyed `(program, frozenset(collection_names_or_empty))`. Auto-invalidated by `_save_collections` (it calls `_blast_clear_cache()`).
+- `_hmmscan_run(query, hmm_path, max_hits=25)` — wraps `pyhmmer.hmmer.hmmscan`. Reads .hmm lazily so Pfam-scale (~1 GB) databases don't pre-fetch into RAM. Returns hit dicts in the same shape as `_blast_search` so `BlastModal._format_hits` renders all three programs uniformly.
+
+**Sanitisation invariants.**
+- `_strip_fasta_headers` drops `>` lines (with leading-whitespace tolerance) before alphabet filtering.
+- `_detect_query_program(raw, hint)` returns `(program, cleaned)`: BLASTN keeps `_BLASTN_QUERY_ALPHABET` (IUPAC); BLASTP keeps `_BLASTP_QUERY_ALPHABET` (20 AAs + B/Z/X/*). Other chars (digits, punctuation) silently dropped.
+- `_MAX_BLAST_QUERY_LEN = 100_000` — anything longer is truncated; the modal surfaces a yellow "(query truncated)" note.
+- `_format_hits` `rich.markup.escape`s subject names + collection labels so a malicious / odd qualifier with `[red]…[/red]` can't inject markup.
+
+**Modal-active gating.** `PlasmidApp.on_key` and `on_click` early-return when `len(screen_stack) > 1` so seq-panel cursor moves / selection slides / RE highlight clears can't fire underneath an active modal. Ctrl+Z / Ctrl+Y stay above this guard so global undo/redo works as a fallback when the focused widget doesn't bind them.
+
+**Cache invalidation note.** `_save_collections` calls `globals().get("_blast_clear_cache")()` (defensive, in case `_save_collections` runs before the engine is defined at import time). If you add another collection-mutation path that doesn't go through `_save_collections`, call `_blast_clear_cache()` manually.
+
 ## On-disk JSON format (schema v1)
 
 All seven libraries (`plasmid_library.json`, `parts_bin.json`, `primers.json`, `codon_tables.json`, `features.json`, `feature_colors.json`, `collections.json`) plus `settings.json` and `cloning_grammars.json` use:
@@ -236,7 +272,9 @@ Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture 
 | `test_circular_math.py` | 38 | Sacred invariant #5; `_bp_in` / `_feat_len` |
 | `test_data_safety.py` | 47 | Sacred invariant #7; envelope round-trip + legacy back-compat + future-version warning; `_atomic_write_text`; `_do_save` atomicity; collections.json isolation |
 | `test_add_feature.py` | 24 | AddFeatureModal: qualifier round-trip, validation, save-to-library dedup, insert-at-cursor |
-| `test_modal_boundaries.py` | 29 | Every modal fits in 160×48 (and AddFeatureModal at 100×30); CollectionsModal, CollectionNameModal, CollectionDeleteConfirmModal, UnsavedNavigateModal included |
+| `test_modal_boundaries.py` | 36 | Every modal fits in 160×48 (and AddFeatureModal at 100×30); CollectionsModal, CollectionNameModal, CollectionDeleteConfirmModal, UnsavedNavigateModal, HelpModal, NewPlasmidModal, BlastModal included |
+| `test_blast.py` | 49 | BLOSUM62 sanity; BLASTN forward/reverse/mismatch; BLASTP CDS-protein matching; cache invalidation on `_save_collections`; query sanitisation (FASTA-strip, alphabet filter, length cap); library-annotation hit cap; modal-active gating; pyhmmer probe; HMMscan via on-the-fly built `.hmm` fixture; backend dispatcher (auto / pyhmmer / pure) + short-query fallback spy |
+| `test_new_plasmid.py` | 17 | `_annotate_seq_from_feature_library` (forward/reverse, palindrome dedup, short-entry skip, circular wrap, max-hits cap); NewPlasmidModal compose, Create / Annotate-from-library / Annotate-via-BLAST flows; BlastModal scaffolding |
 | `test_feature_library_screen.py` | 95 | Workbench CRUD + 4-step strand cycle; deferred-save / dirty-tracking / UnsavedQuitModal-on-close; Edit-button prefill round-trip; AddFeatureModal Orientation + Color; Ctrl+Shift+F capture (drag-matches-feature enrichment); ColorPickerModal xterm grid + drag-to-preview; Export-FASTA |
 | `test_features_library.py` | 29 | JSON round-trip; `_GENBANK_FEATURE_TYPES`; per-entry `color` + `strand=0`; `_resolve_feature_color` precedence |
 | `test_edit_record.py` | 14 | Sacred invariant #9: wrap features survive insert/replace as CompoundLocation |

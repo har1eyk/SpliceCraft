@@ -593,6 +593,14 @@ def _save_collections(entries: list[dict]) -> None:
     _safe_save_json(_COLLECTIONS_FILE, entries, "Plasmid collections")
     from copy import deepcopy
     _collections_cache = deepcopy(entries)
+    # Invalidate any cached BLAST databases so a freshly-renamed /
+    # deleted / edited collection doesn't keep returning hits from the
+    # old contents. The engine helpers are defined later in this file,
+    # so this call is guarded for the brief window during module import
+    # before they exist.
+    _clear = globals().get("_blast_clear_cache")
+    if _clear is not None:
+        _clear()
 
 
 # Active collection — which named collection is the panel currently showing.
@@ -2731,9 +2739,13 @@ class PlasmidMap(Widget):
         # editing in the seq panel; both are focus-gated to the map (no
         # `priority=True`), so rotation only happens when the user has
         # actually clicked into the map panel.
-        Binding("left",        "rotate_ccw",       "Rotate ←",      show=True),
-        Binding("right",       "rotate_cw",        "Rotate →",      show=True),
-        Binding("up",          "reset_origin",     "Reset origin",  show=True),
+        # Rotation/reset-origin bindings used to surface in the Footer
+        # when the map had focus, but the row clipped on narrow
+        # terminals. Hidden 2026-05-01 to keep the Footer minimal —
+        # the keys still work, and `?` Help lists them in full.
+        Binding("left",        "rotate_ccw",       "Rotate ←",      show=False),
+        Binding("right",       "rotate_cw",        "Rotate →",      show=False),
+        Binding("up",          "reset_origin",     "Reset origin",  show=False),
         Binding("shift+left",  "rotate_ccw_lg",    "Rotate ←←",     show=False),
         Binding("shift+right", "rotate_cw_lg",     "Rotate →→",     show=False),
         Binding("[",           "rotate_ccw",       "Rotate ←",      show=False),
@@ -5913,6 +5925,103 @@ class EditSeqDialog(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+# ── Help modal ─────────────────────────────────────────────────────────────────
+
+class HelpModal(ModalScreen):
+    """Keyboard-shortcut + feature-overview reference. Opened by `?`
+    from anywhere in the app; dismissed by any key. Replaces the
+    secondary `#status-bar` row that used to live below the seq panel
+    (removed 2026-05-01 to free real estate for future widgets)."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss_help", "Close"),
+        Binding("?",      "dismiss_help", "Close"),
+        Binding("q",      "dismiss_help", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    HelpModal { align: center middle; }
+    #help-box {
+        width: 88; height: auto; max-height: 90%;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #help-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #help-body { padding: 0 1; }
+    #help-hint {
+        margin-top: 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-box"):
+            yield Static("SpliceCraft — keyboard shortcuts", id="help-title")
+            yield Static(_HELP_BODY_TEXT, id="help-body", markup=True)
+            yield Static(
+                "Press Esc, ?, or q to close.",
+                id="help-hint",
+            )
+
+    def action_dismiss_help(self) -> None:
+        self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        # Catch-all: any key not bound to a modal action also dismisses.
+        # Lets the user close with Enter / Space / etc. without having
+        # to remember the specific Esc binding.
+        if event.key not in ("escape", "question_mark", "q"):
+            self.dismiss(None)
+            event.stop()
+
+
+# Single source of truth for the help body so refactors that add a
+# binding don't need to update two places. Keep entries grouped by
+# panel / context — flat alphabetical lists are harder to scan.
+_HELP_BODY_TEXT = (
+    "[bold]File / Record[/bold]\n"
+    "  [b]f[/b]            Fetch GenBank from NCBI\n"
+    "  [b]^O[/b]           Open file (.gb / .gbk / .dna)\n"
+    "  [b]^S[/b]           Save\n"
+    "  [b]^⇧A[/b]          Add current record to library\n"
+    "  [b]q[/b]            Quit\n"
+    "\n"
+    "[bold]Editing[/bold]\n"
+    "  [b]^E[/b]           Edit sequence (insert / replace)\n"
+    "  [b]^F[/b]           Add feature\n"
+    "  [b]^⇧F[/b]          Capture selection → feature library\n"
+    "  [b]Delete[/b]       Delete selected feature\n"
+    "  [b]^Z / ^⇧Z[/b]     Undo / redo\n"
+    "\n"
+    "[bold]Map / view[/bold]\n"
+    "  [b]← →[/b]         Rotate (focus on map) · move cursor (focus on seq panel)\n"
+    "  [b]Shift+←/→[/b]    Coarse rotate / extend selection\n"
+    "  [b]Home[/b]         Reset map origin / jump to row start (seq)\n"
+    "  [b]End[/b]          Jump to row end (seq panel)\n"
+    "  [b]v[/b]            Toggle linear / circular map\n"
+    "  [b]l[/b]            Toggle feature connectors\n"
+    "  [b]r[/b]            Toggle restriction sites\n"
+    "\n"
+    "[bold]Selection / clipboard[/bold]\n"
+    "  [b]Click bar[/b]    Highlight feature DNA span\n"
+    "  [b]Click base[/b]   Place cursor (no feature pick)\n"
+    "  [b]Shift+click[/b]  Extend selection\n"
+    "  [b]^C[/b]           Copy selection (top strand)\n"
+    "  [b]Alt+C[/b]        Copy selection (bottom strand, reverse-complement)\n"
+    "\n"
+    "[bold]Seq-panel debug[/bold]\n"
+    "  [b]Alt+D[/b]        Toggle hover-status diagnostic row\n"
+    "  [b]H[/b]            Copy hover info to clipboard (debug only)\n"
+    "  [b]D[/b]            Dump rendered chunk to clipboard (debug only)\n"
+)
 
 
 # ── Fetch modal ────────────────────────────────────────────────────────────────
@@ -9449,6 +9558,2002 @@ class AddFeatureModal(ModalScreen):
             f"[green]Imported '{entry.get('name', '?')}' — "
             f"review and Save or Insert.[/green]"
         )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── New plasmid modal ─────────────────────────────────────────────────────────
+
+_DEFAULT_LIB_ANNOT_MAX_HITS = 5_000
+
+
+def _annotate_seq_from_feature_library(
+    sequence: str,
+    *,
+    circular: bool = False,
+    min_overlap: int = 12,
+    max_hits: int = _DEFAULT_LIB_ANNOT_MAX_HITS,
+) -> "list[dict]":
+    """Scan ``sequence`` for substring matches against the feature library
+    on both strands. Returns a list of feature dicts with keys
+    ``{name, feature_type, start, end, strand, sequence, color, qualifiers,
+       description}`` ready for ``SeqFeature`` construction.
+
+    Pure substring match (no mismatches, no gaps). Library entries shorter
+    than ``min_overlap`` are skipped — short hits balloon false-positive
+    counts on a multi-kb paste. Wrap detection on circular templates is
+    handled by appending ``seq[:max_lib_len]`` so a hit straddling 0 lands
+    once with ``end > total`` and the caller can lower it back into the
+    canonical range.
+
+    The library is loaded once per call (caller's job to debounce); the
+    forward/reverse-complement of each library entry is computed once and
+    re-used across all positions.
+
+    ``max_hits`` caps the result list so a chromosome-sized paste with a
+    short common library entry can't blow up memory or render time.
+    Returning **early** (rather than truncating after the fact) means
+    the inner loops also short-circuit. Default 5,000 hits is roughly
+    "every common gene matched ~5× across a 100 kb plasmid" — well past
+    any realistic interactive use, but still bounded.
+    """
+    seq_u = (sequence or "").upper()
+    n = len(seq_u)
+    if n == 0:
+        return []
+    entries = _load_features()
+    if not entries:
+        return []
+    # Pre-compute forward + RC for every library entry so the inner loop
+    # is just `str.find`.
+    prepared: list[tuple[str, str, str, int, str, str, dict, str, str]] = []
+    for e in entries:
+        s = (e.get("sequence", "") or "").upper()
+        if len(s) < min_overlap:
+            continue
+        prepared.append((
+            s,
+            _rc(s),
+            str(e.get("name", "") or "feat"),
+            int(e.get("strand", 1) or 1),
+            str(e.get("feature_type", "") or "misc_feature"),
+            str(e.get("color", "") or ""),
+            dict(e.get("qualifiers") or {}),
+            str(e.get("description", "") or ""),
+            s,  # original sequence for stamping on the new feature dict
+        ))
+    if not prepared:
+        return []
+    # On circular templates, allow hits to span the origin: scan against
+    # `seq + seq[:longest_entry-1]` so a 200 bp feature crossing 0/end
+    # finds a single contiguous hit. Trim back to canonical range later.
+    longest = max(len(p[0]) for p in prepared)
+    scan_seq = seq_u + (seq_u[: longest - 1] if circular and longest > 1 else "")
+    found: list[dict] = []
+    seen_keys: set[tuple[str, int, int, int]] = set()
+    for entry in prepared:
+        if len(found) >= max_hits:
+            break
+        s_fwd, s_rev, nm, lib_strand, ftype, col, quals, desc, raw = entry
+        slen = len(s_fwd)
+        # Forward strand hits.
+        i = scan_seq.find(s_fwd)
+        while i != -1:
+            start = i % n
+            end = (i + slen)
+            # Wrapped hit: store as compound (start..n) + (0..end-n) is
+            # the SeqFeature concern; here we just record (start, end)
+            # with end possibly > n so callers know to wrap it.
+            key = (nm, start, end, 1)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                found.append({
+                    "name": nm,
+                    "feature_type": ftype,
+                    "start": start,
+                    "end": end,
+                    "strand": 1 if lib_strand >= 0 else -1,
+                    "sequence": raw,
+                    "color": col,
+                    "qualifiers": dict(quals),
+                    "description": desc,
+                })
+                if len(found) >= max_hits:
+                    return found
+            i = scan_seq.find(s_fwd, i + 1)
+        # Reverse-complement hits (different strand).
+        if s_rev == s_fwd:
+            # palindromic library entry — already counted on the fwd scan.
+            continue
+        i = scan_seq.find(s_rev)
+        while i != -1:
+            start = i % n
+            end = (i + slen)
+            key = (nm, start, end, -1)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                found.append({
+                    "name": nm,
+                    "feature_type": ftype,
+                    "start": start,
+                    "end": end,
+                    "strand": -1,
+                    "sequence": raw,
+                    "color": col,
+                    "qualifiers": dict(quals),
+                    "description": desc,
+                })
+                if len(found) >= max_hits:
+                    return found
+            i = scan_seq.find(s_rev, i + 1)
+    return found
+
+
+class NewPlasmidModal(ModalScreen):
+    """Build a brand-new plasmid record from pasted DNA.
+
+    User pastes a sequence, optionally names it + sets topology, and
+    chooses one of three commit paths:
+
+      * **Plain create** — just wrap the bases in a SeqRecord.
+      * **Annotate from library** — scan the pasted seq against the
+        feature library; matched entries become SeqFeatures in the
+        resulting record. Pure substring match (both strands), library
+        entries shorter than 12 bp are skipped to keep noise out.
+      * **Annotate via BLAST** — Phase 2 (engine pending). Currently
+        notifies "BLAST engine pending" so the button doesn't crash.
+
+    Dismisses with ``{"record": SeqRecord}`` on commit, ``None`` on
+    cancel. Caller (``PlasmidApp._on_new_plasmid``) routes through
+    ``_import_and_persist`` so the record lands in the active library
+    collection like any fetched / opened plasmid.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",        "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="newplas-dlg"):
+            yield Static(" New Plasmid ", id="newplas-title")
+            with ScrollableContainer(id="newplas-body"):
+                yield Label("Name:")
+                yield Input(value="untitled",
+                            placeholder="e.g. my_construct_v1",
+                            id="newplas-name")
+                with Horizontal(id="newplas-topo-row"):
+                    yield Label("Topology:", id="newplas-topo-label")
+                    with RadioSet(id="newplas-topo"):
+                        yield RadioButton("Circular", value=True,
+                                          id="newplas-topo-circular")
+                        yield RadioButton("Linear",   value=False,
+                                          id="newplas-topo-linear")
+                yield Label("Sequence  (paste 5'→3'; ACGT/IUPAC; "
+                            "whitespace ignored):")
+                yield TextArea("", id="newplas-seq")
+            yield Static("", id="newplas-status", markup=True)
+            with Horizontal(id="newplas-btns"):
+                yield Button("Annotate from library",
+                             id="btn-newplas-annot-lib",
+                             tooltip=("Substring-match the pasted sequence "
+                                      "against your feature library; matched "
+                                      "entries become annotated features."))
+                yield Button("Annotate via BLAST",
+                             id="btn-newplas-annot-blast",
+                             tooltip=("Run BLASTN against every plasmid in "
+                                      "every collection; ≥90% identity hits "
+                                      "become misc_feature annotations on "
+                                      "the new record."))
+                yield Button("Create",
+                             id="btn-newplas-create",
+                             variant="primary")
+                yield Button("Cancel", id="btn-newplas-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#newplas-name", Input).focus()
+        except NoMatches:
+            pass
+
+    # ── Helpers ─────────────────────────────────────────────────────
+
+    def _gather(self) -> "tuple[str, str, bool, str | None]":
+        """Return ``(name, bases, circular, error_or_None)``. ``error``
+        is a user-facing message when the sequence fails validation;
+        callers should surface it via the status bar and abort."""
+        try:
+            name_in = self.query_one("#newplas-name", Input)
+            seq_ta  = self.query_one("#newplas-seq",  TextArea)
+            topo    = self.query_one("#newplas-topo-circular", RadioButton)
+        except NoMatches:
+            return "", "", True, "Modal not fully mounted."
+        name = _sanitize_label(name_in.value, max_len=80) or "untitled"
+        raw  = seq_ta.text or ""
+        # Drop whitespace before the IUPAC check — paste from web pages
+        # almost always carries newlines / leading numbers, so failing
+        # on whitespace would surprise the user.
+        compact = "".join(ch for ch in raw if not ch.isspace())
+        bases, err = _sanitize_bases(compact)
+        if err:
+            return name, bases, bool(topo.value), err
+        if not bases:
+            return name, bases, bool(topo.value), "Paste at least one base."
+        return name, bases, bool(topo.value), None
+
+    def _build_record(self, name: str, bases: str, circular: bool,
+                      annotated_feats: "list[dict] | None" = None):
+        """Wrap ``bases`` in a SeqRecord ready to hand off to
+        ``_import_and_persist``. ``annotated_feats`` is the output of
+        ``_annotate_seq_from_feature_library`` (or empty)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import (
+            SeqFeature, FeatureLocation, CompoundLocation,
+        )
+        # SeqRecord IDs must not contain spaces — collapse to underscore
+        # so a name like "my plasmid v1" still survives a GenBank
+        # round-trip.
+        rec_id = re.sub(r"\s+", "_", name) or "untitled"
+        rec = SeqRecord(
+            Seq(bases),
+            id=rec_id[:16],
+            name=rec_id[:16],
+            description=name,
+        )
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular" if circular else "linear"
+        n = len(bases)
+        for f in (annotated_feats or []):
+            start = int(f.get("start", 0))
+            end   = int(f.get("end",   0))
+            strand = int(f.get("strand", 1)) or 1
+            if start < 0 or start >= n or end <= start:
+                continue
+            qualifiers = dict(f.get("qualifiers") or {})
+            qualifiers.setdefault("label", [f.get("name", "")])
+            color = f.get("color")
+            if color:
+                qualifiers.setdefault("ApEinfo_revcolor", [color])
+                qualifiers.setdefault("ApEinfo_fwdcolor", [color])
+            if end > n:
+                # Wrap-around hit — split into two FeatureLocations.
+                loc = CompoundLocation([
+                    FeatureLocation(start, n, strand=strand),
+                    FeatureLocation(0,    (end - n), strand=strand),
+                ])
+            else:
+                loc = FeatureLocation(start, end, strand=strand)
+            rec.features.append(SeqFeature(
+                loc,
+                type=_sanitize_feat_type(f.get("feature_type", "")),
+                qualifiers=qualifiers,
+            ))
+        return rec
+
+    # ── Buttons ─────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-newplas-create")
+    def _create(self) -> None:
+        name, bases, circular, err = self._gather()
+        status = self.query_one("#newplas-status", Static)
+        if err:
+            status.update(f"[red]{err}[/red]")
+            return
+        try:
+            rec = self._build_record(name, bases, circular, [])
+        except Exception as exc:
+            _log.exception("NewPlasmidModal._create failed")
+            status.update(f"[red]Could not build record: {exc}[/red]")
+            return
+        self.dismiss({"record": rec})
+
+    @on(Button.Pressed, "#btn-newplas-annot-lib")
+    def _annotate_from_library(self) -> None:
+        name, bases, circular, err = self._gather()
+        status = self.query_one("#newplas-status", Static)
+        if err:
+            status.update(f"[red]{err}[/red]")
+            return
+        try:
+            hits = _annotate_seq_from_feature_library(
+                bases, circular=circular,
+            )
+        except Exception as exc:
+            _log.exception("library annotate scan failed")
+            status.update(f"[red]Annotation scan failed: {exc}[/red]")
+            return
+        try:
+            rec = self._build_record(name, bases, circular, hits)
+        except Exception as exc:
+            _log.exception("NewPlasmidModal annotate-from-library build failed")
+            status.update(f"[red]Could not build record: {exc}[/red]")
+            return
+        self.dismiss({"record": rec})
+
+    @on(Button.Pressed, "#btn-newplas-annot-blast")
+    def _annotate_via_blast(self) -> None:
+        """BLASTN the pasted sequence against every collection's
+        plasmids; HSPs above 90% identity become annotated SeqFeatures
+        on the resulting record.
+
+        Higher identity threshold than the engine's default (70%) — for
+        annotation we want clean, confident hits ("this region IS the
+        AmpR from pUC19"), not "weak similarity" noise. Users wanting
+        liberal hits should use the BLAST modal directly.
+
+        Runs synchronously on the main thread because the modal blocks
+        anyway during the build; if a user has a giant collection the
+        UI will pause briefly. (A worker port would mean a callback
+        race against modal dismissal — we'd need a pending-results
+        flag to handle the user clicking Cancel mid-search. For the
+        median-case ~10 kb plasmid this is fast enough.)
+        """
+        name, bases, circular, err = self._gather()
+        status = self.query_one("#newplas-status", Static)
+        if err:
+            status.update(f"[red]{err}[/red]")
+            return
+        # Run BLASTN against all collections; we treat the pasted seq
+        # as the query and use HSP hits to mark feature spans on the
+        # query, sourced from the matching subject's annotations.
+        try:
+            db = _blast_get_db("blastn", None)
+        except Exception as exc:
+            _log.exception("NewPlasmidModal BLAST: DB build failed")
+            status.update(f"[red]BLAST DB build failed: {exc}[/red]")
+            return
+        if not db.get("subjects"):
+            status.update(
+                "[yellow]No collections to BLAST against — add plasmids "
+                "to a collection first, or use 'Annotate from library'."
+                "[/yellow]"
+            )
+            return
+        try:
+            hits = _blast_search(bases, db, max_hits=200)
+        except Exception as exc:
+            _log.exception("NewPlasmidModal BLAST: search failed")
+            status.update(f"[red]BLAST search failed: {exc}[/red]")
+            return
+        # Promote hits to feature dicts. Strict threshold (≥90% id)
+        # avoids "vaguely similar" annotations.
+        annot_feats = self._blast_hits_to_features(hits, db, bases,
+                                                    min_id=90.0)
+        try:
+            rec = self._build_record(name, bases, circular, annot_feats)
+        except Exception as exc:
+            _log.exception("NewPlasmidModal BLAST: build_record failed")
+            status.update(f"[red]Could not build record: {exc}[/red]")
+            return
+        self.dismiss({"record": rec})
+
+    def _blast_hits_to_features(self, hits: "list[dict]", db: dict,
+                                 query_bases: str,
+                                 *, min_id: float = 90.0) -> "list[dict]":
+        """Convert BLASTN HSPs into the feature-dict shape that
+        `_build_record` expects. Each HSP describes a region on the
+        **query** that matched some subject; we project the hit back to
+        the query coordinates and label it after the matching subject's
+        plasmid name (or the closest annotated feature on the subject
+        if we can resolve one).
+
+        Filters by ``min_id`` (default 90%). Multiple HSPs on the same
+        query span dedup to the highest-scoring one — keeps a single
+        clear annotation per region instead of three overlapping ones.
+        """
+        n_query = len(query_bases)
+        promoted: list[dict] = []
+        seen_spans: dict[tuple[int, int, int], dict] = {}
+        for h in hits:
+            if h.get("identity_pct", 0.0) < min_id:
+                continue
+            q_start = int(h.get("q_start", 0))
+            q_end   = int(h.get("q_end", 0))
+            strand  = int(h.get("strand", 1)) or 1
+            if q_end <= q_start or q_end > n_query:
+                continue
+            key = (q_start, q_end, strand)
+            existing = seen_spans.get(key)
+            if existing and existing.get("score", 0) >= h.get("score", 0):
+                continue
+            sub_name = (h.get("subject_name") or h.get("subject_id")
+                        or "BLAST hit")
+            seen_spans[key] = {
+                "name":         str(sub_name)[:80],
+                "feature_type": "misc_feature",
+                "start":        q_start,
+                "end":          q_end,
+                "strand":       strand,
+                "sequence":     query_bases[q_start:q_end],
+                "color":        "",
+                "qualifiers":   {
+                    "label": [str(sub_name)[:80]],
+                    "note":  [(
+                        f"BLAST {h.get('subject_collection', '?')}"
+                        f" / {h.get('subject_id', '?')} "
+                        f"id={h.get('identity_pct', 0)}% "
+                        f"len={h.get('aligned_len', 0)}"
+                    )],
+                },
+                "description": "BLAST hit",
+                "score":       h.get("score", 0),
+            }
+        # Strip the score key (we used it for dedup ordering only;
+        # downstream feature builders don't use it).
+        for f in seen_spans.values():
+            f.pop("score", None)
+        promoted.extend(seen_spans.values())
+        return promoted
+
+    @on(Button.Pressed, "#btn-newplas-cancel")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── BLAST engine (pure-Python BLASTN + BLASTP) ────────────────────────────────
+#
+# Local-alignment search without leaving the process. Implements the BLAST
+# heuristic in plain Python:
+#
+#   1. Build a k-mer index over all subject sequences. For BLASTN, k=11
+#      indexes both strands of every plasmid in the chosen collection(s).
+#      For BLASTP, k=3 indexes the protein of every annotated CDS.
+#
+#   2. Tokenize the query into k-mers. For each (q_pos, kmer) pair, look
+#      up subject hits in the index — these are the **seeds**.
+#
+#   3. For each seed, **ungapped-extend** in both directions. Match adds
+#      score, mismatch subtracts; we track running max and stop early
+#      when the score drops by `_BLAST_X_DROP` below it (X-drop). Trim
+#      the final HSP back to the highest-scoring sub-region.
+#
+#   4. Filter HSPs by minimum score and identity, dedup overlapping seeds
+#      that produced identical HSPs, and return ranked by score.
+#
+# This is the same algorithm as classical BLAST 1.x. We don't gap-extend
+# (no Smith-Waterman after seeding), so an HSP that should bridge an indel
+# becomes two HSPs at the indel boundary — fine for plasmid-scale work,
+# where the typical hit is a contiguous 100+ bp match. NCBI's BLASTN
+# command-line default is also ungapped under -ungapped; gapping is an
+# extension that we'd add in a future pass if we hit a use-case that
+# needs it.
+
+# Default scoring — match the ones in NCBI BLASTN unless a user demands
+# otherwise. -3 mismatch is harsh and biases toward perfect matches,
+# which is what plasmid-on-plasmid users expect (you cloned this from
+# that backbone, not "vaguely similar to it").
+_BLAST_BLASTN_K        = 11
+_BLAST_BLASTN_MATCH    = 1
+_BLAST_BLASTN_MISMATCH = -3
+_BLAST_BLASTN_X_DROP   = 20      # extension stops when score drops X below max
+_BLAST_BLASTN_MIN_SCORE = 30     # ≈ 30 bp perfect match, or 50 bp at 80% id
+_BLAST_BLASTN_MIN_ID    = 0.70   # filter HSPs below this fractional identity
+
+_BLAST_BLASTP_K         = 3
+_BLAST_BLASTP_X_DROP    = 25
+_BLAST_BLASTP_MIN_SCORE = 30
+_BLAST_BLASTP_MIN_ID    = 0.30
+
+
+def _probe_pyhmmer() -> bool:
+    """Return True iff `pyhmmer` is importable. Used by the BLAST modal
+    to switch between "engine pending" and "install hint" messaging.
+
+    `importlib.util.find_spec` is a no-import probe — checking on every
+    modal open is cheap and dodges the "user installed pyhmmer mid-
+    session" edge case that a cached probe would miss."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("pyhmmer") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+# Cache the result for the lifetime of the process; pyhmmer doesn't get
+# installed/uninstalled during a single TUI run, and a missing probe
+# trips a 1-2 ms find_spec hit per modal open we'd rather avoid.
+_PYHMMER_AVAILABLE: bool = _probe_pyhmmer()
+
+# BLOSUM62 substitution matrix (standard NCBI BLAST default for protein).
+# Letters: 20 canonical AAs + B (D/N), Z (E/Q), X (any), * (stop).
+# Values are integer log-odds × 2 (the standard scaled form).
+_BLOSUM62_RAW = """
+   A  R  N  D  C  Q  E  G  H  I  L  K  M  F  P  S  T  W  Y  V  B  Z  X  *
+A  4 -1 -2 -2  0 -1 -1  0 -2 -1 -1 -1 -1 -2 -1  1  0 -3 -2  0 -2 -1  0 -4
+R -1  5  0 -2 -3  1  0 -2  0 -3 -2  2 -1 -3 -2 -1 -1 -3 -2 -3 -1  0 -1 -4
+N -2  0  6  1 -3  0  0  0  1 -3 -3  0 -2 -3 -2  1  0 -4 -2 -3  3  0 -1 -4
+D -2 -2  1  6 -3  0  2 -1 -1 -3 -4 -1 -3 -3 -1  0 -1 -4 -3 -3  4  1 -1 -4
+C  0 -3 -3 -3  9 -3 -4 -3 -3 -1 -1 -3 -1 -2 -3 -1 -1 -2 -2 -1 -3 -3 -2 -4
+Q -1  1  0  0 -3  5  2 -2  0 -3 -2  1  0 -3 -1  0 -1 -2 -1 -2  0  3 -1 -4
+E -1  0  0  2 -4  2  5 -2  0 -3 -3  1 -2 -3 -1  0 -1 -3 -2 -2  1  4 -1 -4
+G  0 -2  0 -1 -3 -2 -2  6 -2 -4 -4 -2 -3 -3 -2  0 -2 -2 -3 -3 -1 -2 -1 -4
+H -2  0  1 -1 -3  0  0 -2  8 -3 -3 -1 -2 -1 -2 -1 -2 -2  2 -3  0  0 -1 -4
+I -1 -3 -3 -3 -1 -3 -3 -4 -3  4  2 -3  1  0 -3 -2 -1 -3 -1  3 -3 -3 -1 -4
+L -1 -2 -3 -4 -1 -2 -3 -4 -3  2  4 -2  2  0 -3 -2 -1 -2 -1  1 -4 -3 -1 -4
+K -1  2  0 -1 -3  1  1 -2 -1 -3 -2  5 -1 -3 -1  0 -1 -3 -2 -2  0  1 -1 -4
+M -1 -1 -2 -3 -1  0 -2 -3 -2  1  2 -1  5  0 -2 -1 -1 -1 -1  1 -3 -1 -1 -4
+F -2 -3 -3 -3 -2 -3 -3 -3 -1  0  0 -3  0  6 -4 -2 -2  1  3 -1 -3 -3 -1 -4
+P -1 -2 -2 -1 -3 -1 -1 -2 -2 -3 -3 -1 -2 -4  7 -1 -1 -4 -3 -2 -2 -1 -2 -4
+S  1 -1  1  0 -1  0  0  0 -1 -2 -2  0 -1 -2 -1  4  1 -3 -2 -2  0  0  0 -4
+T  0 -1  0 -1 -1 -1 -1 -2 -2 -1 -1 -1 -1 -2 -1  1  5 -2 -2  0 -1 -1  0 -4
+W -3 -3 -4 -4 -2 -2 -3 -2 -2 -3 -2 -3 -1  1 -4 -3 -2 11  2 -3 -4 -3 -2 -4
+Y -2 -2 -2 -3 -2 -1 -2 -3  2 -1 -1 -2 -1  3 -3 -2 -2  2  7 -1 -3 -2 -1 -4
+V  0 -3 -3 -3 -1 -2 -2 -3 -3  3  1 -2  1 -1 -2 -2  0 -3 -1  4 -3 -2 -1 -4
+B -2 -1  3  4 -3  0  1 -1  0 -3 -4  0 -3 -3 -2  0 -1 -4 -3 -3  4  1 -1 -4
+Z -1  0  0  1 -3  3  4 -2  0 -3 -3  1 -1 -3 -1  0 -1 -3 -2 -2  1  4 -1 -4
+X  0 -1 -1 -1 -2 -1 -1 -1 -1 -1 -1 -1 -1 -1 -2  0  0 -2 -1 -1 -1 -1 -1 -4
+*-4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4 -4  1
+"""
+
+
+def _build_blosum62() -> "dict[tuple[str, str], int]":
+    """Parse `_BLOSUM62_RAW` once into a (a, b) → score lookup table.
+    Cached at module level via `_BLOSUM62`. Misses (e.g. lowercase) score
+    -4 (the same as a stop-codon mismatch) so the engine doesn't crash on
+    weird inputs."""
+    rows = [ln for ln in _BLOSUM62_RAW.strip().splitlines() if ln.strip()]
+    header = rows[0].split()
+    table: dict[tuple[str, str], int] = {}
+    for row in rows[1:]:
+        # First "column" is a 1-letter row label; everything after is
+        # whitespace-separated ints, possibly with leading "-" attached
+        # to the letter (the `*` row uses `*-4` rather than `*  -4`).
+        # Normalise by splitting on whitespace then peeling letter+sign
+        # off the first token if needed.
+        toks = row.split()
+        if not toks:
+            continue
+        first = toks[0]
+        # Peel the row label off the first token. Most rows: "A 4 ..."
+        # (label is its own token). The "*" row prints as "*-4 -4 ..."
+        # so peel here.
+        if len(first) > 1 and (first[0].isalpha() or first[0] == "*"):
+            label = first[0]
+            rest  = [first[1:]] + toks[1:]
+        else:
+            label = first
+            rest  = toks[1:]
+        for col_letter, score_str in zip(header, rest):
+            try:
+                table[(label, col_letter)] = int(score_str)
+            except ValueError:
+                continue
+    return table
+
+
+_BLOSUM62: "dict[tuple[str, str], int]" = _build_blosum62()
+
+
+def _blosum62_score(a: str, b: str) -> int:
+    return _BLOSUM62.get((a.upper(), b.upper()), -4)
+
+
+# Cap how big a query the engine will accept. Beyond this, the k-mer
+# loop time + HSP-dedup memory grow without bound; users almost never
+# need a >100 kb query (typical: 50-2000 bp). Caller should truncate
+# before calling `_blast_search` with a status-bar warning.
+_MAX_BLAST_QUERY_LEN = 100_000
+
+
+_BLASTN_QUERY_ALPHABET = set("ACGTNRYWSMKBDHV")
+_BLASTP_QUERY_ALPHABET = set("ACDEFGHIKLMNPQRSTVWYBZX*")
+
+
+def _strip_fasta_headers(text: str) -> str:
+    """Drop FASTA header lines (lines whose first non-whitespace char is
+    ``>``) so a paste of a ``>id\\nATG…`` blob becomes just the body.
+    Preserves the rest of the text — `_detect_query_program` then
+    handles whitespace + alphabet.
+
+    Tolerant to leading whitespace on the header so a copy-pasted
+    FASTA from a wrapped editor or e-mail still gets cleaned. A line
+    that's just ``>`` with nothing after it is also dropped (defends
+    against misformatted multi-FASTA pastes).
+    """
+    if ">" not in (text or ""):
+        return text or ""
+    out = []
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith(">"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _detect_query_program(query: str, program_hint: str) -> tuple[str, str]:
+    """Decide whether the query is DNA or protein, and translate to
+    protein if BLASTP was requested with a DNA query.
+
+    Returns ``(program, query_normalised)``. ``program`` is one of
+    ``"blastn"``, ``"blastp"``, ``"hmmscan"``. The query is upper-cased,
+    whitespace-stripped, FASTA-header-stripped, and filtered to the
+    program's alphabet (BLASTN: IUPAC DNA; BLASTP: 20 AA + B/Z/X/*).
+    Out-of-alphabet characters are silently dropped — defends against
+    pastes that include row numbers (``1 ATGAAA 50 GG…``) or comma /
+    pipe delimiters that the seeder would otherwise hash into the
+    k-mer index and never match. For BLASTP with a DNA query, frame 1
+    is translated with stop codons preserved as ``*``.
+
+    Caps the query at ``_MAX_BLAST_QUERY_LEN`` after sanitisation so
+    a chromosome paste can't OOM the seeder.
+    """
+    raw = _strip_fasta_headers(query or "")
+    q = "".join(ch for ch in raw.upper() if not ch.isspace())
+    program_hint = program_hint or "blastn"
+    if program_hint == "blastn":
+        cleaned = "".join(ch for ch in q if ch in _BLASTN_QUERY_ALPHABET)
+        return "blastn", cleaned[:_MAX_BLAST_QUERY_LEN]
+    if program_hint in ("blastp", "hmmscan"):
+        # If the user pasted DNA but asked for BLASTP, translate frame 1.
+        # Heuristic: 95%+ ACGTN of *all alpha chars*. This dodges a
+        # "false-DNA" classification when the user's query happens to
+        # contain numbers or punctuation that pad the protein content.
+        if q and len(q) >= 9:
+            alpha_only = "".join(ch for ch in q if ch.isalpha())
+            if alpha_only:
+                n_dna = sum(1 for c in alpha_only if c in "ACGTN")
+                if n_dna / len(alpha_only) >= 0.95:
+                    dna = "".join(ch for ch in alpha_only
+                                   if ch in _BLASTN_QUERY_ALPHABET)
+                    triplet_len = (len(dna) // 3) * 3
+                    if triplet_len >= 3:
+                        try:
+                            from Bio.Seq import Seq
+                            protein = str(Seq(dna[:triplet_len]).translate())
+                            return program_hint, protein[:_MAX_BLAST_QUERY_LEN]
+                        except Exception:
+                            _log.exception("BLASTP DNA-query translate failed")
+        cleaned = "".join(ch for ch in q if ch in _BLASTP_QUERY_ALPHABET)
+        return program_hint, cleaned[:_MAX_BLAST_QUERY_LEN]
+    return program_hint, q[:_MAX_BLAST_QUERY_LEN]
+
+
+def _ungapped_extend(
+    s_query: str, s_subject: str, q_pos: int, s_pos: int, k: int,
+    *, scorer, x_drop: int,
+) -> "tuple[int, int, int, int, int, int]":
+    """Extend a (q_pos, s_pos) seed of length ``k`` in both directions
+    using ``scorer(a, b) -> int`` per-column scoring. Stops on either
+    side when the running score drops ``x_drop`` below the side's max.
+
+    Returns ``(q_start, q_end, s_start, s_end, score, matches)``. The
+    ``[q_start, q_end)`` / ``[s_start, s_end)`` ranges are half-open and
+    aligned column-for-column (no gaps). ``matches`` is the count of
+    columns where the two letters were equal (useful for identity %).
+
+    `scorer` is parameterised so the same routine handles BLASTN
+    (match/mismatch) and BLASTP (BLOSUM62) without branching inside the
+    inner loop.
+    """
+    # Score the seed itself first.
+    seed_score = 0
+    seed_matches = 0
+    for i in range(k):
+        a, b = s_query[q_pos + i], s_subject[s_pos + i]
+        seed_score += scorer(a, b)
+        if a == b:
+            seed_matches += 1
+
+    # Extend right.
+    q_right = q_pos + k
+    s_right = s_pos + k
+    cur = seed_score
+    best_right = cur
+    best_q_right, best_s_right = q_right, s_right
+    matches_right = 0
+    while q_right < len(s_query) and s_right < len(s_subject):
+        a, b = s_query[q_right], s_subject[s_right]
+        cur += scorer(a, b)
+        if a == b:
+            matches_right += 1
+        if cur > best_right:
+            best_right = cur
+            best_q_right, best_s_right = q_right + 1, s_right + 1
+            # Reset incremental match counter to keep matches counted
+            # only up to the best-right position. Track matches at the
+            # last-best break.
+            best_matches_right = matches_right
+        if best_right - cur > x_drop:
+            break
+        q_right += 1
+        s_right += 1
+    else:
+        # Loop exited without break (hit end of either string). The
+        # best-right position is the loop's `best_q/s_right` already.
+        pass
+    # If no extension improved on seed, best_matches_right wasn't set.
+    if "best_matches_right" not in locals():
+        best_matches_right = 0
+
+    # Extend left.
+    q_left = q_pos - 1
+    s_left = s_pos - 1
+    cur = seed_score
+    best_left_delta = 0   # the score *gained* on the left side beyond the seed
+    best_q_left = q_pos
+    best_s_left = s_pos
+    matches_left = 0
+    best_matches_left = 0
+    while q_left >= 0 and s_left >= 0:
+        a, b = s_query[q_left], s_subject[s_left]
+        cur += scorer(a, b)
+        if a == b:
+            matches_left += 1
+        # Improvement is measured against the seed score (not best_right),
+        # so the two sides are extended independently — this matches
+        # NCBI BLAST semantics.
+        delta = cur - seed_score
+        if delta > best_left_delta:
+            best_left_delta = delta
+            best_q_left = q_left
+            best_s_left = s_left
+            best_matches_left = matches_left
+        if best_left_delta + seed_score - cur > x_drop:
+            break
+        q_left -= 1
+        s_left -= 1
+
+    total_score = best_right + best_left_delta
+    total_matches = seed_matches + best_matches_left + best_matches_right
+    return (best_q_left, best_q_right,
+            best_s_left, best_s_right,
+            total_score, total_matches)
+
+
+def _blast_index_kmers(seq: str, k: int) -> "dict[str, list[int]]":
+    """Return ``{kmer: [positions]}`` for every k-mer in ``seq``. Pure
+    forward — caller is responsible for indexing the reverse complement
+    separately if BLASTN dual-strand search is wanted.
+
+    k-mers containing letters outside the canonical alphabet (``N`` for
+    DNA; ``X`` / ``*`` for protein) are still indexed — the k-mer just
+    won't be hit by canonical-only queries. We let the search side
+    decide on a query-time filter (the query usually doesn't contain
+    those characters anyway).
+    """
+    out: dict[str, list[int]] = {}
+    n = len(seq)
+    for i in range(n - k + 1):
+        out.setdefault(seq[i:i + k], []).append(i)
+    return out
+
+
+def _blast_build_db(program: str,
+                    collection_names: "list[str] | None" = None) -> dict:
+    """Build an in-memory search database for ``program`` from the
+    chosen plasmid collections.
+
+    ``collection_names``:
+      * ``None`` or empty → all collections (the "(all collections)"
+        sentinel from the modal).
+      * non-empty list → just those.
+
+    Returned db schema:
+      ``{"program": str, "k": int, "subjects":
+         [{"id", "name", "seq_fwd", "seq_rev"?, "kind"}],
+         "kmer_index": {kmer: [(subject_idx, position, strand)]}
+        }``
+
+    For BLASTN, ``subjects`` are full plasmid sequences; the index covers
+    both strands (strand=+1 for forward, -1 for RC). For BLASTP, subjects
+    are individual annotated CDS-derived proteins; strand is always +1
+    in the index (BLASTP doesn't search the RC strand).
+    """
+    cols = _load_collections()
+    if collection_names:
+        wanted = set(collection_names)
+        cols = [c for c in cols if c.get("name") in wanted]
+
+    if program == "blastn":
+        return _blast_build_db_blastn(cols)
+    if program == "blastp":
+        return _blast_build_db_blastp(cols)
+    return {"program": program, "k": 0, "subjects": [], "kmer_index": {}}
+
+
+def _blast_build_db_blastn(cols: "list[dict]") -> dict:
+    k = _BLAST_BLASTN_K
+    subjects: list[dict] = []
+    index: dict[str, list[tuple[int, int, int]]] = {}
+    for c in cols:
+        coll_name = c.get("name", "?")
+        for entry in c.get("plasmids") or []:
+            gb = entry.get("gb_text") or ""
+            if not gb:
+                continue
+            try:
+                rec = _gb_text_to_record(gb)
+            except Exception:
+                # Bad GenBank text — skip silently; logging would spam
+                # if a corrupt entry exists. _log.debug for forensics.
+                _log.debug("BLAST DB build: skipped malformed entry "
+                           "in collection %r", coll_name)
+                continue
+            seq_fwd = str(rec.seq).upper()
+            seq_rev = _rc(seq_fwd)
+            sub_idx = len(subjects)
+            subjects.append({
+                "id":      rec.id,
+                "name":    rec.name or rec.id,
+                "collection": coll_name,
+                "kind":    "plasmid",
+                "length":  len(seq_fwd),
+                "seq_fwd": seq_fwd,
+                "seq_rev": seq_rev,
+            })
+            for i in range(len(seq_fwd) - k + 1):
+                index.setdefault(seq_fwd[i:i + k], []).append((sub_idx, i, 1))
+            for i in range(len(seq_rev) - k + 1):
+                index.setdefault(seq_rev[i:i + k], []).append((sub_idx, i, -1))
+    return {
+        "program":     "blastn",
+        "k":           k,
+        "subjects":    subjects,
+        "kmer_index":  index,
+    }
+
+
+def _blast_build_db_blastp(cols: "list[dict]") -> dict:
+    """For BLASTP, every annotated CDS feature in every plasmid in the
+    chosen collections becomes a subject (translated to protein).
+    Plasmids without CDSes contribute nothing — keeps the noise floor
+    low at the cost of missing un-annotated coding regions. Six-frame
+    translation could be added later if a use-case needs it."""
+    k = _BLAST_BLASTP_K
+    subjects: list[dict] = []
+    index: dict[str, list[tuple[int, int, int]]] = {}
+    for c in cols:
+        coll_name = c.get("name", "?")
+        for entry in c.get("plasmids") or []:
+            gb = entry.get("gb_text") or ""
+            if not gb:
+                continue
+            try:
+                rec = _gb_text_to_record(gb)
+            except Exception:
+                continue
+            for feat in rec.features:
+                if feat.type != "CDS":
+                    continue
+                try:
+                    cds_seq = str(feat.extract(rec.seq)).upper()
+                except Exception:
+                    _log.debug("BLAST BLASTP: extract failed on a CDS")
+                    continue
+                if len(cds_seq) < 9 or len(cds_seq) % 3 != 0:
+                    continue
+                try:
+                    # `feat.extract` already orients the sequence in
+                    # transcript direction (reverses + complements
+                    # strand=-1), so we translate frame 1 directly with
+                    # Biopython rather than `_translate_cds(...)` which
+                    # is a positional helper for the seq panel that
+                    # takes (full_seq, start, end, strand).
+                    from Bio.Seq import Seq
+                    protein = str(Seq(cds_seq).translate())
+                except Exception:
+                    continue
+                # Drop trailing stop if present so the index doesn't
+                # hit on a hundred different proteins all ending in '*'.
+                if protein.endswith("*"):
+                    protein = protein[:-1]
+                if len(protein) < k:
+                    continue
+                qual = feat.qualifiers
+                lbl = (qual.get("label") or qual.get("gene")
+                       or qual.get("product") or [rec.name or rec.id])[0]
+                sub_idx = len(subjects)
+                subjects.append({
+                    "id":      f"{rec.id}:{lbl}",
+                    "name":    str(lbl),
+                    "collection": coll_name,
+                    "plasmid": rec.name or rec.id,
+                    "kind":    "cds",
+                    "length":  len(protein),
+                    "seq_fwd": protein,
+                })
+                for i in range(len(protein) - k + 1):
+                    index.setdefault(protein[i:i + k], []).append(
+                        (sub_idx, i, 1))
+    return {
+        "program":     "blastp",
+        "k":           k,
+        "subjects":    subjects,
+        "kmer_index":  index,
+    }
+
+
+_BLAST_MAX_EXTENSIONS = 200_000
+
+
+def _blast_search_pure(query: str, db: dict, *, max_hits: int = 25) -> list[dict]:
+    """Hand-rolled pure-Python BLASTN/BLASTP. Returns up to ``max_hits``
+    HSPs sorted by descending score, each as:
+
+      ``{"subject_idx", "subject_id", "subject_name", "subject_collection",
+         "strand", "q_start", "q_end", "s_start", "s_end",
+         "score", "identity_pct", "aligned_len", "kind"}``
+
+    Returns an empty list if the query is too short for the program's
+    k-mer length, or the database is empty.
+
+    A repetitive query against a repetitive subject can produce
+    hundreds of thousands of seeds at the same k-mer (e.g. a
+    tandem-tetra-repeat query against a tandem-tetra-repeat plasmid).
+    To keep the engine bounded we cap the total number of ungapped
+    extensions at `_BLAST_MAX_EXTENSIONS` per search and stop seeding
+    early when reached. This is a soft cap: hit quality drops off
+    fast in the long tail anyway, so the early-stop just trims the
+    pathological case.
+
+    `_blast_search` (no suffix) is the dispatcher and prefers pyhmmer.
+    Reach for `_blast_search_pure` directly only when you specifically
+    want the hand-rolled behaviour: short queries that pyhmmer's
+    profile-builder rejects, debugging without the HMMER C internals
+    in the picture, or environments where pyhmmer isn't importable.
+    """
+    program = db.get("program", "")
+    k       = int(db.get("k", 0) or 0)
+    if program not in ("blastn", "blastp") or k <= 0:
+        return []
+    q = (query or "").upper()
+    if len(q) < k or not db.get("subjects"):
+        return []
+
+    if program == "blastn":
+        match    = _BLAST_BLASTN_MATCH
+        mismatch = _BLAST_BLASTN_MISMATCH
+        x_drop   = _BLAST_BLASTN_X_DROP
+        min_score = _BLAST_BLASTN_MIN_SCORE
+        min_id    = _BLAST_BLASTN_MIN_ID
+        def scorer(a, b):
+            return match if a == b else mismatch
+    else:  # blastp
+        x_drop   = _BLAST_BLASTP_X_DROP
+        min_score = _BLAST_BLASTP_MIN_SCORE
+        min_id    = _BLAST_BLASTP_MIN_ID
+        scorer = _blosum62_score
+
+    index = db["kmer_index"]
+    subjects = db["subjects"]
+    seen: set[tuple[int, int, int, int, int]] = set()
+    hsps: list[dict] = []
+    extensions = 0
+    capped = False
+
+    # Walk the query's k-mers and look up seeds.
+    for q_pos in range(len(q) - k + 1):
+        if extensions >= _BLAST_MAX_EXTENSIONS:
+            capped = True
+            break
+        kmer = q[q_pos:q_pos + k]
+        seeds = index.get(kmer)
+        if not seeds:
+            continue
+        for sub_idx, s_pos, strand in seeds:
+            extensions += 1
+            if extensions > _BLAST_MAX_EXTENSIONS:
+                capped = True
+                break
+            sub = subjects[sub_idx]
+            s_seq = sub["seq_rev"] if (
+                strand == -1 and "seq_rev" in sub) else sub["seq_fwd"]
+            (q_lo, q_hi, s_lo, s_hi, score, matches) = _ungapped_extend(
+                q, s_seq, q_pos, s_pos, k,
+                scorer=scorer, x_drop=x_drop,
+            )
+            aligned_len = max(q_hi - q_lo, 1)
+            if score < min_score:
+                continue
+            ident = matches / aligned_len if aligned_len else 0.0
+            if ident < min_id:
+                continue
+            # Dedup the same HSP found via a different seed inside it.
+            key = (sub_idx, strand, q_lo, s_lo, q_hi)
+            if key in seen:
+                continue
+            seen.add(key)
+            # For reverse-strand hits, flip s_lo/s_hi back into forward
+            # coordinates so the user sees plasmid-frame positions.
+            if strand == -1 and "seq_rev" in sub:
+                fwd_len = sub["length"]
+                s_lo_disp = fwd_len - s_hi
+                s_hi_disp = fwd_len - s_lo
+            else:
+                s_lo_disp = s_lo
+                s_hi_disp = s_hi
+            hsps.append({
+                "subject_idx":        sub_idx,
+                "subject_id":         sub["id"],
+                "subject_name":       sub["name"],
+                "subject_collection": sub.get("collection", "?"),
+                "kind":               sub.get("kind", "plasmid"),
+                "strand":             strand,
+                "q_start":            q_lo,
+                "q_end":              q_hi,
+                "s_start":            s_lo_disp,
+                "s_end":              s_hi_disp,
+                "score":              score,
+                "matches":            matches,
+                "aligned_len":        aligned_len,
+                "identity_pct":       round(ident * 100.0, 1),
+            })
+    if capped:
+        _log.info(
+            "BLAST search hit the extension cap (%d) — repetitive "
+            "query/subject; results truncated.",
+            _BLAST_MAX_EXTENSIONS,
+        )
+    hsps.sort(key=lambda h: (-h["score"], -h["identity_pct"]))
+    return hsps[:max_hits]
+
+
+# ── pyhmmer-backed BLAST (default) ───────────────────────────────────────────
+#
+# `pyhmmer.hmmer.phmmer` (BLASTP-equivalent) and `pyhmmer.hmmer.nhmmer`
+# (BLASTN-equivalent) run HMMER 3 in-process. Same problem domain as
+# NCBI BLAST — find similar regions of a query inside a sequence
+# database — but with HMMER's profile-based forward algorithm instead
+# of seed/extend. Faster and more sensitive than our hand-rolled BLAST,
+# and we already depend on pyhmmer for HMMscan, so engaging it here is
+# free in dependency terms.
+#
+# Trade-off the user sees: scoring is HMMER bit-score (and we keep an
+# e-value column) rather than NCBI sum-score. Identity % is computed
+# from the alignment so the output column is comparable across both
+# backends. Coordinates: phmmer/nhmmer's `hmm_*` fields are *query*
+# coords (the HMM is built from the query); `target_*` are subject
+# coords. nhmmer signals reverse-strand hits with `target_to <
+# target_from` — we flip back to forward coords + set strand=-1.
+
+# Below this query length pyhmmer rejects the input (HMMER profiles
+# need at least a few residues to be informative). Anything shorter
+# falls back to pure-Python.
+_PYHMMER_MIN_QUERY_BLASTN = 20
+_PYHMMER_MIN_QUERY_BLASTP = 6
+
+
+def _pyhmmer_alignment_identity(ali) -> "tuple[int, int]":
+    """Return (matches, aligned_len) for a pyhmmer Alignment.
+
+    Counts case-insensitive equal positions in the hmm/target sequences,
+    excluding gap columns (`-` / `.`). HMMER's `identity_sequence` puts
+    the match letter at hits and a space at mismatches, so the cheaper
+    `identity_sequence.count(' ')` would also work — but using the raw
+    pair is clearer and stays correct if HMMER changes the convention.
+    """
+    if ali is None:
+        return 0, 0
+    h = (ali.hmm_sequence or "").upper()
+    t = (ali.target_sequence or "").upper()
+    matches = 0
+    aligned = 0
+    for a, b in zip(h, t):
+        if a in "-.":
+            continue
+        aligned += 1
+        if a == b:
+            matches += 1
+    return matches, max(aligned, 1)
+
+
+def _blast_search_pyhmmer(query: str, db: dict, *,
+                           max_hits: int = 25) -> list[dict]:
+    """phmmer / nhmmer backend via pyhmmer. Returns hits in the same
+    dict shape as `_blast_search_pure` so `_format_hits` renders both
+    backends with one code path.
+
+    Caller's responsibility: query is already sanitised (alphabet
+    filter, length cap) by `_detect_query_program`. We don't re-clean
+    here so the bytes that hit pyhmmer are the same bytes the user
+    saw in the modal."""
+    program = db.get("program", "")
+    subjects = db.get("subjects", [])
+    if not subjects or not query:
+        return []
+
+    import pyhmmer
+    from pyhmmer import easel
+
+    if program == "blastn":
+        alphabet = easel.Alphabet.dna()
+        search_fn = pyhmmer.hmmer.nhmmer
+    elif program == "blastp":
+        alphabet = easel.Alphabet.amino()
+        search_fn = pyhmmer.hmmer.phmmer
+    else:
+        return []
+
+    # Digital query. pyhmmer raises ValueError for queries containing
+    # alphabet-foreign symbols, but the caller's `_detect_query_program`
+    # filter has already stripped those — defensive try anyway.
+    try:
+        q_seq = easel.TextSequence(name=b"query", sequence=query)
+        q_digital = q_seq.digitize(alphabet)
+    except Exception:
+        _log.exception("pyhmmer: query digitize failed for %r-len query",
+                        len(query))
+        return []
+
+    # Digital targets. Subject names get bytes-encoded because pyhmmer
+    # wants `bytes`; cap at 255 chars to avoid overrunning HMMER's
+    # internal name buffers.
+    targets: list = []
+    target_meta: list[int] = []   # index into `subjects`
+    for i, sub in enumerate(subjects):
+        s = sub.get("seq_fwd", "")
+        if not s:
+            continue
+        nm = str(sub.get("id", f"sub{i}")).encode("utf-8",
+                                                   errors="replace")[:255]
+        try:
+            ts = easel.TextSequence(name=nm, sequence=s).digitize(alphabet)
+        except Exception:
+            _log.debug("pyhmmer: skipped target %d (digitize failed)", i)
+            continue
+        targets.append(ts)
+        target_meta.append(i)
+    if not targets:
+        return []
+
+    # Quick lookup from the name pyhmmer reports back → subjects index.
+    # `target_meta[ti]` is the index of the t-th target inside `subjects`;
+    # we index by the same `id` field we passed pyhmmer as the target name.
+    name_to_idx = {
+        str(subjects[sub_idx].get("id", f"sub{sub_idx}")): sub_idx
+        for sub_idx in target_meta
+    }
+
+    def _to_str(v):
+        if v is None:
+            return ""
+        if isinstance(v, (bytes, bytearray)):
+            return v.decode("utf-8", errors="replace")
+        return str(v)
+
+    hits_out: list[dict] = []
+    seen: set[tuple[int, int, int, int, int]] = set()
+
+    # phmmer/nhmmer return a TopHits per query. We pass exactly one,
+    # so consume just the first iteration.
+    try:
+        top_hits_iter = search_fn([q_digital], targets, cpus=1)
+    except Exception:
+        _log.exception("pyhmmer search dispatch failed")
+        return []
+
+    import math
+    for top_hits in top_hits_iter:
+        for h in top_hits:
+            if h.score is None:
+                continue
+            name = _to_str(h.name)
+            sub_idx = name_to_idx.get(name, -1)
+            if sub_idx < 0:
+                # Defensive — shouldn't happen given we just built the
+                # name map, but skip cleanly if pyhmmer emits an
+                # unexpected name.
+                continue
+            sub = subjects[sub_idx]
+            evalue = float(h.evalue) if (h.evalue and h.evalue > 0) else 1e-300
+
+            doms = list(h.domains or [])
+            if not doms:
+                # Score-only hit (no per-domain breakdown). Fall back
+                # to whole-query / whole-subject bounds.
+                hits_out.append({
+                    "subject_idx":        sub_idx,
+                    "subject_id":         sub.get("id", name),
+                    "subject_name":       sub.get("name", name),
+                    "subject_collection": sub.get("collection", "?"),
+                    "kind":               sub.get("kind", "plasmid"),
+                    "strand":             1,
+                    "q_start":            0,
+                    "q_end":              len(query),
+                    "s_start":            0,
+                    "s_end":              sub.get("length", 0),
+                    "score":              round(float(h.score), 1),
+                    "matches":            0,
+                    "aligned_len":        len(query),
+                    "identity_pct":       round(min(100.0, max(
+                        0.0, -math.log10(evalue))), 1),
+                    "evalue":             evalue,
+                })
+                continue
+
+            for dom in doms:
+                ali = dom.alignment
+                if ali is None:
+                    continue
+                # phmmer / nhmmer:
+                #   hmm_from / hmm_to       → query coords (1-based)
+                #   target_from / target_to → subject coords (1-based)
+                # nhmmer signals RC-strand hits via target_to < target_from.
+                q_from = int(ali.hmm_from or 1)
+                q_to   = int(ali.hmm_to   or len(query))
+                t_from = int(ali.target_from or 1)
+                t_to   = int(ali.target_to   or 1)
+                if t_to < t_from:
+                    strand = -1
+                    s_lo = t_to - 1
+                    s_hi = t_from
+                else:
+                    strand = 1
+                    s_lo = t_from - 1
+                    s_hi = t_to
+                q_lo = max(0, q_from - 1)
+                q_hi = max(q_lo + 1, q_to)
+                matches, aligned_len = _pyhmmer_alignment_identity(ali)
+                ident_pct = round(matches / max(aligned_len, 1) * 100.0, 1)
+
+                key = (sub_idx, strand, q_lo, s_lo, q_hi)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                d_score = float(getattr(dom, "score", h.score) or h.score)
+                hits_out.append({
+                    "subject_idx":        sub_idx,
+                    "subject_id":         sub.get("id", name),
+                    "subject_name":       sub.get("name", name),
+                    "subject_collection": sub.get("collection", "?"),
+                    "kind":               sub.get("kind", "plasmid"),
+                    "strand":             strand,
+                    "q_start":            q_lo,
+                    "q_end":              q_hi,
+                    "s_start":            s_lo,
+                    "s_end":              s_hi,
+                    "score":              round(d_score, 1),
+                    "matches":            matches,
+                    "aligned_len":        aligned_len,
+                    "identity_pct":       ident_pct,
+                    "evalue":             evalue,
+                })
+        break   # one query → one TopHits group
+
+    hits_out.sort(key=lambda d: (-d["score"], d.get("evalue", 1.0)))
+    return hits_out[:max_hits]
+
+
+def _blast_search(query: str, db: dict, *, max_hits: int = 25,
+                   backend: str = "auto") -> list[dict]:
+    """Top-level BLAST dispatcher. ``backend``:
+
+      * ``"auto"`` (default) — pyhmmer when it can handle the query,
+        else pure-Python. The "can handle" check is a length gate
+        (``_PYHMMER_MIN_QUERY_BLAST{N,P}``); HMMER profiles need at
+        least a handful of residues to score anything, so very short
+        queries skip pyhmmer up front rather than waste a `digitize`
+        round-trip just to fail.
+      * ``"pyhmmer"`` — force the pyhmmer backend; raises
+        ``RuntimeError`` if pyhmmer isn't available.
+      * ``"pure"`` — force the pure-Python backend.
+
+    Output shape is identical regardless of backend so callers
+    (`BlastModal._format_hits`, the NewPlasmidModal annotate path)
+    don't branch on engine."""
+    program = db.get("program", "")
+    if program not in ("blastn", "blastp"):
+        return []
+
+    if backend == "pure":
+        return _blast_search_pure(query, db, max_hits=max_hits)
+    if backend == "pyhmmer" and not _PYHMMER_AVAILABLE:
+        raise RuntimeError(
+            "backend='pyhmmer' requested but pyhmmer is not importable"
+        )
+
+    use_pyhmmer = (backend == "pyhmmer") or (
+        backend == "auto" and _PYHMMER_AVAILABLE
+    )
+    if use_pyhmmer:
+        # Length gate: HMMER profiles can't be built from queries
+        # below a few residues. Falling back to pure-Python is
+        # cheaper than catching pyhmmer's ValueError.
+        min_q = (_PYHMMER_MIN_QUERY_BLASTN if program == "blastn"
+                 else _PYHMMER_MIN_QUERY_BLASTP)
+        if len(query) < min_q:
+            use_pyhmmer = False
+
+    if use_pyhmmer:
+        try:
+            hits = _blast_search_pyhmmer(query, db, max_hits=max_hits)
+            # Empty result from pyhmmer is taken at face value — HMMER
+            # genuinely found nothing significant. Don't double-search
+            # with pure-Python (different scoring would just confuse the
+            # user with spurious "low-confidence" matches).
+            return hits
+        except Exception:
+            _log.exception("pyhmmer backend failed; falling back to pure-Python")
+    return _blast_search_pure(query, db, max_hits=max_hits)
+
+
+def _blast_db_summary(db: dict) -> str:
+    """One-line description for the status bar after a build:
+    ``"BLASTN db ready: 12 subjects, 2,481,302 bp / 187,394 unique k-mers"``"""
+    program = db.get("program", "?").upper()
+    subs = db.get("subjects") or []
+    n_subs = len(subs)
+    if program == "BLASTN":
+        total = sum(s.get("length", 0) for s in subs)
+        unit = "bp"
+    else:
+        total = sum(s.get("length", 0) for s in subs)
+        unit = "aa"
+    n_kmers = len(db.get("kmer_index") or {})
+    return (f"{program} db ready: {n_subs:,} subjects, "
+            f"{total:,} {unit} / {n_kmers:,} unique k-mers")
+
+
+# Module-level cache so re-running BLAST against the same source is
+# instant (for "interactive iteration" use). Keyed by
+# (program, frozenset(collection_names_or_empty_for_all)). Cap = 4
+# entries via OrderedDict eviction so a long session can't balloon
+# memory. Cache is invalidated on any collection-mutation path that
+# matters (we don't currently auto-invalidate; user clicks "Build
+# database" again to refresh).
+from collections import OrderedDict as _OD
+_BLAST_DB_CACHE: "_OD" = _OD()
+_BLAST_DB_CACHE_MAX = 4
+
+
+def _blast_get_db(program: str,
+                  collection_names: "list[str] | None") -> dict:
+    """Cached wrapper around `_blast_build_db`. Returns the same db on
+    subsequent calls with the same inputs until evicted."""
+    key = (program, frozenset(collection_names) if collection_names
+           else frozenset())
+    if key in _BLAST_DB_CACHE:
+        _BLAST_DB_CACHE.move_to_end(key)
+        return _BLAST_DB_CACHE[key]
+    db = _blast_build_db(program, collection_names)
+    _BLAST_DB_CACHE[key] = db
+    while len(_BLAST_DB_CACHE) > _BLAST_DB_CACHE_MAX:
+        _BLAST_DB_CACHE.popitem(last=False)
+    return db
+
+
+def _blast_clear_cache() -> None:
+    """Drop the BLAST DB cache. Called from collection-mutation paths
+    (delete, rename, save) so a stale db doesn't outlive the underlying
+    plasmids."""
+    _BLAST_DB_CACHE.clear()
+
+
+# ── HMMscan engine (pyhmmer) ──────────────────────────────────────────────────
+#
+# Wraps pyhmmer's `hmmscan` so the BLAST modal can run profile-HMM
+# searches against a user-supplied .hmm / .h3m / .h3p file. Heavy
+# scientific work is handled by pyhmmer (HMMER 3 internals); we just
+# marshal the query into an `easel.DigitalSequence`, iterate the
+# matching profiles, and shape the hits to look like our BLASTN/BLASTP
+# HSP dicts so `_format_hits` can render them uniformly.
+#
+# The `.hmm` file is opened fresh on every run — we don't cache the
+# parsed profiles because (a) Pfam-A is ~1 GB so pre-fetching kills
+# memory, and (b) users iterate rarely on HMMscan. If a use-case
+# emerges, we can add an `_HMM_DB_CACHE` analogous to `_BLAST_DB_CACHE`.
+
+_HMMSCAN_MIN_QUERY_LEN = 5     # too-short queries are pure noise hits
+_HMMSCAN_MAX_HITS      = 25    # match the BLAST default for consistency
+
+
+def _hmmscan_run(query_protein: str,
+                 hmm_path: str,
+                 *, max_hits: int = _HMMSCAN_MAX_HITS,
+                 ) -> "list[dict]":
+    """Run pyhmmer's `hmmscan` against an .hmm / .h3m / .h3p file.
+
+    Returns a list of HSP-shaped dicts that `BlastModal._format_hits`
+    can render uniformly with BLASTN/BLASTP results. Each dict has the
+    same keys as the BLAST search output, with ``program`` set to
+    ``"hmmscan"`` and ``score`` / ``identity_pct`` populated from
+    HMMER's bit score and best-domain inclusion (we use ``e-value`` as
+    a confidence proxy for the identity column, since HMMs don't have
+    a strict identity %).
+
+    Pyhmmer's `pyhmmer.hmmer.hmmscan` reads the .hmm file lazily when
+    you pass an HMMFile — this is how we keep memory bounded for
+    Pfam-scale databases.
+
+    Raises:
+      FileNotFoundError if `hmm_path` doesn't exist.
+      ValueError       if the query is too short / not a valid AA seq.
+      OSError / RuntimeError on pyhmmer parse / runtime failure (the
+                       caller surfaces these).
+    """
+    import pyhmmer
+    from pyhmmer import easel as _easel
+    from pyhmmer.plan7 import HMMFile
+
+    cleaned = "".join(ch for ch in (query_protein or "").upper()
+                      if ch in _BLASTP_QUERY_ALPHABET)
+    if len(cleaned) < _HMMSCAN_MIN_QUERY_LEN:
+        raise ValueError(
+            f"HMMscan query is too short (need ≥ "
+            f"{_HMMSCAN_MIN_QUERY_LEN} AA, got {len(cleaned)})"
+        )
+    p = _sanitize_path(hmm_path)
+    if p is None or not p.exists():
+        raise FileNotFoundError(f"HMM database not found: {hmm_path!r}")
+
+    alphabet = _easel.Alphabet.amino()
+    seq = _easel.TextSequence(name=b"query", sequence=cleaned)
+    digital_seq = seq.digitize(alphabet)
+
+    hits_out: list[dict] = []
+    # pyhmmer.hmmer.hmmscan returns an iterator of TopHits, one per
+    # query. We pass exactly one query, so we collect just the first.
+    with HMMFile(str(p)) as hmm_file:
+        for top_hits in pyhmmer.hmmer.hmmscan(
+                [digital_seq], hmm_file, cpus=1):
+            for h in top_hits:
+                # Each `h` is a `pyhmmer.plan7.Hit`. The best domain
+                # gives us the alignment span on the query.
+                if h.score is None:
+                    continue
+                doms = list(h.domains or [])
+                if doms:
+                    best_dom = max(doms, key=lambda d: d.score)
+                    ali = best_dom.alignment
+                    q_start = ali.target_from - 1     # 1-based → 0-based
+                    q_end   = ali.target_to
+                    s_start = ali.hmm_from - 1
+                    s_end   = ali.hmm_to
+                else:
+                    q_start = 0
+                    q_end   = len(cleaned)
+                    s_start = 0
+                    s_end   = 0
+                # HMMER e-value is "expected count of false hits this
+                # good or better"; treat low e-value as high confidence.
+                # Map to a 0-100 "id %"-ish display number for table
+                # consistency: -log10(evalue) capped at 100.
+                import math
+                evalue = h.evalue if h.evalue and h.evalue > 0 else 1e-300
+                conf_pct = round(min(100.0, max(0.0, -math.log10(evalue))), 1)
+                # pyhmmer ≥0.10 sometimes returns Hit.name as `bytes`,
+                # other releases as `str`; handle both shapes.
+                def _to_str(v):
+                    if v is None:
+                        return ""
+                    return v.decode("utf-8", errors="replace") \
+                        if isinstance(v, (bytes, bytearray)) else str(v)
+                hit_id   = _to_str(h.name)
+                hit_desc = _to_str(getattr(h, "description", None))
+                hits_out.append({
+                    "subject_idx":        len(hits_out),
+                    "subject_id":         hit_id,
+                    "subject_name":       hit_desc or hit_id,
+                    "subject_collection": p.name,
+                    "kind":               "hmm",
+                    "strand":             1,
+                    "q_start":            q_start,
+                    "q_end":              q_end,
+                    "s_start":            s_start,
+                    "s_end":              s_end,
+                    "score":              round(h.score, 1),
+                    "matches":            q_end - q_start,
+                    "aligned_len":        q_end - q_start,
+                    "identity_pct":       conf_pct,
+                    "evalue":             evalue,
+                })
+            # We only care about the first (and only) query's TopHits.
+            break
+    hits_out.sort(key=lambda d: (-d["score"], d.get("evalue", 1.0)))
+    return hits_out[:max_hits]
+
+
+# ── BLAST modal ───────────────────────────────────────────────────────────────
+
+class BlastModal(ModalScreen):
+    """Run a sequence query against a database derived from the user's
+    plasmid collections.
+
+    Three program tiers:
+
+      * **BLASTN** — DNA vs DNA. Pure-Python k-mer seed + ungapped
+        extension. Phase 2.
+      * **BLASTP** — protein vs protein. BLOSUM62 substitution. Phase 2.
+      * **HMMscan** — profile HMM. Optional ``pyhmmer`` integration if
+        the user installs it. Phase 2.
+
+    Source database: an entire collection (parsed feature-by-feature
+    from each plasmid in the collection) or "(all collections)".
+    Database building is also Phase 2 — the modal currently shows the
+    plumbing and surfaces a "Phase 2 — engine pending" notice on Run /
+    Build.
+
+    The modal exists today so the Ctrl+B keybinding doesn't crash; it
+    also locks in the UI shape so wiring the engine in Phase 2 is just
+    a method-body change.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",        "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    _PROGRAMS = (
+        ("BLASTN  (DNA → DNA)",   "blastn"),
+        ("BLASTP  (protein → protein)", "blastp"),
+        ("HMMscan (profile HMM)", "hmmscan"),
+    )
+
+    def compose(self) -> ComposeResult:
+        # Build collection options from disk on compose so the modal
+        # always reflects the current set without relying on the App
+        # passing them in. "(all collections)" is a virtual entry that
+        # tells the database builder to merge every collection.
+        coll_opts: list[tuple[str, str]] = [("(all collections)", "")]
+        try:
+            for c in _load_collections():
+                nm = str(c.get("name", "")).strip()
+                if nm:
+                    coll_opts.append((nm, nm))
+        except Exception:
+            _log.exception("BlastModal: failed to enumerate collections")
+
+        with Vertical(id="blast-dlg"):
+            yield Static(" BLAST ", id="blast-title")
+            with ScrollableContainer(id="blast-body"):
+                yield Label("Query  (paste sequence — DNA for BLASTN, "
+                            "protein for BLASTP / HMMscan):")
+                yield TextArea("", id="blast-query")
+                with Horizontal(id="blast-prog-row"):
+                    with Vertical(id="blast-prog-col"):
+                        yield Label("Program:")
+                        yield Select(self._PROGRAMS, value="blastn",
+                                     id="blast-program",
+                                     allow_blank=False)
+                    with Vertical(id="blast-coll-col"):
+                        yield Label("Source (BLASTN / BLASTP):")
+                        yield Select(coll_opts, value="",
+                                     id="blast-source",
+                                     allow_blank=False)
+                yield Label("HMM database  (HMMscan only — path to .hmm "
+                            "or pressed .h3m / .h3p file):")
+                # Remember the last-used HMM path across sessions so
+                # the user doesn't re-type Pfam-A.hmm every launch.
+                # Persisted under settings.json `hmm_db_path` once a
+                # successful run uses it.
+                last_hmm = _get_setting("hmm_db_path", "") or ""
+                yield Input(value=str(last_hmm),
+                            placeholder="e.g. ~/db/Pfam-A.hmm",
+                            id="blast-hmm-path")
+                yield Label("Results:")
+                yield Static("[dim]No query run yet.[/dim]",
+                             id="blast-results", markup=True)
+            yield Static("", id="blast-status", markup=True)
+            with Horizontal(id="blast-btns"):
+                yield Button("Build database",
+                             id="btn-blast-build",
+                             tooltip=("Pre-index the chosen collection (or "
+                                      "all of them) for BLASTN / BLASTP. "
+                                      "HMMscan reads its database directly "
+                                      "from the .hmm path, no pre-build."))
+                yield Button("Run",
+                             id="btn-blast-run",
+                             variant="primary")
+                yield Button("Close", id="btn-blast-close")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#blast-query", TextArea).focus()
+        except NoMatches:
+            pass
+
+    # ── Helpers ─────────────────────────────────────────────────────
+
+    def _query_text(self) -> str:
+        """Return the raw paste from the query TextArea. Sanitisation
+        (FASTA-header strip, whitespace, alphabet filter, length cap)
+        happens in `_detect_query_program` which the run path always
+        passes through, so we keep this as a thin reader."""
+        try:
+            ta = self.query_one("#blast-query", TextArea)
+        except NoMatches:
+            return ""
+        return ta.text or ""
+
+    def _selected_program(self) -> str:
+        try:
+            sel = self.query_one("#blast-program", Select)
+            v = sel.value
+            if isinstance(v, str) and v:
+                return v
+        except NoMatches:
+            pass
+        return "blastn"
+
+    def _selected_source(self) -> str:
+        try:
+            sel = self.query_one("#blast-source", Select)
+            v = sel.value
+            if isinstance(v, str):
+                return v
+        except NoMatches:
+            pass
+        return ""
+
+    # ── Buttons ─────────────────────────────────────────────────────
+
+    def _resolve_collection_filter(self) -> "list[str] | None":
+        """Translate the source dropdown value into the list of collection
+        names to index. ``None`` means "all collections" — same sentinel
+        as ``_blast_build_db``'s `collection_names` argument."""
+        src = self._selected_source()
+        return [src] if src else None
+
+    # ── Worker plumbing ─────────────────────────────────────────────
+    #
+    # DB build + search both run inside `@work(thread=True)` so the UI
+    # thread can keep redrawing while a 50-plasmid collection is being
+    # k-mer indexed. Re-entrancy is gated by `_busy`: a second click
+    # while the first run is still in flight is dropped (with a status
+    # nudge) rather than queued, since stacking up runs against the
+    # same input is almost never what the user wants.
+    _busy: bool = False
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        try:
+            self.query_one("#btn-blast-run",   Button).disabled = busy
+            self.query_one("#btn-blast-build", Button).disabled = busy
+        except NoMatches:
+            pass
+
+    def _safe_status(self, msg: str) -> None:
+        """Update the status line iff the modal is still mounted —
+        protects worker callbacks that fire after a fast Esc-dismiss."""
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one("#blast-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    def _safe_results(self, msg: str) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one("#blast-results", Static).update(msg)
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-blast-run")
+    def _run(self) -> None:
+        if self._busy:
+            self._safe_status(
+                "[yellow]Already running — please wait or close the "
+                "modal to abandon.[/yellow]")
+            return
+        q_raw = self._query_text()
+        if not q_raw:
+            self._safe_status("[red]Paste a query sequence first.[/red]")
+            return
+        prog_hint = self._selected_program()
+        prog, query = _detect_query_program(q_raw, prog_hint)
+        if not query:
+            self._safe_status(
+                "[red]Query is empty after sanitising — make sure your "
+                "paste contains valid bases (BLASTN: A/C/G/T/IUPAC) or "
+                "amino acids (BLASTP / HMMscan).[/red]"
+            )
+            return
+        raw_alpha = sum(1 for ch in _strip_fasta_headers(q_raw)
+                        if ch.isalpha())
+        truncated = raw_alpha > _MAX_BLAST_QUERY_LEN
+        # HMMscan branches off into its own worker — it doesn't hit the
+        # collection-derived database; profiles come from the user-
+        # supplied .hmm file. Reuses `_run_done` for result rendering.
+        if prog_hint == "hmmscan":
+            if not _PYHMMER_AVAILABLE:
+                self._handle_hmmscan_request()
+                return
+            hmm_path = self._hmm_path()
+            if not hmm_path:
+                self._safe_status(
+                    "[red]Set the HMM database path before running "
+                    "HMMscan.[/red]"
+                )
+                return
+            # Persist the path so the next launch pre-fills it. We
+            # save eagerly (before validation) — even an "almost-right"
+            # path is more useful as a starting point than blank.
+            try:
+                _set_setting("hmm_db_path", str(hmm_path))
+            except Exception:
+                _log.exception("failed to persist hmm_db_path")
+            self._set_busy(True)
+            self._safe_status(
+                f"[dim]Loading HMM database from {hmm_path!r} and "
+                f"scanning…[/dim]"
+            )
+            self._do_run_hmmscan(query, hmm_path, truncated)
+            return
+        col_filter = self._resolve_collection_filter()
+        src_label = (col_filter[0] if col_filter else "(all collections)")
+        self._set_busy(True)
+        self._safe_status(
+            f"[dim]Indexing {src_label!r} and searching…[/dim]"
+        )
+        self._do_run(prog, query, col_filter, src_label, truncated)
+
+    def _hmm_path(self) -> str:
+        try:
+            inp = self.query_one("#blast-hmm-path", Input)
+        except NoMatches:
+            return ""
+        return (inp.value or "").strip()
+
+    @work(thread=True)
+    def _do_run_hmmscan(self, query: str, hmm_path: str,
+                        truncated: bool) -> None:
+        try:
+            hits = _hmmscan_run(query, hmm_path)
+        except FileNotFoundError as exc:
+            self.app.call_from_thread(
+                self._run_done, "hmmscan", query, hmm_path, truncated,
+                None, None, f"HMM file not found: {exc}",
+            )
+            return
+        except ValueError as exc:
+            self.app.call_from_thread(
+                self._run_done, "hmmscan", query, hmm_path, truncated,
+                None, None, str(exc),
+            )
+            return
+        except Exception as exc:
+            _log.exception("HMMscan run failed")
+            self.app.call_from_thread(
+                self._run_done, "hmmscan", query, hmm_path, truncated,
+                None, None, f"HMMscan failed: {exc}",
+            )
+            return
+        # Re-use `_run_done`'s shape: provide a fake "db" with one
+        # subject per hit so `_format_hits` renders correctly. Always
+        # include at least one synthetic subject (the .hmm file
+        # itself) so a zero-hit run renders the "no hits" notice
+        # rather than the "empty database" notice.
+        subs = [{"id": h["subject_id"], "name": h["subject_name"],
+                  "kind": "hmm", "length": 0,
+                  "collection": h["subject_collection"]}
+                 for h in hits]
+        if not subs:
+            from pathlib import Path
+            subs = [{"id": Path(hmm_path).name,
+                      "name": Path(hmm_path).name,
+                      "kind": "hmm", "length": 0,
+                      "collection": str(Path(hmm_path).parent)}]
+        fake_db = {
+            "program":  "hmmscan",
+            "k":        0,
+            "subjects": subs,
+            "kmer_index": {},
+        }
+        self.app.call_from_thread(
+            self._run_done, "hmmscan", query, hmm_path, truncated,
+            fake_db, hits, None,
+        )
+
+    @work(thread=True)
+    def _do_run(self, prog: str, query: str,
+                col_filter: "list[str] | None",
+                src_label: str, truncated: bool) -> None:
+        try:
+            db = _blast_get_db(prog, col_filter)
+        except Exception as exc:
+            _log.exception("BLAST DB build failed (worker)")
+            self.app.call_from_thread(
+                self._run_done, prog, query, src_label, truncated,
+                None, None, f"Database build failed: {exc}",
+            )
+            return
+        if not db.get("subjects"):
+            empty_msg = (
+                "[yellow]Database empty — no plasmids "
+                + ("with annotated CDS features "
+                   if prog == "blastp" else "")
+                + f"in {src_label!r}.[/yellow]"
+            )
+            self.app.call_from_thread(
+                self._run_done, prog, query, src_label, truncated,
+                db, [], empty_msg,
+            )
+            return
+        try:
+            hits = _blast_search(query, db)
+        except Exception as exc:
+            _log.exception("BLAST search failed (worker)")
+            self.app.call_from_thread(
+                self._run_done, prog, query, src_label, truncated,
+                db, None, f"Search failed: {exc}",
+            )
+            return
+        self.app.call_from_thread(
+            self._run_done, prog, query, src_label, truncated,
+            db, hits, None,
+        )
+
+    def _run_done(self, prog: str, query: str, src_label: str,
+                  truncated: bool, db: "dict | None",
+                  hits: "list[dict] | None",
+                  err_msg: "str | None") -> None:
+        self._set_busy(False)
+        if not self.is_mounted:
+            return
+        if err_msg is not None and hits is None:
+            self._safe_status(f"[red]{err_msg}[/red]")
+            return
+        if hits == [] and db is not None and not db.get("subjects"):
+            # Empty-DB path — `err_msg` is the yellow notice, render it
+            # in the results panel.
+            self._safe_results(err_msg or "")
+            self._safe_status("")
+            return
+        assert db is not None
+        self._safe_results(self._format_hits(prog, query, hits or [], db))
+        trunc_note = (
+            f"  [yellow](query truncated to {_MAX_BLAST_QUERY_LEN:,} "
+            f"letters)[/yellow]" if truncated else ""
+        )
+        self._safe_status(
+            f"[green]{prog.upper()} done: {len(hits or [])} HSPs over "
+            f"{len(db['subjects']):,} subjects.[/green]" + trunc_note
+        )
+
+    def _handle_hmmscan_request(self) -> None:
+        """Surface a fallback message if pyhmmer isn't importable
+        (which should never happen on a freshly-installed SpliceCraft
+        ≥0.5.1, since pyhmmer is a hard dependency in pyproject.toml).
+        Older installs that pre-date the pyhmmer dep land here.
+
+        Kept as a separate method so `_run`'s HMMscan branch stays
+        readable — early-return into a clear, recoverable error
+        message rather than `_run_done`'s generic red status."""
+        self._safe_results(
+            "[yellow][b]pyhmmer is not importable[/b] — your install of "
+            "SpliceCraft predates the pyhmmer dependency (added in 0.5.1).\n\n"
+            "Upgrade with:\n\n"
+            "  [b]pipx upgrade splicecraft[/b]\n\n"
+            "or:\n\n"
+            "  [b]pip install --upgrade splicecraft[/b][/yellow]"
+        )
+        self._safe_status(
+            "[yellow]HMMscan unavailable — see results panel.[/yellow]"
+        )
+
+    @on(Button.Pressed, "#btn-blast-build")
+    def _build_db(self) -> None:
+        if self._busy:
+            self._safe_status(
+                "[yellow]Already building / searching — please wait.[/yellow]")
+            return
+        prog = self._selected_program()
+        if prog == "hmmscan":
+            # HMMscan reads its profiles directly from the .hmm file
+            # at search time — there's no plasmid-derived database to
+            # pre-build. Validate the path so the user gets feedback
+            # without having to also paste a query first.
+            hmm_path = self._hmm_path()
+            if not _PYHMMER_AVAILABLE:
+                self._handle_hmmscan_request()
+                return
+            if not hmm_path:
+                self._safe_status(
+                    "[yellow]HMMscan reads its database directly from "
+                    "the .hmm file — paste the path above and press Run."
+                    "[/yellow]"
+                )
+                return
+            p = _sanitize_path(hmm_path)
+            if p is None or not p.exists():
+                self._safe_status(
+                    f"[red]HMM file not found: {hmm_path!r}[/red]"
+                )
+                return
+            self._safe_status(
+                f"[green]HMM database OK: {p.name} "
+                f"({p.stat().st_size:,} bytes)[/green]"
+            )
+            return
+        col_filter = self._resolve_collection_filter()
+        # Force a fresh build by clearing the cache.
+        _blast_clear_cache()
+        self._set_busy(True)
+        src_label = col_filter[0] if col_filter else "(all collections)"
+        self._safe_status(
+            f"[dim]Indexing {src_label!r}…[/dim]"
+        )
+        self._do_build(prog, col_filter)
+
+    @work(thread=True)
+    def _do_build(self, prog: str,
+                  col_filter: "list[str] | None") -> None:
+        try:
+            db = _blast_get_db(prog, col_filter)
+        except Exception as exc:
+            _log.exception("BLAST DB build failed (worker)")
+            self.app.call_from_thread(
+                self._build_done, None, f"Database build failed: {exc}",
+            )
+            return
+        self.app.call_from_thread(self._build_done, db, None)
+
+    def _build_done(self, db: "dict | None",
+                    err_msg: "str | None") -> None:
+        self._set_busy(False)
+        if not self.is_mounted:
+            return
+        if err_msg or db is None:
+            self._safe_status(f"[red]{err_msg or 'unknown failure'}[/red]")
+            return
+        self._safe_status(f"[green]{_blast_db_summary(db)}[/green]")
+
+    def _format_hits(self, program: str, query: str,
+                     hits: "list[dict]", db: dict) -> str:
+        """Render search results as a markup-friendly text block. We
+        intentionally don't use a DataTable here so the user can drag-
+        select hits to copy them. Each row is one HSP.
+
+        Subject names + collection labels go through `rich.markup.escape`
+        so a malicious or odd qualifier (e.g. a `[red]` tag in a
+        feature label) can't inject Rich markup into the results panel.
+        """
+        from rich.markup import escape as _esc
+        if not hits:
+            return (f"[dim]No {program.upper()} hits passed the score / "
+                    f"identity filter on a {len(query):,}-letter query "
+                    f"against {len(db.get('subjects') or []):,} subjects."
+                    f"[/dim]")
+        prog = program.upper()
+        # Pyhmmer/HMMER hits carry an `evalue` key; pure-Python hits
+        # don't. Use that to label the score column accurately and to
+        # show / hide the e-value column.
+        has_evalue = any("evalue" in h for h in hits)
+        backend_tag = " [dim](HMMER)[/dim]" if has_evalue else " [dim](pure)[/dim]"
+        score_label = "bits" if has_evalue else "score"
+        if has_evalue:
+            header = (
+                f"[dim]{'name':<28} {'coll':<14} {'q':>10}  "
+                f"{'sub':>11}  {'len':>5} {score_label:>6} {'id%':>5}  "
+                f"{'evalue':>10}[/dim]"
+            )
+        else:
+            header = (
+                f"[dim]{'name':<28} {'coll':<14} {'q':>10}  "
+                f"{'sub':>11}  {'len':>5} {score_label:>6} {'id%':>5}[/dim]"
+            )
+        lines = [f"[bold]{prog}[/bold]{backend_tag}  query={len(query):,}  "
+                 f"subjects={len(db.get('subjects') or []):,}  "
+                 f"hits={len(hits)}",
+                 header]
+        for h in hits:
+            name = _esc(str(h.get("subject_name") or h.get("subject_id")
+                              or "?"))[:28]
+            coll = _esc(str(h.get("subject_collection") or "?"))[:14]
+            q_rng = f"{h['q_start']+1}-{h['q_end']}"
+            strand_marker = "" if h["strand"] >= 0 else "(–)"
+            s_rng = f"{h['s_start']+1}-{h['s_end']}{strand_marker}"
+            row = (f"{name:<28} {coll:<14} {q_rng:>10}  "
+                   f"{s_rng:>11}  {h['aligned_len']:>5} "
+                   f"{h['score']:>6} {h['identity_pct']:>5}")
+            if has_evalue:
+                e = h.get("evalue", 1.0)
+                # Compact scientific notation: 2.3e-15 → "2.3e-15"
+                row += f"  {e:>10.1e}"
+            lines.append(row)
+        return "\n".join(lines)
+
+    @on(Button.Pressed, "#btn-blast-close")
+    def _close_btn(self) -> None:
+        self.dismiss(None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -17097,6 +19202,11 @@ class PlasmidApp(App):
     # before the App's priority bindings could fire). The search input
     # still focuses on click via Textual's default click-to-focus.
     AUTO_FOCUS = "#lib-coll-table, #lib-table"
+    # Disable Textual's built-in command palette (Ctrl+P). It used to
+    # render a "^p palette" indicator on the Footer that ate visible
+    # real estate, and the SpliceCraft surface is small enough that
+    # the dedicated `?` Help modal covers shortcut discovery.
+    ENABLE_COMMAND_PALETTE = False
     _preload_record = None
     _current_record = None   # last-loaded SeqRecord
     _source_path:   "str | None" = None   # file the current record was loaded from
@@ -17154,13 +19264,6 @@ MenuBar { height: 1; dock: top; }
    SequencePanel sits beneath it and uses its own fixed height, giving
    the DNA strip the full window width. */
 #top-row { height: 1fr; }
-
-#status-bar {
-    height: 1;
-    background: $primary-darken-2;
-    color: $text-muted;
-    padding: 0 1;
-}
 
 /* ── Fetch modal ─────────────────────────────────────────── */
 FetchModal { align: center middle; }
@@ -17398,6 +19501,43 @@ AddFeatureModal { align: center middle; }
 #addfeat-status { height: 2; margin-top: 1; }
 #addfeat-btns   { height: 3; margin-top: 1; }
 #addfeat-btns Button { margin-right: 1; }
+
+/* ── New plasmid modal ───────────────────────────────────── */
+NewPlasmidModal { align: center middle; }
+#newplas-dlg {
+    width: 88; height: 90%; max-height: 36;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#newplas-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#newplas-dlg Label { color: $text-muted; margin-top: 1; }
+#newplas-body   { height: 1fr; overflow-y: auto; }
+#newplas-topo-row   { height: 5; }
+#newplas-topo-label { width: 12; margin-top: 1; }
+#newplas-topo       { width: 1fr; height: 5; }
+#newplas-seq    { height: 1fr; min-height: 6; margin-top: 0; }
+#newplas-status { height: 2; margin-top: 1; }
+#newplas-btns   { height: 3; margin-top: 1; }
+#newplas-btns Button { margin-right: 1; }
+
+/* ── BLAST modal ─────────────────────────────────────────── */
+BlastModal { align: center middle; }
+#blast-dlg {
+    width: 96; height: 90%; max-height: 42;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#blast-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#blast-dlg Label { color: $text-muted; margin-top: 1; }
+#blast-body   { height: 1fr; overflow-y: auto; }
+#blast-query  { height: 6; min-height: 4; margin-top: 0; }
+#blast-prog-row  { height: 5; }
+#blast-prog-col  { width: 1fr; height: 5; margin-right: 2; }
+#blast-coll-col  { width: 1fr; height: 5; }
+#blast-prog-col Label, #blast-coll-col Label { margin-top: 0; height: 1; }
+#blast-hmm-path { height: 3; margin-top: 0; }
+#blast-results { height: auto; min-height: 4; margin-top: 0; padding: 0 1; }
+#blast-status { height: 2; margin-top: 1; }
+#blast-btns   { height: 3; margin-top: 1; }
+#blast-btns Button { margin-right: 1; }
 
 /* ── Color picker modal ──────────────────────────────────── */
 ColorPickerModal { align: center middle; }
@@ -17793,24 +19933,38 @@ SpeciesPickerModal { align: center middle; }
 """
 
     BINDINGS = [
-        Binding("f",           "fetch",            "Fetch GenBank", show=True),
-        Binding("ctrl+o",      "open_file",        "Open file",     show=True),
-        Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=True),
-        Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=True),
+        # Footer-visible shortcuts: small set so the bottom row never
+        # clips on narrow terminals. Help (`?`) is listed LAST so the
+        # Footer renders it rightmost. Other bindings stay registered
+        # but `show=False` keeps the Footer uncluttered — the full
+        # shortcut reference lives in the `?` Help modal.
+        Binding("f",           "fetch",            "Fetch",         show=True),
+        Binding("ctrl+o",      "open_file",        "Open",          show=True),
         Binding("ctrl+s",      "save",             "Save",          show=True),
-        Binding("ctrl+f",      "add_feature",      "Add feature",   show=True),
-        Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=True,  priority=True),
+        Binding("ctrl+n",      "new_plasmid",      "New",           show=True),
+        Binding("ctrl+a",      "select_all",       "Select all",    show=True, priority=True),
+        Binding("ctrl+f",      "add_feature",      "+Feat",         show=True),
+        Binding("ctrl+p",      "open_primer_design", "Primers",     show=True, priority=True),
+        Binding("ctrl+b",      "open_blast",       "BLAST",         show=True, priority=True),
+        # Off-footer (still bound):
+        Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=False),
+        Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
+        Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
         # Rotation keys (arrows + [/]) live on PlasmidMap.BINDINGS so they
         # only rotate when the map has focus. Pre-2026-04-29 the `[`/`]`
         # keys were App-level with priority=True, which fired even on
         # modal screens — moving them to the map removes that surprise.
-        Binding("home",        "reset_origin",     "Reset origin",  show=True,  priority=True),
+        Binding("home",        "reset_origin",     "Reset origin",  show=False, priority=True),
         Binding("end",         "end_of_row",       "End of row",    show=False, priority=True),
-        Binding("v",           "toggle_map_view",  "⊙/─ View",      show=True,  priority=True),
-        Binding("l",           "toggle_connectors","Connectors",    show=True,  priority=True),
-        Binding("r",           "toggle_restr",     "RE sites",      show=True,  priority=True),
-        Binding("delete",      "delete_feature",   "Del feature",   show=True,  priority=True),
-        Binding("q",           "quit",             "Quit",          show=True),
+        Binding("v",           "toggle_map_view",  "⊙/─ View",      show=False, priority=True),
+        Binding("l",           "toggle_connectors","Connectors",    show=False, priority=True),
+        Binding("r",           "toggle_restr",     "RE sites",      show=False, priority=True),
+        Binding("delete",      "delete_feature",   "Del feature",   show=False, priority=True),
+        # Quit moved from `q` to Ctrl+Q (2026-05-01) — `q` is too
+        # likely to be typed in any context (label, search, etc.) and
+        # an accidental quit is much more disruptive than missing a
+        # shortcut. Ctrl+Q matches the cross-app convention.
+        Binding("ctrl+q",      "quit",             "Quit",          show=True),
         # Ctrl+C copies the top strand (5'→3'). Reverse-complement
         # (bottom strand) is on Alt+C: most terminal emulators
         # collapse Ctrl+Shift+C to plain Ctrl+C at the byte level
@@ -17823,6 +19977,12 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+c",       "copy_selection",        "",         show=False, priority=True),
         Binding("alt+c",        "copy_selection_bottom", "",         show=False, priority=True),
         Binding("ctrl+shift+c", "copy_selection_bottom", "",         show=False, priority=True),
+        # `?` opens the Help modal (full keyboard-shortcut reference).
+        # Listed last so the Footer renders it rightmost — Textual's
+        # Footer flows bindings left-to-right in declaration order.
+        # `priority=True` so it works even when a modal has focus
+        # (the modal can still receive `?` for itself if it overrides).
+        Binding("?",            "show_help",             "Help",      show=True,  priority=True),
         # H / D / Alt+D used to live here as App-level priority
         # bindings, but they intercepted literal `h` / `d` keystrokes
         # in modal Input fields (e.g. typing the IUPAC `H` ambiguity
@@ -17878,16 +20038,19 @@ SpeciesPickerModal { align: center middle; }
             yield PlasmidMap(id="plasmid-map")
             yield FeatureSidebar(id="sidebar")
         yield SequencePanel(id="seq-panel")
-        yield Static(
-            Text(
-                "  [ ] rotate   ← → cursor/map   Shift coarse   Home reset"
-                "   f fetch   ^O open   ^S save   ^E edit   ^F add-feat   ^⇧F →feat-lib   ^⇧A add-to-lib",
-                style="color(245)",
-                no_wrap=True,
-            ),
-            id="status-bar",
-        )
-        yield Footer()
+        # Removed the secondary `#status-bar` shortcut hint row
+        # (2026-05-01) — Footer alone covers binding hints, and the
+        # extra row was visually noisy. The full shortcut reference
+        # now lives in the `?` Help modal (action_show_help).
+        # `show_command_palette=False` removes the right-side
+        # `^p palette` glyph from the Footer; the App-level
+        # `ENABLE_COMMAND_PALETTE = False` disables the underlying
+        # binding entirely. `compact=True` collapses the Footer's
+        # default 2-row vertical padding to 1 row so it sits flush
+        # against the bottom of the terminal — pre-2026-05-01 the
+        # default padding left a phantom blank row above the Footer
+        # that wasted real estate.
+        yield Footer(show_command_palette=False, compact=True)
 
     # ── Delegate map-level keys to PlasmidMap ──────────────────────────────────
     # Rotation actions used to live here as App-level wrappers so `[`/`]`
@@ -18574,7 +20737,14 @@ SpeciesPickerModal { align: center middle; }
 
         We walk the widget chain upward from `event.widget`; if any
         ancestor is one of the four panels, the click is in-panel and
-        we leave it alone."""
+        we leave it alone.
+
+        Modal-active short-circuit: if a ModalScreen is on top, clicks
+        on it shouldn't clear the seq panel's highlight underneath the
+        modal. The user expects modal interactions to leave the
+        underlying state alone until they confirm or cancel."""
+        if len(self.screen_stack) > 1:
+            return
         node = getattr(event, "widget", None)
         if node is None:
             return
@@ -18607,6 +20777,16 @@ SpeciesPickerModal { align: center middle; }
         if event.key in ("ctrl+shift+z", "ctrl+Z", "ctrl+y"):
             self._action_redo()
             event.stop()
+            return
+
+        # Modal-active short-circuit: if any ModalScreen is on top of the
+        # screen stack, all the seq-panel mutation handlers below this
+        # line should NOT fire (they'd silently slide the selection or
+        # move the cursor behind a modal the user is interacting with).
+        # Ctrl+Z / Ctrl+Y are intentionally above this guard — those
+        # are global undo/redo and should still work as a fallback if
+        # no focused widget binds them.
+        if len(self.screen_stack) > 1:
             return
 
         # ── Ctrl+Arrow: slide the active selection (complement to Shift+Arrow,
@@ -18649,12 +20829,17 @@ SpeciesPickerModal { align: center middle; }
         #   - DataTable — arrows move row cursor, Enter activates row.
         #   - PlasmidMap — arrows rotate origin, Up resets origin.
         #   - Input — Enter submits, arrows move text cursor.
+        #   - TextArea — arrows + Enter move the text cursor / insert
+        #     a newline, exactly like a normal multi-line editor.
+        # The modal-active early return at the top of this handler
+        # already caught modal context, so we only need to filter the
+        # focused widget for the in-base-screen case here.
         # The SequencePanel itself is not focusable, so a "no widget
         # focused" branch is the normal seq-cursor path.
         focused = self.focused
         if focused is not None:
-            from textual.widgets import DataTable, Input
-            if isinstance(focused, (DataTable, PlasmidMap, Input)):
+            from textual.widgets import DataTable, Input, TextArea
+            if isinstance(focused, (DataTable, PlasmidMap, Input, TextArea)):
                 return
 
         # ── RE-highlight + arrow: revert the highlight, park the cursor ─
@@ -19081,6 +21266,53 @@ SpeciesPickerModal { align: center middle; }
         # Same auto-persist policy as fetch; _import_and_persist preserves
         # the record's _tui_source path for later "Save" operations.
         self.push_screen(OpenFileModal(), callback=self._import_and_persist)
+
+    def action_show_help(self) -> None:
+        """`?` — open the keyboard-shortcut reference modal. Bound at
+        the App level (priority) so it's accessible from any context."""
+        self.push_screen(HelpModal())
+
+    def action_select_all(self) -> None:
+        """Ctrl+A — select the entire plasmid sequence so Ctrl+C copies
+        the whole top strand to clipboard. Sets `_user_sel = (0, n)` on
+        the seq panel (matches how a drag-select would feel) and parks
+        the cursor at the start so subsequent arrow keys move
+        intuitively."""
+        if self._current_record is None:
+            self.notify("No plasmid loaded.", severity="warning")
+            return
+        sp = self.query_one("#seq-panel", SequencePanel)
+        n = len(sp._seq)
+        if n == 0:
+            return
+        sp._user_sel  = (0, n)
+        sp._sel_range = None
+        sp._cursor_pos = 0
+        sp._sel_anchor = 0
+        sp._refresh_view()
+        self.notify(f"Selected all {n:,} bp — Ctrl+C to copy",
+                    severity="information")
+
+    def action_new_plasmid(self) -> None:
+        """Ctrl+N — open the New Plasmid modal: paste a sequence,
+        optionally auto-annotate via BLAST against the plasmid library
+        or imported feature library entries."""
+        self.push_screen(NewPlasmidModal(), callback=self._on_new_plasmid)
+
+    def _on_new_plasmid(self, result) -> None:
+        if result is None:
+            return
+        record = result.get("record")
+        if record is None:
+            return
+        self._import_and_persist(record)
+
+    def action_open_blast(self) -> None:
+        """Ctrl+B — open the BLAST modal: query an arbitrary AA / DNA
+        sequence against a plasmid-library or collections database,
+        with a textbox for ad-hoc input plus a database-builder for
+        the user's collections."""
+        self.push_screen(BlastModal())
 
     def action_export_genbank(self) -> None:
         """Prompt for a path and write the current record as GenBank.
