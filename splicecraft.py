@@ -1601,6 +1601,16 @@ _CHUNK_LAYOUT_CACHE: dict = {}
 # eliminates that hot path. Stored as `dict[key, list[Text|None]]`.
 _CHUNK_STATIC_CACHE: dict = {}
 
+# Per-(static_key, selection-state) cache of overlay-painted chunks.
+# Holds the version of each chunk with `_user_sel` / `_sel_range` /
+# `_re_highlight` / `_aa_highlight` baked in but cursor=-1, so cursor
+# moves within a long selection don't re-render every chunk the
+# selection covers. Invalidates whenever any selection state changes
+# (so a different feature pick repopulates), but the static cache
+# survives — chunks the new selection doesn't intersect still hit
+# STATIC_CACHE on the same render pass.
+_CHUNK_OVERLAY_CACHE: dict = {}
+
 
 def _feats_in_chunk(
     feats: list[dict], chunk_start: int, chunk_end: int, total: int
@@ -1777,13 +1787,27 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     # per keystroke when scrolling through cosmid/BAC-scale records.
     chunks_layout, _pf_dna2, _pf_lanes = _chunk_layout(seq, feats, line_width)
 
-    # Per-chunk static-render cache. The first render fills it; subsequent
-    # cursor moves only re-render the chunk under the cursor and reuse the
-    # other ~N pre-rendered Text objects. Without this, the BAC-scale
-    # lane-art cost (~78 % of render time) recurs every keystroke. Cache
-    # stays valid for cursor/selection changes; it invalidates only on
-    # (seq, feats, line_width, show_connectors) change.
-    static_key   = (id(seq), id(feats), line_width, show_connectors)
+    # Two-tier per-chunk render cache:
+    #   STATIC (no overlay)   — keyed only on (seq, feats, line_width,
+    #                           show_connectors). Survives selection
+    #                           changes; reused as long as the lane
+    #                           art itself doesn't change.
+    #   OVERLAY (with sel/etc) — keyed on STATIC key plus the selection
+    #                           state. Cursor stays out of the key so
+    #                           cursor moves on a long selection don't
+    #                           invalidate.
+    # The cursor chunk always renders fresh (cursor moves frequently).
+    # Other chunks pick the overlay cache if any sel/usr/reh/aa
+    # overlay intersects the chunk, else the static cache. So:
+    #   - First click on a feature: cursor chunk fresh + N overlay chunks
+    #     fresh (populates overlay cache) + (chunks - N - 1) STATIC hits.
+    #   - Second click on a different feature: same cost as first
+    #     click — overlay cache key changes — but STATIC chunks still
+    #     hit. So clicking through 16 features doesn't re-render the
+    #     untouched lane art on every click.
+    #   - Cursor moves within a selection: overlay cache hits for
+    #     all selection-overlap chunks; cursor chunk re-renders.
+    static_key = (id(seq), id(feats), line_width, show_connectors)
     static_cache = _CHUNK_STATIC_CACHE.get(static_key)
     if static_cache is None or len(static_cache) != len(chunks_layout):
         static_cache = [None] * len(chunks_layout)
@@ -1791,19 +1815,24 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         if len(_CHUNK_STATIC_CACHE) > 4:
             _CHUNK_STATIC_CACHE.pop(next(iter(_CHUNK_STATIC_CACHE)))
 
+    aa_id = id(aa_highlight) if aa_highlight is not None else 0
+    overlay_key = (static_key, sel_s, sel_e, usr_s, usr_e,
+                   reh_s, reh_e, reh_top_cut, reh_bot_cut, aa_id)
+    overlay_cache = _CHUNK_OVERLAY_CACHE.get(overlay_key)
+    if overlay_cache is None or len(overlay_cache) != len(chunks_layout):
+        overlay_cache = [None] * len(chunks_layout)
+        _CHUNK_OVERLAY_CACHE[overlay_key] = overlay_cache
+        if len(_CHUNK_OVERLAY_CACHE) > 4:
+            _CHUNK_OVERLAY_CACHE.pop(next(iter(_CHUNK_OVERLAY_CACHE)))
+
     for i, (chunk_start, chunk_end, groups, _ab_pairs, _be_pairs,
             *_extra) in enumerate(chunks_layout):
-        # If any overlay touches this chunk, render fresh. Otherwise reuse
-        # (or first-time-populate) the static cache.
+        chunk_has_cursor = (chunk_start <= cursor_pos < chunk_end)
         chunk_has_overlay = (
             (usr_s < chunk_end and usr_e > chunk_start)
             or (sel_s < chunk_end and sel_e > chunk_start)
             or (reh_s < chunk_end and reh_e > chunk_start)
-            or (chunk_start <= cursor_pos < chunk_end)
         )
-        # Active AA highlight on a CDS that overlaps this chunk →
-        # bypass the static cache so the reverse-video AA letters
-        # render fresh. Wrap-aware overlap test mirrors `_bp_in`.
         if aa_highlight is not None:
             aa_s, aa_e = aa_highlight["start"], aa_highlight["end"]
             if aa_e >= aa_s:
@@ -1813,12 +1842,23 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                 if chunk_start < aa_e or chunk_end > aa_s:
                     chunk_has_overlay = True
 
-        if chunk_has_overlay:
+        if chunk_has_cursor:
             _render_chunk(result, chunk_start, chunk_end, groups, styles,
                           num_w, seq_upper, show_connectors,
                           sel_s, sel_e, usr_s, usr_e,
                           reh_s, reh_e, reh_top_cut, reh_bot_cut,
                           cursor_pos, aa_highlight)
+        elif chunk_has_overlay:
+            cached = overlay_cache[i]
+            if cached is None:
+                cached = Text(no_wrap=True, overflow="crop")
+                _render_chunk(cached, chunk_start, chunk_end, groups, styles,
+                              num_w, seq_upper, show_connectors,
+                              sel_s, sel_e, usr_s, usr_e,
+                              reh_s, reh_e, reh_top_cut, reh_bot_cut,
+                              -1, aa_highlight)
+                overlay_cache[i] = cached
+            result.append(cached)
         else:
             cached = static_cache[i]
             if cached is None:
@@ -2018,6 +2058,16 @@ def _copy_to_clipboard_osc52(text: str) -> bool:
         return True
     except (OSError, UnicodeEncodeError):
         return False
+
+
+_MARKUP_TAG_RE = re.compile(r"\[/?[^\[\]]*\]")
+
+
+def _strip_markup(s: str) -> str:
+    """Remove `[...]` Rich markup tags from a string for clipboard copy.
+    Doesn't try to be perfect — just enough to surface plain text from
+    a markup-ish status line."""
+    return _MARKUP_TAG_RE.sub("", s)
 
 
 # Per-CDS AA cache. Key: (id(seq), feature start, feature end, strand)
@@ -4177,7 +4227,9 @@ class SequencePanel(Widget):
     Click  on the sequence → place cursor + select feature at that position.
     Shift+click           → extend selection for editing.
     Ctrl+E                → open insert/replace dialog at cursor / selection.
+    H                     → copy hover-status text to clipboard.
     """
+
 
     DEFAULT_CSS = """
     SequencePanel {
@@ -4188,8 +4240,236 @@ class SequencePanel(Widget):
        the panel (the inner ScrollableContainer takes focus on
        click). See PlasmidMap for the colour rationale. */
     SequencePanel:focus-within { background: #0c0c0c; }
+    /* Hover diagnostic row — shows exactly which cell + feature
+       the mouse is over so the user can confirm clicks land where
+       they expect. Costs 1 row of visible DNA; toggle via
+       `seq panel hover` if it gets in the way. */
+    #seq-hover-status {
+        height: 1;
+        color: #888888;
+        background: #0a0a0a;
+        padding: 0 1;
+    }
     #seq-scroll { height: 1fr; }
     """
+
+    def action_dump_hover_chunk(self) -> None:
+        """Dump the rendered plain text of the chunk under the mouse
+        to clipboard + log. Each line is prefixed with its packed-row
+        / DNA / below classification so we can compare against the
+        hover diagnostic. Crucial for chasing renderer-vs-owner-fill
+        divergences ("I see a bar at this row but you say no feature")."""
+        mx, my = self._last_mouse_xy
+        if mx < 0 or not self._seq:
+            self.app.notify("Move mouse over the panel before pressing D",
+                            severity="warning")
+            return
+        # Identify the chunk under the mouse via the same row-dispatch
+        # logic as `_hover_at` but only as far as needed to find the
+        # chunk index.
+        info = self._hover_at(mx, my)
+        chunk_idx = info.get("chunk")
+        if chunk_idx is None:
+            self.app.notify(f"Hover off-content (kind={info.get('kind')})",
+                            severity="warning")
+            return
+        n = len(self._seq)
+        num_w = len(str(n)) if n else 1
+        line_width = max(20, self._seq_render_width() - (num_w + 2))
+        chunk_start = chunk_idx * line_width
+        chunk_end   = min(chunk_start + line_width, n)
+        # Insertion order — must match `_build_seq_inputs` (used by the
+        # renderer) so click resolution sees the SAME packed_row as
+        # what's drawn. Sorting by length here would produce a
+        # different greedy-pack output and clicks would resolve to
+        # phantom rows. (2026-04-30 bug — was responsible for
+        # consistent "no feature at the bar I'm hovering" misses.)
+        annot_feats = [f for f in self._feats
+                       if f.get("type") not in ("site", "recut")]
+        chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
+        above_p, below_p, above_rows, below_rows = (
+            _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+        )
+        # Build the chunk's render fresh into a stub Text so we can
+        # extract its plain-text lines.
+        stub = Text(no_wrap=True, overflow="crop")
+        # Mirror what `_render_chunk` does, but keep cursor/sel off
+        # so the dump shows the bare lane art / DNA pair.
+        seq_upper = self._seq.upper()
+        _, ann_for_styles = _build_seq_inputs(self._seq, self._feats)
+        styles = ["color(252)"] * len(self._seq)
+        for f in reversed(self._feats):
+            col = f.get("color", "white")
+            if f["end"] >= f["start"]:
+                for i in range(f["start"], min(f["end"], n)):
+                    styles[i] = col
+        _render_chunk(
+            stub, chunk_start, chunk_end,
+            (above_p, below_p, above_rows, below_rows),
+            styles, num_w, seq_upper,
+            self._show_connectors,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            None,
+        )
+        plain_lines = stub.plain.split("\n")
+        # Annotate each line with its row classification.
+        labels: list[str] = []
+        for k in range(above_rows):
+            packed = above_rows - 1 - k
+            labels.append(f"above scr={k} packed={packed}")
+        labels.append("DNA fwd")
+        labels.append("DNA rev")
+        for k in range(below_rows):
+            labels.append(f"below scr={k} packed={k}")
+        labels.append("inter-chunk gap")
+        # Highlight the user's last hover column with a `^` carat
+        # under each line so they don't have to count cells. Adjusted
+        # for the "[label] '" prefix added when formatting each line.
+        hover_seq_col = info.get("seq_col")
+        hover_kind = info.get("kind")
+        hover_packed = info.get("packed_row")
+        hover_dna = hover_kind == "dna"
+        out_lines = [f"chunk={chunk_idx} bp=[{chunk_start},{chunk_end}) "
+                     f"above_rows={above_rows} below_rows={below_rows} "
+                     f"line_width={line_width}  "
+                     f"hover_at: vp_y={info.get('vp_y')} "
+                     f"col={hover_seq_col} kind={hover_kind} "
+                     f"packed={hover_packed}"]
+        for i, line in enumerate(plain_lines):
+            if not line:
+                continue
+            label = labels[i] if i < len(labels) else "?"
+            out_lines.append(f"[{label}] {line!r}")
+            # Add a carat line under the row the user was actually
+            # hovering on, pointing at their seq_col. The full prefix
+            # is `[label] '` (label string + 4 chars `[] '`) plus the
+            # line-number prefix `num_w + 2` columns inside the quoted
+            # content. We need to position the carat under panel col
+            # = num_w + 2 + seq_col. The repr() prefix is `[label] '`.
+            on_this_row = False
+            if hover_kind in ("above", "below") and label.startswith(hover_kind):
+                # Match by `packed=` substring so the carat lands on the
+                # correct row regardless of label format.
+                if f"packed={hover_packed}" in label:
+                    on_this_row = True
+            elif hover_kind == "dna" and label == "DNA fwd":
+                on_this_row = True
+            if on_this_row and hover_seq_col is not None and hover_seq_col >= 0:
+                # `[label] '` = 3 + len(label) + 1 + 1 = len(label) + 5
+                prefix_w = len(label) + 5 + (num_w + 2)
+                pad = " " * (prefix_w + hover_seq_col)
+                out_lines.append(f"{pad}^ ← hover (seq_col={hover_seq_col})")
+        dump = "\n".join(out_lines)
+        _log_event("seq.chunk_dump", chunk=chunk_idx, lines=len(out_lines))
+        _log.info("seq.chunk_dump:\n%s", dump)
+        try:
+            self.app.copy_to_clipboard(dump)
+        except Exception:
+            if not _copy_to_clipboard_osc52(dump):
+                self.app.notify(
+                    "Clipboard unavailable — see splicecraft.log "
+                    "(seq.chunk_dump entry) for the full dump",
+                    severity="warning",
+                )
+                return
+        self.app.notify(
+            f"Copied chunk {chunk_idx} dump ({len(out_lines)} lines)",
+            severity="information",
+        )
+
+    def action_copy_hover_status(self) -> None:
+        """Copy the current hover-status text to the system clipboard.
+        Re-runs `_hover_at` with the last seen mouse position and
+        copies the resulting plain-text status string. Logs the
+        underlying dict so the user has a verbatim record in the log
+        as well."""
+        mx, my = self._last_mouse_xy
+        if mx < 0:
+            self.app.notify(
+                "Move mouse over the panel before pressing H",
+                severity="warning",
+            )
+            return
+        info  = self._hover_at(mx, my)
+        plain = _strip_markup(self._hover_status_text(info)).strip()
+        if not plain:
+            self.app.notify("Nothing under cursor to copy",
+                            severity="information")
+            return
+        _log_event("seq.hover_copy",
+                   screen_x=mx, screen_y=my, text=plain, **{
+                       k: (v.get("label") if isinstance(v, dict) else v)
+                       for k, v in info.items()
+                   })
+        try:
+            self.app.copy_to_clipboard(plain)
+        except Exception:
+            if not _copy_to_clipboard_osc52(plain):
+                self.app.notify(
+                    "Clipboard unavailable — see splicecraft.log "
+                    "(seq.hover_copy event) for the text",
+                    severity="warning",
+                )
+                return
+        self.app.notify(f"Copied: {plain[:60]}{'…' if len(plain) > 60 else ''}",
+                        severity="information")
+
+    def _features_at_col(self, placements: list,
+                          chunk_start: int, chunk_end: int,
+                          seq_col: int) -> list[str]:
+        """List `(label, packed_row range)` for every feature in
+        `placements` whose bp range covers `seq_col` in this chunk.
+        Used by the hover diagnostic when the clicked cell reports
+        `no feature` so the user can see where in the stack the
+        column's actual features ARE rendered."""
+        out: list[str] = []
+        for f, br in placements:
+            bs = max(f["start"], chunk_start) - chunk_start
+            be = min(f["end"],   chunk_end)   - chunk_start
+            if bs <= seq_col < be:
+                h = _feat_stack_height(f)
+                lbl = (f.get("label") or f.get("type") or "?")[:24]
+                out.append(f"{lbl}@row{br}-{br + h - 1}")
+        return out
+
+    def _hover_status_text(self, info: dict) -> str:
+        """Format a hover-status string from a `_hover_at` dict.
+        Extracted from `_update_hover_status` so the freeze action
+        can render the same text without going through the widget."""
+        kind = info.get("kind", "")
+        if kind == "above" or kind == "below":
+            f = info.get("feat")
+            chunk = info["chunk"]
+            row   = info["packed_row"]
+            col   = info["seq_col"]
+            rows  = info.get("above_rows" if kind == "above"
+                              else "below_rows", "?")
+            screen_row = info.get("screen_row", "?")
+            vp_y = info.get("vp_y", "?")
+            if f is not None:
+                feat_label = (f.get("label") or f.get("type") or "?")[:40]
+                bp_range   = f"{f['start']}-{f['end']}"
+                strand_str = (
+                    "+" if f.get("strand", 1) >= 1
+                    else ("-" if f.get("strand", 1) == -1 else "."))
+                return (f"  [bold green]●[/] kind={kind} chunk={chunk} "
+                        f"packed={row}/{rows} screen_row={screen_row} "
+                        f"vp_y={vp_y} col={col}  "
+                        f"feat={feat_label} {bp_range}({strand_str})")
+            others = info.get("others_at_col") or []
+            also = (f"  [yellow]→[/] also at col: {', '.join(others)}"
+                    if others else "")
+            return (f"  [dim]○[/] kind={kind} chunk={chunk} "
+                    f"packed={row}/{rows} screen_row={screen_row} "
+                    f"vp_y={vp_y} col={col}  (no feature){also}")
+        if kind == "dna":
+            return (f"  [cyan]·[/] kind=dna strand={info['strand']} "
+                    f"chunk={info['chunk']} col={info['seq_col']} "
+                    f"bp={info['bp']}")
+        if kind == "gap":
+            return (f"  [dim]—[/] kind=gap chunk={info['chunk']} "
+                    f"col={info.get('seq_col', '?')}")
+        return f"  [dim](kind={kind})[/]"
 
     # ── Messages ───────────────────────────────────────────────────────────────
 
@@ -4229,6 +4509,11 @@ class SequencePanel(Widget):
         super().__init__(**kwargs)
         self._seq:          str                     = ""
         self._feats:        list[dict]              = []
+        # Last mouse position seen by `on_mouse_move` — captured so
+        # `H` can re-run `_hover_at` and copy the verbatim status to
+        # the system clipboard. Initial (-1, -1) sentinel means
+        # "mouse hasn't entered the panel yet".
+        self._last_mouse_xy: "tuple[int, int]" = (-1, -1)
         self._sel_range:    "tuple[int,int] | None" = None  # feature highlight
         self._user_sel:     "tuple[int,int] | None" = None  # drag/shift selection
         self._cursor_pos:   int                     = -1    # -1 = no cursor
@@ -4276,9 +4561,31 @@ class SequencePanel(Widget):
         # the user clicked on top of a larger overlapping feature's bar.
         # Reset alongside `_last_lane_click`.
         self._last_lane_feat: "dict | None" = None
+        # Set by `_click_to_bp` to a small debug dict — what region the
+        # click resolved to (chunk_idx, row-within-chunk classification,
+        # seq_col, feature counts in that row). Read by on_mouse_down on
+        # miss so a "click on lane art that returns -1" complaint
+        # surfaces the resolved row/col in the log.
+        self._last_click_debug: "dict | None" = None
+        # Set by `_check_packed` to the resolution path used:
+        # "owner" — pixel-accurate glyph-owner hit
+        # "footprint" — empty cell within a feature's drawn footprint
+        # "lenient" — col-hits + shorter-feature heuristic fallback
+        # Read by on_mouse_down so users sharing logs can tell us
+        # which tier resolved their click.
+        self._last_resolve_via: str = ""
         self._sorted_feats_cache: "list | None" = None
+        # Per-chunk glyph-owner cache for pixel-accurate click resolution.
+        # Populated lazily by `_check_packed` on the first click in a
+        # given chunk; key is `(chunk_start, chunk_end, id(self._feats))`
+        # so cursor-page-scrolls hit the cache, but a terminal resize
+        # that shifts chunk boundaries OR a feats reassignment outside
+        # `update_seq` invalidates automatically. Cleared on
+        # `update_seq` since a feats change always rebuilds.
+        self._chunks_owners: "dict[tuple, dict]" = {}
 
     def compose(self) -> ComposeResult:
+        yield Static("", id="seq-hover-status")
         with ScrollableContainer(id="seq-scroll"):
             yield Static("", id="seq-view")
 
@@ -4289,6 +4596,7 @@ class SequencePanel(Widget):
         self._seq          = seq
         self._feats        = feats
         self._sorted_feats_cache = None
+        self._chunks_owners.clear()
         self._sel_range    = None
         self._user_sel     = None
         self._cursor_pos   = -1
@@ -4372,15 +4680,22 @@ class SequencePanel(Widget):
         self._last_lane_click     = False
         self._last_lane_feat      = None
         self._last_aa_codon_click = None
+        self._last_resolve_via    = ""
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
             # Log even on miss so a "the app isn't responding to my
             # clicks" complaint shows whether the event reached us at
             # all. `bp=-1` here means the click hit blank space within
             # the seq-panel viewport (gap row, off-grid coordinate).
+            # `_last_click_debug` (set by `_click_to_bp`) carries which
+            # row classification we resolved to + the seq_col, so a
+            # complaint of "I clicked on lane art and nothing happened"
+            # surfaces enough context to confirm/refute that.
+            dbg = self._last_click_debug or {}
             _log_event(
                 "seq.mouse_down_miss",
                 screen_x=event.screen_x, screen_y=event.screen_y,
+                **dbg,
             )
             return
         # AA-letter click → land the cursor at the CENTER bp of the
@@ -4400,12 +4715,16 @@ class SequencePanel(Widget):
         # Snapshot the lane feat clicked at mouse_down so on_mouse_up
         # can demote a tiny in-feature jiggle back to a click.
         self._mouse_down_lane_feat = self._last_lane_feat
+        dbg = self._last_click_debug or {}
         _log_event(
             "seq.mouse_down", bp=bp,
             lane=self._last_lane_click,
             feat=(self._last_lane_feat or {}).get("label") if self._last_lane_feat else None,
             shift=event.shift,
             codon=self._last_aa_codon_click,
+            via=self._last_resolve_via,
+            **{k: v for k, v in dbg.items()
+               if k in ("packed_row", "seq_col", "is_below", "owner_set")},
         )
         if event.shift and self._cursor_pos >= 0:
             # Shift+click: extend selection from anchor (or cursor) to here
@@ -4434,6 +4753,14 @@ class SequencePanel(Widget):
         self._refresh_view()
 
     def on_mouse_move(self, event: MouseMove) -> None:
+        # Hover diagnostic — runs on every move so the user can see
+        # exactly which cell the system thinks the mouse is over
+        # (and which feature, if any) BEFORE clicking. Read-only;
+        # doesn't mutate the click-state flags. The last position
+        # is captured so `H` can copy the verbatim status to the
+        # clipboard without depending on a transient widget update.
+        self._last_mouse_xy = (event.screen_x, event.screen_y)
+        self._update_hover_status(event.screen_x, event.screen_y)
         if not self._mouse_button_held or self._drag_start_bp < 0:
             return
         bp = self._click_to_bp(event.screen_x, event.screen_y)
@@ -4446,6 +4773,146 @@ class SequencePanel(Widget):
         self._cursor_pos = bp
         self._sel_range  = None
         self._refresh_view()
+
+    def _hover_at(self, screen_x: int, screen_y: int) -> dict:
+        """Read-only mirror of `_click_to_bp`'s row-dispatch logic.
+
+        Returns a dict describing what's under (`screen_x`, `screen_y`):
+        which chunk, which packed_row (above or below stack) or DNA
+        strand, which seq_col, and the feature owner at that cell (if
+        any). Used by the hover-status row so the user can see exactly
+        what each pixel resolves to without clicking. No state
+        mutation — safe to call on every MouseMove.
+        """
+        if not self._seq:
+            return {"kind": "no_seq"}
+        try:
+            scroll = self.query_one("#seq-scroll", ScrollableContainer)
+            reg    = scroll.region
+            vp_x   = screen_x - reg.x
+            vp_y   = screen_y - reg.y
+            if (vp_x < 0 or vp_y < 0
+                    or vp_x >= reg.width or vp_y >= reg.height):
+                return {"kind": "off_viewport",
+                        "vp_x": vp_x, "vp_y": vp_y}
+            content_row = vp_y + int(scroll.scroll_y)
+        except Exception:
+            return {"kind": "scroll_query_fail"}
+
+        n           = len(self._seq)
+        num_w       = len(str(n)) if n else 1
+        line_width  = max(20, self._seq_render_width() - (num_w + 2))
+        # Insertion order — must match the renderer (`_build_seq_inputs`)
+        # so hover dispatch sees the SAME packed rows as what's drawn.
+        annot_feats = [f for f in self._feats
+                       if f.get("type") not in ("site", "recut")]
+        seq_col = vp_x - (num_w + 2)
+        row     = 0
+        for chunk_start in range(0, n, line_width):
+            chunk_end   = min(chunk_start + line_width, n)
+            chunk_idx   = chunk_start // line_width
+            chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
+            above_p, below_p, above_rows, below_rows = (
+                _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+            )
+
+            # Above stack (top of stack first)
+            for k in range(above_rows):
+                if row == content_row:
+                    packed_row = above_rows - 1 - k
+                    f = None
+                    if 0 <= seq_col < (chunk_end - chunk_start):
+                        owners_data = self._chunk_glyph_owners(
+                            chunk_start, chunk_end, chunk_feats,
+                            above_p, below_p, above_rows, below_rows,
+                        )
+                        owners = owners_data["owners_above"]
+                        if 0 <= packed_row < len(owners):
+                            f = owners[packed_row][seq_col]
+                    # Also list any features at this column on the
+                    # above strand (across all packed rows) — helps
+                    # the user see WHERE a feature actually renders
+                    # when their hover row reports `(no feature)`.
+                    others = self._features_at_col(
+                        above_p, chunk_start, chunk_end, seq_col,
+                    ) if f is None else []
+                    return {
+                        "kind": "above",
+                        "chunk": chunk_idx,
+                        "packed_row": packed_row,
+                        "screen_row": k,    # 0 = top of above stack on screen
+                        "above_rows": above_rows,
+                        "seq_col": seq_col,
+                        "vp_y": vp_y,
+                        "vp_x": vp_x,
+                        "feat": f,
+                        "others_at_col": others,
+                    }
+                row += 1
+
+            # DNA rows (fwd + rev)
+            for strand_i in range(2):
+                if row == content_row:
+                    if 0 <= seq_col < (chunk_end - chunk_start):
+                        return {
+                            "kind": "dna",
+                            "strand": "fwd" if strand_i == 0 else "rev",
+                            "chunk": chunk_idx,
+                            "seq_col": seq_col,
+                            "bp": chunk_start + seq_col,
+                        }
+                    return {"kind": "dna_off",
+                            "chunk": chunk_idx,
+                            "seq_col": seq_col}
+                row += 1
+
+            # Below stack (closest to DNA first)
+            for k in range(below_rows):
+                if row == content_row:
+                    packed_row = k
+                    f = None
+                    if 0 <= seq_col < (chunk_end - chunk_start):
+                        owners_data = self._chunk_glyph_owners(
+                            chunk_start, chunk_end, chunk_feats,
+                            above_p, below_p, above_rows, below_rows,
+                        )
+                        owners = owners_data["owners_below"]
+                        if 0 <= packed_row < len(owners):
+                            f = owners[packed_row][seq_col]
+                    others = self._features_at_col(
+                        below_p, chunk_start, chunk_end, seq_col,
+                    ) if f is None else []
+                    return {
+                        "kind": "below",
+                        "chunk": chunk_idx,
+                        "packed_row": packed_row,
+                        "screen_row": k,
+                        "below_rows": below_rows,
+                        "seq_col": seq_col,
+                        "vp_y": vp_y,
+                        "vp_x": vp_x,
+                        "feat": f,
+                        "others_at_col": others,
+                    }
+                row += 1
+
+            # Trailing inter-chunk gap row
+            if row == content_row:
+                return {"kind": "gap", "chunk": chunk_idx,
+                        "seq_col": seq_col}
+            row += 1
+
+            if row > content_row:
+                break
+        return {"kind": "past_content"}
+
+    def _update_hover_status(self, screen_x: int, screen_y: int) -> None:
+        try:
+            status = self.query_one("#seq-hover-status", Static)
+        except NoMatches:
+            return
+        info = self._hover_at(screen_x, screen_y)
+        status.update(self._hover_status_text(info))
 
     def on_mouse_up(self, event: MouseUp) -> None:
         if event.button != 1:
@@ -4588,9 +5055,77 @@ class SequencePanel(Widget):
         """Character width of the render area, minus the 2-col vertical scrollbar."""
         return max(20, self.size.width - 2)
 
+    def _chunk_glyph_owners(self, chunk_start: int, chunk_end: int,
+                             chunk_feats: list[dict],
+                             above_p: list, below_p: list,
+                             above_rows: int, below_rows: int) -> dict:
+        """Return per-(packed_row, col) feature owners for one chunk.
+
+        The result is cached in `self._chunks_owners` keyed by
+        ``(chunk_start, chunk_end, id(self._feats))`` (so re-clicks
+        in the same chunk are O(1) but a terminal resize that shifts
+        chunk boundaries — or a feats-list reassignment outside
+        `update_seq` — invalidates automatically).
+
+        Each owner cell `owners_above[packed_row][col]` is the feature
+        dict whose `(footprint_rows × bp_range)` rectangle covers that
+        cell, or None if the cell is outside every feature's drawn
+        area. Greedy packing guarantees these rectangles don't overlap
+        per-strand, so each cell has at most one owner.
+
+        Owners are filled across the FULL footprint+bp rectangle (not
+        just per-glyph) so that a click on a label-padding space, an
+        AA-row inter-letter cell, or a wide bar all resolve to the
+        feature whose bar you visibly clicked. Glyph-specific behavior
+        like CDS codon-vs-bar dispatch happens later in `_check_packed`
+        (it checks `packed_row - bottom_row` and on-letter math).
+
+        Returns dict with keys:
+            owners_above[packed_row][col] -> dict | None
+            owners_below[packed_row][col] -> dict | None
+            above_rows, below_rows         (mirrored for caller)
+        """
+        cache_key = (chunk_start, chunk_end, id(self._feats))
+        cached = self._chunks_owners.get(cache_key)
+        if cached is not None:
+            return cached
+        content_w = chunk_end - chunk_start
+
+        def _fill(placements: list, total_rows: int) -> list[list]:
+            arr = [[None] * content_w for _ in range(total_rows)]
+            for f, bottom_row in placements:
+                bar_s = max(f["start"], chunk_start) - chunk_start
+                bar_e = min(f["end"],   chunk_end)   - chunk_start
+                if bar_e <= bar_s:
+                    continue
+                height = _feat_stack_height(f)
+                for r in range(bottom_row,
+                               min(bottom_row + height, total_rows)):
+                    row = arr[r]
+                    for c in range(max(0, bar_s),
+                                   min(bar_e, content_w)):
+                        row[c] = f
+            return arr
+
+        owners_above = _fill(above_p, above_rows) if above_rows > 0 else []
+        owners_below = _fill(below_p, below_rows) if below_rows > 0 else []
+        result = {
+            "owners_above": owners_above,
+            "owners_below": owners_below,
+            "above_rows":   above_rows,
+            "below_rows":   below_rows,
+        }
+        self._chunks_owners[cache_key] = result
+        return result
+
     def _click_to_bp(self, screen_x: int, screen_y: int) -> int:
         """Map absolute screen coords to a bp index, or -1 if not on a base."""
+        # Reset diagnostic state — populated as we resolve so a miss
+        # (return -1) carries the resolved row/col classification in
+        # `_last_click_debug` for on_mouse_down to log.
+        self._last_click_debug = None
         if not self._seq:
+            self._last_click_debug = {"reason": "no_seq"}
             return -1
         try:
             scroll      = self.query_one("#seq-scroll", ScrollableContainer)
@@ -4598,18 +5133,25 @@ class SequencePanel(Widget):
             vp_x        = screen_x - reg.x       # column within the viewport
             vp_y        = screen_y - reg.y       # visible row within the viewport
             if vp_x < 0 or vp_y < 0 or vp_x >= reg.width or vp_y >= reg.height:
+                self._last_click_debug = {
+                    "reason": "off_viewport",
+                    "vp_x": vp_x, "vp_y": vp_y,
+                    "vp_w": reg.width, "vp_h": reg.height,
+                }
                 return -1
             content_row = vp_y + int(scroll.scroll_y)
         except Exception:
+            self._last_click_debug = {"reason": "scroll_query_fail"}
             return -1
 
         n           = len(self._seq)
         num_w       = len(str(n)) if n else 1
         line_width  = max(20, self._seq_render_width() - (num_w + 2))
-        annot_feats = sorted(
-            [f for f in self._feats if f.get("type") not in ("site", "recut")],
-            key=lambda f: -_feat_len(f["start"], f["end"], n),
-        )
+        # Insertion order — must match the renderer's `_build_seq_inputs`
+        # so click resolution lands on the SAME packed_row as what's
+        # actually drawn. Sorting by length here would diverge.
+        annot_feats = [f for f in self._feats
+                       if f.get("type") not in ("site", "recut")]
         rpg     = 2 + (1 if self._show_connectors else 0)  # rows per feature group
         row     = 0
         seq_col = vp_x - (num_w + 2)   # offset past the num+2-space prefix
@@ -4642,13 +5184,68 @@ class SequencePanel(Widget):
                 """Map a screen-row offset within the strand stack to a
                 feature lane click. `screen_row_idx_from_top=0` is the
                 first row drawn for that strand; below-DNA flips the
-                packed-row index to account for the close→far order."""
+                packed-row index to account for the close→far order.
+
+                Resolution tiers:
+                  1. Glyph owner — if the clicked cell has a non-None
+                     owner (= a feature's paint helper wrote a non-space
+                     character there), pick that feature exactly. This
+                     handles nested features pixel-accurately.
+                  2. Footprint — if no glyph but the (col, row) cell
+                     falls inside a feature's (bp range × footprint),
+                     pick that feature. Catches empty cells inside a
+                     feature's drawn footprint (e.g. padding around a
+                     centered label).
+                  3. Lenient (caller-side) — no footprint match either:
+                     return -1 here so the caller's column-hits +
+                     shorter-feature heuristic runs.
+                """
                 if is_below:
                     packed_row = screen_row_idx_from_top
                 else:
                     packed_row = total_rows - 1 - screen_row_idx_from_top
-                # Find the feature whose footprint covers (col, packed_row)
-                # at the click column; mirrors `_check_lane` in spirit.
+                # Tier 1: pixel-accurate glyph owner. Lazy-built per
+                # chunk and cached on the panel — first click in a
+                # chunk pays ~1 ms; subsequent clicks are O(1).
+                owners_data = self._chunk_glyph_owners(
+                    chunk_start, chunk_end, chunk_feats,
+                    above_p, below_p, above_rows, below_rows,
+                )
+                owners = (owners_data["owners_below"] if is_below
+                          else owners_data["owners_above"])
+                owner_feat = None
+                if (0 <= packed_row < len(owners)
+                        and 0 <= seq_col < len(owners[packed_row])):
+                    owner_feat = owners[packed_row][seq_col]
+                if owner_feat is not None:
+                    # Replace the iteration with the single owner so
+                    # the existing CDS-AA / resite / regular branches
+                    # below still run their bookkeeping for the right
+                    # feat. Footprint + bp-range checks below pass
+                    # trivially since the owner painted a glyph here.
+                    for pf, br in placements:
+                        if pf is owner_feat:
+                            placements = [(pf, br)]
+                            break
+                    self._last_resolve_via = "owner"
+                else:
+                    self._last_resolve_via = "footprint"
+                # Expose click coords on every `_check_packed` so
+                # successful resolutions also carry packed_row/seq_col
+                # in the seq.mouse_down log — diagnoses "I clicked the
+                # bar but got the wrong feat" without retrofitting a
+                # second log call per branch.
+                self._last_click_debug = {
+                    "packed_row": packed_row,
+                    "seq_col": seq_col,
+                    "is_below": is_below,
+                    "above_rows": above_rows,
+                    "below_rows": below_rows,
+                    "owner_set": owner_feat is not None,
+                }
+                # Tier 2 (and 1, when owner_feat replaces placements):
+                # find the feature whose footprint covers
+                # (col, packed_row) at the click column.
                 for f, bottom_row in placements:
                     if not (bottom_row <= packed_row
                             < bottom_row + _feat_stack_height(f)):
@@ -4738,36 +5335,96 @@ class SequencePanel(Widget):
                         # landed on a larger overlapping bar).
                         self._last_lane_feat = f
                         return (f["start"] + f["end"]) // 2
+                # Conservative lenient fallback — owner-fill missed
+                # AND footprint loop missed (= click cell is outside
+                # every feature's rectangle on this strand). If the
+                # column has exactly ONE feature on this strand, that
+                # is unambiguous user intent (clicked above/below a
+                # standalone feature's footprint at its column). Pick
+                # it. If multiple features share the column, return
+                # -1 — the user's "no win/lose" rule still applies
+                # in the ambiguous case.
+                col_hits = [
+                    (f, br) for (f, br) in placements
+                    if (max(f["start"], chunk_start) - chunk_start)
+                       <= seq_col
+                       < (min(f["end"], chunk_end) - chunk_start)
+                ]
+                if len(col_hits) == 1:
+                    f, _ = col_hits[0]
+                    if f.get("type") == "resite":
+                        self._last_resite_click = f
+                    else:
+                        self._last_lane_click = True
+                    self._last_lane_feat = f
+                    self._last_resolve_via = "lenient_solo"
+                    return (f["start"] + f["end"]) // 2
                 return -1
 
             # Above traversal: top of stack first (row index from top = 0).
             for k in range(above_rows):
                 if row == content_row:
-                    return _check_packed(above_p, k, above_rows, False)
+                    bp = _check_packed(above_p, k, above_rows, False)
+                    if bp < 0:
+                        self._last_click_debug = {
+                            "reason": "lane_miss_above",
+                            "chunk": chunk_start // line_width,
+                            "row_in_chunk": k,
+                            "above_rows": above_rows,
+                            "seq_col": seq_col, "line_width": line_width,
+                            "n_above": len(above_p),
+                        }
+                    return bp
                 row += 1
 
             # DNA rows: fwd strand + RC strand (2 rows)
-            for _ in range(2):
+            for strand_i in range(2):
                 if row == content_row:
                     if 0 <= seq_col < (chunk_end - chunk_start):
                         return chunk_start + seq_col
+                    self._last_click_debug = {
+                        "reason": "dna_off_strand",
+                        "chunk": chunk_start // line_width,
+                        "strand": "fwd" if strand_i == 0 else "rc",
+                        "seq_col": seq_col, "line_width": line_width,
+                        "chunk_len": chunk_end - chunk_start,
+                    }
                     return -1
                 row += 1
 
             # Below traversal: closest to DNA first (row index from top = 0).
             for k in range(below_rows):
                 if row == content_row:
-                    return _check_packed(below_p, k, below_rows, True)
+                    bp = _check_packed(below_p, k, below_rows, True)
+                    if bp < 0:
+                        self._last_click_debug = {
+                            "reason": "lane_miss_below",
+                            "chunk": chunk_start // line_width,
+                            "row_in_chunk": k,
+                            "below_rows": below_rows,
+                            "seq_col": seq_col, "line_width": line_width,
+                            "n_below": len(below_p),
+                        }
+                    return bp
                 row += 1
 
             # Trailing blank row appended in `_render_chunk` for
             # inter-chunk spacing — clicks here are no-ops.
             if row == content_row:
+                self._last_click_debug = {
+                    "reason": "inter_chunk_gap",
+                    "chunk": chunk_start // line_width,
+                    "seq_col": seq_col,
+                }
                 return -1
             row += 1
 
             if row > content_row:
                 break
+        self._last_click_debug = {
+            "reason": "past_content",
+            "content_row": content_row, "final_row": row,
+        }
         return -1
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -14660,15 +15317,34 @@ class SplashScreen(ModalScreen):
     def on_key(self, event) -> None:
         # Catch-all: any keystroke dismisses, including keys not in BINDINGS.
         # `event.stop()` keeps the app from also processing the key.
-        self.dismiss(None)
+        # Guarded — a fast Enter press can fire after on_click already
+        # dismissed the splash, leaving the screen stack with only the
+        # default screen and `pop_screen` raising ScreenStackError.
+        self._safe_dismiss()
         event.stop()
 
     def on_click(self, _event) -> None:
         # Mouse click dismisses too — same affordance as "press any key".
-        self.dismiss(None)
+        self._safe_dismiss()
 
     def action_dismiss_splash(self) -> None:
-        self.dismiss(None)
+        self._safe_dismiss()
+
+    def _safe_dismiss(self) -> None:
+        """Dismiss only if the splash is still on the screen stack.
+        Without this guard, a second key/click event arriving after
+        the first dismiss has already popped the screen would call
+        `pop_screen` on a stack that only has the default screen,
+        raising ScreenStackError."""
+        try:
+            stack = self.app._screen_stack
+        except AttributeError:
+            stack = []
+        if self in stack:
+            try:
+                self.dismiss(None)
+            except Exception:
+                _log.exception("splash dismiss failed")
 
 
 class UnsavedNavigateModal(ModalScreen):
@@ -16339,6 +17015,19 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+c",       "copy_selection",        "",         show=False, priority=True),
         Binding("alt+c",        "copy_selection_bottom", "",         show=False, priority=True),
         Binding("ctrl+shift+c", "copy_selection_bottom", "",         show=False, priority=True),
+        # H (any case) copies the seq-panel hover-status text to
+        # clipboard. App-level + priority so it fires regardless of
+        # which widget currently has focus — the panel-level binding
+        # was missing reliably because the seq-scroll inside the
+        # panel takes focus on click and Textual's binding lookup
+        # didn't always reach the parent.
+        Binding("h",            "copy_hover_status",     "Copy hover", show=False, priority=True),
+        # D dumps the rendered text of the chunk under the mouse to
+        # clipboard + log — diagnoses cases where the user reports
+        # seeing a bar that the owner-fill says doesn't exist there.
+        # Lets us compare the actual render output against the
+        # owner-fill data to pinpoint a renderer/owner divergence.
+        Binding("d",            "dump_hover_chunk",      "Dump chunk", show=False, priority=True),
     ]
 
     # Actions that remain available even when a screen is pushed on top.
@@ -16973,6 +17662,33 @@ SpeciesPickerModal { align: center middle; }
         """Ctrl+Shift+C — copy the bottom strand (5'→3' on the
         reverse-complement) of the selection."""
         self._copy_strand(bottom=True)
+
+    def action_copy_hover_status(self) -> None:
+        """H — copy the seq-panel hover-status text to clipboard.
+        Delegates to the panel since it owns the last-mouse-position
+        state. App-level + priority so the binding fires regardless
+        of which widget has focus (the panel-level binding wasn't
+        reliable because the inner seq-scroll captures focus on
+        click and Textual's binding lookup didn't always reach the
+        parent panel)."""
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            return
+        sp.action_copy_hover_status()
+
+    def action_dump_hover_chunk(self) -> None:
+        """D — dump the rendered plain-text of the chunk under the
+        mouse cursor to clipboard + log. Lets the user paste a row-
+        by-row view of what the renderer is actually emitting so we
+        can compare against the hover diagnostic's owner-fill data
+        — pinpoints the exact row the bar visually lives on if the
+        two ever disagree."""
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            return
+        sp.action_dump_hover_chunk()
 
     def _copy_strand(self, *, bottom: bool) -> None:
         sp  = self.query_one("#seq-panel", SequencePanel)
@@ -18570,13 +19286,15 @@ SpeciesPickerModal { align: center middle; }
         # moment the modal closes — the user sees confirmation of
         # what was added AND can locate the bar (which sits at the
         # top of the lane stack with insertion-order packing) by
-        # following the highlighted bp range. Without this cue users
-        # have to hunt for an unfamiliar bar position and repeated
-        # off-target clicks read as "the app stopped responding".
+        # following the highlighted bp range.
+        # Don't move `_cursor_pos` — the new feature ADDS a row to
+        # the lane stack which already shifts the DNA strand down
+        # by one row. Forcing the cursor to the feature's start on
+        # top of that compounds the visible "jump" and disorients
+        # the user. The highlight alone is the cue they need.
         sp._user_sel  = (start, end)
         sp._sel_range = None
         sp._sel_anchor = start
-        sp._cursor_pos = start
         sp._refresh_view()
         # Map / sidebar should also reflect the new selection.
         try:

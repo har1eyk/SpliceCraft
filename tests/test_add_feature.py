@@ -496,6 +496,155 @@ class TestPackerNewOnTop:
         assert rows["b"] == 0
 
 
+class TestGlyphOwnerTracking:
+    """`SequencePanel._chunk_glyph_owners` fills per-(packed_row, col)
+    owners across the FULL `(footprint_rows × bp_range)` rectangle of
+    each feature — clicks anywhere on the visible lane art (bar,
+    label-text, label-padding, AA cells) all resolve to the right
+    feature. `_check_packed` does the codon-vs-bar dispatch for CDS
+    afterward."""
+
+    def _build_panel(self, seq: str, feats: list) -> "sc.SequencePanel":
+        sp = sc.SequencePanel.__new__(sc.SequencePanel)
+        sp._seq = seq
+        sp._feats = feats
+        sp._chunks_owners = {}
+        return sp
+
+    def test_owners_fill_full_footprint_for_non_cds(self):
+        """A non-CDS feature occupies 2 packed rows (bar + label).
+        owners_above[0..1][bp_range] should all be the feature, even
+        in label-padding cells (so clicking on padding still picks
+        the feature). Outside the bp range, owner=None."""
+        f = {"start": 5, "end": 15, "type": "misc_feature",
+              "label": "f", "strand": 1, "color": "white"}
+        above_p, below_p, above_rows, below_rows = sc._chunk_lane_groups(
+            [f], 0, 20,
+        )
+        sp = self._build_panel("A" * 20, [f])
+        result = sp._chunk_glyph_owners(
+            0, 20, [f], above_p, below_p, above_rows, below_rows,
+        )
+        owners = result["owners_above"]
+        assert len(owners) == above_rows == 2
+        for r in (0, 1):
+            for col in range(5, 15):
+                assert owners[r][col] is f, (
+                    f"row {r} col {col} should own f"
+                )
+            for col in (0, 4, 15, 19):
+                assert owners[r][col] is None
+
+    def test_nested_features_get_distinct_owners_per_cell(self):
+        """Smaller feature inside a larger one — every cell in the
+        smaller's rectangle should own the smaller, every cell in
+        the larger's rectangle (outside the smaller) should own the
+        larger. Greedy packing ensures the rectangles don't overlap
+        per row, so each cell has one unambiguous owner."""
+        outer = {"start": 0, "end": 30, "type": "misc_feature",
+                  "label": "outer", "strand": 1, "color": "white"}
+        inner = {"start": 12, "end": 18, "type": "misc_feature",
+                  "label": "inner", "strand": 1, "color": "red"}
+        above_p, below_p, above_rows, below_rows = sc._chunk_lane_groups(
+            [outer, inner], 0, 30,
+        )
+        sp = self._build_panel("A" * 30, [outer, inner])
+        result = sp._chunk_glyph_owners(
+            0, 30, [outer, inner],
+            above_p, below_p, above_rows, below_rows,
+        )
+        owners = result["owners_above"]
+        # outer at rows 0-1, inner at rows 2-3 (greedy packing pushes
+        # inner above outer where bp ranges overlap).
+        assert owners[0][5]  is outer
+        assert owners[0][15] is outer
+        assert owners[0][25] is outer
+        assert owners[1][5]  is outer
+        # Inner's rectangle: rows 2-3, cols 12-17.
+        for r in (2, 3):
+            for col in range(12, 18):
+                assert owners[r][col] is inner
+            for col in (5, 11, 18, 25):
+                assert owners[r][col] is None
+
+    def test_below_strand_owners_filled(self):
+        """Reverse-strand feature in the below-DNA stack — `_check_packed`
+        for `is_below=True` looks up `owners_below` indexed by
+        screen_row_idx_from_top (= packed_row directly). Owners must
+        be filled across the bp range for that strand, mirroring above."""
+        rev = {"start": 5, "end": 25, "type": "misc_feature",
+                "label": "rev", "strand": -1, "color": "white"}
+        above_p, below_p, above_rows, below_rows = sc._chunk_lane_groups(
+            [rev], 0, 30,
+        )
+        # Reverse-strand goes to below_p, not above_p.
+        assert any(p[0] is rev for p in below_p)
+        sp = self._build_panel("A" * 30, [rev])
+        result = sp._chunk_glyph_owners(
+            0, 30, [rev], above_p, below_p, above_rows, below_rows,
+        )
+        owners = result["owners_below"]
+        assert len(owners) == below_rows == 2
+        for r in (0, 1):
+            for col in range(5, 25):
+                assert owners[r][col] is rev
+            for col in (0, 4, 25, 29):
+                assert owners[r][col] is None
+
+    def test_owner_cache_invalidates_on_feats_change(self):
+        """Cache key includes `id(self._feats)` — reassigning `_feats`
+        forces a fresh compute. Without this, post-annotate clicks
+        could lookup stale owners that don't include the new feature."""
+        f1 = {"start": 0, "end": 10, "type": "misc_feature",
+               "label": "f1", "strand": 1, "color": "white"}
+        above_p, below_p, above_rows, below_rows = sc._chunk_lane_groups(
+            [f1], 0, 30,
+        )
+        sp = self._build_panel("A" * 30, [f1])
+        first = sp._chunk_glyph_owners(
+            0, 30, [f1], above_p, below_p, above_rows, below_rows,
+        )
+        # Reassign feats — simulating annotate's update_seq path,
+        # but skip the .clear() to verify cache key is the safety net.
+        f2 = {"start": 20, "end": 28, "type": "misc_feature",
+               "label": "f2", "strand": 1, "color": "red"}
+        sp._feats = [f1, f2]
+        above_p2, below_p2, above_rows2, below_rows2 = (
+            sc._chunk_lane_groups([f1, f2], 0, 30)
+        )
+        second = sp._chunk_glyph_owners(
+            0, 30, [f1, f2],
+            above_p2, below_p2, above_rows2, below_rows2,
+        )
+        assert second is not first, (
+            "id-based cache key must invalidate on feats reassignment"
+        )
+
+    def test_cds_owners_fill_full_footprint(self):
+        """A CDS occupies 3 packed rows (AA + bar + label). All 3 rows
+        own the CDS across its bp range — owner-fill is uniform across
+        the rectangle. The codon-vs-bar dispatch happens in
+        `_check_packed` based on `packed_row - bottom_row`, not in
+        the owner data itself, so AA-row inter-letter cells still
+        own the CDS (and `_check_packed` resolves them as bar clicks)."""
+        cds = {"start": 0, "end": 30, "type": "CDS",
+                "strand": 1, "color": "white", "label": "c"}
+        above_p, below_p, above_rows, below_rows = sc._chunk_lane_groups(
+            [cds], 0, 30,
+        )
+        sp = self._build_panel("A" * 30, [cds])
+        result = sp._chunk_glyph_owners(
+            0, 30, [cds], above_p, below_p, above_rows, below_rows,
+        )
+        owners = result["owners_above"]
+        assert above_rows == 3
+        for r in (0, 1, 2):
+            for col in range(30):
+                assert owners[r][col] is cds, (
+                    f"row {r} col {col} should own CDS"
+                )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Modal surface — mount + gather
 # ═══════════════════════════════════════════════════════════════════════════════
