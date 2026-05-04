@@ -1423,6 +1423,114 @@ def _paint_feature_label(arr: list[tuple[str, str]], f: dict,
             arr[col] = (ch, color)
 
 
+def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
+                              chunk_start: int, chunk_end: int) -> None:
+    """Bound-region row for a primer with a 5' flap.
+
+    Unlike `_paint_feature_bar` which fills the bar with `▒` block
+    characters, this painter writes the **primer's bases** into the
+    bar cells with the feature colour as the cell BACKGROUND. The
+    eye reads the primer sequence inline with the strand below — a
+    bound base lines up directly above the matching template base.
+    The arrow glyph (`►` / `◄`) sits at the primer's 3' end so the
+    direction reads as in any other feature.
+
+    Strand 0 (no direction) gets no arrow — the bar is just the
+    primer's bound bases over the strand. The flap (if any) is
+    drawn by `_paint_primer_flap_bar` on the row above.
+    """
+    s, e = f["start"], f["end"]
+    bar_s = max(s, chunk_start) - chunk_start
+    bar_e = min(e, chunk_end)   - chunk_start
+    bar_len = bar_e - bar_s
+    if bar_len <= 0:
+        return
+    strand = f.get("strand", 1)
+    color  = f.get("color", "white")
+    primer_seq = str(f.get("_primer_seq") or "")
+    flap_len   = int(f.get("_flap_len")   or 0)
+    bound_len  = int(f.get("_bound_len")  or (e - s if e >= s else 0))
+    starts_here = s >= chunk_start
+    ends_here   = e <= chunk_end
+    content_w   = chunk_end - chunk_start
+
+    # Top-strand-oriented bound bases: forward primer's bound region
+    # is `primer_seq[flap_len:]`; reverse primer's bound region in
+    # top-strand orientation = RC of the same slice.
+    if not primer_seq or bound_len <= 0:
+        # Defensive: malformed; fall back to plain bar painter so
+        # the user still sees the feature.
+        _paint_feature_bar(arr, f, chunk_start, chunk_end)
+        return
+    if strand >= 0:
+        bound_bases = primer_seq[flap_len:flap_len + bound_len]
+    else:
+        bound_bases = _rc(primer_seq[flap_len:flap_len + bound_len])
+
+    # Slice off the bases that fall before / after the visible chunk.
+    skip_left   = max(0, chunk_start - s)
+    skip_right  = max(0, e - chunk_end)
+    visible_bases = bound_bases[
+        skip_left:
+        (len(bound_bases) - skip_right) if skip_right else len(bound_bases)
+    ]
+    bg_style = f"black on {color}"
+    # Bases occupy the bar's nominal column range `[s, e)` — every
+    # bound base stays visible (unlike `_paint_feature_bar` which
+    # eats the last base for the arrow). The arrow takes one EXTRA
+    # cell beyond the bar (col `e` for fwd, col `s-1` for rev) so
+    # the user keeps the full primer sequence.
+    for i, ch in enumerate(visible_bases):
+        col = bar_s + i
+        if 0 <= col < content_w:
+            arr[col] = (ch, bg_style)
+    # Arrow glyph in the extra cell. Only draw when the relevant
+    # primer edge is inside the visible chunk; clipped otherwise.
+    if strand >= 0 and ends_here:
+        arrow_col = e - chunk_start
+        if 0 <= arrow_col < content_w:
+            arr[arrow_col] = ("▶", bg_style)
+    elif strand < 0 and starts_here:
+        arrow_col = s - chunk_start - 1
+        if 0 <= arrow_col < content_w:
+            arr[arrow_col] = ("◀", bg_style)
+
+
+def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
+                             chunk_start: int, chunk_end: int) -> None:
+    """Flap-row painter — sits one row farther from the strand than
+    the bound bar (`sub == 1` of a primer-with-flap). Renders the
+    flap's bases in the column range `[_flap_start, _flap_end)`
+    (= LEFT of the bound bar for fwd, RIGHT for rev) so the flap
+    visually floats off to the side of the bound region without
+    vertically overlapping it. Background = primer color, fg =
+    cell text colour, identical typography to the bound row so the
+    eye reads them as one continuous primer.
+    """
+    flap_s = int(f.get("_flap_start") or 0)
+    flap_e = int(f.get("_flap_end")   or 0)
+    flap_bases = str(f.get("_flap_bases") or "")
+    if flap_e <= flap_s or not flap_bases:
+        return
+    color = f.get("color", "white")
+    bg_style = f"black on {color}"
+    content_w = chunk_end - chunk_start
+    # Clip flap to the visible chunk.
+    vis_s = max(flap_s, chunk_start)
+    vis_e = min(flap_e, chunk_end)
+    if vis_e <= vis_s:
+        return
+    # Slice the bases to match the visible window.
+    src_start = vis_s - flap_s
+    src_end   = src_start + (vis_e - vis_s)
+    visible = flap_bases[src_start:src_end]
+    bar_s = vis_s - chunk_start
+    for i, ch in enumerate(visible):
+        col = bar_s + i
+        if 0 <= col < content_w:
+            arr[col] = (ch if ch else "▒", bg_style)
+
+
 def _paint_feature_bar(arr: list[tuple[str, str]], f: dict,
                         chunk_start: int, chunk_end: int,
                         is_below_dna: bool = False) -> None:
@@ -1579,12 +1687,28 @@ def _render_packed_strand(result: "Text",
                     _paint_feature_label(arr, f, chunk_start, chunk_end,
                                          re_highlight_se=re_highlight_se)
             else:
+                # Primer with a flap (set by `PlasmidMap._parse` when
+                # the source `primer_bind` carries a `/primer_seq`
+                # qualifier): bound bases on the bar row, flap bases
+                # on the row farther from the strand. Replaces the
+                # default bar+label rendering for these features —
+                # the primer name lives elsewhere (sidebar tooltip).
+                has_flap = (
+                    f.get("type") == "primer_bind"
+                    and f.get("_flap_bases")
+                )
                 if sub == 0:
-                    _paint_feature_bar(arr, f, chunk_start, chunk_end,
-                                       is_below_dna=is_below_dna)
+                    if has_flap:
+                        _paint_primer_bound_bar(arr, f, chunk_start, chunk_end)
+                    else:
+                        _paint_feature_bar(arr, f, chunk_start, chunk_end,
+                                           is_below_dna=is_below_dna)
                 else:   # sub == 1
-                    _paint_feature_label(arr, f, chunk_start, chunk_end,
-                                         re_highlight_se=re_highlight_se)
+                    if has_flap:
+                        _paint_primer_flap_bar(arr, f, chunk_start, chunk_end)
+                    else:
+                        _paint_feature_label(arr, f, chunk_start, chunk_end,
+                                             re_highlight_se=re_highlight_se)
         _emit_packed_row(result, arr, prefix_w)
 
 
@@ -3563,14 +3687,59 @@ class PlasmidMap(Widget):
                     start, end = clamped_start, clamped_end
 
             idx    = len(feats)
-            feats.append({
+            new_feat: dict = {
                 "type":   feat.type,
                 "start":  start,
                 "end":    end,
                 "strand": strand,
                 "color":  _FEATURE_PALETTE[idx % len(_FEATURE_PALETTE)],
                 "label":  _feat_label(feat),
-            })
+            }
+            # ── Partial-binding primer detection ────────────────────
+            # When a `primer_bind` feature carries a `/primer_seq`
+            # qualifier (set by `_add_selected_to_map` since 0.5.9),
+            # we know the primer's full 5'→3' bases. The bound region
+            # is `[start, end)` (where the primer pairs with the
+            # template); the difference between primer-length and
+            # bound-length is the **5' flap**. The flap is rendered
+            # by the seq panel as a floating coloured segment one
+            # row away from the bound bar — see `_render_chunk`.
+            #
+            # Wrap-aware: a binding that crosses the origin has
+            # `end < start`; the bound length is `_feat_len(start, end, total)`.
+            #
+            # The flap is positioned to the LEFT (fwd primer) or
+            # RIGHT (rev primer) of the bound region in template
+            # coords, so the flap's column range can be negative or
+            # exceed `total`. Renderer clips per-chunk.
+            if feat.type == "primer_bind":
+                primer_seq_q = feat.qualifiers.get("primer_seq")
+                primer_seq = ""
+                if isinstance(primer_seq_q, list) and primer_seq_q:
+                    primer_seq = str(primer_seq_q[0]).strip().upper()
+                if primer_seq:
+                    bound_len = _feat_len(start, end, total) or 0
+                    flap_len = max(0, len(primer_seq) - bound_len)
+                    if flap_len > 0:
+                        new_feat["_primer_seq"] = primer_seq
+                        new_feat["_bound_len"]  = bound_len
+                        new_feat["_flap_len"]   = flap_len
+                        # Top-strand-oriented flap bases (so they
+                        # read inline with the strand below):
+                        # forward primer flap = primer_seq[:flap_len];
+                        # reverse primer flap = RC of primer_seq[:flap_len]
+                        # (the 5' end of the rev primer is on the
+                        # right side of the bound region in top-
+                        # strand orientation).
+                        if strand >= 0:
+                            new_feat["_flap_bases"] = primer_seq[:flap_len]
+                            new_feat["_flap_start"] = start - flap_len
+                            new_feat["_flap_end"]   = start
+                        else:
+                            new_feat["_flap_bases"] = _rc(primer_seq[:flap_len])
+                            new_feat["_flap_start"] = end
+                            new_feat["_flap_end"]   = end + flap_len
+            feats.append(new_feat)
         return feats
 
     # ── Actions ────────────────────────────────────────────────────────────────
@@ -20050,9 +20219,20 @@ class PrimerDesignScreen(Screen):
             )
             if already:
                 continue
+            # Stash the primer's full 5'→3' sequence as a `/primer_seq`
+            # qualifier so the seq-panel renderer can compute the
+            # 5' flap (= primer bases that don't bind the template)
+            # and visualise it as a floating segment offset from the
+            # bound bar. Standard `primer_bind` features without
+            # this qualifier (e.g. imported from external GenBank
+            # files) keep the legacy plain-bar look.
+            full_seq = str(p.get("sequence") or "")
+            quals: dict[str, list[str]] = {"label": [name]}
+            if full_seq:
+                quals["primer_seq"] = [full_seq]
             new_rec.features.append(SeqFeature(
                 loc, type="primer_bind",
-                qualifiers={"label": [name]},
+                qualifiers=quals,
             ))
             added.append(name)
 
@@ -23813,6 +23993,17 @@ SpeciesPickerModal { align: center middle; }
         # hand-edited settings.json can't poison the scanner.
         rml = _get_setting("restr_min_len", 6)
         self._restr_min_len = rml if rml in (4, 6) else 6
+        # Hybridization parameters: minimum contiguous 3'-end binding
+        # length below which a primer is flagged as "weak" (warning
+        # glyph in the seq panel + tooltip). Used by the partial-
+        # binding visualisation — primers with a flap shorter than
+        # `_min_primer_binding` are still drawn, just marked.
+        # Range-checked at hydrate time so a hand-edited settings
+        # entry can't smuggle a negative or absurdly large value.
+        mpb = _get_setting("min_primer_binding", 15)
+        self._min_primer_binding = mpb if (
+            isinstance(mpb, int) and 1 <= mpb <= 60
+        ) else 15
         # `show_connectors` lives on both seq panel and map; can't
         # hydrate from compose() because the children haven't
         # composed yet — defer to on_mount via a saved class attr.

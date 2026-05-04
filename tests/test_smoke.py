@@ -4168,6 +4168,122 @@ class TestShiftClickFeatureExtend:
             from textual.widgets import Button
             assert not modal.query_one("#btn-ged-entry-clear", Button).disabled
 
+    async def test_primer_with_flap_parsed_into_feat_dict(
+            self, isolated_library):
+        """A `primer_bind` feature carrying a `/primer_seq` qualifier
+        whose length exceeds the bound region's bp count picks up
+        `_flap_bases`, `_flap_start`, `_flap_end`, and `_flap_len`
+        on its parsed feat dict — the data the seq-panel renderer
+        needs to draw the floating flap segment."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Forward primer 5'-GAATCG-ATGAAACG-3': bound region 12..20
+        # (8 bp) on the top strand, flap = "GAATCG" (6 bp).
+        rec = SeqRecord(Seq("ATGAAATCAGCCATGAAACGGCCAAGCATGTAACGTGCATG"),
+                        id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(12, 20, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P-fwd"],
+                                    "primer_seq": ["GAATCGATGAAACG"]}),
+            # Reverse primer at 30..38: top strand is "TAACGTGC" RC =
+            # "GCACGTTA", primer = 5'-GTATGC-GCACGTTA-3', flap = GTATGC
+            # which RC's to GCATAC for top-strand orientation.
+            SeqFeature(FeatureLocation(30, 38, strand=-1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P-rev"],
+                                    "primer_seq": ["GTATGCGCACGTTA"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            f_fwd = next(f for f in pm._feats if f.get("label") == "P-fwd")
+            f_rev = next(f for f in pm._feats if f.get("label") == "P-rev")
+            # Forward flap = first 6 bases of primer (raw).
+            assert f_fwd["_flap_bases"] == "GAATCG"
+            assert f_fwd["_flap_len"] == 6
+            assert f_fwd["_bound_len"] == 8
+            assert f_fwd["_flap_start"] == 6
+            assert f_fwd["_flap_end"]   == 12
+            # Reverse flap = RC of first 6 primer bases (top-strand
+            # orientation), positioned to the RIGHT of the bound region.
+            assert f_rev["_flap_bases"] == "GCATAC"
+            assert f_rev["_flap_len"] == 6
+            assert f_rev["_bound_len"] == 8
+            assert f_rev["_flap_start"] == 38
+            assert f_rev["_flap_end"]   == 44
+
+    async def test_primer_no_flap_skips_extra_fields(self, isolated_library):
+        """When primer_seq length equals bound length, no flap fields
+        get set — the feature renders as a plain primer_bind bar."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 110, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["full-bind"],
+                                    "primer_seq": ["AAAAAAAAAA"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            f = next(f for f in pm._feats if f.get("label") == "full-bind")
+            assert "_flap_bases" not in f
+            assert "_flap_len" not in f
+
+    async def test_seq_panel_renders_primer_flap_bases(
+            self, isolated_library):
+        """End-to-end: load a primer with a flap, render the seq
+        panel, and verify both the bound bases AND the flap bases
+        appear in the rendered text. The bg-color encoding lives in
+        the Rich Style spans, but the bases themselves should be
+        present in the plain-text projection."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("ATGAAATCAGCCATGAAACGGCCAAGCATGT" + "A" * 100),
+                        id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(12, 20, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P-fwd"],
+                                    "primer_seq": ["GAATCGATGAAACG"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            text = sc._build_seq_text(str(rec.seq), [
+                {"type": "primer_bind", "start": 12, "end": 20, "strand": 1,
+                 "color": "#00BFFF", "label": "P-fwd",
+                 "_primer_seq": "GAATCGATGAAACG", "_flap_bases": "GAATCG",
+                 "_flap_start": 6, "_flap_end": 12,
+                 "_flap_len": 6, "_bound_len": 8},
+            ])
+            plain = text.plain
+            # Bound bases (the bound region is `ATGAAACG`) should be
+            # present — they overlap the strand bases at cols 12..19.
+            # The strand row also contains `ATGAAACG`, so we can't
+            # use that as a discriminator on its own. The flap
+            # `GAATCG` is unique to the primer flap row, so its
+            # presence confirms the flap rendered.
+            assert "GAATCG" in plain, (
+                "expected flap bases in rendered seq-panel text"
+            )
+
     def test_pairwise_align_basic(self):
         """1-bp substitution in a 300 bp sequence aligns with no gaps,
         99.67% identity, 1 mismatch, 0 gaps."""

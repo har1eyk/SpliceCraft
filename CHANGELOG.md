@@ -2,6 +2,20 @@
 
 ---
 
+## [0.5.9.0] — 2026-05-04
+
+### Added
+
+- **Partial-binding primer visualisation in the seq panel.** Primers added to the map from the library now carry the original 5'→3' sequence as a `/primer_seq` qualifier. When the primer is longer than its bound region (typical for cloning primers with restriction-site / Gibson-overhang 5' tails), the seq-panel renders the **bound bases** inline with the strand and the **flap bases** on a floating segment one row farther from the strand. The bar's primer-color background spans both rows so the eye reads them as one continuous primer; the flap is offset horizontally so it never vertically overlaps the bound region. Forward-primer flap floats UP-and-LEFT; reverse-primer flap floats DOWN-and-RIGHT (mirror geometry).
+- **Hybridization parameter `min_primer_binding`** (default 15 bp) added to `settings.json` — minimum contiguous binding length below which a primer is flagged as weak. Range-checked at hydrate (1-60 bp inclusive); a hand-edited settings entry that smuggles a non-int / out-of-range value falls back to 15. Surfacing in the Settings menu + a per-primer warning glyph follow in the next iteration; the field is wired through now so the data model is in place.
+- Rendering: bound bar uses 9 cells per 8 bp (was 8 — the arrow now takes its own extra cell beyond the bound region's `[start, end)` range so every bound base stays visible). The arrow extends one cell past the bound bar (col `end` for fwd, col `start - 1` for rev). Other features sharing the arrow's column won't collide visually because the arrow paints last in the row.
+
+### Tests
+
+- +3 tests in `test_smoke.py`: forward/reverse primer flap data computed correctly on the parsed feat dict (`_flap_bases`, `_flap_start`, `_flap_end`, `_flap_len`, `_bound_len`); full-binding primers (no flap) skip the extra fields entirely; end-to-end seq-panel render contains the flap bases at the expected columns.
+
+---
+
 ## [0.5.8.1] — 2026-05-04
 
 ### Added
