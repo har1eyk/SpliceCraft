@@ -2900,6 +2900,288 @@ class TestShiftClickFeatureExtend:
         event = Key(key, character=None)
         app.on_key(event)
 
+    def test_restriction_scan_cache_hits_on_repeat(self):
+        """Second call with the same (seq, args) tuple returns the
+        cached list without re-scanning. Verifies via list identity:
+        if the cache is a hit, the SAME list object comes back."""
+        seq = "ATGCATGCATGC" * 200
+        a = sc._scan_restriction_sites(seq, 6, True, True)
+        b = sc._scan_restriction_sites(seq, 6, True, True)
+        assert a is b, (
+            "second call should return the cached list object — "
+            "indicates we re-scanned"
+        )
+
+    def test_restriction_scan_cache_separate_keys(self):
+        """Different (min_len, unique_only, circular) combinations
+        cache independently — toggling unique-only doesn't return the
+        previous min-length-6 result."""
+        seq = "ATGCATGCATGC" * 200
+        unique = sc._scan_restriction_sites(seq, 6, True,  True)
+        all_   = sc._scan_restriction_sites(seq, 6, False, True)
+        # Identity differs — separate cache entries.
+        assert unique is not all_
+
+    def test_restriction_scan_cache_evicts_at_cap(self):
+        """LRU cap holds at `_RESTR_SCAN_CACHE_MAX` entries."""
+        sc._RESTR_SCAN_CACHE.clear()
+        # Build > cap distinct (id-keyed) sequences, scan each.
+        seqs = [f"ATGC{i:04d}" * 50 for i in range(sc._RESTR_SCAN_CACHE_MAX + 2)]
+        for s in seqs:
+            sc._scan_restriction_sites(s, 6, True, True)
+        assert len(sc._RESTR_SCAN_CACHE) <= sc._RESTR_SCAN_CACHE_MAX
+
+    async def test_feats_by_start_index_built(self, isolated_library):
+        """`PlasmidMap._feats_by_start` indexes features in start-sorted
+        order — used by the linear renderer's bisect-based visible-
+        range filter."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="X", name="X",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(800, 900, strand=1), type="CDS",
+                        qualifiers={"label": ["c"]}),
+            SeqFeature(FeatureLocation(100, 200, strand=1), type="CDS",
+                        qualifiers={"label": ["a"]}),
+            SeqFeature(FeatureLocation(400, 500, strand=1), type="CDS",
+                        qualifiers={"label": ["b"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            idx = pm._feats_by_start
+            assert len(idx) == 3
+            starts = [pm._feats[i]["start"] for i in idx]
+            assert starts == sorted(starts)
+
+    def test_build_seq_text_viewport_y_range_skips_chunks(self):
+        """Lazy chunk rendering — when `viewport_y_range` excludes
+        most chunks, the function emits blank-line placeholders and
+        returns much faster than the full-render path on a long
+        sequence."""
+        import time
+        seq = "ATGC" * 25_000   # 100 kb
+        t0 = time.perf_counter()
+        full = sc._build_seq_text(seq, [], line_width=120)
+        t_full = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        lazy = sc._build_seq_text(seq, [], line_width=120,
+                                    viewport_y_range=(0, 30))
+        t_lazy = time.perf_counter() - t0
+        # The lazy variant must produce a Text whose total newline
+        # count matches the full variant — placeholder lines preserve
+        # height for accurate scrollbar positioning.
+        assert full.plain.count("\n") == lazy.plain.count("\n")
+        # Speed: lazy at minimum 2x faster on a 100 kb sequence; in
+        # practice 10x+. Loose budget so a slow CI box doesn't fail.
+        assert t_lazy < t_full / 1.5, (
+            f"expected lazy < full/1.5; got full={t_full*1000:.1f}ms "
+            f"lazy={t_lazy*1000:.1f}ms"
+        )
+
+    async def test_linear_zoom_in_out_changes_view_range(
+        self, isolated_library
+    ):
+        """Zoom in shrinks the visible bp range; zoom out expands it.
+        Reset (`0`) returns to whole-record view."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 10_000), id="Z", name="Z",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            # Initial: full view
+            view_s, view_e = pm._linear_view_range()
+            assert (view_s, view_e) == (0, 10_000)
+            # Zoom in once → ~6,667 bp visible (10000/1.5)
+            pm.action_linear_zoom_in()
+            view_s2, view_e2 = pm._linear_view_range()
+            assert (view_e2 - view_s2) < 8_000
+            # Reset → whole record
+            pm.action_linear_reset_zoom()
+            assert pm._linear_view_range() == (0, 10_000)
+
+    async def test_linear_pan_clamped_to_record_bounds(
+        self, isolated_library
+    ):
+        """Pan can't scroll past either end of the record."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 10_000), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            # Zoom in so a window-fits-portion is visible
+            for _ in range(4):
+                pm.action_linear_zoom_in()
+            visible_before = pm._linear_view_range()
+            visible_w = visible_before[1] - visible_before[0]
+            # Pan left from origin → still anchored at 0
+            for _ in range(20):
+                pm._linear_pan(-1)
+            assert pm._linear_view_range()[0] == 0
+            # Pan all the way right → end snaps to total
+            for _ in range(50):
+                pm._linear_pan(+1)
+            view_s, view_e = pm._linear_view_range()
+            assert view_e == 10_000
+            assert view_s == 10_000 - visible_w
+
+    async def test_linear_auto_fog_zooms_in_for_large_records(
+        self, isolated_library
+    ):
+        """Records longer than `_LINEAR_LARGE_BP` open with the
+        viewport zoomed in to ~50 kb visible (auto-fog), so the user
+        sees a readable slice instead of an unreadable strip."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 500_000), id="LRG", name="LRG",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            view_s, view_e = pm._linear_view_range()
+            visible = view_e - view_s
+            # Visible window should be ~50 kb (target), well below
+            # the 500 kb total. Allow slack for ratio rounding.
+            assert visible < 100_000, (
+                f"large-record auto-fog should zoom in to <100 kb; "
+                f"got {visible:,} bp"
+            )
+
+    async def test_linear_zoom_does_not_apply_in_circular_mode(
+        self, isolated_library
+    ):
+        """`+`/`-` are no-ops when the map is in circular mode so they
+        don't surprise users by silently changing zoom on a view that
+        doesn't show it."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 1000), id="C", name="C",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm._map_mode == "circular"
+            zoom_before = pm._linear_zoom
+            pm.action_linear_zoom_in()
+            assert pm._linear_zoom == zoom_before
+
+    async def test_load_record_circular_record_uses_circular_view(
+        self, isolated_library
+    ):
+        """Loading a circular plasmid sets the map to circular even
+        if the user had toggled to linear in the previous session.
+        Linear is a session-local view choice; the record's
+        `topology` annotation is the authoritative per-load default.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec_a = SeqRecord(Seq("A" * 500), id="A", name="A",
+                          annotations={"molecule_type": "DNA",
+                                         "topology": "circular"})
+        rec_b = SeqRecord(Seq("C" * 500), id="B", name="B",
+                          annotations={"molecule_type": "DNA",
+                                         "topology": "circular"})
+        app = _build_app(rec_a, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # Toggle to linear mid-session
+            pm._map_mode = "linear"
+            assert pm._map_mode == "linear"
+            # Load a circular record → snaps back to circular
+            pm.load_record(rec_b)
+            assert pm._map_mode == "circular"
+
+    async def test_load_record_linear_topology_uses_linear_view(
+        self, isolated_library
+    ):
+        """Linear plasmids (PCR products, sequencing fragments, etc.)
+        carry `topology=linear` in GenBank and must open in the
+        linear view. Forcing them into circular would distort the
+        biology — the ends of a true linear record are not adjacent."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        circ = SeqRecord(Seq("A" * 200), id="C", name="C",
+                         annotations={"molecule_type": "DNA",
+                                        "topology": "circular"})
+        lin  = SeqRecord(Seq("C" * 200), id="L", name="L",
+                         annotations={"molecule_type": "DNA",
+                                        "topology": "linear"})
+        app = _build_app(circ, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # Starts circular (the preloaded record is circular)
+            assert pm._map_mode == "circular"
+            # Loading a linear record → linear view
+            pm.load_record(lin)
+            assert pm._map_mode == "linear", (
+                "linear topology must default to linear view"
+            )
+            # Loading a circular record AFTER linear → back to circular
+            pm.load_record(circ)
+            assert pm._map_mode == "circular"
+
+    async def test_load_record_missing_topology_defaults_circular(
+        self, isolated_library
+    ):
+        """A record with no topology annotation (rare; mostly via
+        ad-hoc construction) falls back to circular — matches the
+        common case for this app."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="R", name="R",
+                        annotations={"molecule_type": "DNA"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm._map_mode == "circular"
+
+    async def test_map_mode_not_persisted_across_sessions(self,
+                                                            isolated_library):
+        """Even if `map_mode` is set to 'linear' in settings.json
+        (e.g. from a hand-edit or older app version), the next session
+        starts in circular — map_mode is intentionally not hydrated."""
+        sc._set_setting("map_mode", "linear")
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="X", name="X",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm._map_mode == "circular"
+
     async def test_linear_view_uses_double_row_arrows(self,
                                                           isolated_library):
         """Regression: linear plasmid view paints features as 2-row
@@ -3004,6 +3286,54 @@ class TestShiftClickFeatureExtend:
         # The zip's *file* size on disk will exceed 100 bytes.
         with pytest.raises(ValueError, match="too large"):
             sc._list_gbk_members_in_zip(zp)
+
+    def test_bulk_import_folder_progress_cb(self, tmp_path):
+        """Per-file progress callback fires for every importable file
+        in order, with 1-based indices and stable totals."""
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGC" * 30), id="r", name="r",
+                        annotations={"molecule_type": "DNA"})
+        # Three good files + one corrupt file.
+        for i, name in enumerate(["a.gb", "b.gb", "c.gb"]):
+            SeqIO.write(rec, tmp_path / name, "genbank")
+        (tmp_path / "broken.dna").write_bytes(b"not a commercialsaas")
+        ticks = []
+        def cb(idx, total, fname, ok):
+            ticks.append((idx, total, fname, ok))
+        entries, failures = sc._bulk_import_folder(
+            tmp_path, progress_cb=cb,
+        )
+        assert len(ticks) == 4, f"expected 4 ticks, got {ticks}"
+        # Indices 1..4 in order
+        assert [t[0] for t in ticks] == [1, 2, 3, 4]
+        # Total stays at 4 throughout
+        assert all(t[1] == 4 for t in ticks)
+        # Three OKs + one fail (broken.dna)
+        oks = [t for t in ticks if t[3]]
+        fails = [t for t in ticks if not t[3]]
+        assert len(oks) == 3
+        assert len(fails) == 1
+        assert fails[0][2] == "broken.dna"
+
+    def test_bulk_import_folder_progress_cb_failure_does_not_crash(
+        self, tmp_path
+    ):
+        """Exceptions inside the progress callback are caught and
+        logged — they must not abort the import."""
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGC" * 30), id="r", name="r",
+                        annotations={"molecule_type": "DNA"})
+        for name in ["a.gb", "b.gb"]:
+            SeqIO.write(rec, tmp_path / name, "genbank")
+        def boom(*_):
+            raise RuntimeError("test")
+        # Must NOT raise — progress_cb errors are caught and logged.
+        entries, _ = sc._bulk_import_folder(tmp_path, progress_cb=boom)
+        assert len(entries) == 2
 
     def test_extract_gbk_member_round_trip(self, tmp_path):
         import zipfile

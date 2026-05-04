@@ -178,6 +178,9 @@ _MODAL_CASES = [
     ("NewPlasmidModal",              lambda: sc.NewPlasmidModal()),
     ("BlastModal",                   lambda: sc.BlastModal()),
     ("PlasmidsaurusAlignModal",      lambda: sc.PlasmidsaurusAlignModal()),
+    ("LargeFileConfirmModal",        lambda: sc.LargeFileConfirmModal(
+                                                "/some/big.gb", "12.3 MB",
+                                                threshold_text="cap = 5 MB")),
 ]
 
 

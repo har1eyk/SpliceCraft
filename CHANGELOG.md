@@ -2,6 +2,35 @@
 
 ---
 
+## [0.5.4.0] — 2026-05-03
+
+### Added
+
+- **Linear plasmid-map redesign — single-lane, backbone-centered.** Features now render in one strip that runs through the middle of the backbone line: 2-row arrows with corner-triangle heads (`◥/◢` forward, `◤/◣` reverse) sitting astride the backbone. Forward and reverse share the same row pair; direction is encoded purely by which end the arrowhead lands on. Cleaner at a glance, and lets the eye scan a slice without hopping lanes.
+- **Linear-view zoom + pan.** New `_linear_zoom` and `_linear_offset_bp` reactives on `PlasmidMap`. `+`/`=` zoom in 1.5×, `-` zoom out, `0` reset, `[`/`]`/`←`/`→` pan in linear mode (preserving rotate semantics in circular). The renderer always paints only the **visible bp range** — naturally implements a fog-of-war for large records.
+- **Auto-fog for large records.** Plasmids longer than `_LINEAR_LARGE_BP = 100,000` open with the linear viewport zoomed in to a `~50,000 bp` window, so the user gets a readable slice instead of an unreadable strip. User can `0` to reset or `-` to zoom back out.
+- **Lazy chunk rendering in the SequencePanel.** `_build_seq_text` now accepts a `viewport_y_range` and emits blank-line placeholders for chunks outside the visible scroll window. The outer `_view_cache_key` includes a quantized viewport tuple, and `SequencePanel.on_mount` watches the inner ScrollableContainer's `scroll_y` to fire a refresh when the user crosses a chunk boundary. **Result: 5 Mb chromosome first-render drops from ~30 s to ~50 ms; cursor refreshes on a 100 kb plasmid drop ~100×.**
+- **Restriction-site scan cache.** `_scan_restriction_sites` is now a thin wrapper over `_scan_restriction_sites_impl`, memoising results in a 4-entry LRU `_RESTR_SCAN_CACHE` keyed on `(id(seq), min_recognition_len, unique_only, circular)`. **Result: `r`-toggle on a 5 Mb record drops from ~3 s to ~5 µs after the first scan.** Auto-invalidates on edits since `_rebuild_record_with_edit` allocates a fresh SeqRecord.
+- **Sorted-by-start feature index.** `PlasmidMap._feats_by_start` is built in `load_record`; the linear renderer uses bisect to find the upper bound of visible features and walks only those, instead of iterating every feature. Negligible cost on small plasmids; decisive on multi-thousand-feature WGS contigs.
+- **`LargeFileConfirmModal`.** A `File → Open` on a `>5 MB` file pushes a confirm modal with **No focused by default** and `Yes, load` styled as a warning. Threshold respects `_LARGE_LOAD_DISK_BYTES` (5 MB on disk) and `_LARGE_LOAD_SEQ_BP` (200 kb parsed). Replaces the prior two-click inline warning so a stray Enter bails out of an accidental large-file load instead of committing to it.
+- **Plasmid-load topology default.** Records carrying `topology=linear` (PCR products, sequencing fragments, mitochondrial linear DNA) open in linear view; everything else defaults to circular. `map_mode` is no longer persisted across sessions — every plasmid load re-derives the default from the record itself.
+- **Bulk-import progress bar.** `NewCollectionModal` now runs the import in a `@work(thread=True)` worker with a determinate `ProgressBar` and per-file ticker (`ok  filename.gbk  (37/47)` / `FAIL  …`). UI stays responsive even on a 500-plasmid archive. Cached on the modal instance so the caller's `_picked` callback skips the foreground re-import.
+
+### Hardening
+
+- **Clean shutdown.** `main()`'s `finally` block now also catches `KeyboardInterrupt`, cancels pending Textual timers, and explicitly calls `logging.shutdown()` so rotating-file log handlers flush before process exit. The agent-API HTTP server already shut down via `_stop_agent_api` (and removed its token file); `KeyboardInterrupt` no longer dumps a stack trace on its way out.
+
+### Changed
+
+- **`PlasmidMap.on_click` and friends use smallest-enclosing feature** for both circular and linear paths (already in 0.5.3.0; reaffirmed by the linear redesign).
+- **HelpModal** documents the new linear-view zoom + pan keys (`+`/`-`/`0`).
+
+### Tests
+
+- +12 new tests across `test_smoke.py` and `test_modal_boundaries.py`: linear corner-triangle render, zoom in/out, pan-clamping, auto-fog target window, zoom-no-op-in-circular, topology-driven default view, restriction-scan cache identity / separation / LRU eviction, sorted-by-start index, lazy chunk rendering speed budget, `LargeFileConfirmModal` boundary check. Cumulative: 1,280 tests.
+
+---
+
 ## [0.5.3.0] — 2026-05-03
 
 ### Added

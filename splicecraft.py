@@ -30,6 +30,7 @@ import re
 import shutil
 import sys
 import uuid as _uuid
+from collections import OrderedDict as _OD
 from datetime import date as _date
 from io import StringIO
 from logging.handlers import RotatingFileHandler
@@ -301,8 +302,8 @@ from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import (
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
-    ListItem, ListView, Markdown, RadioButton, RadioSet, Select, Static,
-    TextArea,
+    ListItem, ListView, Markdown, ProgressBar, RadioButton, RadioSet, Select,
+    Static, TextArea,
 )
 from rich.text import Text
 
@@ -1043,7 +1044,49 @@ def _rebuild_scan_catalog() -> None:
 _rebuild_scan_catalog()
 
 
+# Per-record restriction-scan cache. Keyed by `(id(seq), min_len,
+# unique_only, circular)` so the same record + filter combo doesn't
+# re-scan on every panel refresh. Capped at 4 entries (matches the
+# `_BUILD_SEQ_CACHE` policy) — we only need recent active records,
+# not historical ones. Auto-invalidated by sequence edits because
+# `_rebuild_record_with_edit` returns a fresh SeqRecord, hence a new
+# `id(seq)`.
+_RESTR_SCAN_CACHE: "OrderedDict[tuple, list]" = _OD()
+_RESTR_SCAN_CACHE_MAX = 4
+
+
 def _scan_restriction_sites(
+    seq: str,
+    min_recognition_len: int = 6,
+    unique_only: bool = True,
+    circular: bool = True,
+) -> list[dict]:
+    """Cached entry point for restriction-site scans. Identical
+    signature + return shape to the inner `_scan_restriction_sites_impl`;
+    consults `_RESTR_SCAN_CACHE` first so a `r`-toggle on a 5 Mb record
+    drops from ~3 s to ~5 ms after the first scan."""
+    # Cache key uses `id(seq)` since the same SeqRecord's seq is
+    # immutable and string identity is the cheapest stable handle. On
+    # an edit, `_rebuild_record_with_edit` allocates a new SeqRecord
+    # so the id changes and the cache misses cleanly.
+    key = (id(seq), int(min_recognition_len),
+           bool(unique_only), bool(circular))
+    hit = _RESTR_SCAN_CACHE.get(key)
+    if hit is not None:
+        # Move to end (LRU touch) so a steady-state "I'm scanning the
+        # same record" stays hot.
+        _RESTR_SCAN_CACHE.move_to_end(key)
+        return hit
+    result = _scan_restriction_sites_impl(
+        seq, min_recognition_len, unique_only, circular,
+    )
+    if len(_RESTR_SCAN_CACHE) >= _RESTR_SCAN_CACHE_MAX:
+        _RESTR_SCAN_CACHE.popitem(last=False)
+    _RESTR_SCAN_CACHE[key] = result
+    return result
+
+
+def _scan_restriction_sites_impl(
     seq: str,
     min_recognition_len: int = 6,
     unique_only: bool = True,
@@ -1778,7 +1821,8 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                     cursor_pos: int = -1,
                     show_connectors: bool = False,
                     re_highlight: "dict | None" = None,
-                    aa_highlight: "dict | None" = None) -> Text:
+                    aa_highlight: "dict | None" = None,
+                    viewport_y_range: "tuple[int,int] | None" = None) -> Text:
     """Rich Text of the sequence with per-position feature coloring.
 
     sel_range    — feature highlight: bold + underline on feature bases
@@ -1787,6 +1831,18 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     re_highlight — dict with keys: start, end, top_cut_bp, bottom_cut_bp, color, name
                    When set, highlights the recognition bases on both strands
                    and marks cut positions with reverse-video.
+    viewport_y_range — optional `(min_row, max_row)` half-open row range
+                   currently visible in the seq panel's scroll viewport.
+                   When supplied, chunks whose row range falls entirely
+                   outside this window emit blank-line placeholders
+                   instead of rendering. The total content height
+                   stays correct so scrolling shows the right
+                   coordinates; chunks fill in as they come into view
+                   (caller is expected to refresh on scroll). The
+                   per-chunk static / overlay caches survive across
+                   refreshes so a scroll back-and-forth doesn't pay
+                   the render cost twice. None = render everything
+                   (the historical behaviour).
 
     Rendering order (closest to DNA first):
       RE sites (far) → regular feature bars (close) → DNA → regular (close) → RE (far)
@@ -1839,6 +1895,9 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     # 200 kb plasmid that's ~1500 chunks × N features → milliseconds saved
     # per keystroke when scrolling through cosmid/BAC-scale records.
     chunks_layout, _pf_dna2, _pf_lanes = _chunk_layout(seq, feats, line_width)
+    # `_pf_dna2` is used below by the lazy-render viewport filter to
+    # decide which chunks to skip. `_pf_lanes` stays unused until /
+    # unless connectors come back.
 
     # Two-tier per-chunk render cache:
     #   STATIC (no overlay)   — keyed only on (seq, feats, line_width,
@@ -1889,8 +1948,29 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         if len(_CHUNK_OVERLAY_CACHE) > 16:
             _CHUNK_OVERLAY_CACHE.pop(next(iter(_CHUNK_OVERLAY_CACHE)))
 
+    # Lazy-render filter: when `viewport_y_range` is supplied, chunks
+    # whose row range falls entirely outside the visible window emit
+    # a blank-line placeholder instead of rendering. The placeholder
+    # preserves the total content height so the scrollbar coordinates
+    # stay correct; the chunk fills in via the cache when it scrolls
+    # back into view. `_pf_dna2[i]` is the row at the start of chunk
+    # i; chunk i occupies rows `[_pf_dna2[i], _pf_dna2[i+1])`.
+    vp_min, vp_max = (viewport_y_range
+                       if viewport_y_range is not None
+                       else (None, None))
     for i, (chunk_start, chunk_end, groups, _ab_pairs, _be_pairs,
             *_extra) in enumerate(chunks_layout):
+        if vp_min is not None and vp_max is not None:
+            row_lo = _pf_dna2[i]
+            row_hi = _pf_dna2[i + 1] if i + 1 < len(_pf_dna2) else row_lo
+            if row_hi <= vp_min or row_lo >= vp_max:
+                # Outside viewport — emit blanks of the same height
+                # so the total content row count matches what the
+                # scrollbar expects. Don't touch the static / overlay
+                # caches; they survive as is.
+                if row_hi > row_lo:
+                    result.append("\n" * (row_hi - row_lo))
+                continue
         chunk_has_cursor = (chunk_start <= cursor_pos < chunk_end)
         chunk_has_overlay = (
             (usr_s < chunk_end and usr_e > chunk_start)
@@ -2512,13 +2592,23 @@ def _record_to_library_entry(record, source_path: Path) -> dict:
     }
 
 
-def _bulk_import_folder(folder: Path) -> "tuple[list[dict], list[tuple[Path, str]]]":
+def _bulk_import_folder(
+    folder: Path,
+    *,
+    progress_cb: "callable | None" = None,
+) -> "tuple[list[dict], list[tuple[Path, str]]]":
     """Walk `folder` for .dna / .gb / .gbk / .genbank files and load each.
 
     Returns (entries, failures). Each file is loaded independently —
     a single corrupt file doesn't abort the batch. Entries are deduped
     by id within the batch; collisions get a `_2`, `_3`, ... suffix.
     Failures carry (path, reason) so the caller can surface them.
+
+    ``progress_cb``, if supplied, is called once per file as
+    ``progress_cb(i, total, filename, ok)`` where ``i`` is 1-based.
+    The callback runs in this function's thread (the worker thread,
+    not the UI thread) — Textual UI updates from inside it must
+    route through ``app.call_from_thread``.
 
     Defensive against:
       - Folders that can't be read (PermissionError / FileNotFoundError /
@@ -2543,6 +2633,11 @@ def _bulk_import_folder(folder: Path) -> "tuple[list[dict], list[tuple[Path, str
         _log.warning("bulk_import: cannot read folder %s: %s", folder, exc)
         return [], [(folder, f"could not read folder: {exc}")]
 
+    # Pre-filter to importable files so `progress_cb` gets a stable
+    # total and can drive a determinate progress bar. Per-file stat
+    # failures (broken symlinks, special files) still become per-file
+    # failures but don't pollute the progress denominator.
+    importable: list[Path] = []
     for path in children:
         try:
             if not path.is_file():
@@ -2552,34 +2647,51 @@ def _bulk_import_folder(folder: Path) -> "tuple[list[dict], list[tuple[Path, str
             continue
         if path.suffix.lower() not in _BULK_IMPORT_EXTS:
             continue
+        importable.append(path)
+    total = len(importable)
+
+    for i, path in enumerate(importable, start=1):
+        ok = False
         try:
-            size = path.stat().st_size
-        except OSError as exc:
-            failures.append((path, f"stat failed: {exc}"))
-            continue
-        if size > _BULK_IMPORT_MAX_BYTES:
-            failures.append((
-                path,
-                f"file too large ({size:,} bytes; cap "
-                f"{_BULK_IMPORT_MAX_BYTES:,}). Skipping to avoid OOM.",
-            ))
-            continue
-        try:
-            rec = load_genbank(str(path))
-            if len(rec.seq) == 0:
-                failures.append((path, "empty sequence (no bases)"))
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                failures.append((path, f"stat failed: {exc}"))
                 continue
-            entry = _record_to_library_entry(rec, path)
-            base_id = entry["id"]
-            n = 1
-            while entry["id"] in seen_ids:
-                n += 1
-                entry["id"] = f"{base_id}_{n}"
-            seen_ids.add(entry["id"])
-            entries.append(entry)
-        except Exception as exc:
-            _log.exception("bulk_import: failed to load %s", path)
-            failures.append((path, str(exc)))
+            if size > _BULK_IMPORT_MAX_BYTES:
+                failures.append((
+                    path,
+                    f"file too large ({size:,} bytes; cap "
+                    f"{_BULK_IMPORT_MAX_BYTES:,}). Skipping to avoid OOM.",
+                ))
+                continue
+            try:
+                rec = load_genbank(str(path))
+                if len(rec.seq) == 0:
+                    failures.append((path, "empty sequence (no bases)"))
+                    continue
+                entry = _record_to_library_entry(rec, path)
+                base_id = entry["id"]
+                n = 1
+                while entry["id"] in seen_ids:
+                    n += 1
+                    entry["id"] = f"{base_id}_{n}"
+                seen_ids.add(entry["id"])
+                entries.append(entry)
+                ok = True
+            except Exception as exc:
+                _log.exception("bulk_import: failed to load %s", path)
+                failures.append((path, str(exc)))
+        finally:
+            # Tick the progress callback for every importable file
+            # — success OR failure. The bar should advance whether
+            # or not the load succeeded; the failures list carries
+            # the detail for the post-import summary.
+            if progress_cb is not None:
+                try:
+                    progress_cb(i, total, path.name, ok)
+                except Exception:
+                    _log.exception("bulk_import: progress_cb raised")
     return entries, failures
 
 
@@ -3160,12 +3272,27 @@ class PlasmidMap(Widget):
         Binding("comma",       "aspect_dec",       "Circle wider",   show=False),
         Binding("full_stop",   "aspect_inc",       "Circle taller",  show=False),
         Binding("v",           "toggle_map_view",  "Toggle view",    show=False),
+        # Linear-view zoom + pan (no-ops in circular mode). The action
+        # methods early-return when `_map_mode != "linear"` so binding
+        # collisions on `+` / `-` / `0` don't surprise circular-view
+        # users. `0` resets the zoom + pan to "show whole record".
+        Binding("plus",        "linear_zoom_in",   "Zoom in",        show=False),
+        Binding("equals_sign", "linear_zoom_in",   "Zoom in",        show=False),
+        Binding("minus",       "linear_zoom_out",  "Zoom out",       show=False),
+        Binding("0",           "linear_reset_zoom", "Reset zoom",    show=False),
     ]
 
     origin_bp:    reactive[int]   = reactive(0)
     selected_idx: reactive[int]   = reactive(-1)
     _aspect:      reactive[float] = reactive(2.0)
     _map_mode:    reactive[str]   = reactive("circular")
+    # Linear-view zoom + horizontal pan. Zoom 1.0 = the whole record
+    # fits in the visible width. Higher zoom = smaller bp range
+    # visible. `_linear_offset_bp` is the bp at the LEFT edge of the
+    # view; clamped to `[0, total - visible_bp]` in `_linear_view_range`
+    # so pan can't scroll past either end.
+    _linear_zoom:      reactive[float] = reactive(1.0)
+    _linear_offset_bp: reactive[int]   = reactive(0)
 
     # ── Messages ───────────────────────────────────────────────────────────────
 
@@ -3204,7 +3331,44 @@ class PlasmidMap(Widget):
         self.origin_bp    = 0
         self.selected_idx = -1
         self._feats       = self._parse(record)
+        # Sorted-by-start index: lets `_draw_linear` skip features
+        # outside the visible bp window in O(log n + visible_count)
+        # via bisect, instead of iterating every feature on every
+        # zoom / pan / refresh. Negligible cost on small plasmids
+        # (~50 features); decisive on multi-thousand-feature WGS
+        # contigs where the linear panner used to chug.
+        self._feats_by_start = sorted(
+            range(len(self._feats)),
+            key=lambda i: self._feats[i]["start"],
+        )
         self._restr_feats = []
+        # Default the map view to match the record's topology. The
+        # GenBank `topology` annotation is the authoritative answer
+        # — circular plasmids open in circular, true linear records
+        # (PCR products, sequencing fragments, mitochondrial linear
+        # DNA, partial maps) open in linear. Missing / unknown values
+        # fall back to circular since that's the common case for
+        # this app's primary user. Within a session the user can
+        # always toggle with `v`; this just sets the per-load default.
+        topology = ""
+        try:
+            topology = (record.annotations or {}).get("topology", "") or ""
+        except Exception:
+            pass
+        self._map_mode = "linear" if str(topology).lower() == "linear" else "circular"
+        # Auto-fog: very long records open zoomed in so labels / arrows
+        # remain readable. Below the threshold, default to whole-record
+        # view (zoom=1.0). User can `0` to reset or `-` to zoom out.
+        self._linear_offset_bp = 0
+        if self._total > self._LINEAR_LARGE_BP:
+            target_visible = self._LINEAR_LARGE_TARGET_BP
+            self._linear_zoom = max(
+                self._LINEAR_MIN_ZOOM,
+                min(self._LINEAR_MAX_ZOOM,
+                     self._total / max(1, target_visible)),
+            )
+        else:
+            self._linear_zoom = 1.0
         # Click-target bboxes for feature labels — rebuilt every
         # `_draw` / `_draw_linear` call. Each entry is
         # `(x0, x1, y, feat_idx)`. `_feat_at` / `_feat_at_linear`
@@ -3365,23 +3529,121 @@ class PlasmidMap(Widget):
         return max(1, self._total // (10 if coarse else 200))
 
     def action_rotate_cw(self):
-        if self._total:
-            self.origin_bp = (self.origin_bp - self._step()) % self._total
+        if not self._total:
+            return
+        if self._map_mode == "linear":
+            self._linear_pan(+1)
+            return
+        self.origin_bp = (self.origin_bp - self._step()) % self._total
 
     def action_rotate_ccw(self):
-        if self._total:
-            self.origin_bp = (self.origin_bp + self._step()) % self._total
+        if not self._total:
+            return
+        if self._map_mode == "linear":
+            self._linear_pan(-1)
+            return
+        self.origin_bp = (self.origin_bp + self._step()) % self._total
 
     def action_rotate_cw_lg(self):
-        if self._total:
-            self.origin_bp = (self.origin_bp - self._step(True)) % self._total
+        if not self._total:
+            return
+        if self._map_mode == "linear":
+            self._linear_pan(+10)
+            return
+        self.origin_bp = (self.origin_bp - self._step(True)) % self._total
 
     def action_rotate_ccw_lg(self):
-        if self._total:
-            self.origin_bp = (self.origin_bp + self._step(True)) % self._total
+        if not self._total:
+            return
+        if self._map_mode == "linear":
+            self._linear_pan(-10)
+            return
+        self.origin_bp = (self.origin_bp + self._step(True)) % self._total
 
     def action_reset_origin(self):
+        if self._map_mode == "linear":
+            self.action_linear_reset_zoom()
+            return
         self.origin_bp = 0
+
+    # ── Linear-view zoom + pan ─────────────────────────────────────────────
+    # Zoom factor 1.0 = the whole record fits in the visible width.
+    # Each `+`/`=` press multiplies the zoom by 1.5; `-` divides.
+    # Capped at `_LINEAR_MAX_ZOOM` so the user can't end up with <2 bp
+    # visible (the renderer becomes meaningless below that).
+    _LINEAR_ZOOM_STEP = 1.5
+    _LINEAR_MAX_ZOOM  = 1_000_000.0   # ~1 bp/col on a 1 Mbp record
+    _LINEAR_MIN_ZOOM  = 1.0           # full record
+    # Records longer than this auto-zoom on load so the user gets a
+    # readable slice (~50 kb visible) rather than an unreadable
+    # everything-at-once strip.
+    _LINEAR_LARGE_BP        = 100_000
+    _LINEAR_LARGE_TARGET_BP = 50_000
+
+    def action_linear_zoom_in(self) -> None:
+        if self._map_mode != "linear" or not self._total:
+            return
+        new = min(self._LINEAR_MAX_ZOOM,
+                   self._linear_zoom * self._LINEAR_ZOOM_STEP)
+        self._set_linear_zoom(new, anchor_center=True)
+
+    def action_linear_zoom_out(self) -> None:
+        if self._map_mode != "linear" or not self._total:
+            return
+        new = max(self._LINEAR_MIN_ZOOM,
+                   self._linear_zoom / self._LINEAR_ZOOM_STEP)
+        self._set_linear_zoom(new, anchor_center=True)
+
+    def action_linear_reset_zoom(self) -> None:
+        if not self._total:
+            return
+        self._linear_zoom      = 1.0
+        self._linear_offset_bp = 0
+
+    def _set_linear_zoom(self, zoom: float,
+                          *, anchor_center: bool = False) -> None:
+        """Apply a new zoom level. With `anchor_center=True`, the
+        viewport's CENTER bp stays put — feels like the user zoomed
+        toward the middle of what they were looking at, rather than
+        snapping back to the origin."""
+        if not self._total:
+            return
+        zoom = max(self._LINEAR_MIN_ZOOM,
+                    min(self._LINEAR_MAX_ZOOM, zoom))
+        # Compute the current center, then re-center after zoom.
+        view_s, view_e = self._linear_view_range()
+        center_bp = (view_s + view_e) // 2 if anchor_center else view_s
+        self._linear_zoom = zoom
+        # Recompute offset around the same center bp.
+        new_visible = max(1, int(self._total / zoom))
+        new_offset  = max(0, min(self._total - new_visible,
+                                    center_bp - new_visible // 2))
+        self._linear_offset_bp = new_offset
+
+    def _linear_pan(self, direction: int) -> None:
+        """Pan the linear viewport. `direction` is in units of
+        ``visible_bp / 8`` so `[`/`]` step a sane amount at any zoom
+        level. Clamped to record bounds."""
+        if not self._total:
+            return
+        view_s, view_e = self._linear_view_range()
+        visible = max(1, view_e - view_s)
+        step    = max(1, visible // 8)
+        new_off = max(0, min(self._total - visible,
+                                self._linear_offset_bp + direction * step))
+        self._linear_offset_bp = new_off
+
+    def _linear_view_range(self) -> "tuple[int, int]":
+        """Return ``(view_start_bp, view_end_bp)`` — the half-open
+        bp range currently visible. Always within `[0, total]`. Empty
+        record returns ``(0, 0)``."""
+        if not self._total:
+            return (0, 0)
+        zoom    = max(self._LINEAR_MIN_ZOOM, float(self._linear_zoom or 1.0))
+        visible = max(1, int(self._total / zoom))
+        offset  = max(0, min(self._total - visible,
+                                int(self._linear_offset_bp)))
+        return (offset, offset + visible)
 
     def action_aspect_inc(self):
         self._aspect = round(min(5.0, self._aspect + 0.05), 3)
@@ -3832,18 +4094,21 @@ class PlasmidMap(Widget):
 
     def _feat_at_linear(self, x: int, y: int) -> tuple[int, int]:
         """Return (feature_idx, click_bp) at terminal cell (x, y) in
-        the cell-based linear view.
+        the single-lane linear view.
 
         Click resolution:
-          1. Label bbox match (populated by `_draw_linear`).
-          2. Lane match: the click row maps to a forward / reverse
-             lane, and the click column resolves to a bp within the
-             feature's cell range.
+          1. Label bbox match (populated by `_draw_linear`). Forward
+             labels float ABOVE the bar, reverse labels BELOW —
+             those rows are reserved for labels and route to the
+             feature directly.
+          2. Bar-row match: rows backbone_row±1 are the feature top
+             and bottom halves. A click in either row resolves to a
+             bp via the current zoom + offset; smallest-enclosing
+             feature at that bp wins. Both strands share the same
+             rows in the new layout, so we DON'T strand-gate by row.
 
-        Smallest-enclosing wins on nested features so a click on an
-        inner annotation routes to the inner feature (mirrors the
-        circular path). Strand-gated: clicks above the backbone only
-        match forward features, below only reverse.
+        Coordinates respect the current zoom: only bp inside the
+        visible window are clickable.
         """
         if not self._total:
             return -1, -1
@@ -3861,23 +4126,23 @@ class PlasmidMap(Widget):
         backbone_row = max(4, h // 2)
         if x < margin_l or x >= w - margin_r or usable_w <= 0:
             return -1, -1
-        bp = int((x - margin_l) / usable_w * self._total)
-        above = y < backbone_row
-        below = y > backbone_row
-        # Smallest-enclosing wins on nested features (mirrors `_feat_at`
-        # in the circular path). Strand gate stays so a forward-strand
-        # click row never picks a reverse-strand inner feature.
+        # Only the bar rows (backbone±1) and backbone row itself
+        # resolve to a feature. Other rows return no match — labels
+        # are handled above by `_label_at`.
+        if y not in (backbone_row - 1, backbone_row, backbone_row + 1):
+            return -1, -1
+        view_s, view_e = self._linear_view_range()
+        visible_bp     = max(1, view_e - view_s)
+        bp = view_s + int((x - margin_l) / max(1, usable_w) * visible_bp)
+        bp = max(view_s, min(view_e - 1, bp))
+        # Smallest-enclosing wins on nested features (matches the
+        # circular path + sequence-panel fallback). No strand gating
+        # here because the new layout puts both strands on the same
+        # row pair.
         best_idx  = -1
         best_span = float("inf")
         for i, f in enumerate(self._feats):
-            # Use half-open [start, end) to match _bp_in elsewhere. This
-            # also makes zero-width features (s == e) unclickable instead
-            # of matching every column on the backbone.
             if not self._bp_in(bp, f):
-                continue
-            if above and f["strand"] < 0:
-                continue
-            if below and f["strand"] >= 0:
                 continue
             span = _feat_len(f["start"], f["end"], self._total) or 0
             if span < best_span:
@@ -3886,8 +4151,30 @@ class PlasmidMap(Widget):
         return (best_idx, bp) if best_idx >= 0 else (-1, -1)
 
     def _draw_linear(self, w: int, h: int) -> Text:
-        """Render a horizontal linear plasmid map."""
+        """Render a horizontal linear plasmid map.
+
+        Layout (single-lane, backbone-centered):
+
+          row -2: feature label (above bar)
+          row -1: feature TOP half — `█` body, `◤`/`◥` arrowhead
+          row  0: BACKBONE — `─` outside features, untouched inside
+          row +1: feature BOTTOM half — `█` body, `◣`/`◢` arrowhead
+          row +2: bp tick labels
+
+        All features (forward + reverse) share the SAME row pair; the
+        strand is encoded by which end the arrowhead lands on:
+
+          forward:   ████◥        reverse:  ◤████
+                     ████◢                  ◣████
+
+        The backbone runs THROUGH the middle of the feature line art.
+        Renderer respects the current zoom + pan: only the visible bp
+        range `[view_s, view_e)` is painted, so a 5 Mbp chromosome
+        opens zoomed in to a readable ~50 kb window (auto-fog-of-war).
+        """
         canvas = _Canvas(w, h)
+        # Empty braille canvas just so we can use the existing
+        # `combine()` plumbing to convert the cell grid to a Rich Text.
         bc     = _BrailleCanvas(w, h)
         total  = self._total
 
@@ -3903,66 +4190,83 @@ class PlasmidMap(Widget):
         margin_l     = 5
         margin_r     = 2
         usable_w     = w - margin_l - margin_r
-        px_w         = usable_w * 2
-        px_start     = margin_l * 2
         backbone_row = max(4, h // 2)
-        backbone_py  = backbone_row * 4 + 1   # braille pixel row
+        # `_LINEAR_BAR_ROWS` is still 2 — split above and below the
+        # backbone so the backbone runs through the centre.
+        bar_top_row    = backbone_row - 1
+        bar_bottom_row = backbone_row + 1
+        label_row_fwd  = backbone_row - 2
+        label_row_rev  = backbone_row + 2
+        tick_label_row = backbone_row + 3
+        # Visible bp window from zoom + pan.
+        view_s, view_e = self._linear_view_range()
+        if view_e <= view_s:
+            view_e = view_s + 1
+        visible_bp = max(1, view_e - view_s)
 
-        _BIT      = (0, 3, 1, 4, 2, 5, 6, 7)
-        bc_bits   = bc._bits
-        bc_colors = bc._colors
-        bc_prio   = bc._prio
-        bc_cols   = bc.cols
-        bc_rows   = bc.rows
+        def bp_to_col(bp: int) -> int:
+            return margin_l + int(
+                (bp - view_s) / visible_bp * usable_w
+            )
 
-        def bp_to_px(bp: int) -> int:
-            return px_start + int(bp / total * px_w)
-
-        def _set(px: int, py: int, color: str, prio: int) -> None:
-            pcol, prow = px >> 1, py >> 2
-            if 0 <= pcol < bc_cols and 0 <= prow < bc_rows:
-                bc_bits[prow][pcol]   |= 1 << _BIT[(py & 3) << 1 | (px & 1)]
-                if prio >= bc_prio[prow][pcol]:
-                    bc_colors[prow][pcol] = color
-                    bc_prio[prow][pcol]   = prio
-
-        # ── Backbone ──
-        for px in range(px_start, px_start + px_w + 1):
-            _set(px, backbone_py, "color(238)", 1)
+        # ── Backbone (single horizontal line through the middle) ──
+        for cx in range(margin_l, margin_l + usable_w + 1):
+            canvas.put(cx, backbone_row, "─", "color(238)")
 
         # ── Ticks + bp labels ──
-        tick_int  = _nice_tick(total)
-        label_row = backbone_row + 1
-        bp = 0
-        while bp <= total:
-            tx = margin_l + bp * usable_w // total
-            canvas.put(tx, backbone_row, "┼", "color(250)")
-            lbl = _format_bp(bp)
-            if label_row < h:
-                canvas.put_text(tx - len(lbl) // 2, label_row, lbl, "color(245)")
+        tick_int  = max(1, _nice_tick(visible_bp))
+        # Anchor ticks to multiples of tick_int that fall in view.
+        first_tick = (view_s // tick_int) * tick_int
+        if first_tick < view_s:
+            first_tick += tick_int
+        bp = first_tick
+        while bp <= view_e:
+            tx = bp_to_col(bp)
+            if margin_l <= tx <= margin_l + usable_w:
+                canvas.put(tx, backbone_row, "┼", "color(250)")
+                lbl = _format_bp(bp)
+                lx  = tx - len(lbl) // 2
+                if 0 <= tick_label_row < h:
+                    canvas.put_text(lx, tick_label_row, lbl, "color(245)")
             bp += tick_int
-        # Right cap
+        # Left / right caps — always anchored to the viewport edges so
+        # the user sees where the visible window starts and ends.
+        canvas.put(margin_l, backbone_row,
+                    "├" if view_s == 0 else "─",
+                    "color(250)")
         end_tx = min(margin_l + usable_w, w - 1)
-        canvas.put(end_tx, backbone_row, "┤", "color(250)")
+        canvas.put(end_tx, backbone_row,
+                    "┤" if view_e >= total else "─",
+                    "color(250)")
 
-        # ── Restriction site marks (cell-based) ──
-        # Pre-fix this layer drew via the braille canvas at backbone
-        # ±2 braille rows, which collides with lane-0 feature rows in
-        # the redesigned cell-based view. Cell glyphs in the gap row
-        # adjacent to the backbone (row ±1) keep restriction sites
-        # outside any feature lane while staying close enough that
-        # the strand association is obvious. Recut markers come
-        # AFTER the resite bar in the loop so the ↓/↑ glyph
-        # overwrites the bar at its column — preserves the visual
-        # cue for "this is where the cut is" inside the recognition
-        # span.
+        # ── Restriction site marks ──
+        # Drawn at the backbone row itself: resite spans get the
+        # body filled `█` to overlay the backbone (so the user sees
+        # exactly which bp range the recognition site covers); the
+        # recut `┼` overlays the resite at the cut column. Strand
+        # association comes from the resite color (set in
+        # _scan_restriction_sites) — the strand-encoding via
+        # different rows isn't useful in the new single-lane layout,
+        # since features overlap with restriction-site visualisation
+        # whenever they coincide on the backbone.
         for rf in self._restr_feats:
             color = rf["color"]
+            r_start = rf.get("start", 0)
+            r_end   = rf.get("end",   0)
+            # Skip restriction sites entirely outside the visible
+            # window — the auto-fog principle applies here too.
+            if r_end <= view_s or r_start >= view_e:
+                continue
+            r_start = max(view_s, min(view_e, r_start))
+            r_end   = max(view_s, min(view_e, r_end))
             if rf["type"] == "resite":
-                x0 = margin_l + rf["start"] * usable_w // total
-                x1 = margin_l + rf["end"]   * usable_w // total
+                x0 = bp_to_col(r_start)
+                x1 = bp_to_col(r_end)
                 x0 = max(margin_l, min(x0, w - margin_r - 1))
-                x1 = max(margin_l, min(x1, w - margin_r - 1))
+                x1 = max(margin_l, min(x1, w - margin_r))
+                # Mark the resite span on the row JUST ABOVE the
+                # backbone (forward) or BELOW (reverse) — distinct
+                # from feature top/bottom rows so they don't fight.
                 bar_row = (backbone_row - 1
                             if rf["strand"] >= 0
                             else backbone_row + 1)
@@ -3970,89 +4274,74 @@ class PlasmidMap(Widget):
                     for cx in range(x0, x1 + 1):
                         canvas.put(cx, bar_row, "─", color)
             elif rf["type"] == "recut":
-                cut_x = margin_l + rf["start"] * usable_w // total
+                cut_x = bp_to_col(r_start)
                 if margin_l <= cut_x < w - margin_r:
-                    row_above = backbone_row - 1
-                    row_below = backbone_row + 1
                     canvas.put(cut_x, backbone_row, "┼", color)
-                    if 0 <= row_above < h:
-                        canvas.put(cut_x, row_above, "↓" if rf["strand"] >= 0 else " ", color)
-                    if 0 <= row_below < h:
-                        canvas.put(cut_x, row_below, "↑" if rf["strand"] < 0 else " ", color)
 
-        # ── Lane assignment (greedy interval scheduling) ──
-        # Cell-based now: lane "ends" are tracked in terminal columns,
-        # not braille pixels. A feature occupies its bar columns plus
-        # the arrowhead column plus the label width (whichever is
-        # wider) — we use the bar-end column for collision detection
-        # and let the label live above (for forward) / below (for
-        # reverse) the bar where it can extend slightly past without
-        # bumping the next lane.
-        def bp_to_col(bp: int) -> int:
-            return margin_l + bp * usable_w // total
-
-        fwd_ends: list[int] = []   # rightmost terminal col used per fwd lane
-        rev_ends: list[int] = []
-        feat_meta: list[tuple[bool, int]] = []   # (is_fwd, lane_idx)
-
-        for feat in self._feats:
-            is_fwd = feat["strand"] >= 0
-            x0     = bp_to_col(feat["start"])
-            x1     = bp_to_col(feat["end"])
-            # Pad lane width by 1 col so adjacent features don't share
-            # a column, and reserve an extra arrowhead col when the
-            # bar is otherwise zero-width.
-            x1 = max(x1, x0 + 1)
-            ends = fwd_ends if is_fwd else rev_ends
-            lane = len(ends)
-            for li, ex in enumerate(ends):
-                if x0 > ex + 1:
-                    lane = li
-                    ends[li] = x1
-                    break
-            else:
-                ends.append(x1)
-            feat_meta.append((is_fwd, lane))
-
-        # ── Draw features (cell-based, double-row arrows) ──
-        # Layout per lane (top → bottom for forward; mirrored for
-        # reverse): label row, bar-top row, bar-bottom row, gap row.
-        # That's 4 rows per lane (`_LINEAR_LANE_H`). Reverse stack
-        # mirrors below the backbone with the label on the BOTTOM so
-        # text is always on the side of the strand pointing AWAY from
-        # the backbone.
-        bar_rows = self._LINEAR_BAR_ROWS
-        lane_h   = self._LINEAR_LANE_H
-        gap      = self._LINEAR_BACKBONE_GAP
-
-        for i, (feat, (is_fwd, lane)) in enumerate(zip(self._feats, feat_meta)):
-            start_bp = feat["start"]
-            end_bp   = feat["end"]
-            strand   = feat["strand"]
-            color    = feat["color"]
-            label    = feat.get("label", feat.get("type", ""))
-            is_sel   = (i == self.selected_idx)
-            style    = ("reverse " + color) if is_sel else color
-
-            # Handle wrap-around features by emitting two segments.
-            if end_bp > start_bp:
-                segments = [(start_bp, end_bp)]
-            else:
-                segments = [(start_bp, total), (0, end_bp)]
-
-            # Vertical placement. Forward stack grows upward from the
-            # backbone; reverse stack grows downward.
-            if is_fwd:
-                bar_bottom_row = backbone_row - gap - lane * lane_h
-                bar_top_row    = bar_bottom_row - (bar_rows - 1)
-                label_row      = bar_top_row - 1
-            else:
-                bar_top_row    = backbone_row + gap + lane * lane_h
-                bar_bottom_row = bar_top_row + (bar_rows - 1)
-                label_row      = bar_bottom_row + 1
-
-            if bar_top_row < 0 or bar_bottom_row >= h:
+        # ── Single-lane feature draw ──
+        # All features (forward + reverse) render on the same two
+        # rows that straddle the backbone. Strand encoded purely by
+        # arrowhead column:
+        #   forward: arrowhead at the END column → ◥/◢
+        #   reverse: arrowhead at the START column → ◤/◣
+        # Render order: largest first, so smaller annotations land
+        # ON TOP and stay visible inside larger surrounding features.
+        feats_in_view = []
+        # Walk non-wrap features via the sorted-by-start index so we
+        # can stop as soon as `start >= view_e`. For records with
+        # thousands of features (WGS contigs, metagenomic chunks),
+        # this drops the per-frame scan from O(n) to O(log n + visible).
+        # Wrap features (end < start) are rare enough that a separate
+        # linear sweep is fine; their bp range can land anywhere
+        # relative to a sort-by-start key, so the index can't bound them.
+        sorted_idx = getattr(self, "_feats_by_start", None) \
+                     or list(range(len(self._feats)))
+        import bisect as _bs
+        # bisect_right on an array of starts — but `sorted_idx` holds
+        # indices into _feats, not starts. We need the first position
+        # in sorted_idx whose feature.start > view_e to set the upper
+        # walk bound. Build a tiny key-extracting helper that bisect
+        # doesn't natively support, then linear-walk up to it.
+        starts = [self._feats[i]["start"] for i in sorted_idx]
+        upper = _bs.bisect_right(starts, view_e)
+        for k in range(upper):
+            i  = sorted_idx[k]
+            feat = self._feats[i]
+            sb = feat["start"]
+            eb = feat["end"]
+            if eb < sb:
+                # Wrap feature; handled in the second pass below.
                 continue
+            if eb <= view_s:
+                continue
+            segs = [(max(view_s, sb), min(view_e, eb))]
+            span = _feat_len(sb, eb, total) or 0
+            feats_in_view.append((-span, i, feat, segs))
+        # Wrap-feature pass — full sweep, but typically <5 wrap features
+        # per record so the cost is negligible.
+        for i, feat in enumerate(self._feats):
+            sb = feat["start"]
+            eb = feat["end"]
+            if eb >= sb:
+                continue
+            segs = []
+            if view_s < eb:
+                segs.append((view_s, min(view_e, eb)))
+            if sb < view_e:
+                segs.append((max(view_s, sb), min(view_e, total)))
+            if not segs:
+                continue
+            span = _feat_len(sb, eb, total) or 0
+            feats_in_view.append((-span, i, feat, segs))
+        feats_in_view.sort()  # largest span first (negative key)
+
+        for _neg_span, i, feat, segments in feats_in_view:
+            strand = feat["strand"]
+            color  = feat["color"]
+            label  = feat.get("label", feat.get("type", ""))
+            is_sel = (i == self.selected_idx)
+            style  = ("reverse " + color) if is_sel else color
+            is_fwd = strand >= 0
 
             for seg_start, seg_end in segments:
                 cx0 = bp_to_col(seg_start)
@@ -4062,6 +4351,10 @@ class PlasmidMap(Widget):
                 if cx1 <= cx0:
                     cx1 = cx0 + 1   # at least show the arrowhead
                 bar_w = cx1 - cx0
+                # Choose the label row by strand: forward labels go
+                # above, reverse below — so the user's eye can scan
+                # one strand without dropping into the other's text.
+                label_row = label_row_fwd if is_fwd else label_row_rev
 
                 # Fill the body. Forward: arrowhead occupies the LAST
                 # column; reverse: arrowhead occupies the FIRST column
@@ -4775,6 +5068,11 @@ class LibraryPanel(Widget):
 
     @on(Button.Pressed, "#btn-coll-add")
     def _btn_coll_add(self):
+        # Hold a reference to the modal so the callback can read its
+        # `_worker_result` cache. The closure below uses
+        # `nonlocal modal_ref` after push_screen returns.
+        modal_ref: "NewCollectionModal | None" = None
+
         def _picked(result) -> None:
             if not result:
                 return
@@ -4788,7 +5086,21 @@ class LibraryPanel(Widget):
             plasmids: list[dict] = []
             description = ""
             if folder is not None:
-                entries, failures = _bulk_import_folder(folder)
+                # If the modal's worker already imported the folder
+                # (the new progress-bar path), reuse its cached
+                # result instead of re-importing in the foreground.
+                # Old code path (no worker, e.g. from a unit test
+                # that injects (name, folder) directly via dismiss)
+                # still falls through to a synchronous import.
+                cached = (modal_ref._worker_result
+                           if modal_ref is not None
+                           and getattr(modal_ref, "_worker_result", None)
+                                is not None
+                           else None)
+                if cached is not None:
+                    entries, failures = cached
+                else:
+                    entries, failures = _bulk_import_folder(folder)
                 plasmids = entries
                 description = f"Bulk imported from {folder}"
                 n_ok, n_fail = len(entries), len(failures)
@@ -4834,10 +5146,8 @@ class LibraryPanel(Widget):
             })
             _save_collections(existing)
             self._repopulate_collections()
-        self.app.push_screen(
-            NewCollectionModal(),
-            callback=_picked,
-        )
+        modal_ref = NewCollectionModal()
+        self.app.push_screen(modal_ref, callback=_picked)
 
     @on(Button.Pressed, "#btn-coll-del")
     def _btn_coll_del(self):
@@ -5362,6 +5672,44 @@ class SequencePanel(Widget):
         yield status
         with ScrollableContainer(id="seq-scroll"):
             yield Static("", id="seq-view")
+
+    def on_mount(self) -> None:
+        # Scroll watcher: when the inner ScrollableContainer's
+        # `scroll_y` reactive changes, re-fire `_refresh_view` so the
+        # lazy-render viewport filter picks up the new visible window.
+        # Without this, chunks scrolled into view stay blank — the
+        # outer cache's vp tuple wouldn't be invalidated by anything
+        # else. Watching is cross-widget so we use Textual's
+        # `watch(other_widget, attr, callback)` API.
+        try:
+            scroll = self.query_one("#seq-scroll", ScrollableContainer)
+        except NoMatches:
+            return
+        # Quantize the watcher: only refresh when the scroll position
+        # crosses a chunk boundary (≈ vp_h rows). Avoids paying a
+        # full re-render on every 1-row scroll while still keeping the
+        # viewport up to date during fast scrolls.
+        self._last_refreshed_scroll_y = -1
+
+        def _on_scroll_y_changed(new_y: float) -> None:
+            try:
+                vp_h = max(1, int(scroll.size.height))
+            except Exception:
+                vp_h = 12
+            new_int = int(new_y)
+            if abs(new_int - self._last_refreshed_scroll_y) < vp_h // 2:
+                return
+            self._last_refreshed_scroll_y = new_int
+            self._refresh_view()
+
+        try:
+            self.watch(scroll, "scroll_y", _on_scroll_y_changed,
+                        init=False)
+        except Exception:
+            # Defensive: if the Textual API changes shape, don't kill
+            # the panel — the lazy-render still works for the initial
+            # paint, just not for incremental scroll fill-in.
+            _log.exception("SequencePanel: failed to attach scroll watcher")
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -6496,9 +6844,33 @@ class SequencePanel(Widget):
             self._re_highlight["start"], self._re_highlight["end"]
         ) if self._re_highlight else None
         aa_key = id(self._aa_highlight) if self._aa_highlight is not None else None
+        # Lazy-render viewport: only chunks whose row range overlaps
+        # the visible scroll window get fresh-rendered. Above the
+        # `_LAZY_RENDER_THRESHOLD_BP` threshold the gain matters
+        # (5 Mb chromosome first-render: 30 s → ~50 ms); below it
+        # the overhead of the viewport check is negligible so we
+        # pass it unconditionally. `vp` is rounded to a chunk-sized
+        # quantum so that small scrolls don't always invalidate the
+        # outer cache key — without this the user would pay a re-
+        # render every time the scrollbar moved by a single line.
+        vp = None
+        if scroll is not None:
+            try:
+                scroll_y = int(scroll.scroll_y)
+                vp_h     = max(1, int(scroll.size.height))
+                # Pad both ends by one viewport so a fast scroll
+                # already finds the next chunk pre-rendered. Quantize
+                # by `vp_h` so the cache key is stable across small
+                # scroll deltas.
+                quant = vp_h
+                lo = max(0, (scroll_y - vp_h) // quant * quant)
+                hi = (scroll_y + 2 * vp_h + quant - 1) // quant * quant
+                vp = (lo, hi)
+            except Exception:
+                vp = None
         key = (id(self._seq), id(self._feats), line_width,
                self._sel_range, self._user_sel, self._cursor_pos,
-               self._show_connectors, reh_key, aa_key)
+               self._show_connectors, reh_key, aa_key, vp)
         if key != self._view_cache_key:
             with _log_timing("seq.build_text"):
                 self._view_cache_txt = _build_seq_text(
@@ -6510,6 +6882,7 @@ class SequencePanel(Widget):
                     show_connectors = self._show_connectors,
                     re_highlight    = self._re_highlight,
                     aa_highlight    = self._aa_highlight,
+                    viewport_y_range = vp,
                 )
             self._view_cache_key = key
 
@@ -6740,11 +7113,14 @@ _HELP_BODY_MD = """\
 
 | Key | Action |
 |---|---|
-| `←` `→` | Rotate (map focus) · move cursor (seq focus) |
-| `Shift+←/→` | Coarse rotate / extend selection |
+| `←` `→` | Rotate (circular map) · pan (linear map) · move cursor (seq focus) |
+| `Shift+←/→` | Coarse rotate / pan, or extend selection |
 | `Home` | Reset map origin / jump to row start (seq) |
 | `End` | Jump to row end (seq panel) |
 | `v` | Toggle linear / circular map |
+| `+` / `=` | Zoom IN (linear map only) |
+| `-` | Zoom OUT (linear map only) |
+| `0` | Reset zoom + pan to whole-record view (linear map only) |
 | `l` | Toggle feature connectors |
 | `r` | Toggle restriction sites |
 
@@ -6867,21 +7243,6 @@ class OpenFileModal(ModalScreen):
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
-    # Files larger than this trigger a confirmation step before
-    # `load_genbank()` runs. Crosses the threshold where the first
-    # `_build_seq_text` render starts to take >5 s on typical
-    # hardware (~5 Mb genomic = chromosome-scale, vs ~50 kb
-    # cosmid-scale plasmids that load instantly).
-    _LARGE_FILE_MB = 5.0
-
-    def __init__(self) -> None:
-        super().__init__()
-        # Two-state modal: first Open click on a >5 MB file warns;
-        # second click bypasses the size check and proceeds. Resets
-        # if the path field changes (= user picked a different file).
-        self._confirmed_large: bool = False
-        self._last_seen_path: str = ""
-
     def compose(self) -> ComposeResult:
         with Vertical(id="open-box"):
             yield Static(" Open Plasmid File ", id="open-title")
@@ -6899,26 +7260,41 @@ class OpenFileModal(ModalScreen):
         if not path:
             status.update("[red]Enter a file path.[/red]")
             return
-        # Reset large-file confirmation if the user changed paths
-        # between clicks — otherwise they could confirm File A and
-        # then accidentally load File B without re-confirming.
-        if path != self._last_seen_path:
-            self._confirmed_large = False
-            self._last_seen_path = path
         # Probe size BEFORE invoking the parser — avoids a 30 s
         # parse on a 50 MB file the user clicked by accident.
         try:
-            size_mb = Path(path).expanduser().stat().st_size / (1024 * 1024)
+            size_bytes = Path(path).expanduser().stat().st_size
         except OSError:
-            size_mb = 0.0
-        if size_mb > self._LARGE_FILE_MB and not self._confirmed_large:
-            status.update(
-                f"[yellow]File is {size_mb:.1f} MB — parsing and the first "
-                f"sequence-panel render may take 10s+. "
-                f"Click [b]Open[/b] again to load anyway.[/]"
+            size_bytes = 0
+        if size_bytes > _LARGE_LOAD_DISK_BYTES:
+            # Push the confirm modal on top; on Yes proceed with the
+            # actual load, on No just leave the OpenFileModal open so
+            # the user can pick a different file. Default focus is on
+            # No inside the confirm so a stray Enter bails out.
+            size_mb = size_bytes / (1024 * 1024)
+
+            def _confirmed(ok: "bool | None") -> None:
+                if not ok:
+                    return
+                self._actually_load(path)
+
+            self.app.push_screen(
+                LargeFileConfirmModal(
+                    description=path,
+                    size_text=f"{size_mb:.1f} MB on disk",
+                    threshold_text=(
+                        f"Threshold: > "
+                        f"{_LARGE_LOAD_DISK_BYTES // (1024 * 1024)} MB. "
+                        f"Parsing + first render may take many seconds."
+                    ),
+                ),
+                callback=_confirmed,
             )
-            self._confirmed_large = True
             return
+        self._actually_load(path)
+
+    def _actually_load(self, path: str) -> None:
+        status = self.query_one("#open-status", Static)
         try:
             record = load_genbank(path)
             record._tui_source = path   # remember where it came from
@@ -11737,8 +12113,8 @@ def _blast_db_summary(db: dict) -> str:
 # entries via OrderedDict eviction so a long session can't balloon
 # memory. Cache is invalidated on any collection-mutation path that
 # matters (we don't currently auto-invalidate; user clicks "Build
-# database" again to refresh).
-from collections import OrderedDict as _OD
+# database" again to refresh). `_OD = OrderedDict` is imported at
+# module top.
 _BLAST_DB_CACHE: "_OD" = _OD()
 _BLAST_DB_CACHE_MAX = 4
 
@@ -19372,6 +19748,15 @@ class NewCollectionModal(ModalScreen):
                 id="newcoll-folder-disp", markup=True,
             )
             yield DirectoryTree(self._start, id="newcoll-tree")
+            # Progress bar + ticker label, hidden until the user
+            # commits an import. The bar's `total` is set on first
+            # tick from the worker so it shows "X / Y" immediately
+            # rather than spinning indeterminately.
+            yield ProgressBar(
+                id="newcoll-progress",
+                total=None, show_eta=False, show_percentage=True,
+            )
+            yield Static("", id="newcoll-progress-status", markup=True)
             yield Static("", id="newcoll-status", markup=True)
             with Horizontal(id="newcoll-btns"):
                 yield Button("Create",        id="btn-newcoll-ok",
@@ -19380,6 +19765,15 @@ class NewCollectionModal(ModalScreen):
                 yield Button("Cancel",        id="btn-newcoll-cancel")
 
     def on_mount(self) -> None:
+        # Progress widgets stay hidden until the user clicks Create
+        # with a folder selected — they only matter for the import
+        # phase, which the user doesn't enter unless they're about
+        # to do bulk work.
+        try:
+            self.query_one("#newcoll-progress").display = False
+            self.query_one("#newcoll-progress-status").display = False
+        except NoMatches:
+            pass
         self.query_one("#newcoll-name", Input).focus()
 
     @on(DirectoryTree.DirectorySelected)
@@ -19408,6 +19802,11 @@ class NewCollectionModal(ModalScreen):
         self._submit()
 
     def _submit(self) -> None:
+        # Re-entrancy guard: if a worker import is already running,
+        # subsequent Enter / OK presses are dropped (we don't want to
+        # spawn a second worker against the same target).
+        if getattr(self, "_importing", False):
+            return
         # Run the typed name through the same normaliser the agent-API
         # uses (strip control chars, trim, cap length). Stops a typed
         # `name\x00\n` from corrupting the panel header.
@@ -19418,14 +19817,218 @@ class NewCollectionModal(ModalScreen):
                 "[red]Name cannot be empty.[/red]"
             )
             return
-        self.dismiss((name, self._selected_folder))
+        # No folder → empty collection. Dismiss synchronously; the
+        # caller's `_picked` callback handles the persistence (no
+        # progress bar needed for the zero-file case).
+        if self._selected_folder is None:
+            self.dismiss((name, None))
+            return
+        # Folder picked: switch to import mode, spawn worker. The
+        # worker drives the progress bar and dismisses the modal
+        # itself when done (with the same (name, folder) shape so
+        # the existing `_picked` callback's contract is preserved
+        # — the callback re-runs the import in the foreground only
+        # if the worker hasn't already cached a result on the modal
+        # instance).
+        self._importing = True
+        self._worker_result: "tuple[list, list] | None" = None
+        # Hide the tree + tree-related labels; show progress.
+        for sel in ("#newcoll-tree", "#newcoll-folder-disp",
+                     "#newcoll-folder-hint"):
+            try:
+                self.query_one(sel).display = False
+            except NoMatches:
+                pass
+        try:
+            self.query_one("#newcoll-progress").display = True
+            self.query_one("#newcoll-progress-status").display = True
+            self.query_one("#newcoll-progress-status", Static).update(
+                "[dim]Scanning folder…[/]"
+            )
+        except NoMatches:
+            pass
+        # Disable the OK + Clear buttons during import (Cancel stays
+        # active so a stuck import on a network share can still be
+        # bailed out of via Esc / button).
+        try:
+            self.query_one("#btn-newcoll-ok",    Button).disabled = True
+            self.query_one("#btn-newcoll-clear", Button).disabled = True
+        except NoMatches:
+            pass
+        self._run_import(name, self._selected_folder)
+
+    @work(thread=True, exclusive=True)
+    def _run_import(self, name: str, folder: Path) -> None:
+        """Worker: walks the folder via `_bulk_import_folder` with a
+        progress callback that posts UI updates back to the main
+        thread. On done, dismisses the modal with the (name, folder)
+        payload so the caller's existing `_picked` flow keeps working.
+        The bulk-import result is cached on the modal instance so the
+        caller's foreground re-import call can short-circuit (see
+        `LibraryPanel._btn_coll_add`)."""
+        def _cb(idx: int, total: int, fname: str, ok: bool) -> None:
+            try:
+                self.app.call_from_thread(
+                    self._tick_progress, idx, total, fname, ok,
+                )
+            except Exception:
+                _log.exception("NewCollectionModal: progress dispatch")
+        try:
+            entries, failures = _bulk_import_folder(folder, progress_cb=_cb)
+        except Exception as exc:
+            _log.exception("NewCollectionModal: import worker raised")
+            try:
+                self.app.call_from_thread(
+                    self._on_import_error, str(exc),
+                )
+            except Exception:
+                pass
+            return
+        try:
+            self.app.call_from_thread(
+                self._on_import_done, name, folder, entries, failures,
+            )
+        except Exception:
+            _log.exception("NewCollectionModal: done dispatch")
+
+    def _tick_progress(self, idx: int, total: int,
+                        fname: str, ok: bool) -> None:
+        try:
+            bar = self.query_one("#newcoll-progress", ProgressBar)
+            if bar.total != total:
+                bar.update(total=total, progress=0)
+            bar.update(progress=idx)
+        except NoMatches:
+            pass
+        try:
+            from rich.markup import escape as _esc
+            symbol = "ok  " if ok else "FAIL"
+            self.query_one("#newcoll-progress-status", Static).update(
+                f"[dim]{symbol}  {_esc(fname)}  ({idx}/{total})[/]"
+            )
+        except NoMatches:
+            pass
+
+    def _on_import_error(self, msg: str) -> None:
+        from rich.markup import escape as _esc
+        self._importing = False
+        try:
+            self.query_one("#btn-newcoll-ok",    Button).disabled = False
+            self.query_one("#btn-newcoll-clear", Button).disabled = False
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#newcoll-status", Static).update(
+                f"[red]Import failed: {_esc(msg)}[/]"
+            )
+        except NoMatches:
+            pass
+
+    def _on_import_done(self, name: str, folder: "Path | None",
+                         entries: list, failures: list) -> None:
+        # Cache the worker's result on the modal instance so the
+        # caller's `_picked` callback can re-use it instead of
+        # re-running the import. The (name, folder) dismiss payload
+        # stays the same shape as before for back-compat.
+        self._worker_result = (entries, failures)
+        self._importing = False
+        self.dismiss((name, folder))
 
     @on(Button.Pressed, "#btn-newcoll-cancel")
     def _cancel_btn(self, _) -> None:
+        # Cancelling during an import: the worker keeps running but
+        # we tear down the modal. The cached result (if any) is
+        # discarded; the caller sees None and treats it as a cancel.
         self.dismiss(None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class LargeFileConfirmModal(ModalScreen):
+    """Confirm before loading a large record (file or NCBI fetch).
+
+    Shown whenever the on-disk size or the parsed sequence length
+    crosses the "this is going to take a noticeable while" threshold.
+    Default focus is on **No** so a tap of Enter (or Esc) bails — the
+    user has to deliberately reach for Yes to commit. Dismisses True
+    (load) or False (cancel).
+
+    `description` is a short context line that explains what's about
+    to load (file path, accession, member name) so the user can tell
+    "yes, this is the chromosome I asked for" from "wait, that's not
+    what I expected".
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    LargeFileConfirmModal { align: center middle; }
+    #lfc-dlg {
+        width: 72; height: auto; max-height: 60%;
+        background: #1c1c1c; border: solid $warning; padding: 1 2;
+    }
+    #lfc-title { background: $warning-darken-2; color: $text;
+                  padding: 0 1; margin-bottom: 1; }
+    #lfc-msg   { margin-bottom: 1; }
+    #lfc-btns  { height: 3; margin-top: 1; }
+    #lfc-btns Button { margin-right: 1; min-width: 14; }
+    """
+
+    def __init__(self, description: str,
+                 size_text: str = "",
+                 *, threshold_text: str = "") -> None:
+        super().__init__()
+        self.description    = description
+        self.size_text      = size_text
+        self.threshold_text = threshold_text
+
+    def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
+        with Vertical(id="lfc-dlg"):
+            yield Static(" Large record — confirm load ", id="lfc-title")
+            body  = f"  About to load:\n  [bold]{_esc(self.description)}[/]\n"
+            if self.size_text:
+                body += f"\n  Size: {_esc(self.size_text)}\n"
+            if self.threshold_text:
+                body += f"  [dim]{_esc(self.threshold_text)}[/]\n"
+            body += (
+                "\n  Loading large records can take several seconds and use "
+                "significant memory. Continue?"
+            )
+            yield Static(body, id="lfc-msg", markup=True)
+            with Horizontal(id="lfc-btns"):
+                yield Button("No (default)", id="btn-lfc-no",
+                              variant="default")
+                yield Button("Yes, load",    id="btn-lfc-yes",
+                              variant="warning")
+
+    def on_mount(self) -> None:
+        # Default focus is No so a stray Enter bails out rather than
+        # commits to a multi-second load.
+        self.query_one("#btn-lfc-no", Button).focus()
+
+    @on(Button.Pressed, "#btn-lfc-no")
+    def _no(self, _) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-lfc-yes")
+    def _yes(self, _) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+# Module-level threshold: files / fetches above this size on disk or
+# in bp need user confirmation before loading. 5 MB is well above any
+# normal plasmid; chromosomes / metagenomic contigs / WGS assemblies
+# easily exceed it.
+_LARGE_LOAD_DISK_BYTES = 5 * 1024 * 1024     # 5 MB on disk
+_LARGE_LOAD_SEQ_BP     = 200_000              # 200 kb parsed
 
 
 class CollectionDeleteConfirmModal(ModalScreen):
@@ -21334,6 +21937,8 @@ NewCollectionModal { align: center middle; }
 #newcoll-folder-hint { height: 1; color: $text-muted; }
 #newcoll-folder-disp { height: 1; margin-top: 1; }
 #newcoll-tree        { height: 1fr; border: solid $primary-darken-2; margin-top: 1; }
+#newcoll-progress           { margin-top: 1; height: 1; }
+#newcoll-progress-status    { height: 1; color: $text-muted; margin-top: 1; }
 #newcoll-status      { height: 1; margin-top: 1; }
 #newcoll-btns        { height: 3; margin-top: 1; }
 #newcoll-btns Button { margin-right: 1; min-width: 10; }
@@ -21962,9 +22567,10 @@ SpeciesPickerModal { align: center middle; }
         self._pending_show_connectors = bool(
             _get_setting("show_connectors", False)
         )
-        # `map_mode` similarly applies to PlasmidMap once mounted.
-        mm = _get_setting("map_mode", "circular")
-        self._pending_map_mode = mm if mm in ("circular", "linear") else "circular"
+        # `map_mode` is deliberately NOT hydrated from settings:
+        # circular is the canonical default for every plasmid load,
+        # and `PlasmidMap.load_record` resets the mode on every
+        # record. Persisting would override that intent.
         yield Header()
         yield MenuBar()
         # Three side-by-side panels share the top row; the sequence
@@ -22045,9 +22651,13 @@ SpeciesPickerModal { align: center middle; }
         self._seq_jump_row_edge(end=True)
 
     def action_toggle_map_view(self):
+        # Map mode (circular ↔ linear) is intentionally NOT persisted:
+        # circular is the canonical default and the per-record
+        # `load_record` reset re-applies it on every plasmid load.
+        # Persisting would defeat that reset and surprise users who
+        # expect the wider context view by default.
         pm = self.query_one("#plasmid-map", PlasmidMap)
         pm.action_toggle_map_view()
-        _set_setting("map_mode", pm._map_mode)
 
     def action_toggle_connectors(self):
         sp = self.query_one("#seq-panel", SequencePanel)
@@ -22350,8 +22960,9 @@ SpeciesPickerModal { align: center middle; }
             if getattr(self, "_pending_show_connectors", False):
                 sp._show_connectors = True
                 pm._show_connectors = True
-            if getattr(self, "_pending_map_mode", "circular") == "linear":
-                pm._map_mode = "linear"
+            # map_mode intentionally NOT hydrated — circular is the
+            # canonical default and `PlasmidMap.load_record` resets
+            # it on every plasmid load.
         except (NoMatches, AttributeError):
             pass
         # Agent API: opt-in localhost server for external CLI/IDE
@@ -24828,12 +25439,40 @@ def main():
 
     try:
         app.run()
+    except KeyboardInterrupt:
+        # Ctrl+C at the terminal — the Textual app may have already
+        # shut itself down; surface as a normal exit, not a stack
+        # trace. The `finally` below still runs.
+        _log.info("SpliceCraft session %s interrupted by user", _SESSION_ID)
     except Exception:
         _log.exception("App terminated with unhandled exception")
         raise
     finally:
+        # Stop the agent-API HTTP server thread and remove the token
+        # file. Defensive against double-call (server may already be
+        # None if it failed to bind; `_stop_agent_api(None)` is a
+        # no-op).
         _stop_agent_api(getattr(app, "_agent_api_server", None))
+        # Cancel any pending autosave timers Textual may have queued.
+        # `App.exit()` triggers normal teardown, but if the user hit
+        # the OS terminal kill signal a timer might still be pending
+        # — explicit clear keeps it from firing on a half-torn-down
+        # widget tree during the final tick.
+        try:
+            for timer in list(getattr(app, "_timers", []) or []):
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         _log.info("SpliceCraft session %s ending", _SESSION_ID)
+        # Flush the rotating-file log handlers so the final session
+        # banner + any pending DEBUG records hit disk before the
+        # process exits. The stdlib's atexit hook does this for us
+        # under most Python builds, but explicit shutdown is cheap
+        # insurance against truncated logs on hard exits.
+        logging.shutdown()
 
 
 if __name__ == "__main__":
