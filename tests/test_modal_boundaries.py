@@ -181,6 +181,17 @@ _MODAL_CASES = [
     ("LargeFileConfirmModal",        lambda: sc.LargeFileConfirmModal(
                                                 "/some/big.gb", "12.3 MB",
                                                 threshold_text="cap = 5 MB")),
+    ("PrimerEditModal",              lambda: sc.PrimerEditModal(
+                                                idx=0,
+                                                feat={"label": "P-fwd",
+                                                      "type":  "primer_bind",
+                                                      "start": 100,
+                                                      "end":   108,
+                                                      "strand": 1,
+                                                      "color": "#00BFFF"},
+                                                total=2686,
+                                                primer_seq="GAATTCATGAAACG",
+                                                notes="See Bolivar 1977")),
     ("FeatureEditModal",             lambda: sc.FeatureEditModal(
                                                 idx=0,
                                                 feat={"label": "lacZ",

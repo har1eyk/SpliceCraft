@@ -11970,6 +11970,305 @@ def _annotate_seq_from_feature_library(
     return found
 
 
+class PrimerEditModal(ModalScreen):
+    """View / edit a `primer_bind` feature.
+
+    Mirrors `FeatureEditModal` in look + behaviour (read-only by
+    default, `Edit` button unlocks, `Save` commits) but with
+    primer-specific fields:
+
+      * **Sequence** (the primary editable field) — the full primer
+        bases 5'→3'. Editable; on save updates the
+        `qualifiers["primer_seq"]` of the underlying SeqFeature so
+        the seq-panel re-renders the bound + flap rendering with
+        the new bases.
+      * **Read-only stats** — primer length, GC %, predicted Tm
+        (via primer3, lazy-imported), bound region in template
+        coords, flap length. Re-computed live as the user types
+        when in edit mode.
+      * **Strand**, **label**, **notes** — same semantics as
+        `FeatureEditModal`.
+
+    Position is intentionally NOT editable: changing where a primer
+    binds means re-aligning to the template, which is closer to
+    "delete + re-add" than "edit". Same trade-off as the regular
+    feature editor.
+
+    Triggers — handled by `PlasmidApp._open_feature_editor`, which
+    dispatches based on feature type:
+      * `primer_bind` → push `PrimerEditModal`
+      * everything else → push `FeatureEditModal`
+
+    Returned dict (on Save):
+      `{idx, label, primer_seq, strand, notes}`
+    Or `None` on cancel.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    PrimerEditModal { align: center middle; }
+    #primedit-dlg {
+        width: 90; max-width: 95%; height: auto; max-height: 38;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #primedit-title {
+        height: 1;
+        text-style: bold;
+        background: $accent;
+        color: $text;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    #primedit-body { height: 1fr; padding: 0 1; }
+    #primedit-body Label { color: $text-muted; margin: 0; height: 1; }
+    #primedit-stats {
+        height: 1; padding: 0 1; color: $text-muted;
+    }
+    #primedit-pos { height: 1; padding: 0 1; color: $text-muted; }
+    #primedit-row1 { height: auto; }
+    #primedit-name-col { width: 2fr; }
+    #primedit-strand-col { width: 1fr; }
+    #primedit-seq {
+        height: 4; border: solid $primary-darken-1;
+    }
+    #primedit-notes-md {
+        height: 4; border: solid $primary-darken-1;
+        padding: 0 1; overflow-y: auto;
+    }
+    #primedit-notes-edit { height: 4; border: solid $primary-darken-1; }
+    #primedit-status { height: 1; padding: 0 1; }
+    #primedit-btns { height: 3; margin-top: 1; }
+    #primedit-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, idx: int, feat: dict, total: int,
+                 *, primer_seq: str = "", notes: str = "") -> None:
+        super().__init__()
+        self._idx       = idx
+        self._feat      = dict(feat)
+        self._total     = total
+        self._primer_seq = str(primer_seq or "")
+        self._notes_md   = str(notes or "")
+        self._editing    = False
+
+    def compose(self) -> ComposeResult:
+        # Lazy-import Markdown — same rationale as HelpModal.compose.
+        from textual.widgets import Markdown as _Markdown
+
+        f = self._feat
+        label  = f.get("label", "")
+        strand = f.get("strand", 1)
+        start  = int(f.get("start", 0))
+        end    = int(f.get("end",   0))
+
+        # Position display: 1-indexed, end-inclusive in the human-
+        # facing form.
+        bp_len = _feat_len(start, end, self._total) or 0
+        pos_str = f"{start + 1:,}..{end:,}  ({bp_len:,} bp bound)"
+        if end < start:
+            pos_str += "  · wraps origin"
+        flap_len = max(0, len(self._primer_seq) - bp_len)
+        if flap_len > 0:
+            pos_str += f"  · 5' flap: {flap_len} bp"
+
+        with Vertical(id="primedit-dlg"):
+            yield Static(f" Primer: {label or '(unnamed)'} ",
+                         id="primedit-title")
+            with Vertical(id="primedit-body"):
+                with Horizontal(id="primedit-row1"):
+                    with Vertical(id="primedit-name-col"):
+                        yield Label("Name:")
+                        yield Input(value=label, id="primedit-name",
+                                     disabled=True)
+                    with Vertical(id="primedit-strand-col"):
+                        yield Label("Strand:")
+                        with RadioSet(id="primedit-strand", disabled=True):
+                            yield RadioButton("Forward (▶)",
+                                              value=(strand == 1),
+                                              id="primedit-strand-fwd")
+                            yield RadioButton("Reverse (◀)",
+                                              value=(strand == -1),
+                                              id="primedit-strand-rev")
+
+                # Live stats — repainted on every keystroke when
+                # editing the sequence.
+                yield Static(self._stats_line(self._primer_seq),
+                             id="primedit-stats", markup=True)
+                yield Static(pos_str, id="primedit-pos")
+
+                # Editable primer sequence. Title sits on the border
+                # so we save a row vs an external Label.
+                seq_ta = TextArea(self._primer_seq, id="primedit-seq",
+                                   read_only=True, soft_wrap=True)
+                seq_ta.border_title = "Primer sequence  (5'→3', flap + bound)"
+                yield seq_ta
+
+                # Notes — Markdown viewer (clickable links) in view
+                # mode, TextArea editor in edit mode.
+                md = _Markdown(self._notes_md or "_(none)_",
+                                id="primedit-notes-md")
+                md.border_title = (
+                    "Notes / references  "
+                    "(Markdown — links + [text](url) supported)"
+                )
+                yield md
+                ta = TextArea(self._notes_md, id="primedit-notes-edit",
+                               soft_wrap=True)
+                ta.border_title = "Notes / references  (Edit mode)"
+                ta.display = False
+                yield ta
+
+            yield Static("", id="primedit-status", markup=True)
+            with Horizontal(id="primedit-btns"):
+                yield Button("Edit", id="btn-primedit-edit",
+                             variant="primary")
+                yield Button("Save", id="btn-primedit-save",
+                             variant="success", disabled=True)
+                yield Button("Cancel", id="btn-primedit-cancel")
+
+    # ── Helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _stats_line(seq: str) -> str:
+        """Compose `[bold]Length:[/bold] N bp · GC: X% · Tm: Y°C`
+        from a primer sequence. Uses primer3 for Tm if the sequence
+        is at least 5 bp (primer3 panics on shorter inputs).
+        """
+        s = (seq or "").strip().upper()
+        if not s:
+            return "[dim]Length: — · GC: — · Tm: —[/dim]"
+        n  = len(s)
+        gc = sum(1 for ch in s if ch in "GC")
+        gc_pct = (gc * 100.0 / n) if n else 0.0
+        tm_str = "—"
+        if n >= 5:
+            try:
+                import primer3
+                tm = primer3.calc_tm(s)
+                tm_str = f"{tm:.1f}°C"
+            except Exception:
+                tm_str = "—"
+        return (f"[bold]Length:[/bold] {n} bp  · "
+                f"[bold]GC:[/bold] {gc_pct:.1f}%  · "
+                f"[bold]Tm:[/bold] {tm_str}")
+
+    def on_mount(self) -> None:
+        # No-op for now; the stats line is composed in `compose()`.
+        return
+
+    def _set_editing(self, on: bool) -> None:
+        """Toggle the form between read-only and editable."""
+        self._editing = on
+        for sel in ("#primedit-name", "#primedit-strand", "#primedit-seq"):
+            try:
+                w = self.query_one(sel)
+                if hasattr(w, "read_only"):
+                    w.read_only = not on
+                else:
+                    w.disabled = not on
+            except NoMatches:
+                pass
+        try:
+            self.query_one("#btn-primedit-edit",
+                            Button).display = not on
+            self.query_one("#btn-primedit-save",
+                            Button).disabled = not on
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#primedit-notes-md").display = not on
+            self.query_one("#primedit-notes-edit").display = on
+        except NoMatches:
+            pass
+        if on:
+            try:
+                self.query_one("#primedit-name", Input).focus()
+            except NoMatches:
+                pass
+
+    def _read_strand(self) -> int:
+        for sid, val in (("#primedit-strand-fwd", 1),
+                         ("#primedit-strand-rev", -1)):
+            try:
+                if self.query_one(sid, RadioButton).value:
+                    return val
+            except NoMatches:
+                pass
+        return self._feat.get("strand", 1)
+
+    @on(TextArea.Changed, "#primedit-seq")
+    def _seq_changed(self, _event: TextArea.Changed) -> None:
+        """Live stats: every keystroke in the primer sequence
+        TextArea repaints the `#primedit-stats` row so the user
+        sees length / GC / Tm update as they type."""
+        if not self._editing:
+            return
+        try:
+            ta = self.query_one("#primedit-seq", TextArea)
+            stats = self.query_one("#primedit-stats", Static)
+        except NoMatches:
+            return
+        stats.update(self._stats_line(ta.text))
+
+    # ── Buttons ─────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-primedit-edit")
+    def _on_edit(self) -> None:
+        self._set_editing(True)
+        try:
+            self.query_one("#primedit-status", Static).update(
+                "[dim]Edit mode — make changes and press Save.[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-primedit-cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-primedit-save")
+    def _on_save(self) -> None:
+        if not self._editing:
+            return
+        try:
+            label = self.query_one("#primedit-name", Input).value
+            seq   = self.query_one("#primedit-seq",   TextArea).text
+            notes = self.query_one("#primedit-notes-edit",
+                                     TextArea).text
+        except NoMatches:
+            return
+        new_label = _sanitize_label(label, max_len=200)
+        # Sanitize primer sequence: strip whitespace + control bytes,
+        # uppercase. We don't strictly enforce DNA alphabet (users
+        # may legitimately use IUPAC bases for degenerate primers).
+        new_seq = _CONTROL_CHARS_RE.sub("", str(seq or "")).strip().upper()
+        new_seq = "".join(new_seq.split())   # drop any internal whitespace
+        if not new_seq:
+            try:
+                self.query_one("#primedit-status", Static).update(
+                    "[red]Primer sequence cannot be empty.[/red]"
+                )
+            except NoMatches:
+                pass
+            return
+        self.dismiss({
+            "idx":        self._idx,
+            "label":      new_label,
+            "primer_seq": new_seq,
+            "strand":     self._read_strand(),
+            "notes":      _sanitize_note(notes),
+        })
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class NewPlasmidModal(ModalScreen):
     """Build a brand-new plasmid record from pasted DNA.
 
@@ -26051,11 +26350,23 @@ SpeciesPickerModal { align: center middle; }
         self._open_feature_editor(event.idx)
 
     def _open_feature_editor(self, idx: int) -> None:
-        """Push the FeatureEditModal for feature `idx`. Extracts the
-        feature's bases (wrap-aware) and `note` qualifier from the
-        SeqRecord at open time so the modal doesn't need to know
-        about circular topology. On dismiss with a result dict,
-        apply the edits via `_apply_feature_edit`."""
+        """Push the appropriate edit modal for feature `idx`.
+
+        Type-aware dispatch:
+          * `primer_bind` features → `PrimerEditModal` — primer-
+            specific fields (full 5'→3' sequence, Tm/GC stats,
+            bound + flap breakdown).
+          * Everything else → `FeatureEditModal` — generic feature
+            metadata (label, type, strand, color, notes).
+
+        `idx` is the index into `pm._feats`, set by whichever click
+        / Enter path triggered this open. Each click path resolves
+        to a SPECIFIC feature (smallest-enclosing for arc clicks,
+        the row's own idx for sidebar clicks, the `_check_packed`
+        result for seq-panel clicks) so a feature stack opens the
+        editor only for the topmost visible / clicked feature, never
+        for the underlying overlap.
+        """
         try:
             pm = self.query_one("#plasmid-map", PlasmidMap)
         except NoMatches:
@@ -26064,44 +26375,41 @@ SpeciesPickerModal { align: center middle; }
             return
         feat = pm._feats[idx]
         total = pm._total or 0
-        # Extract feature sequence + notes from the SeqRecord. The
-        # PlasmidMap feat dict only carries display metadata; we walk
-        # the source record to find the matching SeqFeature (skipping
-        # the synthetic `source` row) so qualifiers are accessible.
-        # Both extraction paths sanitize their output before it
-        # reaches the modal — defence in depth against malicious .gb
-        # files that smuggle terminal-escape sequences in qualifier
-        # values or non-DNA bytes in the sequence body. The save
-        # path already sanitizes user-typed input; this guard covers
-        # the read side.
+        # Walk the source record to find the matching SeqFeature so
+        # qualifiers are accessible. Both extraction paths sanitize
+        # their output before it reaches the modal — defence in
+        # depth against malicious .gb files smuggling terminal-
+        # escape sequences in qualifier values.
         seq_str = ""
         notes_str = ""
+        primer_seq_str = ""
         rec = self._current_record
         if rec is not None:
             full_seq = str(rec.seq)
             start = int(feat.get("start", 0))
             end   = int(feat.get("end",   0))
             if total > 0 and end < start:
-                # Wrap feature: tail [start, total) + head [0, end).
                 seq_str = full_seq[start:total] + full_seq[0:end]
             else:
                 seq_str = full_seq[start:end]
-            # Strip any non-printable bytes from the displayed
-            # sequence — Bio.Seq doesn't enforce a DNA alphabet, so a
-            # corrupted record could in theory carry control chars
-            # that would scramble the TextArea.
             seq_str = _CONTROL_CHARS_RE.sub("", seq_str)
             seen = 0
             for sf in rec.features:
                 if sf.type == "source":
                     continue
                 if seen == idx:
-                    raw = sf.qualifiers.get("note", []) or []
-                    if isinstance(raw, list):
-                        notes_str = "\n\n".join(str(x) for x in raw if x)
+                    raw_notes = sf.qualifiers.get("note", []) or []
+                    if isinstance(raw_notes, list):
+                        notes_str = "\n\n".join(
+                            str(x) for x in raw_notes if x)
                     else:
-                        notes_str = str(raw)
+                        notes_str = str(raw_notes)
                     notes_str = _sanitize_note(notes_str)
+                    raw_pseq = sf.qualifiers.get("primer_seq", []) or []
+                    if isinstance(raw_pseq, list) and raw_pseq:
+                        primer_seq_str = _CONTROL_CHARS_RE.sub(
+                            "", str(raw_pseq[0])
+                        ).strip().upper()
                     break
                 seen += 1
 
@@ -26109,17 +26417,31 @@ SpeciesPickerModal { align: center middle; }
             if result is None:
                 return
             try:
-                self._apply_feature_edit(result)
+                if "primer_seq" in result:
+                    self._apply_primer_edit(result)
+                else:
+                    self._apply_feature_edit(result)
             except Exception:
                 _log.exception("feature edit failed")
                 self.notify("Failed to apply feature edits.",
                              severity="error")
 
-        self.push_screen(
-            FeatureEditModal(idx, feat, total,
-                              sequence=seq_str, notes=notes_str),
-            _on_dismiss,
-        )
+        # Type-aware modal dispatch. Primer features get the
+        # primer-specific editor (sequence + Tm/GC stats); other
+        # features get the generic editor.
+        if feat.get("type") == "primer_bind":
+            self.push_screen(
+                PrimerEditModal(idx, feat, total,
+                                  primer_seq=primer_seq_str,
+                                  notes=notes_str),
+                _on_dismiss,
+            )
+        else:
+            self.push_screen(
+                FeatureEditModal(idx, feat, total,
+                                  sequence=seq_str, notes=notes_str),
+                _on_dismiss,
+            )
 
     def _apply_feature_edit(self, payload: dict) -> None:
         """Mutate the SeqRecord with the modal's edited label / type /
@@ -26224,6 +26546,102 @@ SpeciesPickerModal { align: center middle; }
         sp.update_seq(str(new_record.seq), pm._feats + displayed)
         self._mark_dirty()
         self.notify(f"Updated feature: {new_label or '(unnamed)'}  "
+                     f"(Ctrl+Z to undo)")
+
+    def _apply_primer_edit(self, payload: dict) -> None:
+        """Mutate a `primer_bind` SeqFeature with the modal's edited
+        label / sequence / strand / notes, push undo, refresh panels.
+
+        Mirrors `_apply_feature_edit` but with primer-specific
+        fields. The `/primer_seq` qualifier is the source of truth
+        for the primer's full 5'→3' sequence — updating it triggers
+        the seq panel's bound-bar + flap-row re-render. Empty
+        sequence is rejected at the modal level; defence-in-depth
+        rejection happens here too.
+
+        Position is intentionally not edited from this path — the
+        modal doesn't expose it. Callers wanting to relocate a
+        primer should delete + re-add via the library flow.
+        """
+        idx        = int(payload["idx"])
+        new_label  = payload.get("label")
+        new_pseq   = payload.get("primer_seq")
+        new_str    = payload.get("strand")
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+            sp = self.query_one("#seq-panel",   SequencePanel)
+            sb = self.query_one("#sidebar",     FeatureSidebar)
+        except NoMatches:
+            return
+        if idx < 0 or idx >= len(pm._feats):
+            return
+        if self._current_record is None:
+            return
+        from copy import deepcopy
+        new_record = deepcopy(self._current_record)
+        seen = 0
+        target = None
+        for feat in new_record.features:
+            if feat.type == "source":
+                continue
+            if seen == idx:
+                target = feat
+                break
+            seen += 1
+        if target is None:
+            return
+        if target.type != "primer_bind":
+            # Defensive: dispatch should never call this for a
+            # non-primer feature, but if it does just no-op.
+            _log.warning(
+                "_apply_primer_edit invoked on non-primer feature "
+                "type=%s idx=%d", target.type, idx,
+            )
+            return
+        if new_label is not None:
+            target.qualifiers["label"] = [str(new_label)]
+        # Sanitize primer sequence at the boundary too — same control-
+        # byte filter the label sanitizer uses, but no-newline
+        # because primers are single-line strings.
+        if new_pseq is not None:
+            clean = _CONTROL_CHARS_RE.sub("", str(new_pseq)).strip().upper()
+            clean = "".join(clean.split())
+            if clean:
+                target.qualifiers["primer_seq"] = [clean]
+        if new_str is not None and new_str in (-1, 0, 1):
+            biop_strand = new_str if new_str in (-1, 1) else None
+            from Bio.SeqFeature import FeatureLocation, CompoundLocation
+            loc = target.location
+            if isinstance(loc, CompoundLocation):
+                target.location = CompoundLocation([
+                    FeatureLocation(int(p.start), int(p.end),
+                                     strand=biop_strand)
+                    for p in loc.parts
+                ])
+            else:
+                target.location = FeatureLocation(
+                    int(loc.start), int(loc.end), strand=biop_strand,
+                )
+        new_notes = payload.get("notes")
+        if new_notes is not None:
+            new_notes_str = _sanitize_note(new_notes)
+            if new_notes_str:
+                parts = [p.strip() for p in re.split(r"\n\s*\n", new_notes_str)
+                         if p.strip()]
+                target.qualifiers["note"] = parts or [new_notes_str]
+            else:
+                target.qualifiers.pop("note", None)
+
+        self._push_undo()
+        self._current_record = new_record
+        pm.load_record(new_record)
+        sb.populate(pm._feats)
+        displayed = self._restr_cache if self._show_restr else []
+        pm._restr_feats = displayed
+        pm.refresh()
+        sp.update_seq(str(new_record.seq), pm._feats + displayed)
+        self._mark_dirty()
+        self.notify(f"Updated primer: {new_label or '(unnamed)'}  "
                      f"(Ctrl+Z to undo)")
 
     # ── Library events ─────────────────────────────────────────────────────────

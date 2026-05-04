@@ -2,6 +2,19 @@
 
 ---
 
+## [0.5.10.0] — 2026-05-04
+
+### Added
+
+- **Primer-specific editor (`PrimerEditModal`).** Opens when a `primer_bind` feature is activated via Enter on the sidebar, double-click on a sidebar row, or Enter on the seq panel with a primer selected. Read-only by default like `FeatureEditModal`; `Edit` button unlocks the form. Edit fields: name, full primer sequence (5'→3'), strand, notes. Live stats line updates as the user types: length / GC% / Tm (via primer3, lazy-imported). Save round-trips through the `/primer_seq` qualifier so the seq-panel re-renders the bound + flap visualisation with the new bases. Position is intentionally NOT editable from this modal — relocation goes through delete + re-add (same trade-off as `FeatureEditModal`).
+- **Type-aware dispatch in `_open_feature_editor`.** Primer features land in `PrimerEditModal`; other features land in `FeatureEditModal`. Each path opens for the EXACT `idx` passed in — so when a user clicks one feature out of an overlapping stack, the editor opens for THAT feature, not for any feature it shares column-space with. Verified via three tests covering primer dispatch, non-primer dispatch fallback, and the no-leak invariant on identically-positioned overlapping CDSs.
+
+### Tests
+
+- +5 tests in `test_smoke.py`: primer-modal dispatch on a `primer_bind` feature, fallback dispatch on a non-primer feature, idx-specific opening on overlapping CDSs (no leak), end-to-end primer save round-trip through the `/primer_seq` qualifier, plus `PrimerEditModal` boundary check at the 160×48 baseline terminal.
+
+---
+
 ## [0.5.9.1] — 2026-05-04
 
 ### Fixed

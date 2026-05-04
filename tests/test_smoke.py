@@ -4249,6 +4249,145 @@ class TestShiftClickFeatureExtend:
             assert f["_primer_seq"] == "AAAAAAAAAA"
             assert f["_bound_len"]  == 10
 
+    async def test_open_feature_editor_dispatches_primer_to_primer_modal(
+            self, isolated_library):
+        """A `primer_bind` feature opens `PrimerEditModal`, not the
+        generic `FeatureEditModal`. Type-aware dispatch lives in
+        `_open_feature_editor`. Regression guard for 2026-05-04."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 60, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["my-primer"],
+                                    "primer_seq": ["GAATTCAAAAAAAAAA"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.PrimerEditModal)
+            assert not isinstance(app.screen, sc.FeatureEditModal)
+            # Primer's full 5'→3' sequence (from /primer_seq qualifier)
+            # round-trips into the modal's `_primer_seq` state.
+            assert app.screen._primer_seq == "GAATTCAAAAAAAAAA"
+
+    async def test_open_feature_editor_dispatches_other_to_feature_modal(
+            self, isolated_library):
+        """Non-primer features still open `FeatureEditModal`, not
+        the primer-specific one. Confirms the dispatch fallback."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 60, strand=1),
+                        type="CDS",
+                        qualifiers={"label": ["my-cds"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.FeatureEditModal)
+            assert not isinstance(app.screen, sc.PrimerEditModal)
+
+    async def test_open_feature_editor_targets_specific_idx_in_stack(
+            self, isolated_library):
+        """When two features share / overlap bp ranges, the editor
+        opens for the EXACT index passed to `_open_feature_editor`,
+        never an overlapping neighbour. Regression guard for the
+        feature-stack disambiguation request."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Two CDSs at the SAME bp range — the lane packer stacks
+        # them; click hit-testing picks one or the other; the
+        # editor must open for whichever idx is requested.
+        rec = SeqRecord(Seq("A" * 200), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 60, strand=1),
+                        type="CDS", qualifiers={"label": ["alpha"]}),
+            SeqFeature(FeatureLocation(50, 60, strand=1),
+                        type="CDS", qualifiers={"label": ["beta"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            # Modal carries the EXACT feat dict for idx=0 — its
+            # label is "alpha", not "beta".
+            assert modal._feat.get("label") == "alpha"
+            modal.dismiss(None)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Now open for idx=1 — should be "beta" without leaking.
+            app._open_feature_editor(1)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal2 = app.screen
+            assert isinstance(modal2, sc.FeatureEditModal)
+            assert modal2._feat.get("label") == "beta"
+
+    async def test_primer_edit_modal_save_round_trip(self, isolated_library):
+        """End-to-end: open the primer editor, edit the sequence,
+        Save → the SeqFeature's `/primer_seq` qualifier reflects
+        the new bases."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 60, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P"],
+                                    "primer_seq": ["GAATTCAAAAAAAAAA"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.PrimerEditModal)
+            from textual.widgets import Button, TextArea
+            modal.query_one("#btn-primedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#primedit-seq", TextArea).text = (
+                "AAGCTTCCCCCCCCCC"
+            )
+            modal.query_one("#btn-primedit-save", Button).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # The persisted SeqFeature's primer_seq qualifier got
+            # the new bases.
+            target = next(f for f in app._current_record.features
+                            if f.type == "primer_bind")
+            assert target.qualifiers.get("primer_seq") == ["AAGCTTCCCCCCCCCC"]
+
     async def test_wrap_primer_bound_bases_dont_overflow(self):
         """Regression guard for 2026-05-04 fix: when a primer's bound
         region wraps the origin (start=95, end=5 on a 100-bp plasmid),
