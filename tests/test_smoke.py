@@ -3357,7 +3357,7 @@ class TestShiftClickFeatureExtend:
 
     async def test_focus_panel_library_only_hides_others(
             self, isolated_library):
-        """Alt+1 collapses to library-only: PlasmidMap, FeatureSidebar,
+        """F1 collapses to library-only: PlasmidMap, FeatureSidebar,
         and SequencePanel become non-displayed; LibraryPanel remains
         visible with width overridden so it fills the row."""
         from Bio.Seq import Seq
@@ -3377,7 +3377,7 @@ class TestShiftClickFeatureExtend:
             assert app.query_one("#seq-panel").display is False
 
     async def test_focus_panel_map_only(self, isolated_library):
-        """Alt+2 collapses to plasmid-map-only."""
+        """F2 collapses to plasmid-map-only."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         rec = SeqRecord(Seq("A" * 200), id="L", name="L",
@@ -3395,7 +3395,7 @@ class TestShiftClickFeatureExtend:
             assert app.query_one("#seq-panel").display is False
 
     async def test_focus_panel_sidebar_only(self, isolated_library):
-        """Alt+3 collapses to feature-sidebar-only."""
+        """F3 collapses to feature-sidebar-only."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         rec = SeqRecord(Seq("A" * 200), id="L", name="L",
@@ -3414,7 +3414,7 @@ class TestShiftClickFeatureExtend:
 
     async def test_focus_panel_seq_only_hides_top_row(
             self, isolated_library):
-        """Alt+4 collapses to seq-panel-only, hiding the entire
+        """F4 collapses to seq-panel-only, hiding the entire
         top-row container (not just its individual children) so the
         sequence strip can use the full window height. Verifies the
         seq-panel actually expands beyond its fixed CSS height of 14
@@ -3446,7 +3446,7 @@ class TestShiftClickFeatureExtend:
 
     async def test_focus_panel_all_restores_layout(
             self, isolated_library):
-        """Alt+5 restores the multi-panel layout after any focus
+        """F5 restores the multi-panel layout after any focus
         mode. All four panels become displayed again, and the
         Library / Sidebar widths are restored to their canonical
         fixed widths (26 / 32) — overrides applied during focus mode
@@ -3476,12 +3476,12 @@ class TestShiftClickFeatureExtend:
             assert int(lib.styles.width.value) == 26
             assert int(sb.styles.width.value) == 32
             # Seq-panel height also restored to the canonical 14 rows
-            # (the override-to-1fr that Alt+4 applies must not stick).
+            # (the override-to-1fr that F4 applies must not stick).
             assert int(sp.styles.height.value) == 14
 
     async def test_focus_panel_seq_then_restore_resets_height(
             self, isolated_library):
-        """Regression guard for 2026-05-04 fix: Alt+4 → Alt+5 sequence
+        """Regression guard for 2026-05-04 fix: F4 → F5 sequence
         must put the seq-panel height back to the canonical 14 rows.
         Without explicit restoration the override-to-1fr would persist
         and the multi-panel layout would render with a malformed
@@ -3505,15 +3505,16 @@ class TestShiftClickFeatureExtend:
             # And the top-row panels are visible again at full height.
             assert sp.size.height < 20  # squeezed back to its strip
 
-    async def test_focus_panel_alt_digit_bindings_fire(
+    async def test_focus_panel_f_key_bindings_fire(
             self, isolated_library):
-        """End-to-end binding test: pressing Alt+1 / Alt+2 / Alt+3 /
-        Alt+4 / Alt+5 actually triggers the matching `action_focus_*`.
-        Regression guard for the 2026-05-04 binding swap from Ctrl+N
-        (which most terminals fail to disambiguate from a bare digit)
-        to Alt+N (which sends ESC <digit> reliably). Without this the
-        keystroke→action wire could silently regress to the old
-        broken state and only show up in user reports."""
+        """End-to-end binding test: pressing F1 / F2 / F3 / F4 / F5
+        actually triggers the matching `action_focus_*`. Regression
+        guard for the 2026-05-04 binding settle: started as Ctrl+N
+        (terminals collapse Ctrl+digit to a bare digit), tried Alt+N
+        (Windows Terminal / iTerm2 / GNOME Terminal eat Alt+digit
+        for tab-switching), landed on F-keys which send dedicated
+        CSI/SS3 sequences no terminal hijacks. Catches a future
+        binding-string regression at CI time."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         rec = SeqRecord(Seq("A" * 200), id="L", name="L",
@@ -3523,23 +3524,23 @@ class TestShiftClickFeatureExtend:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            await pilot.press("alt+1")
+            await pilot.press("f1")
             await pilot.pause()
             assert app.query_one("#library").display is True
             assert app.query_one("#plasmid-map").display is False
-            await pilot.press("alt+2")
+            await pilot.press("f2")
             await pilot.pause()
             assert app.query_one("#plasmid-map").display is True
             assert app.query_one("#library").display is False
-            await pilot.press("alt+3")
+            await pilot.press("f3")
             await pilot.pause()
             assert app.query_one("#sidebar").display is True
             assert app.query_one("#plasmid-map").display is False
-            await pilot.press("alt+4")
+            await pilot.press("f4")
             await pilot.pause()
             assert app.query_one("#top-row").display is False
             assert app.query_one("#seq-panel").display is True
-            await pilot.press("alt+5")
+            await pilot.press("f5")
             await pilot.pause()
             assert app.query_one("#library").display is True
             assert app.query_one("#plasmid-map").display is True
@@ -3547,7 +3548,7 @@ class TestShiftClickFeatureExtend:
             assert app.query_one("#seq-panel").display is True
 
     async def test_focus_panel_chain_then_restore(self, isolated_library):
-        """Alt+1 → Alt+2 → Alt+3 → Alt+5 leaves the layout in
+        """F1 → F2 → F3 → F5 leaves the layout in
         the canonical multi-panel state, exercising the snapshot
         logic that remembers original widths only on the first
         focus action."""

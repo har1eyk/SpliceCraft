@@ -7379,11 +7379,11 @@ _HELP_BODY_MD = """\
 
 | Key | Action |
 |---|---|
-| `Alt+1` | Library only |
-| `Alt+2` | Plasmid map only |
-| `Alt+3` | Feature list only |
-| `Alt+4` | Sequence panel only |
-| `Alt+5` | Restore all panels |
+| `F1` | Library only |
+| `F2` | Plasmid map only |
+| `F3` | Feature list only |
+| `F4` | Sequence panel only |
+| `F5` | Restore all panels |
 
 ### Selection / clipboard
 
@@ -22716,20 +22716,22 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
         Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
-        # Panel focus shortcuts: each Alt+N collapses the multi-panel
-        # layout to just one panel; Alt+5 restores. priority=True so
-        # they fire even when an inner DataTable / Input has focus.
-        # Alt+digit (rather than Ctrl+digit) because most terminals
-        # don't emit a distinct byte sequence for Ctrl+digit — only
-        # Ctrl+@ / A-Z / [ / \ / ] / ^ / _ / ? get unique control
-        # bytes, so Ctrl+1, Ctrl+3, Ctrl+4, Ctrl+5 reach the app as
-        # bare digits and the binding never fires. Alt sends the
-        # digit prefixed with ESC, which IS distinct cross-terminal.
-        Binding("alt+1",       "focus_panel_library",  "Library only", show=False, priority=True),
-        Binding("alt+2",       "focus_panel_map",      "Map only",     show=False, priority=True),
-        Binding("alt+3",       "focus_panel_sidebar",  "Features only",show=False, priority=True),
-        Binding("alt+4",       "focus_panel_seq",      "Sequence only",show=False, priority=True),
-        Binding("alt+5",       "focus_panel_all",      "All panels",   show=False, priority=True),
+        # Panel focus shortcuts: each F-key collapses the multi-panel
+        # layout to just one panel; F5 restores. priority=True so they
+        # fire even when an inner DataTable / Input has focus.
+        # F1-F5 (rather than Ctrl+digit / Alt+digit) because both
+        # modifier+digit combos are unreliable cross-terminal: most
+        # terminals don't emit distinct bytes for Ctrl+1/3/4/5 (only
+        # Ctrl+@/A-Z/[/\/]/^/_/? get unique control codes), and many
+        # terminal emulators (Windows Terminal, iTerm2 default,
+        # GNOME Terminal with tabs) intercept Alt+digit for
+        # tab-switching before the app sees it. F-keys send dedicated
+        # CSI/SS3 sequences that no terminal hijacks.
+        Binding("f1",          "focus_panel_library",  "Library only", show=False, priority=True),
+        Binding("f2",          "focus_panel_map",      "Map only",     show=False, priority=True),
+        Binding("f3",          "focus_panel_sidebar",  "Features only",show=False, priority=True),
+        Binding("f4",          "focus_panel_seq",      "Sequence only",show=False, priority=True),
+        Binding("f5",          "focus_panel_all",      "All panels",   show=False, priority=True),
         # Rotation keys (arrows + [/]) live on PlasmidMap.BINDINGS so they
         # only rotate when the map has focus. Pre-2026-04-29 the `[`/`]`
         # keys were App-level with priority=True, which fired even on
@@ -25198,7 +25200,7 @@ SpeciesPickerModal { align: center middle; }
                 sp.query_one(ScrollableContainer).focus()
             except (NoMatches, Exception):
                 pass
-            self.notify("Layout: sequence panel only  [Alt+5 = restore]",
+            self.notify("Layout: sequence panel only  [F5 = restore]",
                          timeout=2)
             return
 
@@ -25237,7 +25239,7 @@ SpeciesPickerModal { align: center middle; }
         except (NoMatches, Exception):
             pass
 
-        self.notify(f"Layout: {label} only  [Alt+5 = restore]", timeout=2)
+        self.notify(f"Layout: {label} only  [F5 = restore]", timeout=2)
 
     def action_focus_panel_library(self) -> None:
         self._focus_panel("library")

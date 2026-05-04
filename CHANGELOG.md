@@ -2,6 +2,14 @@
 
 ---
 
+## [0.5.5.2] — 2026-05-04
+
+### Fixed
+
+- **Panel focus shortcuts moved from Alt+N to F1-F5.** Alt+digit was eaten by Windows Terminal / iTerm2 / GNOME Terminal for tab-switching before reaching the app — same root cause as the Ctrl+digit failure in 0.5.5.0 (terminals intercept the keystroke before Textual sees it). Settled on `F1`-`F5`: function keys send dedicated CSI/SS3 sequences that no terminal hijacks. HelpModal + toast hints updated; the `pilot.press` regression test now drives F-keys.
+
+---
+
 ## [0.5.5.1] — 2026-05-04
 
 ### Fixed
