@@ -2,6 +2,14 @@
 
 ---
 
+## [0.5.5.1] — 2026-05-04
+
+### Fixed
+
+- **Panel focus shortcuts moved from Ctrl+N to Alt+N.** Most terminals don't emit a distinct byte sequence for `Ctrl+1` / `Ctrl+3` / `Ctrl+4` / `Ctrl+5` — only `Ctrl+@` / `A-Z` / `[ \ ] ^ _ ?` get unique control bytes, so Ctrl+digit reaches the app as a bare digit and the binding silently never fires. Swapped to `Alt+1` … `Alt+5` (sends `ESC <digit>` cross-terminal reliably). HelpModal updated; toast hint updated. Added an end-to-end `pilot.press("alt+N")` regression test so the keystroke→action wire is enforced, not just the action methods.
+
+---
+
 ## [0.5.5.0] — 2026-05-04
 
 ### Added

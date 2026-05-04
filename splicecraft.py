@@ -7379,11 +7379,11 @@ _HELP_BODY_MD = """\
 
 | Key | Action |
 |---|---|
-| `Ctrl+1` | Library only |
-| `Ctrl+2` | Plasmid map only |
-| `Ctrl+3` | Feature list only |
-| `Ctrl+4` | Sequence panel only |
-| `Ctrl+5` | Restore all panels |
+| `Alt+1` | Library only |
+| `Alt+2` | Plasmid map only |
+| `Alt+3` | Feature list only |
+| `Alt+4` | Sequence panel only |
+| `Alt+5` | Restore all panels |
 
 ### Selection / clipboard
 
@@ -22716,14 +22716,20 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
         Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
-        # Panel focus shortcuts: each Ctrl+N collapses the multi-panel
-        # layout to just one panel; Ctrl+5 restores. priority=True so
+        # Panel focus shortcuts: each Alt+N collapses the multi-panel
+        # layout to just one panel; Alt+5 restores. priority=True so
         # they fire even when an inner DataTable / Input has focus.
-        Binding("ctrl+1",      "focus_panel_library",  "Library only", show=False, priority=True),
-        Binding("ctrl+2",      "focus_panel_map",      "Map only",     show=False, priority=True),
-        Binding("ctrl+3",      "focus_panel_sidebar",  "Features only",show=False, priority=True),
-        Binding("ctrl+4",      "focus_panel_seq",      "Sequence only",show=False, priority=True),
-        Binding("ctrl+5",      "focus_panel_all",      "All panels",   show=False, priority=True),
+        # Alt+digit (rather than Ctrl+digit) because most terminals
+        # don't emit a distinct byte sequence for Ctrl+digit — only
+        # Ctrl+@ / A-Z / [ / \ / ] / ^ / _ / ? get unique control
+        # bytes, so Ctrl+1, Ctrl+3, Ctrl+4, Ctrl+5 reach the app as
+        # bare digits and the binding never fires. Alt sends the
+        # digit prefixed with ESC, which IS distinct cross-terminal.
+        Binding("alt+1",       "focus_panel_library",  "Library only", show=False, priority=True),
+        Binding("alt+2",       "focus_panel_map",      "Map only",     show=False, priority=True),
+        Binding("alt+3",       "focus_panel_sidebar",  "Features only",show=False, priority=True),
+        Binding("alt+4",       "focus_panel_seq",      "Sequence only",show=False, priority=True),
+        Binding("alt+5",       "focus_panel_all",      "All panels",   show=False, priority=True),
         # Rotation keys (arrows + [/]) live on PlasmidMap.BINDINGS so they
         # only rotate when the map has focus. Pre-2026-04-29 the `[`/`]`
         # keys were App-level with priority=True, which fired even on
@@ -25192,7 +25198,7 @@ SpeciesPickerModal { align: center middle; }
                 sp.query_one(ScrollableContainer).focus()
             except (NoMatches, Exception):
                 pass
-            self.notify("Layout: sequence panel only  [^5 = restore]",
+            self.notify("Layout: sequence panel only  [Alt+5 = restore]",
                          timeout=2)
             return
 
@@ -25231,7 +25237,7 @@ SpeciesPickerModal { align: center middle; }
         except (NoMatches, Exception):
             pass
 
-        self.notify(f"Layout: {label} only  [^5 = restore]", timeout=2)
+        self.notify(f"Layout: {label} only  [Alt+5 = restore]", timeout=2)
 
     def action_focus_panel_library(self) -> None:
         self._focus_panel("library")
