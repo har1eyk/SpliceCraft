@@ -5218,6 +5218,9 @@ class LibraryPanel(Widget):
 
     DEFAULT_CSS = """
     LibraryPanel {
+        /* Width starts at the minimum and grows in `_apply_panel_width`
+           after the library is loaded. The CSS default keeps the
+           panel sane during compose / before the first repopulate. */
         width: 26;
         border-right: solid $primary;
     }
@@ -5237,6 +5240,27 @@ class LibraryPanel(Widget):
     #lib-coll-btns Button  { min-width: 5; margin: 0 0 0 1; }
     """
 
+    # Key binding fires on the panel's focused descendant — primarily
+    # the DataTable rows. Doesn't conflict with the `_SearchInput`
+    # since text inputs swallow `s` as a normal character.
+    BINDINGS = [
+        Binding("s", "request_status", "Set status",
+                show=False, priority=False),
+    ]
+
+    def action_request_status(self) -> None:
+        """Posted up to the app, which opens `PlasmidStatusPickerModal`
+        for the cursor row of the visible plasmid table. No-op when
+        we're in collections view (cursor would be on a collection,
+        not a plasmid)."""
+        if self._view_mode != "plasmids":
+            return
+        try:
+            t = self.query_one("#lib-table", DataTable)
+        except NoMatches:
+            return
+        self.post_message(self.StatusRequested(_cursor_row_key(t)))
+
     class PlasmidLoad(Message):
         """User selected a library entry to load."""
         def __init__(self, entry: dict):
@@ -5250,6 +5274,16 @@ class LibraryPanel(Widget):
     class RenameRequested(Message):
         """User pressed the rename (✎) button with a library row focused.
         entry_id is the library key of the row with the cursor."""
+        def __init__(self, entry_id: "str | None"):
+            self.entry_id = entry_id
+            super().__init__()
+
+    class StatusRequested(Message):
+        """User triggered the workflow-status picker for a library row
+        (key binding `s` on the plasmid table). entry_id is the
+        library key of the cursor row, or None if the cursor isn't
+        on a row yet — the app handler turns the latter into a
+        gentle "highlight a row first" notification."""
         def __init__(self, entry_id: "str | None"):
             self.entry_id = entry_id
             super().__init__()
@@ -5327,8 +5361,9 @@ class LibraryPanel(Widget):
         coll = self.query_one("#lib-coll-table", DataTable)
         coll.add_columns("Name", "Plasmids")
         plas = self.query_one("#lib-table", DataTable)
-        plas.add_columns("Name", "bp")
+        plas.add_columns("Name", "Status", "bp")
         self._apply_view_mode()
+        self._apply_panel_width()
         self._repopulate()
 
     @on(Input.Submitted, "#lib-search")
@@ -5381,15 +5416,84 @@ class LibraryPanel(Widget):
     # ── Repopulate dispatch ────────────────────────────────────────────────
 
     def _repopulate(self) -> None:
+        # Re-measure the longest name on every repopulate — content
+        # can change underfoot via add/remove/rename, library load,
+        # or collection swap.
+        self._apply_panel_width()
         if self._view_mode == "collections":
             self._repopulate_collections()
         else:
             self._repopulate_plasmids()
 
+    # Panel-width budget. The plasmid name column scales to fit the
+    # longest name in the active library (clipping it would hide
+    # the most important info), but is capped so a single 200-char
+    # name doesn't push the map / sidebar off-screen. Status column
+    # is sized to "SEQUENCING" + a 2-cell circle prefix; bp column
+    # to a 7-digit count + "bp" suffix room.
+    _NAME_COL_FLOOR  = 12
+    _NAME_COL_CEIL   = 30
+    _STATUS_COL_W    = 12
+    _BP_COL_W        = 9
+    _PANEL_FIXED_PAD = 8   # border + padding + datatable separators
+
+    def _compute_name_col_width(self) -> int:
+        """Longest plasmid + collection name in cells, clamped to
+        `[_NAME_COL_FLOOR, _NAME_COL_CEIL]`. The panel and table
+        both use this so the two views stay visually aligned when
+        the user toggles between them.
+
+        The +2 is the colour-circle prefix: `● ` always reserves
+        two cells on plasmid rows even when no status is set, so
+        names don't shift left/right when the user assigns a
+        status. Collection names skip the circle but are still
+        sized against the same width so the panel doesn't reflow.
+        """
+        max_name = 0
+        for entry in _load_library():
+            n = len(str(entry.get("name") or entry.get("id") or ""))
+            if n > max_name:
+                max_name = n
+        for c in _load_collections():
+            n = len(str(c.get("name") or ""))
+            if n > max_name:
+                max_name = n
+        # `+2` accounts for the circle prefix on plasmid rows.
+        return max(self._NAME_COL_FLOOR,
+                    min(max_name + 2, self._NAME_COL_CEIL))
+
+    def _apply_panel_width(self) -> None:
+        """Resize the panel and the plasmid DataTable's columns to
+        fit the current library content. Called on mount, on every
+        repopulate, and after add/remove/rename so the layout never
+        clips a longer name than what's been measured."""
+        name_w = self._compute_name_col_width()
+        total_w = (name_w + self._STATUS_COL_W + self._BP_COL_W
+                    + self._PANEL_FIXED_PAD)
+        try:
+            self.styles.width = total_w
+        except Exception:
+            # Style assignment can fail if the widget hasn't been
+            # mounted yet; the next refresh will pick up the value.
+            pass
+        # Resize the column itself so the rendered name occupies
+        # the new width. Textual's DataTable uses content-driven
+        # auto-sizing by default, so explicit column widths keep
+        # both views (collections + plasmids) aligned.
+        try:
+            for tid in ("#lib-table", "#lib-coll-table"):
+                t = self.query_one(tid, DataTable)
+                if t.columns:
+                    name_col = next(iter(t.columns.values()))
+                    name_col.width = name_w
+        except (NoMatches, AttributeError, StopIteration):
+            pass
+
     def _repopulate_collections(self) -> None:
         t = self.query_one("#lib-coll-table", DataTable)
         t.clear()
         flt = self._filter_text
+        name_w = self._compute_name_col_width()
         # Natural sort by display name so `Backbones 2`, `Backbones 10`
         # land in human-readable order instead of lexicographic
         # `Backbones 10`, `Backbones 2`.
@@ -5402,12 +5506,16 @@ class LibraryPanel(Widget):
             # Wrap in Text() so any markup chars (e.g. a collection
             # named "[red]x[/red]") render literally — Text(str) is
             # opaque to Rich's markup parser, unlike a bare string.
-            t.add_row(Text(name[:14]), str(n_plas), key=name)
+            t.add_row(Text(name[:name_w]), str(n_plas), key=name)
 
     def _repopulate_plasmids(self) -> None:
         t = self.query_one("#lib-table", DataTable)
         t.clear()
         flt = self._filter_text
+        name_w = self._compute_name_col_width()
+        # Inner name budget after the 2-cell circle prefix is
+        # reserved on every plasmid row.
+        name_inner = max(1, name_w - 2)
         # Natural sort by name (`pBin2` before `pBin10`) — see
         # `_natural_sort_key`. Splits each name into text + integer
         # runs so the sort respects numeric magnitude rather than the
@@ -5419,11 +5527,32 @@ class LibraryPanel(Widget):
             if not _fuzzy_match(flt, name):
                 continue
             is_dirty = (entry["id"] == self._active_id and self._active_dirty)
-            name_disp = ("*" + name)[:14] if is_dirty else name[:14]
-            # See _repopulate_collections: Text() prevents markup
-            # injection from filename-derived display names.
+            name_disp = ("*" + name) if is_dirty else name
+            name_disp = name_disp[:name_inner]
+            status = _sanitize_plasmid_status(entry.get("status"))
+            color  = _PLASMID_STATUS_COLORS.get(status)
+            # Build the name cell as a `Text` so the circle prefix
+            # gets its own colour while the name itself stays the
+            # default foreground (otherwise long names tint).
+            name_cell = Text(no_wrap=True, overflow="ellipsis")
+            if color is not None:
+                name_cell.append("● ", style=color)
+            else:
+                # Reserve the same 2 cells for "no status" entries
+                # so the names align column-wise. Empty space, no
+                # background tint.
+                name_cell.append("  ")
+            name_cell.append(name_disp)
+            # Status column: coloured workflow tag, or a dim em-dash
+            # when no status is set.
+            if status and color is not None:
+                status_cell = Text(status,
+                                    style=f"{color} bold")
+            else:
+                status_cell = Text("—", style="dim")
             t.add_row(
-                Text(name_disp),
+                name_cell,
+                status_cell,
                 f"{entry['size']:,}",
                 key=entry["id"],
             )
@@ -5431,9 +5560,20 @@ class LibraryPanel(Widget):
     # ── Plasmid view: existing flow + back button ──────────────────────────
 
     def add_entry(self, record) -> None:
-        """Serialize record and persist into the active collection."""
+        """Serialize record and persist into the active collection.
+
+        Preserves any existing workflow `status` on the entry —
+        re-saving a plasmid that was already marked VERIFIED keeps
+        the green badge instead of resetting to "no status". Status
+        is reset only when the user explicitly clears it via the
+        picker."""
         gb_text = _record_to_gb_text(record)
         entries = _load_library()
+        prev_status = ""
+        for e in entries:
+            if e.get("id") == record.id:
+                prev_status = _sanitize_plasmid_status(e.get("status"))
+                break
         entries = [e for e in entries if e.get("id") != record.id]
         entries.insert(0, {
             "name":    record.name or record.id,
@@ -5443,9 +5583,11 @@ class LibraryPanel(Widget):
             "source":  getattr(record, "_tui_source", f"id:{record.id}"),
             "added":   _date.today().isoformat(),
             "gb_text": gb_text,
+            "status":  prev_status,
         })
         _save_library(entries)
         if self._view_mode == "plasmids":
+            self._apply_panel_width()
             self._repopulate_plasmids()
 
     @on(DataTable.RowSelected, "#lib-table")
@@ -7823,10 +7965,27 @@ _HELP_BODY_MD = """\
 
 # ── What's New modal ──────────────────────────────────────────────────────────
 
-# Cache: parsing the CHANGELOG is cheap (~5 ms) but happens once
-# per app launch + whenever the user opens the modal manually, so
-# avoid repeating the file read on the second open within a session.
-_WHATS_NEW_CACHE: "tuple[str, str] | None" = None  # (changelog_path_str, body_md)
+# Cache: parsing the CHANGELOG is cheap, but the Markdown render of
+# the body is the slow part and the modal opens on every version
+# bump + on demand from File → What's New… Cache by (path, mtime)
+# so an in-session edit to CHANGELOG.md isn't masked by a stale
+# render.
+_WHATS_NEW_CACHE: "tuple[str, float, str] | None" = None  # (path, mtime, body_md)
+
+# Cap the modal to the most recent N releases. The full CHANGELOG
+# is ~24 versions / 60 KB; rendering all of it through Textual's
+# Markdown widget is noticeably slow on cold open and most users
+# only care about what changed since they last upgraded. The
+# remainder lives on GitHub; the body links there explicitly.
+_WHATS_NEW_MAX_VERSIONS = 3
+_WHATS_NEW_GITHUB_URL = (
+    "https://github.com/Binomica-Labs/SpliceCraft/blob/master/CHANGELOG.md"
+)
+
+# Pre-compiled at module load — the parser runs over every line of
+# CHANGELOG.md (hundreds of lines) and recompiling per call adds
+# measurable overhead on a cold open.
+_CHANGELOG_HEADING_RE = re.compile(r"^##\s*\[([^\]]+)\]")
 
 
 def _parse_changelog_sections(changelog_md: str) -> list[tuple[str, str]]:
@@ -7839,11 +7998,10 @@ def _parse_changelog_sections(changelog_md: str) -> list[tuple[str, str]]:
     the caller can filter them out if it wants strict releases only.
     """
     sections: list[tuple[str, str]] = []
-    lines = changelog_md.splitlines()
     cur_ver: "str | None" = None
     cur_buf: list[str] = []
-    for ln in lines:
-        m = re.match(r"^##\s*\[([^\]]+)\]", ln)
+    for ln in changelog_md.splitlines():
+        m = _CHANGELOG_HEADING_RE.match(ln)
         if m:
             if cur_ver is not None:
                 sections.append((cur_ver, "\n".join(cur_buf).rstrip()))
@@ -7876,32 +8034,48 @@ def _version_sort_key(version_str: str) -> tuple:
 
 
 def _build_whats_new_body(changelog_md: str,
-                            current_version: str) -> str:
+                            current_version: str,
+                            max_versions: int = _WHATS_NEW_MAX_VERSIONS,
+                            ) -> str:
     """Compose the Markdown body of the What's New modal.
 
     Pulls every `## [X.Y.Z]` section out of `changelog_md`, sorts
-    the version blocks newest-first (descending by parsed
-    components), and returns one big Markdown string.
+    the version blocks newest-first, and returns the most recent
+    `max_versions` of them as one Markdown string. The body
+    finishes with a footer pointing at the full changelog on
+    GitHub for older releases.
 
     Adds a small thank-you header at the top reserving space for
     future contributor credits — referenced in each version's
     section as `**Contributors:** name1, name2` or wherever the
     maintainer chooses. Cite-by-name is intentional; the modal is
-    where contributors get visible recognition without buyers
+    where contributors get visible recognition without users
     having to dig through git log.
     """
     sections = _parse_changelog_sections(changelog_md)
+    # Drop `[Unreleased]` (and any other non-numeric heading) — the
+    # modal is for end users on a tagged build and should only
+    # surface released versions. The parser keeps these blocks so
+    # dev tooling can still see them; the filter lives here.
+    sections = [
+        (v, body) for (v, body) in sections
+        if v and v[0:1].isdigit()
+    ]
     sections.sort(key=lambda s: _version_sort_key(s[0]), reverse=True)
     if not sections:
         return ("# What's New in SpliceCraft\n\n"
                 f"You're on **{current_version}**. No changelog "
                 "entries parsed — see `CHANGELOG.md` in the repo.")
+    cap = max(1, int(max_versions))
+    shown = sections[:cap]
+    truncated = len(sections) > len(shown)
     parts: list[str] = []
     parts.append("# What's New in SpliceCraft")
     parts.append(
         f"You're running **{current_version}**.  "
-        "Each release block below corresponds to a version of the app, "
-        "newest at the top. To see this dialog again any time, open "
+        f"Showing the {len(shown)} most recent release"
+        f"{'s' if len(shown) != 1 else ''}, newest first. "
+        "To see this dialog again any time, open "
         "`File → What's New…`."
     )
     parts.append("---")
@@ -7911,17 +8085,29 @@ def _build_whats_new_body(changelog_md: str,
         "Per-release contributor credits appear inline in the "
         "matching version block._"
     )
-    for ver, body in sections:
+    for _ver, body in shown:
         parts.append(body)
+    parts.append("---")
+    if truncated:
+        parts.append(
+            "For older releases and the full version history, please "
+            f"visit the GitHub changelog: <{_WHATS_NEW_GITHUB_URL}>"
+        )
+    else:
+        parts.append(
+            "Full changelog (mirrored on GitHub): "
+            f"<{_WHATS_NEW_GITHUB_URL}>"
+        )
     return "\n\n".join(parts)
 
 
 def _load_whats_new_body(current_version: str) -> str:
     """Locate `CHANGELOG.md` next to the running module, parse it,
-    and return the modal body. Cached after the first call so a
-    quick reopen doesn't re-read the file. Falls back to a
-    placeholder if the changelog is missing (e.g. a stripped wheel
-    install on some platforms)."""
+    and return the modal body. Cached on (path, mtime) so a quick
+    reopen doesn't re-read the file but a mid-session edit (rare
+    but possible during development) doesn't get masked. Falls
+    back to a placeholder if the changelog is missing (e.g. a
+    stripped wheel install on some platforms)."""
     global _WHATS_NEW_CACHE
     candidates = [
         Path(__file__).resolve().parent / "CHANGELOG.md",
@@ -7933,11 +8119,18 @@ def _load_whats_new_body(current_version: str) -> str:
     if cl_path is None:
         return (f"# What's New in SpliceCraft\n\n"
                 f"You're on **{current_version}**.\n\n"
-                "_(CHANGELOG.md not found in this install — see the "
-                "GitHub repo for release notes.)_")
+                f"_(CHANGELOG.md not found in this install — see the "
+                f"GitHub changelog for release notes:_ "
+                f"<{_WHATS_NEW_GITHUB_URL}>)")
     cache_key = str(cl_path)
-    if _WHATS_NEW_CACHE is not None and _WHATS_NEW_CACHE[0] == cache_key:
-        return _WHATS_NEW_CACHE[1]
+    try:
+        mtime = cl_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if (_WHATS_NEW_CACHE is not None
+            and _WHATS_NEW_CACHE[0] == cache_key
+            and _WHATS_NEW_CACHE[1] == mtime):
+        return _WHATS_NEW_CACHE[2]
     try:
         text = cl_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -7946,7 +8139,7 @@ def _load_whats_new_body(current_version: str) -> str:
                 f"You're on **{current_version}** "
                 "(could not read CHANGELOG.md).")
     body = _build_whats_new_body(text, current_version)
-    _WHATS_NEW_CACHE = (cache_key, body)
+    _WHATS_NEW_CACHE = (cache_key, mtime, body)
     return body
 
 
@@ -7974,22 +8167,77 @@ class WhatsNewModal(ModalScreen):
 
     DEFAULT_CSS = """
     WhatsNewModal { align: center middle; }
+    /* Quiet, green-accented styling. Default Textual themes paint
+       Markdown headings + the modal title with `$accent`, which
+       in `dark-ansi` maps to ANSI yellow/orange — visually
+       jarring against the rest of the app. We override every
+       accented element with `$success` (green) so the modal reads
+       as a calm "good news" colour instead. */
     #whatsnew-box {
         width: 92; height: 90%; max-height: 40;
         background: $surface;
-        border: solid $accent;
+        border: round $success;
         padding: 1 2;
     }
     #whatsnew-title {
+        height: 1;
         text-style: bold;
-        background: $accent;
-        color: $text;
-        padding: 0 1;
+        color: $success;
         margin-bottom: 1;
     }
-    #whatsnew-body-scroll { height: 1fr; min-height: 10; padding: 0 1; }
-    #whatsnew-body { height: auto; }
-    #whatsnew-btns { height: 3; margin-top: 1; }
+    #whatsnew-body-scroll {
+        height: 1fr; min-height: 10; padding: 0 1;
+        background: $surface;
+    }
+    #whatsnew-body {
+        height: auto;
+        background: $surface;
+    }
+    /* Recolour every Markdown heading level — `## [version]` is
+       the loudest highlight in a real CHANGELOG, and `### Added`
+       / `### Fixed` show up in nearly every section. All four
+       (H1 for the dialog header, H2/H3 for version + category,
+       H4 as a tail) get the same green so the body reads as a
+       single quiet palette. */
+    #whatsnew-body MarkdownH1 {
+        color: $success;
+        text-style: bold;
+        background: $surface;
+    }
+    #whatsnew-body MarkdownH2 {
+        color: $success;
+        text-style: bold;
+        background: $surface;
+    }
+    #whatsnew-body MarkdownH3 {
+        color: $success;
+        text-style: bold;
+        background: $surface;
+    }
+    #whatsnew-body MarkdownH4 {
+        color: $success;
+        text-style: bold;
+        background: $surface;
+    }
+    /* Inline code spans (single backticks) — `File → What's New…`,
+       `0.5.11.0`, `CHANGELOG.md`, etc. The default Markdown theme
+       paints these with `$accent` (orange in `dark-ansi`). The
+       Textual `MarkdownBlock` widget exposes the inline code
+       style as a COMPONENT_CLASS named `code_inline` (note the
+       underscore), so the selector is `MarkdownBlock > .code_inline`
+       — matching the pattern Textual uses internally. We remap
+       to a green-tinted background + green text so backtick spans
+       blend into the rest of the modal palette. */
+    #whatsnew-body MarkdownBlock > .code_inline {
+        color: $success;
+        background: $success 15%;
+    }
+    #whatsnew-hint {
+        margin-top: 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+    #whatsnew-btns { height: 3; margin-top: 1; align: right middle; }
     #whatsnew-btns Button { margin-right: 1; }
     """
 
@@ -8002,15 +8250,21 @@ class WhatsNewModal(ModalScreen):
         from textual.widgets import Markdown as _Markdown
         body_md = _load_whats_new_body(self._version)
         with Vertical(id="whatsnew-box"):
+            # Title is text-only (no filled bar); the dot separator
+            # keeps the version next to the heading without a
+            # second row.
             yield Static(
-                f" What's New  ·  v{self._version} ",
+                f"What's New  ·  v{self._version}",
                 id="whatsnew-title",
             )
             with VerticalScroll(id="whatsnew-body-scroll"):
                 yield _Markdown(body_md, id="whatsnew-body")
+            yield Static(
+                "Press Esc or q to close.", id="whatsnew-hint",
+            )
             with Horizontal(id="whatsnew-btns"):
                 yield Button("Dismiss", id="btn-whatsnew-dismiss",
-                              variant="primary")
+                              variant="default")
 
     @on(Button.Pressed, "#btn-whatsnew-dismiss")
     def _on_dismiss_btn(self, _: Button.Pressed) -> None:
@@ -8018,6 +8272,120 @@ class WhatsNewModal(ModalScreen):
 
     def action_dismiss_whatsnew(self) -> None:
         self.dismiss(None)
+
+
+# ── Update check (PyPI) ───────────────────────────────────────────────────────
+
+# Endpoint returns a JSON document with the latest released version
+# at `info.version`. Hitting this is bandwidth-cheap (~7 KB
+# response) and PyPI's CDN is fast worldwide. We never hit the
+# package archive itself — just the metadata blob.
+_PYPI_JSON_URL = "https://pypi.org/pypi/splicecraft/json"
+
+# How long to trust a cached "latest version" answer before
+# re-asking PyPI. 24 h keeps the chatter low while still surfacing
+# new releases promptly for daily users.
+_UPDATE_CHECK_INTERVAL_S = 24 * 60 * 60
+
+# Hard timeout on the urllib fetch. Anything slower than this and
+# we'd rather skip the check than block the worker thread for the
+# session's lifetime. PyPI's CDN typically answers in <500 ms.
+_UPDATE_CHECK_TIMEOUT_S = 3.0
+
+# Hard ceiling on the PyPI response size — defence against an
+# upstream returning a giant blob (compromised or misconfigured).
+# The real splicecraft JSON document is ~10 KB; 256 KB is wildly
+# generous while still bounding worker memory + parse time.
+_PYPI_MAX_RESPONSE_BYTES = 256 * 1024
+
+
+def _parse_pypi_version(v: str) -> "tuple[int, ...] | None":
+    """Strict parser for canonical SpliceCraft version strings
+    (`X.Y.Z` or `X.Y.Z.W`). Returns a tuple of ints for valid
+    inputs or None for anything that doesn't fully parse —
+    pre-releases, hashes, blank strings, etc. Returning None lets
+    the comparator treat "weird PyPI metadata" as "don't notify"
+    rather than silently producing a wrong answer."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s:
+        return None
+    parts = s.split(".")
+    out: list[int] = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except ValueError:
+            return None
+    return tuple(out)
+
+
+def _is_newer_pypi_version(remote: str, local: str) -> bool:
+    """True iff `remote` parses as a strictly newer canonical
+    version than `local`. Returns False for any parse failure or
+    for equal versions — defensive: if we can't be sure, don't
+    nag the user."""
+    r = _parse_pypi_version(remote)
+    l = _parse_pypi_version(local)
+    if r is None or l is None:
+        return False
+    return r > l
+
+
+def _fetch_latest_pypi_version(timeout: float = _UPDATE_CHECK_TIMEOUT_S
+                                ) -> "str | None":
+    """Hit PyPI's JSON metadata endpoint and return the published
+    `info.version` string. Returns None for any network error,
+    parse failure, or missing field — the caller treats None as
+    "couldn't tell, skip notification".
+
+    Pure stdlib (urllib + json), no third-party dependency. The
+    UA string is set politely so PyPI's logs distinguish us from
+    anonymous scrapers — they explicitly ask packaging clients to
+    self-identify.
+
+    Defensive: response is capped at `_PYPI_MAX_RESPONSE_BYTES`
+    (much larger than any legitimate JSON payload for one package
+    but small enough to bound memory + parse time on a malicious
+    or misconfigured upstream); the parsed version string is
+    capped at 64 chars (PEP 440 versions are far shorter).
+    """
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        _PYPI_JSON_URL,
+        headers={
+            "User-Agent": f"splicecraft/{__version__} (update-check)",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # Cap the read so a malformed / hostile upstream can't
+            # OOM the worker. PyPI's JSON for splicecraft is ~10 KB
+            # in practice; 256 KB leaves comfortable headroom.
+            raw = resp.read(_PYPI_MAX_RESPONSE_BYTES + 1)
+        if len(raw) > _PYPI_MAX_RESPONSE_BYTES:
+            _log.debug("PyPI update check: response exceeded %d-byte cap",
+                        _PYPI_MAX_RESPONSE_BYTES)
+            return None
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        _log.debug("PyPI update check failed (network): %s", exc)
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        _log.debug("PyPI update check failed (parse): %s", exc)
+        return None
+    info = data.get("info") if isinstance(data, dict) else None
+    if not isinstance(info, dict):
+        return None
+    latest = info.get("version")
+    if not isinstance(latest, str):
+        return None
+    latest = latest.strip()[:64]
+    return latest or None
 
 
 # ── Fetch modal ────────────────────────────────────────────────────────────────
@@ -12169,6 +12537,48 @@ def _annotate_seq_from_feature_library(
     return found
 
 
+# Pre-compiled — `_on_apply_prefix` re-runs this on every Apply
+# click and the primer-save path also validates against the same
+# alphabet. Module-level keeps the compilation cost off the hot
+# path (Python's regex cache amortises this anyway, but explicit
+# is clearer).
+_PRIMER_IUPAC_RE = re.compile(r"[ACGTRYWSMKBDHVN]+")
+
+# Defensive caps on primer-modal text inputs. The 5'-add-on prefix
+# is a 6-7 bp restriction site plus an optional spacer — anything
+# beyond ~60 bp doesn't fit a realistic cloning primer; 100 gives
+# users headroom for a long Gibson overhang while still rejecting
+# adversarial / accidental large pastes before the regex even
+# runs. The full-sequence cap matches the longest commercial
+# oligo synthesis (Twist's 300-mer service) with comfortable
+# headroom; a primer longer than this is almost certainly a gene
+# fragment pasted into the wrong field.
+_PRIMER_PREFIX_MAX_LEN = 100
+_PRIMER_SEQ_MAX_LEN    = 500
+
+
+@_functools.lru_cache(maxsize=512)
+def _primer_tm_safe(seq: str) -> "float | None":
+    """Memoized, defensive primer3 Tm calculation. Returns None if
+    primer3 is unavailable, the seq is outside the calc's useful
+    range (5..200 bp), or the underlying call raises. Caller
+    renders a `—` placeholder for None.
+
+    Cached because `PrimerEditModal._seq_changed` repaints the
+    stats line on every keystroke — a user typing/backspacing
+    re-hits the same intermediate strings, and the nearest-
+    neighbor thermodynamics is the slow part of the path.
+    """
+    s = (seq or "").upper()
+    if not (5 <= len(s) <= 200):
+        return None
+    try:
+        import primer3
+        return float(primer3.calc_tm(s))
+    except (ImportError, OSError, ValueError, RuntimeError, TypeError):
+        return None
+
+
 _PRIMER_5P_RE_SITES: list[tuple[str, str]] = [
     # (display label, recognition site to prepend). Curated subset
     # of common cloning enzymes — full NEB catalog (~200) is too
@@ -12193,6 +12603,16 @@ _PRIMER_5P_RE_SITES: list[tuple[str, str]] = [
     ("BbsI     · GAAGAC (Type IIS)", "GAAGAC"),
     ("SapI     · GCTCTTC (Type IIS)", "GCTCTTC"),
 ]
+
+
+# Hard ceiling on the preview window width. The CSS scrollbar
+# handles real-world overruns (long flap + context) gracefully,
+# but a malformed feat with bound_len in the hundreds of kb would
+# otherwise allocate a massive per-cell list on every keystroke.
+# 2000 cells covers a 500-bp primer + 500-bp bound region with
+# ample context on both sides — well past any biologically
+# meaningful preview.
+_PRIMER_PREVIEW_MAX_WIDTH = 2000
 
 
 def _build_primer_preview(template: str, primer_seq: str,
@@ -12244,6 +12664,11 @@ def _build_primer_preview(template: str, primer_seq: str,
     win_end = win_end_unclamped
     if win_end <= win_start:
         return Text("(no overlap with template)", style="dim italic")
+    if win_end - win_start > _PRIMER_PREVIEW_MAX_WIDTH:
+        # Malformed feat coords or an absurdly long primer — bail
+        # before allocating a giant per-cell list every keystroke.
+        return Text("(preview window too wide — primer / binding "
+                    "coordinates out of range)", style="dim italic")
 
     # Top strand: clamp to template length, pad with spaces past
     # the end so the flap can render at its full column range
@@ -12518,8 +12943,9 @@ class PrimerEditModal(ModalScreen):
     @staticmethod
     def _stats_line(seq: str) -> str:
         """Compose `[bold]Length:[/bold] N bp · GC: X% · Tm: Y°C`
-        from a primer sequence. Uses primer3 for Tm if the sequence
-        is at least 5 bp (primer3 panics on shorter inputs).
+        from a primer sequence. Tm via the memoized
+        `_primer_tm_safe` helper — repeat keystrokes hit the cache
+        instead of re-running the thermodynamics calc.
         """
         s = (seq or "").strip().upper()
         if not s:
@@ -12527,14 +12953,8 @@ class PrimerEditModal(ModalScreen):
         n  = len(s)
         gc = sum(1 for ch in s if ch in "GC")
         gc_pct = (gc * 100.0 / n) if n else 0.0
-        tm_str = "—"
-        if n >= 5:
-            try:
-                import primer3
-                tm = primer3.calc_tm(s)
-                tm_str = f"{tm:.1f}°C"
-            except Exception:
-                tm_str = "—"
+        tm = _primer_tm_safe(s)
+        tm_str = f"{tm:.1f}°C" if tm is not None else "—"
         return (f"[bold]Length:[/bold] {n} bp  · "
                 f"[bold]GC:[/bold] {gc_pct:.1f}%  · "
                 f"[bold]Tm:[/bold] {tm_str}")
@@ -12592,20 +13012,27 @@ class PrimerEditModal(ModalScreen):
             color=str(f.get("color", "white")),
         )
 
-    def _refresh_preview(self) -> None:
+    def _refresh_preview(self, seq: "str | None" = None) -> None:
+        """Repaint the in-modal preview. Pass `seq` to skip the
+        TextArea query — the per-keystroke `_seq_changed` path
+        already has the value in hand."""
         try:
             preview = self.query_one("#primedit-preview", Static)
-            ta      = self.query_one("#primedit-seq",     TextArea)
         except NoMatches:
             return
-        preview.update(self._build_preview_text(ta.text))
+        if seq is None:
+            try:
+                seq = self.query_one("#primedit-seq", TextArea).text
+            except NoMatches:
+                return
+        preview.update(self._build_preview_text(seq))
 
     @on(Button.Pressed, "#btn-primedit-prefix-apply")
     def _on_apply_prefix(self, _: Button.Pressed) -> None:
         """Prepend the picked restriction site (or custom bases) to
         the primer sequence. Validates that the prefix is DNA-ish
-        (ACGT/IUPAC) and uppercases it. Both inputs are sanitized
-        for control bytes — defence in depth against pasted blobs.
+        (ACGT/IUPAC), uppercases it, and applies a hard length cap
+        before the regex check so a pasted blob bounces fast.
         """
         if not self._editing:
             return
@@ -12623,9 +13050,17 @@ class PrimerEditModal(ModalScreen):
         if custom_raw:
             cleaned = _CONTROL_CHARS_RE.sub("", custom_raw).upper()
             cleaned = "".join(cleaned.split())
+            # Length cap BEFORE regex — a 10 MB paste should fail
+            # immediately, not run the regex over the whole blob.
+            if len(cleaned) > _PRIMER_PREFIX_MAX_LEN:
+                status.update(
+                    f"[red]Custom prefix too long "
+                    f"(>{_PRIMER_PREFIX_MAX_LEN} bp). Trim before applying.[/red]"
+                )
+                return
             # Allow A/C/G/T + IUPAC + N. Reject anything else so
             # the user can't smuggle markup tags or random chars.
-            if not re.fullmatch(r"[ACGTRYWSMKBDHVN]+", cleaned):
+            if not _PRIMER_IUPAC_RE.fullmatch(cleaned):
                 status.update(
                     "[red]Custom prefix must be DNA / IUPAC bases only.[/red]"
                 )
@@ -12641,8 +13076,17 @@ class PrimerEditModal(ModalScreen):
             prefix = re_value.upper()
         if not prefix:
             return
-        new_seq = prefix + ta.text.strip().upper()
-        ta.text = new_seq
+        # Cap the COMBINED length too — prepending a 100-bp prefix
+        # to an already-near-cap primer would silently push past
+        # the save-time limit and surprise the user later.
+        existing = ta.text.strip().upper()
+        if len(prefix) + len(existing) > _PRIMER_SEQ_MAX_LEN:
+            status.update(
+                f"[red]Prepending would exceed the {_PRIMER_SEQ_MAX_LEN}-bp "
+                "primer cap. Shorten the sequence or prefix first.[/red]"
+            )
+            return
+        ta.text = prefix + existing
         status.update(
             f"[dim]Added {len(prefix)}-bp 5' prefix: {prefix}[/dim]"
         )
@@ -12650,7 +13094,9 @@ class PrimerEditModal(ModalScreen):
         cust.value = ""
         try:
             sel.value = ""
-        except Exception:
+        except ValueError:
+            # Select with allow_blank=False rejects "" — already
+            # at default, nothing to do.
             pass
         self._refresh_preview()
 
@@ -12668,17 +13114,18 @@ class PrimerEditModal(ModalScreen):
     def _seq_changed(self, _event: TextArea.Changed) -> None:
         """Live stats + preview: every keystroke in the primer
         sequence TextArea repaints the `#primedit-stats` row AND
-        the in-modal preview so the user sees length / GC / Tm /
-        flap-vs-bound update as they type."""
+        the in-modal preview. Single TextArea query — the value
+        feeds both the stats line and `_refresh_preview` so the
+        preview path doesn't re-query the same widget."""
         if not self._editing:
             return
         try:
-            ta = self.query_one("#primedit-seq", TextArea)
+            seq = self.query_one("#primedit-seq", TextArea).text
             stats = self.query_one("#primedit-stats", Static)
         except NoMatches:
             return
-        stats.update(self._stats_line(ta.text))
-        self._refresh_preview()
+        stats.update(self._stats_line(seq))
+        self._refresh_preview(seq)
 
     # ── Buttons ─────────────────────────────────────────────────────
 
@@ -12719,6 +13166,19 @@ class PrimerEditModal(ModalScreen):
             try:
                 self.query_one("#primedit-status", Static).update(
                     "[red]Primer sequence cannot be empty.[/red]"
+                )
+            except NoMatches:
+                pass
+            return
+        if len(new_seq) > _PRIMER_SEQ_MAX_LEN:
+            # A primer longer than this is almost certainly a gene
+            # fragment pasted into the wrong field. Reject loud
+            # rather than truncate silently.
+            try:
+                self.query_one("#primedit-status", Static).update(
+                    f"[red]Primer sequence too long "
+                    f"({len(new_seq):,} bp > {_PRIMER_SEQ_MAX_LEN} bp cap). "
+                    "Trim before saving.[/red]"
                 )
             except NoMatches:
                 pass
@@ -22397,6 +22857,117 @@ class RenamePlasmidModal(ModalScreen):
         self.dismiss(None)
 
 
+class PlasmidStatusPickerModal(ModalScreen):
+    """Tiny modal to set the workflow status on a library entry.
+
+    Five RadioButtons (the four canonical statuses + "no status").
+    Dismisses with the chosen status string (one of
+    `_PLASMID_STATUS_VALUES` or "" for cleared) or None on cancel.
+
+    The picker doesn't persist on its own — caller is responsible
+    for routing the result through `_save_library` so the on-disk
+    entry + active-collection mirror stay in sync.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    PlasmidStatusPickerModal { align: center middle; }
+    #status-dlg {
+        width: 56; height: auto; max-height: 22;
+        background: $surface;
+        border: round $primary;
+        padding: 1 2;
+    }
+    #status-title {
+        height: 1;
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #status-current { color: $text-muted; margin-bottom: 1; }
+    #status-radios { height: auto; padding: 0 1; }
+    #status-btns { height: 3; margin-top: 1; align: right middle; }
+    #status-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, plasmid_name: str, current_status: str = "") -> None:
+        super().__init__()
+        self._plasmid_name = str(plasmid_name or "")
+        self._current      = _sanitize_plasmid_status(current_status)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="status-dlg"):
+            yield Static(
+                f"Set status: {self._plasmid_name or '(unnamed)'}",
+                id="status-title",
+            )
+            yield Static(
+                f"Current: {self._current or '(none)'}",
+                id="status-current",
+            )
+            with RadioSet(id="status-radios"):
+                # Order: workflow-natural (designing → verified) plus
+                # an explicit "(none)" sentinel so the user can clear
+                # a previous assignment without leaving the modal.
+                yield RadioButton(
+                    "(none)", id="status-radio-none",
+                    value=(self._current == ""),
+                )
+                for s in _PLASMID_STATUS_VALUES:
+                    color = _PLASMID_STATUS_COLORS.get(s, "white")
+                    # Embed the colour swatch in the label so the
+                    # radio reads as the colour the user will see
+                    # in the library table.
+                    yield RadioButton(
+                        f"[{color}]●[/]  {s}",
+                        id=f"status-radio-{s.lower()}",
+                        value=(self._current == s),
+                    )
+            with Horizontal(id="status-btns"):
+                yield Button("Save",   id="btn-status-save",
+                             variant="primary")
+                yield Button("Cancel", id="btn-status-cancel")
+
+    def on_mount(self) -> None:
+        # Focus the radio set so up/down navigates immediately.
+        try:
+            self.query_one("#status-radios", RadioSet).focus()
+        except NoMatches:
+            pass
+
+    def _read_status(self) -> str:
+        for s in ("",) + _PLASMID_STATUS_VALUES:
+            rid = ("status-radio-none" if s == ""
+                    else f"status-radio-{s.lower()}")
+            try:
+                if self.query_one(f"#{rid}", RadioButton).value:
+                    return s
+            except NoMatches:
+                continue
+        return self._current
+
+    @on(Button.Pressed, "#btn-status-save")
+    def _save(self, _) -> None:
+        chosen = _sanitize_plasmid_status(self._read_status())
+        if chosen == self._current:
+            # No-op — same as cancel so the caller doesn't bother
+            # re-writing the library.
+            self.dismiss(None)
+            return
+        self.dismiss(chosen)
+
+    @on(Button.Pressed, "#btn-status-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class LibraryDeleteConfirmModal(ModalScreen):
     """Generic delete-confirmation modal. Used by the plasmid library,
     primer library, and any future list that needs handslip protection.
@@ -22586,6 +23157,50 @@ def _sanitize_path(p: "str | None") -> "Path | None":
     if not isinstance(p, str) or not p:
         return None
     return Path(p).expanduser()
+
+
+# ── Plasmid lifecycle status ─────────────────────────────────────────────────
+# Workflow stage of a plasmid in the user's library. Stored on the
+# library entry dict under the `status` key (additive; missing on
+# legacy entries → empty / "no status set"). The four canonical
+# values match the typical wet-lab arc:
+#   DESIGNING  — drafted in silico, no construct built yet
+#   CLONING    — assembly in progress at the bench
+#   SEQUENCING — submitted for verification, awaiting reads
+#   VERIFIED   — sequence-confirmed and ready to share / use
+# Empty string is the "no status assigned" sentinel and is never
+# rendered as a coloured badge.
+_PLASMID_STATUS_VALUES: tuple[str, ...] = (
+    "DESIGNING", "CLONING", "SEQUENCING", "VERIFIED",
+)
+# Display colours per status. Purple / orange / blue / green —
+# distinct enough on the standard 256-colour palettes Textual
+# renders into; the green for VERIFIED also doubles as the "good
+# to go" indicator that the at-a-glance circle uses.
+_PLASMID_STATUS_COLORS: dict[str, str] = {
+    "DESIGNING":  "#B975FF",   # purple
+    "CLONING":    "#FFA62B",   # orange (matches the app's accent)
+    "SEQUENCING": "#5FB3FF",   # blue
+    "VERIFIED":   "#4EBF71",   # green (matches success accent)
+}
+
+
+def _sanitize_plasmid_status(s) -> str:
+    """Type-strict acceptance of the four canonical workflow status
+    strings. Anything else — including None, empty string, dicts,
+    leading/trailing whitespace variants of recognised values, or
+    case mismatches — collapses to empty (the "no status" sentinel).
+
+    Strict matching is intentional: a hand-edited library JSON with
+    `"status": "Designing"` (mixed case) silently degrades to no
+    status rather than being normalised, because we want the on-
+    disk value to round-trip through this function exactly. Callers
+    that want lenient parsing should upper-case + strip themselves
+    before passing through.
+    """
+    if not isinstance(s, str):
+        return ""
+    return s if s in _PLASMID_STATUS_VALUES else ""
 
 
 def _coerce_int(value, *, name: str = "value") -> "tuple[int | None, str | None]":
@@ -23926,6 +24541,13 @@ class PlasmidApp(App):
     # because the splash modal blocks pilot.click before the suite drives
     # the actual UI).
     _skip_splash:    bool         = False
+    # PyPI update check on launch. Default-True for tests so the suite
+    # never hits the network; `main()` flips it to False so the
+    # production launch runs the background worker.
+    _skip_update_check: bool      = True
+    # Hydrated from the persisted `check_updates` setting in compose();
+    # the in-memory mirror is read by the worker and the menu toggle.
+    _check_updates: bool          = True
 
     CSS = """
 Screen { background: $background; }
@@ -24797,6 +25419,7 @@ SpeciesPickerModal { align: center middle; }
             _get_setting("show_feature_tooltips", True)
         )
         self._click_debug          = bool(_get_setting("click_debug", False))
+        self._check_updates        = bool(_get_setting("check_updates", True))
         self._show_restr           = bool(_get_setting("show_restr",  False))
         self._restr_unique_only    = bool(
             _get_setting("restr_unique_only", True)
@@ -25263,6 +25886,16 @@ SpeciesPickerModal { align: center middle; }
         if not getattr(self, "_skip_splash", False):
             self.push_screen(SplashScreen(),
                              callback=self._on_splash_dismissed)
+        # Background PyPI update check. Threaded + 24h-cached + 3s-
+        # timeout-bounded so it can never slow down startup or block
+        # the UI thread. Skipped under tests (`_skip_update_check`
+        # defaults True; `main()` flips it to False) and silenced
+        # via the `Settings → Check for updates on launch` toggle
+        # so users on offline / restricted networks don't generate
+        # noise every launch.
+        if (not getattr(self, "_skip_update_check", True)
+                and getattr(self, "_check_updates", True)):
+            self._check_for_updates_worker()
         # Per-plasmid undo: switching plasmids stashes the old stacks under
         # the old record.id and restores this plasmid's own history if it
         # was edited before. See _stash_current_undo_and_load.
@@ -25431,6 +26064,81 @@ SpeciesPickerModal { align: center middle; }
             f"Unsaved recovery files from a prior session: {names}. "
             f"Open via File > Open from {_CRASH_RECOVERY_DIR}",
             severity="warning", timeout=15,
+        )
+
+    @work(thread=True)
+    def _check_for_updates_worker(self) -> None:
+        """Background PyPI update check. Threaded so the network
+        round-trip never blocks startup; cached in `settings.json`
+        for `_UPDATE_CHECK_INTERVAL_S` (24h) so repeat launches
+        don't keep hammering PyPI; hard-timeout-bounded so a slow
+        connection can't keep the worker alive forever.
+
+        On a cache hit (fresh `last_known_latest`) we still compare
+        against the running `__version__` and notify if newer —
+        this covers the case where the user upgraded and we want
+        the toast to stop appearing immediately, no settings hand-
+        edit required.
+
+        Errors are logged at DEBUG only; the user never sees a
+        crash from this path. Best-effort by design.
+        """
+        try:
+            now = time.time()
+            try:
+                last_check = float(_get_setting("last_update_check_ts", 0)
+                                     or 0)
+            except (TypeError, ValueError):
+                last_check = 0.0
+            cached = _get_setting("last_known_latest", "")
+            # Type-strict + length-cap so a hand-edited / corrupted
+            # settings.json can't push a non-string or absurdly long
+            # value into the version comparator.
+            if isinstance(cached, str):
+                cached_str = cached.strip()[:64]
+            else:
+                cached_str = ""
+            # Cache-hit path: skip the network entirely if we asked
+            # PyPI recently. Still fall through to the comparator
+            # below using the cached value.
+            latest = cached_str
+            if (not cached_str
+                    or (now - last_check) > _UPDATE_CHECK_INTERVAL_S):
+                fetched = _fetch_latest_pypi_version()
+                if fetched is not None:
+                    latest = fetched
+                    try:
+                        _set_setting("last_known_latest", latest)
+                        _set_setting("last_update_check_ts", now)
+                    except OSError as exc:
+                        _log.debug("update-check cache write failed: %s",
+                                    exc)
+            if not latest:
+                return
+            if _is_newer_pypi_version(latest, __version__):
+                self.call_from_thread(self._notify_update_available,
+                                       latest)
+        except Exception:
+            # Best-effort: any unexpected failure is logged but
+            # never bubbles to the user. The check fires on every
+            # launch and a crash here would create a startup
+            # regression with no recovery path.
+            _log.exception("Update check worker hit unexpected error")
+
+    def _notify_update_available(self, latest: str) -> None:
+        """Show a non-modal toast that a newer SpliceCraft is on
+        PyPI. Called from the update-check worker via
+        `call_from_thread`. The toast auto-dismisses; users who
+        want to silence it can flip the `Settings → Check for
+        updates on launch` toggle off.
+        """
+        self.notify(
+            f"SpliceCraft v{latest} is available "
+            f"(you're on v{__version__}).  "
+            f"Upgrade with:  pipx upgrade splicecraft",
+            title="Update available",
+            severity="information",
+            timeout=10,
         )
 
     @work(thread=True)
@@ -27185,6 +27893,56 @@ SpeciesPickerModal { align: center middle; }
         except NoMatches:
             pass
 
+    @on(LibraryPanel.StatusRequested)
+    def _library_status_requested(self, event: LibraryPanel.StatusRequested):
+        """`s` key on a library row → open the status picker.
+
+        Persists through `_save_library` so the active-collection
+        mirror picks up the change. The plasmid table refreshes so
+        the new colour-coded badge + circle render immediately.
+        """
+        if event.entry_id is None:
+            self.notify("Highlight a library row first.",
+                         severity="warning")
+            return
+        entry: "dict | None" = None
+        for e in _load_library():
+            if e.get("id") == event.entry_id:
+                entry = e
+                break
+        if entry is None:
+            self.notify("Library entry not found.", severity="warning")
+            return
+        current = _sanitize_plasmid_status(entry.get("status"))
+        name = str(entry.get("name") or entry.get("id") or "?")
+
+        def _on_pick(new_status: "str | None") -> None:
+            if new_status is None:
+                return  # cancel / no-op
+            new_status = _sanitize_plasmid_status(new_status)
+            entries = _load_library()
+            for e in entries:
+                if e.get("id") == event.entry_id:
+                    e["status"] = new_status
+                    break
+            else:
+                self.notify("Library entry vanished.",
+                             severity="warning")
+                return
+            _save_library(entries)
+            try:
+                lib = self.query_one("#library", LibraryPanel)
+                lib._repopulate()
+            except NoMatches:
+                pass
+            label = new_status or "(none)"
+            self.notify(f"Status set: {label}")
+
+        self.push_screen(
+            PlasmidStatusPickerModal(name, current),
+            callback=_on_pick,
+        )
+
     @on(LibraryPanel.RenameRequested)
     def _library_rename_requested(self, event: LibraryPanel.RenameRequested):
         """Library's ✎ button was clicked. Opens RenamePlasmidModal; on Save,
@@ -27359,6 +28117,7 @@ SpeciesPickerModal { align: center middle; }
         # for simple booleans only.
         ft = "✓" if self._show_feature_tooltips else " "
         cd = "✓" if self._click_debug          else " "
+        cu = "✓" if self._check_updates        else " "
         # Linear layout is a tri-label since it's NOT a binary toggle —
         # show the *current* layout name so the menu reads as the
         # action that will fire ("Switch to flag" vs "Switch to centered").
@@ -27387,6 +28146,7 @@ SpeciesPickerModal { align: center middle; }
             "Settings": [
                 (f"[{ft}] Show feature hover tooltips",  "toggle_feature_tooltips"),
                 (f"[{cd}] Click debug echo  [Alt+M]",    "toggle_click_debug"),
+                (f"[{cu}] Check for updates on launch",  "toggle_check_updates"),
                 (f"Linear layout: {pm_layout} → switch to {ll_next}",
                                                           "toggle_linear_layout"),
             ],
@@ -27433,6 +28193,18 @@ SpeciesPickerModal { align: center middle; }
         self._apply_restr_visibility()
         state = "shown" if self._show_restr else "hidden"
         self.notify(f"Restriction enzymes {state}")
+
+    def action_toggle_check_updates(self) -> None:
+        """Settings → Check for updates on launch.
+
+        Persists to `settings.json` so the choice survives across
+        sessions. Doesn't fire the worker on toggle-on — the user
+        sees the next check on their next launch (avoids surprise
+        toasts mid-session)."""
+        self._check_updates = not self._check_updates
+        _set_setting("check_updates", self._check_updates)
+        state = "enabled" if self._check_updates else "disabled"
+        self.notify(f"Update check on launch: {state}")
 
     def action_open_align_zip(self) -> None:
         """File → Align sequencing run (Plasmidsaurus .zip)…
@@ -28165,6 +28937,11 @@ def main():
     _log_startup_banner()
     app = PlasmidApp()
     app._skip_splash = skip_splash
+    # Production launch opts in to the background PyPI update check
+    # (test conftest leaves this True so the suite never hits the
+    # network). The worker is also gated by the user's persisted
+    # `check_updates` setting — both must be true for a fetch.
+    app._skip_update_check = False
     if enable_agent_api:
         app._agent_api_port = agent_port
 

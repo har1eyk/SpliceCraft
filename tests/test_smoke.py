@@ -1724,8 +1724,10 @@ class TestLibrarySearch:
                 row = t.get_row(row_key)
                 cell0 = row[0]
                 name = cell0.plain if hasattr(cell0, "plain") else str(cell0)
-                # Strip the dirty-marker asterisk.
-                name = name.lstrip("*")
+                # Strip the colour-circle prefix (2 cells: `● ` for
+                # status-bearing rows, `  ` for no-status rows) plus
+                # the dirty-marker asterisk.
+                name = name.lstrip("● ").lstrip("*")
                 if name in ours:
                     order.append(name)
             assert order == ["pBin1", "pBin2", "pBin10", "pBin20"], (
@@ -4652,6 +4654,106 @@ class TestShiftClickFeatureExtend:
                 "expected flap bases in rendered seq-panel text"
             )
 
+    def test_parse_pypi_version_strict(self):
+        """Parser accepts canonical X.Y.Z[.W] integers and rejects
+        anything with a non-numeric component (pre-releases,
+        garbage, blanks). None for failure lets the caller skip
+        notification rather than guess."""
+        assert sc._parse_pypi_version("0.5.11.0") == (0, 5, 11, 0)
+        assert sc._parse_pypi_version("1.0.0") == (1, 0, 0)
+        assert sc._parse_pypi_version("0.5.11.0.1") == (0, 5, 11, 0, 1)
+        assert sc._parse_pypi_version("1.0rc1") is None
+        assert sc._parse_pypi_version("1.0.0a") is None
+        assert sc._parse_pypi_version("") is None
+        assert sc._parse_pypi_version("   ") is None
+        assert sc._parse_pypi_version(None) is None  # type: ignore[arg-type]
+
+    def test_is_newer_pypi_version_comparator(self):
+        """Strict newer-than: equal is False, parse failures are
+        False, lex order matches numeric order across all four
+        components."""
+        assert sc._is_newer_pypi_version("0.5.11.0", "0.5.10.0") is True
+        assert sc._is_newer_pypi_version("0.5.11.0", "0.5.11.0") is False
+        assert sc._is_newer_pypi_version("0.5.10.0", "0.5.11.0") is False
+        assert sc._is_newer_pypi_version("1.0.0.0", "0.5.99.0") is True
+        assert sc._is_newer_pypi_version("0.5.11.1", "0.5.11.0") is True
+        # Parse failures bias to "no notification".
+        assert sc._is_newer_pypi_version("garbage", "0.5.11.0") is False
+        assert sc._is_newer_pypi_version("0.5.11.0", "garbage") is False
+
+    def test_sanitize_plasmid_status_strict(self):
+        """Strict acceptance of the four canonical statuses; anything
+        else (case-mismatched, padded, non-string, dict, None)
+        collapses to empty so a hand-edited library JSON can't
+        smuggle a junk status into the renderer."""
+        for ok in sc._PLASMID_STATUS_VALUES:
+            assert sc._sanitize_plasmid_status(ok) == ok
+        for bad in ("Designing", "VERIFIED ", " VERIFIED", "verified",
+                     "DONE", "", None, 1, {"x": "y"}, ["VERIFIED"]):
+            assert sc._sanitize_plasmid_status(bad) == ""
+
+    async def test_library_panel_persists_status_through_save(
+            self, tiny_record, isolated_library):
+        """Setting status on a library entry persists through a
+        re-save (`add_entry`) — saving the same plasmid again
+        keeps the previously-assigned status instead of resetting
+        to empty."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            rec = SeqRecord(Seq("A" * 50), id="myplas", name="myplas",
+                             annotations={"molecule_type": "DNA",
+                                          "topology": "circular"})
+            lib.add_entry(rec)
+            # Manually set status (simulating the picker's save path).
+            entries = sc._load_library()
+            for e in entries:
+                if e.get("id") == "myplas":
+                    e["status"] = "VERIFIED"
+            sc._save_library(entries)
+            # Re-add (e.g. user re-saved after edits) — status should
+            # survive.
+            lib.add_entry(rec)
+            entries = sc._load_library()
+            after = next(
+                (e for e in entries if e.get("id") == "myplas"), None
+            )
+            assert after is not None
+            assert after.get("status") == "VERIFIED"
+
+    def test_compute_name_col_width_caps_at_ceiling(
+            self, isolated_library):
+        """Library + collection names beyond the cap don't push the
+        panel beyond `_NAME_COL_CEIL` — a single 200-char name must
+        not stretch the layout off-screen."""
+        # Seed a library with one absurdly long name.
+        sc._save_library([{
+            "id": "x", "name": "p" * 200, "size": 100,
+            "n_feats": 0, "source": "test", "added": "2026-05-04",
+            "gb_text": "", "status": "",
+        }])
+        # Build a panel directly to exercise the helper without
+        # standing up a full app harness.
+        panel = sc.LibraryPanel()
+        # The helper reads `_load_library` / `_load_collections`
+        # directly, which is what we just wrote.
+        w = panel._compute_name_col_width()
+        assert w == sc.LibraryPanel._NAME_COL_CEIL
+        # And short-name libraries clamp to the floor.
+        sc._save_library([{
+            "id": "x", "name": "p", "size": 100,
+            "n_feats": 0, "source": "test", "added": "2026-05-04",
+            "gb_text": "", "status": "",
+        }])
+        # Re-create panel so the cached library is fresh.
+        panel2 = sc.LibraryPanel()
+        assert panel2._compute_name_col_width() == \
+            sc.LibraryPanel._NAME_COL_FLOOR
+
     def test_changelog_section_parser_round_trip(self):
         """`_parse_changelog_sections` splits a mock CHANGELOG into
         (version, body) pairs preserving source order."""
@@ -4685,12 +4787,151 @@ class TestShiftClickFeatureExtend:
             "## [0.5.11.0] — 2026-05-04\n### Added\n- Foo\n"
             "## [0.5.10.0] — 2026-05-03\n### Fixed\n- Bar\n"
         )
-        out = sc._build_whats_new_body(md, current_version="0.5.11.0")
+        out = sc._build_whats_new_body(md, current_version="0.5.11.0",
+                                         max_versions=10)
         # Newest version's section title appears before older ones.
         i_11 = out.index("0.5.11.0")
         i_10 = out.index("0.5.10.0")
         i_9  = out.index("0.5.9.0")
         assert i_11 < i_10 < i_9
+
+    def test_build_whats_new_body_truncates_to_max_versions(self):
+        """Body keeps only the N most recent releases when more
+        than N versions are present, and includes a footer pointing
+        users at the GitHub changelog for older entries."""
+        md = "".join(
+            f"## [0.5.{i}.0] — 2026-05-04\n### Added\n- v{i}\n"
+            for i in range(10)
+        )
+        out = sc._build_whats_new_body(md, current_version="0.5.9.0",
+                                         max_versions=3)
+        # Newest 3 are present; older bullets are not.
+        for keep in ("v9", "v8", "v7"):
+            assert keep in out
+        for drop in ("v6", "v5", "v0"):
+            assert drop not in out
+        # Footer points at the GitHub changelog when truncated.
+        assert sc._WHATS_NEW_GITHUB_URL in out
+        assert "older releases" in out.lower()
+
+    def test_build_whats_new_body_drops_unreleased(self):
+        """Non-numeric headings like `[Unreleased]` are filtered
+        out — the modal is for end users on a tagged build."""
+        md = (
+            "## [Unreleased]\n### Added\n- in-progress thing\n"
+            "## [0.5.11.0] — 2026-05-04\n### Added\n- shipped thing\n"
+        )
+        out = sc._build_whats_new_body(md, current_version="0.5.11.0",
+                                         max_versions=10)
+        assert "shipped thing" in out
+        assert "in-progress thing" not in out
+        assert "Unreleased" not in out
+
+    def test_build_whats_new_body_no_truncation_footer(self):
+        """When all versions fit under the cap, the footer phrasing
+        switches to 'mirrored on GitHub' rather than 'older releases'."""
+        md = "## [0.5.11.0] — 2026-05-04\n### Added\n- Foo\n"
+        out = sc._build_whats_new_body(md, current_version="0.5.11.0",
+                                         max_versions=3)
+        assert sc._WHATS_NEW_GITHUB_URL in out
+        assert "older releases" not in out.lower()
+        assert "mirrored on github" in out.lower()
+
+    def test_primer_tm_safe_bounds(self):
+        """`_primer_tm_safe` returns None for too-short / too-long
+        inputs and a positive float for a typical primer."""
+        assert sc._primer_tm_safe("") is None
+        assert sc._primer_tm_safe("AC") is None        # < 5 bp
+        assert sc._primer_tm_safe("A" * 250) is None   # > 200 bp cap
+        tm = sc._primer_tm_safe("GAATTCATGAAACGAAGCT")
+        assert tm is not None and 30.0 < tm < 80.0
+
+    def test_primer_tm_safe_is_cached(self):
+        """Repeat calls hit the lru_cache rather than re-running
+        primer3 thermodynamics."""
+        sc._primer_tm_safe.cache_clear()
+        sc._primer_tm_safe("GAATTCATGAAACGAAGCT")
+        info1 = sc._primer_tm_safe.cache_info()
+        sc._primer_tm_safe("GAATTCATGAAACGAAGCT")
+        info2 = sc._primer_tm_safe.cache_info()
+        assert info2.hits == info1.hits + 1
+
+    async def test_primer_edit_modal_rejects_oversized_prefix(
+            self, isolated_library):
+        """A custom prefix longer than `_PRIMER_PREFIX_MAX_LEN` is
+        bounced before the regex check; the primer sequence is
+        unchanged and the status row reports the cap."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(10, 18, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P"],
+                                    "primer_seq": ["AAAAAAAA"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button, Input, TextArea
+            modal.query_one("#btn-primedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#primedit-custom-prefix",
+                              Input).value = "A" * (sc._PRIMER_PREFIX_MAX_LEN + 1)
+            await pilot.pause()
+            modal.query_one("#btn-primedit-prefix-apply",
+                              Button).action_press()
+            await pilot.pause()
+            # Sequence unchanged — the oversized prefix was rejected.
+            assert modal.query_one("#primedit-seq",
+                                     TextArea).text == "AAAAAAAA"
+
+    async def test_primer_edit_modal_rejects_oversized_save(
+            self, isolated_library):
+        """Saving a primer longer than `_PRIMER_SEQ_MAX_LEN` is
+        rejected — modal stays open with a status message rather
+        than dismissing with a giant qualifier."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(10, 18, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P"],
+                                    "primer_seq": ["AAAAAAAA"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.PrimerEditModal)
+            from textual.widgets import Button, TextArea
+            modal.query_one("#btn-primedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#primedit-seq", TextArea).text = (
+                "A" * (sc._PRIMER_SEQ_MAX_LEN + 1)
+            )
+            await pilot.pause()
+            modal.query_one("#btn-primedit-save", Button).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Modal still up — save was rejected.
+            assert isinstance(app.screen, sc.PrimerEditModal)
 
     async def test_whats_new_auto_pushes_on_version_change(
             self, tiny_record, isolated_library):

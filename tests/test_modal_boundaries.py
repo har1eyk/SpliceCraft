@@ -176,6 +176,8 @@ _MODAL_CASES = [
     ("SplashScreen",                 lambda: sc.SplashScreen()),
     ("HelpModal",                    lambda: sc.HelpModal()),
     ("WhatsNewModal",                lambda: sc.WhatsNewModal("0.5.11.0")),
+    ("PlasmidStatusPickerModal",     lambda: sc.PlasmidStatusPickerModal(
+                                                "pUC19", "VERIFIED")),
     ("NewPlasmidModal",              lambda: sc.NewPlasmidModal()),
     ("BlastModal",                   lambda: sc.BlastModal()),
     ("PlasmidsaurusAlignModal",      lambda: sc.PlasmidsaurusAlignModal()),

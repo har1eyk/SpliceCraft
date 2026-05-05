@@ -2,6 +2,32 @@
 
 ---
 
+## [0.5.12.0] — 2026-05-04
+
+### Added
+
+- **Plasmid workflow status field.** Each library entry can now carry a workflow status — `DESIGNING` (purple), `CLONING` (orange), `SEQUENCING` (blue), or `VERIFIED` (green) — set via `PlasmidStatusPickerModal` (5-radio picker, Esc to cancel). Triggered by pressing `s` on a library row in the plasmids view. The status persists across re-saves, mirrors into the active collection through `_save_library`, and survives renames.
+- **Status column in the library panel** — dedicated column rendering the status text in its colour, plus a colour-circle prefix on the plasmid name itself for at-a-glance scanning. Rows with no status reserve the same 2-cell prefix slot so name columns stay aligned.
+- **Dynamic plasmid-name column width.** Library panel measures the longest plasmid + collection name on every repopulate and resizes both panel and column to fit, clamped to `[12, 30]` cells. Long names no longer clip to 14; absurdly long names still cap so they can't push the map / sidebar off-screen.
+- **PyPI update check on launch.** Background `@work` worker hits `https://pypi.org/pypi/splicecraft/json`, compares the published version against the running `__version__`, and toasts a friendly upgrade hint (`pipx upgrade splicecraft`) when a newer release is available. Pure-stdlib (urllib + json), 3 s timeout, 24 h cache in `settings.json` (`last_known_latest` + `last_update_check_ts`), 256 KB response cap, polite UA. Toggle via `Settings → [✓] Check for updates on launch` (persisted as `check_updates`); skipped under tests via the class-level `_skip_update_check` flag.
+- New helpers: `_sanitize_plasmid_status`, `_parse_pypi_version`, `_is_newer_pypi_version`, `_fetch_latest_pypi_version`, `_primer_tm_safe` (memoized).
+
+### Changed
+
+- **What's New modal — content trimming + colour overhaul.** Body is now capped at the 3 most recent releases by default (`_WHATS_NEW_MAX_VERSIONS = 3`); previous all-24-versions render was visibly slow on cold open. Footer now points at the GitHub changelog (`https://github.com/Binomica-Labs/SpliceCraft/blob/master/CHANGELOG.md`) for older releases. Dialog colour scheme moved off the loud `$accent` (orange in `dark-ansi`) and onto `$success` (green) for the title, border, every Markdown heading level (H1–H4), inline code spans (`MarkdownBlock > .code_inline`), and links. Cache key upgraded to `(path, mtime)` so an in-session edit to `CHANGELOG.md` isn't masked by a stale render.
+- **`[Unreleased]` block in `CHANGELOG.md` folded into `[0.4.4]`** with a leading "catch-up entry" note — covers the features that landed across the 0.2.x → 0.4.x development arc before the per-release changelog convention. The What's New modal also now filters out any non-numeric heading defensively, so future `[Unreleased]` staging during dev won't sneak into the modal.
+- **PrimerEditModal performance + hardening.** Per-keystroke Tm calc is memoized via `@lru_cache(512)` on `_primer_tm_safe` so retyping doesn't re-run primer3 thermodynamics; `_seq_changed` now does a single TextArea query and threads the value through both stats line and preview repaint. Bare `except Exception` in `_stats_line` narrowed to `(ImportError, OSError, ValueError, RuntimeError, TypeError)`. Custom 5'-prefix capped at 100 bp (defence against pasted blobs); primer sequence capped at 500 bp on save; preview window capped at 2000 cells (malformed feat coords can't allocate giant cell lists).
+
+### Fixed
+
+- **Pre-compiled regexes** for the changelog heading parser and the IUPAC primer-prefix validator — both were being recompiled on each call (Python's regex cache amortised it, but explicit module-level compilation is clearer and faster on cold paths).
+
+### Tests
+
+- +13 tests covering: plasmid status sanitizer (strict canonical-only acceptance), status persistence through re-save, name-column width cap + floor, `PlasmidStatusPickerModal` boundary, `_parse_pypi_version` strict parser, `_is_newer_pypi_version` comparator, `_primer_tm_safe` bounds + cache hit, `_build_whats_new_body` truncation + GitHub footer + no-truncation footer + `[Unreleased]` filter, oversized custom prefix rejection, oversized primer save rejection. Total: 1350 (was 1337).
+
+---
+
 ## [0.5.11.0] — 2026-05-04
 
 ### Added
@@ -509,7 +535,12 @@ Versioning switched to 4 components (MAJOR.MINOR.PATCH.MICRO) to allow finer-gra
 
 ---
 
-## [Unreleased]
+## [0.4.4] — 2026-04-29
+
+_Catch-up entry covering features and fixes that accumulated across
+the 0.2.x and 0.4.x development arc, prior to the per-release
+changelog convention. Listed under 0.4.4 — the last untagged-in-
+CHANGELOG release before structured logging began at [0.4.5]._
 
 ### Added
 
