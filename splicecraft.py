@@ -7821,6 +7821,205 @@ _HELP_BODY_MD = """\
 """
 
 
+# ── What's New modal ──────────────────────────────────────────────────────────
+
+# Cache: parsing the CHANGELOG is cheap (~5 ms) but happens once
+# per app launch + whenever the user opens the modal manually, so
+# avoid repeating the file read on the second open within a session.
+_WHATS_NEW_CACHE: "tuple[str, str] | None" = None  # (changelog_path_str, body_md)
+
+
+def _parse_changelog_sections(changelog_md: str) -> list[tuple[str, str]]:
+    """Split the CHANGELOG markdown into ``[(version, section_md), ...]``
+    in source order. The "version" string is whatever appears between
+    `[` and `]` on a `## [X.Y.Z]` heading; everything between that
+    heading and the next `## [` (or end-of-file) is the section body.
+
+    `[Unreleased]` blocks (if any) parse just like versioned ones —
+    the caller can filter them out if it wants strict releases only.
+    """
+    sections: list[tuple[str, str]] = []
+    lines = changelog_md.splitlines()
+    cur_ver: "str | None" = None
+    cur_buf: list[str] = []
+    for ln in lines:
+        m = re.match(r"^##\s*\[([^\]]+)\]", ln)
+        if m:
+            if cur_ver is not None:
+                sections.append((cur_ver, "\n".join(cur_buf).rstrip()))
+            cur_ver = m.group(1).strip()
+            cur_buf = [ln]
+        elif cur_ver is not None:
+            cur_buf.append(ln)
+    if cur_ver is not None:
+        sections.append((cur_ver, "\n".join(cur_buf).rstrip()))
+    return sections
+
+
+def _version_sort_key(version_str: str) -> tuple:
+    """Sort key for canonical SemVer / `X.Y.Z.W` strings — split on
+    dots, parse each component as int (non-numeric tokens like
+    `Unreleased` sort to the front so they appear above any released
+    version). Returns a tuple suitable for `sorted(..., reverse=True)`
+    so newer versions land first."""
+    parts = version_str.strip().split(".")
+    out: list = []
+    for p in parts:
+        try:
+            out.append((1, int(p)))
+        except ValueError:
+            # Non-numeric component (e.g. `1.0rc1`, `Unreleased`):
+            # rank them BEFORE numeric components when reversed,
+            # i.e. they show at the top of the descending sort.
+            out.append((2, p))
+    return tuple(out) if out else ((0, ""),)
+
+
+def _build_whats_new_body(changelog_md: str,
+                            current_version: str) -> str:
+    """Compose the Markdown body of the What's New modal.
+
+    Pulls every `## [X.Y.Z]` section out of `changelog_md`, sorts
+    the version blocks newest-first (descending by parsed
+    components), and returns one big Markdown string.
+
+    Adds a small thank-you header at the top reserving space for
+    future contributor credits — referenced in each version's
+    section as `**Contributors:** name1, name2` or wherever the
+    maintainer chooses. Cite-by-name is intentional; the modal is
+    where contributors get visible recognition without buyers
+    having to dig through git log.
+    """
+    sections = _parse_changelog_sections(changelog_md)
+    sections.sort(key=lambda s: _version_sort_key(s[0]), reverse=True)
+    if not sections:
+        return ("# What's New in SpliceCraft\n\n"
+                f"You're on **{current_version}**. No changelog "
+                "entries parsed — see `CHANGELOG.md` in the repo.")
+    parts: list[str] = []
+    parts.append("# What's New in SpliceCraft")
+    parts.append(
+        f"You're running **{current_version}**.  "
+        "Each release block below corresponds to a version of the app, "
+        "newest at the top. To see this dialog again any time, open "
+        "`File → What's New…`."
+    )
+    parts.append("---")
+    parts.append(
+        "_A standing thank-you to everyone who flagged a bug, "
+        "filed a feature request, or contributed code. "
+        "Per-release contributor credits appear inline in the "
+        "matching version block._"
+    )
+    for ver, body in sections:
+        parts.append(body)
+    return "\n\n".join(parts)
+
+
+def _load_whats_new_body(current_version: str) -> str:
+    """Locate `CHANGELOG.md` next to the running module, parse it,
+    and return the modal body. Cached after the first call so a
+    quick reopen doesn't re-read the file. Falls back to a
+    placeholder if the changelog is missing (e.g. a stripped wheel
+    install on some platforms)."""
+    global _WHATS_NEW_CACHE
+    candidates = [
+        Path(__file__).resolve().parent / "CHANGELOG.md",
+        Path.cwd() / "CHANGELOG.md",
+    ]
+    cl_path: "Path | None" = next(
+        (p for p in candidates if p.is_file()), None
+    )
+    if cl_path is None:
+        return (f"# What's New in SpliceCraft\n\n"
+                f"You're on **{current_version}**.\n\n"
+                "_(CHANGELOG.md not found in this install — see the "
+                "GitHub repo for release notes.)_")
+    cache_key = str(cl_path)
+    if _WHATS_NEW_CACHE is not None and _WHATS_NEW_CACHE[0] == cache_key:
+        return _WHATS_NEW_CACHE[1]
+    try:
+        text = cl_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        _log.warning("Could not read CHANGELOG: %s", cl_path)
+        return (f"# What's New in SpliceCraft\n\n"
+                f"You're on **{current_version}** "
+                "(could not read CHANGELOG.md).")
+    body = _build_whats_new_body(text, current_version)
+    _WHATS_NEW_CACHE = (cache_key, body)
+    return body
+
+
+class WhatsNewModal(ModalScreen):
+    """Per-release "What's New" dialog.
+
+    Auto-pushed once per version on app launch (once the splash is
+    dismissed) and available any time from `File → What's New…`.
+    The auto-trigger uses the persisted `last_seen_version` setting:
+    if it differs from the running `__version__`, the modal shows
+    and the setting bumps to the current version on dismiss. So
+    a user who's already seen the dialog for `0.5.10.0` won't see
+    it again until they upgrade to a newer version.
+
+    Body is rendered from `CHANGELOG.md` via `_load_whats_new_body`,
+    sorted newest-version-first. Scrollable; closes on Escape, the
+    `Dismiss` button, or any key not bound to internal scroll
+    (mirrors the HelpModal pattern).
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_whatsnew", "Close"),
+        Binding("q",      "dismiss_whatsnew", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    WhatsNewModal { align: center middle; }
+    #whatsnew-box {
+        width: 92; height: 90%; max-height: 40;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #whatsnew-title {
+        text-style: bold;
+        background: $accent;
+        color: $text;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    #whatsnew-body-scroll { height: 1fr; min-height: 10; padding: 0 1; }
+    #whatsnew-body { height: auto; }
+    #whatsnew-btns { height: 3; margin-top: 1; }
+    #whatsnew-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, current_version: "str | None" = None) -> None:
+        super().__init__()
+        self._version = str(current_version or __version__)
+
+    def compose(self) -> ComposeResult:
+        # Lazy-import Markdown — same rationale as HelpModal.compose.
+        from textual.widgets import Markdown as _Markdown
+        body_md = _load_whats_new_body(self._version)
+        with Vertical(id="whatsnew-box"):
+            yield Static(
+                f" What's New  ·  v{self._version} ",
+                id="whatsnew-title",
+            )
+            with VerticalScroll(id="whatsnew-body-scroll"):
+                yield _Markdown(body_md, id="whatsnew-body")
+            with Horizontal(id="whatsnew-btns"):
+                yield Button("Dismiss", id="btn-whatsnew-dismiss",
+                              variant="primary")
+
+    @on(Button.Pressed, "#btn-whatsnew-dismiss")
+    def _on_dismiss_btn(self, _: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_dismiss_whatsnew(self) -> None:
+        self.dismiss(None)
+
+
 # ── Fetch modal ────────────────────────────────────────────────────────────────
 
 class FetchModal(ModalScreen):
@@ -11970,6 +12169,140 @@ def _annotate_seq_from_feature_library(
     return found
 
 
+_PRIMER_5P_RE_SITES: list[tuple[str, str]] = [
+    # (display label, recognition site to prepend). Curated subset
+    # of common cloning enzymes — full NEB catalog (~200) is too
+    # cluttered for a dropdown. The leading entry is the "no site"
+    # sentinel so the user can clear a previous selection.
+    ("(none)",                       ""),
+    ("EcoRI    · GAATTC",            "GAATTC"),
+    ("BamHI    · GGATCC",            "GGATCC"),
+    ("HindIII  · AAGCTT",            "AAGCTT"),
+    ("XhoI     · CTCGAG",            "CTCGAG"),
+    ("SacI     · GAGCTC",            "GAGCTC"),
+    ("KpnI     · GGTACC",            "GGTACC"),
+    ("SalI     · GTCGAC",            "GTCGAC"),
+    ("PstI     · CTGCAG",            "CTGCAG"),
+    ("NotI     · GCGGCCGC",          "GCGGCCGC"),
+    ("SpeI     · ACTAGT",            "ACTAGT"),
+    ("XbaI     · TCTAGA",            "TCTAGA"),
+    ("NcoI     · CCATGG",            "CCATGG"),
+    ("NdeI     · CATATG",            "CATATG"),
+    ("BsaI     · GGTCTC (Type IIS)", "GGTCTC"),
+    ("BsmBI    · CGTCTC (Type IIS)", "CGTCTC"),
+    ("BbsI     · GAAGAC (Type IIS)", "GAAGAC"),
+    ("SapI     · GCTCTTC (Type IIS)", "GCTCTTC"),
+]
+
+
+def _build_primer_preview(template: str, primer_seq: str,
+                            bound_start: int, bound_end: int,
+                            strand: int, color: str,
+                            context_bp: int = 12) -> Text:
+    """Build a 4-row mini-rendering of a primer (flap + bound)
+    aligned to its template binding site, mirroring the seq panel's
+    bound-bar + flap-row visualisation.
+
+    Forward primer (strand >= 0):
+      row 0: flap bases (right-justified to bound start, primer bg)
+      row 1: bound bases + ► arrow (primer bg)
+      row 2: top strand window
+      row 3: bottom strand (RC, dim)
+
+    Reverse primer mirrors: top/bottom strand on top, bound bar
+    with ◄ on the LEFT, then flap underneath.
+
+    `context_bp` extends the strand window past the primer's
+    footprint so the user sees flanking bases. Wrap-binding
+    primers fall back to a "(wrap primer — preview not supported)"
+    note since the seq-panel split-half rendering is overkill for
+    an in-modal preview.
+    """
+    if not primer_seq:
+        return Text("(no primer sequence)", style="dim italic")
+    if bound_end < bound_start:
+        return Text("(wrap primer — preview not supported)",
+                    style="dim italic")
+    bound_len = bound_end - bound_start
+    flap_len  = max(0, len(primer_seq) - bound_len)
+    if not template:
+        return Text("(no template loaded — open a plasmid to preview)",
+                    style="dim italic")
+
+    # Window calculation: cover the bound region + the flap range
+    # (which lives outside the template for a 5'-extension primer).
+    # We extend `win_end` past the template's actual length when
+    # the flap dangles off the end — the strand display below is
+    # padded with spaces in that range so the flap row stays
+    # visually aligned to its column.
+    if strand >= 0:
+        win_start = max(0, bound_start - flap_len - context_bp)
+        win_end_unclamped = bound_end + context_bp
+    else:
+        win_start = max(0, bound_start - context_bp)
+        win_end_unclamped = bound_end + flap_len + context_bp
+    win_end = win_end_unclamped
+    if win_end <= win_start:
+        return Text("(no overlap with template)", style="dim italic")
+
+    # Top strand: clamp to template length, pad with spaces past
+    # the end so the flap can render at its full column range
+    # without an out-of-template tail clipping the row.
+    template_end = min(len(template), win_end)
+    top_strand_real = template[win_start:template_end]
+    pad_right = max(0, win_end - template_end)
+    top_strand = top_strand_real + (" " * pad_right)
+    bot_strand = _rc(top_strand_real)[::-1] + (" " * pad_right)
+
+    if strand >= 0:
+        flap_bases  = primer_seq[:flap_len]
+        bound_bases = primer_seq[flap_len:]
+        flap_col    = bound_start - flap_len - win_start
+        bound_col   = bound_start - win_start
+        arrow_col   = bound_col + len(bound_bases)
+    else:
+        flap_bases  = _rc(primer_seq[:flap_len])
+        bound_bases = _rc(primer_seq[flap_len:])
+        flap_col    = bound_end - win_start
+        bound_col   = bound_start - win_start
+        arrow_col   = bound_col - 1
+
+    line_w    = win_end - win_start
+    flap_row  = [(" ", "")] * line_w
+    bound_row = [(" ", "")] * line_w
+
+    bg = f"black on {color}"
+    for i, c in enumerate(flap_bases):
+        col = flap_col + i
+        if 0 <= col < line_w:
+            flap_row[col] = (c, bg)
+    for i, c in enumerate(bound_bases):
+        col = bound_col + i
+        if 0 <= col < line_w:
+            bound_row[col] = (c, bg)
+    if 0 <= arrow_col < line_w:
+        bound_row[arrow_col] = ("▶" if strand >= 0 else "◀", bg)
+
+    def _row_to_text(row) -> Text:
+        t = Text(no_wrap=True)
+        for c, sty in row:
+            t.append(c, style=sty)
+        return t
+
+    out = Text(no_wrap=True, overflow="crop")
+    if strand >= 0:
+        out.append(_row_to_text(flap_row));  out.append("\n")
+        out.append(_row_to_text(bound_row)); out.append("\n")
+        out.append(top_strand, style="color(252)"); out.append("\n")
+        out.append(bot_strand, style="color(244)")
+    else:
+        out.append(top_strand, style="color(252)"); out.append("\n")
+        out.append(bot_strand, style="color(244)"); out.append("\n")
+        out.append(_row_to_text(bound_row)); out.append("\n")
+        out.append(_row_to_text(flap_row))
+    return out
+
+
 class PrimerEditModal(ModalScreen):
     """View / edit a `primer_bind` feature.
 
@@ -12012,7 +12345,7 @@ class PrimerEditModal(ModalScreen):
     DEFAULT_CSS = """
     PrimerEditModal { align: center middle; }
     #primedit-dlg {
-        width: 90; max-width: 95%; height: auto; max-height: 38;
+        width: 90; max-width: 95%; height: auto; max-height: 36;
         background: $surface;
         border: solid $accent;
         padding: 1 2;
@@ -12030,37 +12363,56 @@ class PrimerEditModal(ModalScreen):
     #primedit-stats {
         height: 1; padding: 0 1; color: $text-muted;
     }
-    #primedit-pos { height: 1; padding: 0 1; color: $text-muted; }
+    #primedit-pos { height: 1; padding: 0 1; color: $text-muted; margin: 0; }
     #primedit-row1 { height: auto; }
     #primedit-name-col { width: 2fr; }
     #primedit-strand-col { width: 1fr; }
     #primedit-seq {
-        height: 4; border: solid $primary-darken-1;
+        height: 3; border: solid $primary-darken-1;
     }
-    #primedit-notes-md {
-        height: 4; border: solid $primary-darken-1;
-        padding: 0 1; overflow-y: auto;
-    }
-    #primedit-notes-edit { height: 4; border: solid $primary-darken-1; }
+    /* Notes: single-line Input (see compose comment).
+       Standard Input height is 3 (1 content + 2 border). */
+    #primedit-notes-edit { width: 1fr; }
     #primedit-status { height: 1; padding: 0 1; }
     #primedit-btns { height: 3; margin-top: 1; }
     #primedit-btns Button { margin-right: 1; }
+    /* 5' add-on row: dropdown + custom bases + Apply. Three-column
+       Horizontal so the row stays one cell tall and the controls
+       distribute evenly across the dialog width. */
+    #primedit-prefix-row { height: 3; align: left middle; }
+    #primedit-prefix-label  { width: 8; padding: 1 1 0 0; }
+    #primedit-re-select     { width: 30; margin-right: 1; }
+    #primedit-custom-prefix { width: 1fr; margin-right: 1; }
+    #primedit-prefix-row Button { min-width: 10; }
+    /* Preview: exactly 4 rows of content (flap, bound, top, bot)
+       — no border so we don't burn the dialog's tight vertical
+       budget on a frame around 4 lines. The visible feature-color
+       backgrounds in the bound + flap rows already give the
+       preview clear visual containment. Scrolls horizontally if
+       the binding-site window exceeds the dialog width. */
+    #primedit-preview {
+        height: 4; padding: 0 1; overflow-x: auto;
+    }
     """
 
     def __init__(self, idx: int, feat: dict, total: int,
-                 *, primer_seq: str = "", notes: str = "") -> None:
+                 *, primer_seq: str = "", notes: str = "",
+                 template: str = "") -> None:
         super().__init__()
         self._idx       = idx
         self._feat      = dict(feat)
         self._total     = total
         self._primer_seq = str(primer_seq or "")
         self._notes_md   = str(notes or "")
+        # Template bases for the in-modal preview. Empty string is
+        # acceptable — the preview just shows a "no template" hint.
+        # Caller (`PlasmidApp._open_feature_editor`) extracts this
+        # from `self._current_record.seq` so wrap-aware extraction
+        # stays out of the modal.
+        self._template   = str(template or "")
         self._editing    = False
 
     def compose(self) -> ComposeResult:
-        # Lazy-import Markdown — same rationale as HelpModal.compose.
-        from textual.widgets import Markdown as _Markdown
-
         f = self._feat
         label  = f.get("label", "")
         strand = f.get("strand", 1)
@@ -12096,11 +12448,12 @@ class PrimerEditModal(ModalScreen):
                                               value=(strand == -1),
                                               id="primedit-strand-rev")
 
-                # Live stats — repainted on every keystroke when
-                # editing the sequence.
-                yield Static(self._stats_line(self._primer_seq),
-                             id="primedit-stats", markup=True)
-                yield Static(pos_str, id="primedit-pos")
+                # Combined stats + position row — single line, dim
+                # text, repainted on every keystroke in edit mode.
+                yield Static(
+                    self._stats_line(self._primer_seq) + "  ·  " + pos_str,
+                    id="primedit-stats", markup=True,
+                )
 
                 # Editable primer sequence. Title sits on the border
                 # so we save a row vs an external Label.
@@ -12109,20 +12462,48 @@ class PrimerEditModal(ModalScreen):
                 seq_ta.border_title = "Primer sequence  (5'→3', flap + bound)"
                 yield seq_ta
 
-                # Notes — Markdown viewer (clickable links) in view
-                # mode, TextArea editor in edit mode.
-                md = _Markdown(self._notes_md or "_(none)_",
-                                id="primedit-notes-md")
-                md.border_title = (
-                    "Notes / references  "
-                    "(Markdown — links + [text](url) supported)"
+                # 5'-end add-on row: pick a restriction site OR type
+                # custom bases, then Apply prepends to the primer.
+                # Disabled until Edit mode; the dropdown options +
+                # Apply behaviour mirror the cloning workflow where
+                # users routinely tack a 6-bp recognition site onto
+                # the primer's 5' end before ordering.
+                with Horizontal(id="primedit-prefix-row"):
+                    yield Label("Add 5':", id="primedit-prefix-label")
+                    yield Select(
+                        _PRIMER_5P_RE_SITES,
+                        value="",
+                        id="primedit-re-select",
+                        allow_blank=False,
+                        prompt="Restriction site",
+                        disabled=True,
+                    )
+                    yield Input(placeholder="custom bases (5'→3')",
+                                 id="primedit-custom-prefix",
+                                 disabled=True)
+                    yield Button("+ Apply", id="btn-primedit-prefix-apply",
+                                 variant="primary", disabled=True)
+
+                # Live preview — tiny 4-row rendering of the primer
+                # over its template binding site, mirroring the
+                # seq panel's bound-bar + flap-row visualisation.
+                # Repaints on every keystroke in the sequence
+                # textbox (when in edit mode).
+                preview = Static(
+                    self._build_preview_text(),
+                    id="primedit-preview",
+                    markup=False,
                 )
-                yield md
-                ta = TextArea(self._notes_md, id="primedit-notes-edit",
-                               soft_wrap=True)
-                ta.border_title = "Notes / references  (Edit mode)"
-                ta.display = False
-                yield ta
+                yield preview
+
+                # Notes are dropped from the primer modal — they
+                # don't fit the 48-row baseline terminal once the
+                # prefix row + preview are factored in. A primer's
+                # `/note` qualifier is still editable through the
+                # generic FeatureEditModal if the user really needs
+                # multi-paragraph references; for the common case,
+                # primer name + sequence are the only edits that
+                # matter, and the dialog stays compact.
 
             yield Static("", id="primedit-status", markup=True)
             with Horizontal(id="primedit-btns"):
@@ -12174,6 +12555,13 @@ class PrimerEditModal(ModalScreen):
                     w.disabled = not on
             except NoMatches:
                 pass
+        # 5'-end add-on controls also unlock with Edit.
+        for sel in ("#primedit-re-select", "#primedit-custom-prefix",
+                     "#btn-primedit-prefix-apply"):
+            try:
+                self.query_one(sel).disabled = not on
+            except NoMatches:
+                pass
         try:
             self.query_one("#btn-primedit-edit",
                             Button).display = not on
@@ -12181,16 +12569,90 @@ class PrimerEditModal(ModalScreen):
                             Button).disabled = not on
         except NoMatches:
             pass
-        try:
-            self.query_one("#primedit-notes-md").display = not on
-            self.query_one("#primedit-notes-edit").display = on
-        except NoMatches:
-            pass
+        # Notes input is no longer in the modal (see compose
+        # comment); nothing to toggle here.
         if on:
             try:
                 self.query_one("#primedit-name", Input).focus()
             except NoMatches:
                 pass
+
+    def _build_preview_text(self, primer_seq: "str | None" = None) -> Text:
+        """Render the in-modal preview Text using the current primer
+        sequence (or `primer_seq` arg if provided — used by the
+        live-update path before the TextArea has been queried)."""
+        seq = primer_seq if primer_seq is not None else self._primer_seq
+        f = self._feat
+        return _build_primer_preview(
+            template=self._template,
+            primer_seq=str(seq or ""),
+            bound_start=int(f.get("start", 0)),
+            bound_end=int(f.get("end",   0)),
+            strand=int(f.get("strand", 1)),
+            color=str(f.get("color", "white")),
+        )
+
+    def _refresh_preview(self) -> None:
+        try:
+            preview = self.query_one("#primedit-preview", Static)
+            ta      = self.query_one("#primedit-seq",     TextArea)
+        except NoMatches:
+            return
+        preview.update(self._build_preview_text(ta.text))
+
+    @on(Button.Pressed, "#btn-primedit-prefix-apply")
+    def _on_apply_prefix(self, _: Button.Pressed) -> None:
+        """Prepend the picked restriction site (or custom bases) to
+        the primer sequence. Validates that the prefix is DNA-ish
+        (ACGT/IUPAC) and uppercases it. Both inputs are sanitized
+        for control bytes — defence in depth against pasted blobs.
+        """
+        if not self._editing:
+            return
+        try:
+            sel = self.query_one("#primedit-re-select", Select)
+            cust = self.query_one("#primedit-custom-prefix", Input)
+            ta  = self.query_one("#primedit-seq", TextArea)
+            status = self.query_one("#primedit-status", Static)
+        except NoMatches:
+            return
+        # Custom prefix takes precedence when non-empty (lets the
+        # user combine the dropdown's "(none)" with a typed value).
+        custom_raw = (cust.value or "").strip()
+        prefix = ""
+        if custom_raw:
+            cleaned = _CONTROL_CHARS_RE.sub("", custom_raw).upper()
+            cleaned = "".join(cleaned.split())
+            # Allow A/C/G/T + IUPAC + N. Reject anything else so
+            # the user can't smuggle markup tags or random chars.
+            if not re.fullmatch(r"[ACGTRYWSMKBDHVN]+", cleaned):
+                status.update(
+                    "[red]Custom prefix must be DNA / IUPAC bases only.[/red]"
+                )
+                return
+            prefix = cleaned
+        else:
+            re_value = sel.value if isinstance(sel.value, str) else ""
+            if not re_value:
+                status.update(
+                    "[yellow]Pick a restriction site or type custom bases.[/yellow]"
+                )
+                return
+            prefix = re_value.upper()
+        if not prefix:
+            return
+        new_seq = prefix + ta.text.strip().upper()
+        ta.text = new_seq
+        status.update(
+            f"[dim]Added {len(prefix)}-bp 5' prefix: {prefix}[/dim]"
+        )
+        # Clear the inputs so the next Apply is a fresh action.
+        cust.value = ""
+        try:
+            sel.value = ""
+        except Exception:
+            pass
+        self._refresh_preview()
 
     def _read_strand(self) -> int:
         for sid, val in (("#primedit-strand-fwd", 1),
@@ -12204,9 +12666,10 @@ class PrimerEditModal(ModalScreen):
 
     @on(TextArea.Changed, "#primedit-seq")
     def _seq_changed(self, _event: TextArea.Changed) -> None:
-        """Live stats: every keystroke in the primer sequence
-        TextArea repaints the `#primedit-stats` row so the user
-        sees length / GC / Tm update as they type."""
+        """Live stats + preview: every keystroke in the primer
+        sequence TextArea repaints the `#primedit-stats` row AND
+        the in-modal preview so the user sees length / GC / Tm /
+        flap-vs-bound update as they type."""
         if not self._editing:
             return
         try:
@@ -12215,6 +12678,7 @@ class PrimerEditModal(ModalScreen):
         except NoMatches:
             return
         stats.update(self._stats_line(ta.text))
+        self._refresh_preview()
 
     # ── Buttons ─────────────────────────────────────────────────────
 
@@ -12239,10 +12703,12 @@ class PrimerEditModal(ModalScreen):
         try:
             label = self.query_one("#primedit-name", Input).value
             seq   = self.query_one("#primedit-seq",   TextArea).text
-            notes = self.query_one("#primedit-notes-edit",
-                                     TextArea).text
         except NoMatches:
             return
+        # Notes input was dropped from the primer modal — pass the
+        # original notes payload back unchanged so callers' notes
+        # qualifier doesn't get cleared by the save.
+        notes = self._notes_md
         new_label = _sanitize_label(label, max_len=200)
         # Sanitize primer sequence: strip whitespace + control bytes,
         # uppercase. We don't strictly enforce DNA alphabet (users
@@ -25575,10 +26041,31 @@ SpeciesPickerModal { align: center middle; }
 
     def _on_splash_dismissed(self, _result) -> None:
         """Flush any notifications queued during the splash. Replays in
-        order so a startup corruption-recovery message still surfaces."""
+        order so a startup corruption-recovery message still surfaces.
+
+        Also gates the per-version "What's New" modal: if the
+        persisted `last_seen_version` doesn't match the current
+        `__version__`, push the dialog. The setting bumps to the
+        current version on the modal's dismiss so the user only
+        sees it once per upgrade.
+        """
         queue, self._splash_notify_queue = self._splash_notify_queue, []
         for msg, kwargs in queue:
             super().notify(msg, **kwargs)
+        try:
+            seen = str(_get_setting("last_seen_version", "") or "")
+        except Exception:
+            seen = ""
+        if seen != __version__:
+            def _on_seen(_dismiss_result) -> None:
+                _set_setting("last_seen_version", __version__)
+            self.push_screen(WhatsNewModal(__version__), _on_seen)
+
+    def action_show_whats_new(self) -> None:
+        """File → What's New… — manual reopen of the per-version
+        dialog, regardless of `last_seen_version`. Doesn't touch the
+        setting (the user has already seen it via the auto-trigger)."""
+        self.push_screen(WhatsNewModal(__version__))
 
     def _do_save(self) -> bool:
         """Save current record to its source file and/or library. Returns True on success."""
@@ -26430,10 +26917,17 @@ SpeciesPickerModal { align: center middle; }
         # primer-specific editor (sequence + Tm/GC stats); other
         # features get the generic editor.
         if feat.get("type") == "primer_bind":
+            # Pass the FULL template seq so the modal's preview can
+            # render the binding-site context. The preview clips to
+            # bound region ± `context_bp` internally, so passing
+            # the full string is fine even for long records.
+            full_template = str(rec.seq) if rec is not None else ""
+            full_template = _CONTROL_CHARS_RE.sub("", full_template)
             self.push_screen(
                 PrimerEditModal(idx, feat, total,
                                   primer_seq=primer_seq_str,
-                                  notes=notes_str),
+                                  notes=notes_str,
+                                  template=full_template),
                 _on_dismiss,
             )
         else:
@@ -26885,6 +27379,8 @@ SpeciesPickerModal { align: center middle; }
                 ("Collections...",               "open_collections"),
                 ("Align sequencing run (Plasmidsaurus .zip)...",
                                                  "open_align_zip"),
+                ("---",                          None),
+                ("What's New…",                  "show_whats_new"),
                 ("---",                          None),
                 ("Quit  [q]",                    "quit"),
             ],

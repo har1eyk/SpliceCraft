@@ -175,6 +175,7 @@ _MODAL_CASES = [
     ("QuitConfirmModal",             lambda: sc.QuitConfirmModal()),
     ("SplashScreen",                 lambda: sc.SplashScreen()),
     ("HelpModal",                    lambda: sc.HelpModal()),
+    ("WhatsNewModal",                lambda: sc.WhatsNewModal("0.5.11.0")),
     ("NewPlasmidModal",              lambda: sc.NewPlasmidModal()),
     ("BlastModal",                   lambda: sc.BlastModal()),
     ("PlasmidsaurusAlignModal",      lambda: sc.PlasmidsaurusAlignModal()),
@@ -191,7 +192,8 @@ _MODAL_CASES = [
                                                       "color": "#00BFFF"},
                                                 total=2686,
                                                 primer_seq="GAATTCATGAAACG",
-                                                notes="See Bolivar 1977")),
+                                                notes="See Bolivar 1977",
+                                                template="A" * 2686)),
     ("FeatureEditModal",             lambda: sc.FeatureEditModal(
                                                 idx=0,
                                                 feat={"label": "lacZ",

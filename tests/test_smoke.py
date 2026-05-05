@@ -4249,6 +4249,165 @@ class TestShiftClickFeatureExtend:
             assert f["_primer_seq"] == "AAAAAAAAAA"
             assert f["_bound_len"]  == 10
 
+    def test_build_primer_preview_forward(self):
+        """`_build_primer_preview` renders 4 lines for a forward
+        primer: flap row, bound row, top strand, bottom strand.
+        The flap bases sit one row above the bound bar, never
+        vertically overlapping its column range."""
+        # Template col 12..19 = "ATGAAACG"; primer = "GAATCG" + bound.
+        template = "ATGAAATCAGCCATGAAACGGCCAAGCATGT"
+        out = sc._build_primer_preview(
+            template=template,
+            primer_seq="GAATCGATGAAACG",
+            bound_start=12, bound_end=20,
+            strand=1, color="#00BFFF",
+            context_bp=4,
+        )
+        plain = out.plain
+        lines = plain.splitlines()
+        assert len(lines) == 4
+        # Line 0 = flap, line 1 = bound, line 2 = top, line 3 = bot.
+        assert "GAATCG" in lines[0]
+        assert "ATGAAACG" in lines[1]
+        assert "▶"        in lines[1]
+        assert "ATGAAACG" in lines[2]   # top strand context
+
+    def test_build_primer_preview_reverse(self):
+        """Reverse primer: bound bar with ◄ on the LEFT, flap below."""
+        template = "ATGAAATCAGCCATGAAACGGCCAAGCATGT"
+        out = sc._build_primer_preview(
+            template=template,
+            primer_seq="GTATGCAAGCATGT",
+            bound_start=22, bound_end=30,
+            strand=-1, color="#FF80FF",
+            context_bp=4,
+        )
+        lines = out.plain.splitlines()
+        # Layout: top, bottom, bound, flap (reverse-strand mirror).
+        assert len(lines) == 4
+        assert "◀" in lines[2]
+        # Flap on row 3, top-strand-RC of GTATGC = GCATAC.
+        assert "GCATAC" in lines[3]
+
+    def test_build_primer_preview_wrap_unsupported(self):
+        """Wrap primers fall back to a friendly hint instead of
+        rendering — split-half logic is overkill for the modal."""
+        out = sc._build_primer_preview(
+            template="A" * 100, primer_seq="GAATTCAAAAAAAAAA",
+            bound_start=95, bound_end=5, strand=1, color="cyan",
+        )
+        assert "wrap primer" in out.plain.lower()
+
+    async def test_primer_edit_modal_apply_re_site_prefix(
+            self, isolated_library):
+        """Clicking '+ Apply' with EcoRI selected prepends GAATTC to
+        the primer sequence in the textbox."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("ATGAAATCAGCCATGAAACGGCCAAGCATGT" + "A" * 50),
+                        id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(12, 20, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P"],
+                                    "primer_seq": ["ATGAAACG"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.PrimerEditModal)
+            from textual.widgets import Button, TextArea, Select
+            modal.query_one("#btn-primedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#primedit-re-select", Select).value = "GAATTC"
+            modal.query_one("#btn-primedit-prefix-apply", Button).action_press()
+            await pilot.pause()
+            assert modal.query_one("#primedit-seq", TextArea).text == \
+                   "GAATTCATGAAACG"
+
+    async def test_primer_edit_modal_apply_custom_prefix_iupac(
+            self, isolated_library):
+        """Custom prefix accepts DNA/IUPAC bases (uppercase, no
+        whitespace) and prepends to the primer sequence."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 100), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(10, 18, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P"],
+                                    "primer_seq": ["AAAAAAAA"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.PrimerEditModal)
+            from textual.widgets import Button, Input, TextArea
+            modal.query_one("#btn-primedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#primedit-custom-prefix",
+                              Input).value = "GANNTC"
+            await pilot.pause()
+            modal.query_one("#btn-primedit-prefix-apply",
+                              Button).action_press()
+            await pilot.pause()
+            assert modal.query_one("#primedit-seq",
+                                     TextArea).text == "GANNTCAAAAAAAA"
+
+    async def test_primer_edit_modal_apply_rejects_bad_prefix(
+            self, isolated_library):
+        """Non-DNA characters in the custom prefix are rejected; the
+        primer sequence stays unchanged and the status row shows a
+        red error message."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 100), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(10, 18, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["P"],
+                                    "primer_seq": ["AAAAAAAA"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button, Input, TextArea
+            modal.query_one("#btn-primedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#primedit-custom-prefix",
+                              Input).value = "BAD!CHARS"
+            await pilot.pause()
+            modal.query_one("#btn-primedit-prefix-apply",
+                              Button).action_press()
+            await pilot.pause()
+            # Sequence unchanged.
+            assert modal.query_one("#primedit-seq",
+                                     TextArea).text == "AAAAAAAA"
+
     async def test_open_feature_editor_dispatches_primer_to_primer_modal(
             self, isolated_library):
         """A `primer_bind` feature opens `PrimerEditModal`, not the
@@ -4492,6 +4651,96 @@ class TestShiftClickFeatureExtend:
             assert "GAATCG" in plain, (
                 "expected flap bases in rendered seq-panel text"
             )
+
+    def test_changelog_section_parser_round_trip(self):
+        """`_parse_changelog_sections` splits a mock CHANGELOG into
+        (version, body) pairs preserving source order."""
+        md = (
+            "# Changelog\n"
+            "## [0.5.11.0] — 2026-05-04\n\n"
+            "### Added\n- Foo\n"
+            "## [0.5.10.0] — 2026-05-03\n\n"
+            "### Fixed\n- Bar\n"
+            "## [0.5.9.0] — 2026-05-02\n\n"
+            "### Added\n- Baz\n"
+        )
+        sections = sc._parse_changelog_sections(md)
+        assert [s[0] for s in sections] == ["0.5.11.0", "0.5.10.0", "0.5.9.0"]
+        assert "Foo" in sections[0][1]
+        assert "Bar" in sections[1][1]
+        assert "Baz" in sections[2][1]
+
+    def test_version_sort_descending(self):
+        """`_version_sort_key` sorts SemVer-like strings such that
+        `sorted(..., reverse=True)` puts the newest version first."""
+        versions = ["0.5.10.0", "0.5.9.0", "0.5.11.0", "0.5.9.1"]
+        ordered = sorted(versions, key=sc._version_sort_key, reverse=True)
+        assert ordered == ["0.5.11.0", "0.5.10.0", "0.5.9.1", "0.5.9.0"]
+
+    def test_build_whats_new_body_orders_versions_newest_first(self):
+        """Body markdown lists versions newest-first regardless of
+        the order they appear in the source CHANGELOG."""
+        md = (
+            "## [0.5.9.0] — 2026-05-02\n### Added\n- Baz\n"
+            "## [0.5.11.0] — 2026-05-04\n### Added\n- Foo\n"
+            "## [0.5.10.0] — 2026-05-03\n### Fixed\n- Bar\n"
+        )
+        out = sc._build_whats_new_body(md, current_version="0.5.11.0")
+        # Newest version's section title appears before older ones.
+        i_11 = out.index("0.5.11.0")
+        i_10 = out.index("0.5.10.0")
+        i_9  = out.index("0.5.9.0")
+        assert i_11 < i_10 < i_9
+
+    async def test_whats_new_auto_pushes_on_version_change(
+            self, tiny_record, isolated_library):
+        """Fresh install (no `last_seen_version`): the modal auto-
+        pushes after the splash dismisses. Persists `last_seen_version`
+        on dismiss so the next launch on the same version stays
+        quiet."""
+        # Pre-condition: settings has no last_seen_version.
+        assert sc._get_setting("last_seen_version", None) is None
+        sc.PlasmidApp._preload_record = tiny_record
+        # Don't skip splash for THIS test — we need to verify the
+        # post-splash hook fires the WhatsNewModal.
+        sc.PlasmidApp._skip_splash = False
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Splash is on top; dismiss it.
+            assert isinstance(app.screen, sc.SplashScreen)
+            app.screen.action_dismiss_splash()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # WhatsNewModal should be active now.
+            assert isinstance(app.screen, sc.WhatsNewModal)
+            app.screen.action_dismiss_whatsnew()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Setting now reflects the running version.
+            assert sc._get_setting("last_seen_version") == sc.__version__
+        sc.PlasmidApp._preload_record = None
+        sc.PlasmidApp._skip_splash = True
+
+    async def test_whats_new_skipped_when_version_already_seen(
+            self, tiny_record, isolated_library):
+        """If `last_seen_version` already matches the running app
+        version, the auto-push doesn't fire."""
+        sc._set_setting("last_seen_version", sc.__version__)
+        sc.PlasmidApp._preload_record = tiny_record
+        sc.PlasmidApp._skip_splash = False
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.SplashScreen)
+            app.screen.action_dismiss_splash()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, sc.WhatsNewModal)
+        sc.PlasmidApp._preload_record = None
+        sc.PlasmidApp._skip_splash = True
 
     def test_pairwise_align_basic(self):
         """1-bp substitution in a 300 bp sequence aligns with no gaps,

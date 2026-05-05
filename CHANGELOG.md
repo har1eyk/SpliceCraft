@@ -2,6 +2,22 @@
 
 ---
 
+## [0.5.11.0] — 2026-05-04
+
+### Added
+
+- **5'-add-on workbench in `PrimerEditModal`.** New "Add 5':" row sits between the primer-sequence textbox and the live preview: a curated dropdown of 17 common cloning enzymes (EcoRI, BamHI, HindIII, XhoI, SacI, KpnI, SalI, PstI, NotI, SpeI, XbaI, NcoI, NdeI + Type IIS BsaI/BsmBI/BbsI/SapI), a free-form custom-bases Input (DNA/IUPAC validation), and an `+ Apply` button that prepends the chosen prefix to the primer sequence. Custom prefix takes precedence when non-empty so the user can combine the dropdown's `(none)` with a typed value.
+- **Live primer preview** inside the modal — a 4-row mini-rendering of the primer's flap + bound bar aligned to the template binding site, mirroring the seq-panel visualisation. Repaints on every keystroke in the sequence textbox so users see the bound region grow/shrink as they type or apply prefixes. Out-of-template flap bases (5' overhang dangling past a linear plasmid's end) are padded with spaces so the layout stays aligned.
+- **What's New modal (`WhatsNewModal`).** Auto-pushed once per version after the splash dismisses; stays quiet on subsequent launches at the same version. Available any time from `File → What's New…` for users who want to re-read the release notes. Body is built from `CHANGELOG.md` at open time, sorted newest-version-first by parsed SemVer components. Scrollable; closes on Escape, `q`, or the Dismiss button. The header reserves space for per-release contributor credits — feature requests and code contributions get visible recognition without users having to dig through git log.
+- New `last_seen_version` setting, persisted in `settings.json`, drives the auto-trigger.
+
+### Tests
+
+- +5 tests covering the 5'-add-on workflow: `_build_primer_preview` for fwd / rev / wrap-unsupported scenarios, the EcoRI dropdown round-trip, custom prefix DNA/IUPAC validation.
+- +6 tests for the What's New modal: CHANGELOG section parser round-trip, version sort key, body composition orders newest-first, auto-push fires after splash on version change, auto-push skipped when version already seen, modal-boundary check at the 160×48 baseline.
+
+---
+
 ## [0.5.10.0] — 2026-05-04
 
 ### Added
