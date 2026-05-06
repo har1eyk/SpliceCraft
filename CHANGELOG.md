@@ -2,6 +2,24 @@
 
 ---
 
+## [0.7.0.0] — 2026-05-06
+
+### Added
+
+- **Diff with another plasmid** (Phase 2.1) — File → Diff with another plasmid… opens `PlasmidPickerModal` to choose a comparison target, runs `_pairwise_align` in a `@work(thread=True, exclusive=True, group="diff_align")` worker so the UI stays responsive, then pushes the existing `AlignmentScreen`. New `_h_diff_plasmid` agent endpoint returns the same alignment result dict (`{score, identity_pct, aligned_q, aligned_t, n_matches, n_mismatches, n_gaps, q_len, t_len}`) shape so an agent can answer "how similar are these two" in one round-trip.
+- **Annotation transfer** (Phase 2.2) — Edit → Transfer annotations from… picks a source library entry, runs the new `_find_annotation_transfers` exact-sequence matcher across both strands (and across the origin on circular targets), and previews the matched coords in `AnnotationTransferModal`. "Apply all" appends matched features as `SeqFeature`s on the loaded record (wrap matches become `CompoundLocation` of `[start, n) + [0, end)`) — undo-able in one Ctrl+Z. New `_h_transfer_annotations` agent endpoint with `dry_run` (default true) so an agent can preview before committing. Skips features below 30 bp by default to silence primer-binding-site noise.
+- **GFF3 export** (Phase 3) — File → Export as GFF3 (.gff3)… writes the loaded record as GFF3 1.26: `##gff-version 3` header, `##sequence-region` pragma, synthesised top-level `region` row carrying `Is_circular=true` for circular plasmids, one tab-separated row per `FeatureLocation` part. Wrap features become two rows joined by a shared `ID=...` (the standard GFF3 split-feature convention); attribute values are percent-encoded so labels containing `;` / `=` round-trip cleanly. New `_h_export_gff` agent endpoint mirrors the existing `_h_export_genbank` / `_h_export_fasta` shape.
+
+### Tests
+
+- 29 new tests across `_find_annotation_transfers` (forward / RC / wrap / min-length / no-match / source-feature-skip), `_record_to_gff3` (header / coords / strand / wrap split / `Is_circular` / `source` skip / attribute escaping), `_export_gff_to_path` round-trip, the three new agent endpoints (`diff-plasmid`, `transfer-annotations`, `export-gff`), and modal-fits-in-baseline-terminal coverage for `AnnotationTransferModal` and `GffExportModal`.
+
+### Roadmap
+
+- v1.0.0.0 scope status: FASTA export ✓, GFF export ✓, diff view ✓, ORF finder ✓, annotation transfer ✓, cross-collection search ✓, SnapGene .dna round-trip (in flight), stability gate (next).
+
+---
+
 ## [0.6.0.0] — 2026-05-06
 
 ### Added

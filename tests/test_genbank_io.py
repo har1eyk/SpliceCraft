@@ -835,6 +835,146 @@ class TestExportFastaToPath:
         assert out.exists()
 
 
+class TestRecordToGff3:
+    """`_record_to_gff3` produces spec-compliant GFF3 (1.26):
+    `##gff-version 3` header, sequence-region pragma, region row
+    with `Is_circular=true` for circular plasmids, one tab-separated
+    feature row per location part, percent-encoded attribute values.
+    Wrap features get two rows sharing the same `ID=...`."""
+
+    def _build(self, seq: str, feats: list[tuple], *,
+                circular: bool = True):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        rec = SeqRecord(Seq(seq), id="P", name="P")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular" if circular else "linear"
+        n = len(seq)
+        for s, e, strand, ftype, label in feats:
+            if e < s:
+                loc = CompoundLocation([
+                    FeatureLocation(s, n, strand=strand),
+                    FeatureLocation(0, e, strand=strand),
+                ])
+            else:
+                loc = FeatureLocation(s, e, strand=strand)
+            rec.features.append(SeqFeature(
+                loc, type=ftype, qualifiers={"label": [label]}
+            ))
+        return rec
+
+    def test_header_and_sequence_region(self):
+        rec = self._build("ACGT" * 10, [])
+        gff = sc._record_to_gff3(rec)
+        lines = gff.splitlines()
+        assert lines[0] == "##gff-version 3"
+        assert lines[1] == f"##sequence-region P 1 {40}"
+
+    def test_circular_record_carries_is_circular_flag(self):
+        rec = self._build("AAAA", [], circular=True)
+        gff = sc._record_to_gff3(rec)
+        assert "Is_circular=true" in gff
+
+    def test_linear_record_omits_is_circular_flag(self):
+        rec = self._build("AAAA", [], circular=False)
+        gff = sc._record_to_gff3(rec)
+        assert "Is_circular" not in gff
+
+    def test_feature_row_uses_one_based_inclusive_coords(self):
+        # CDS at internal 0-based half-open [3, 9) → GFF 1-based
+        # inclusive [4, 9].
+        rec = self._build("AA" + "ATGGCCTAA" + "AA",
+                            [(2, 11, 1, "CDS", "x")])
+        gff = sc._record_to_gff3(rec)
+        # CDS row has start=3, end=11 (2+1 .. 11). type column is "CDS".
+        cds_lines = [l for l in gff.splitlines()
+                     if l and not l.startswith("##") and "CDS" in l]
+        assert len(cds_lines) == 1
+        cols = cds_lines[0].split("\t")
+        assert cols[2] == "CDS"
+        assert cols[3] == "3"   # 1-based start = 0-based start + 1
+        assert cols[4] == "11"
+
+    def test_strand_column(self):
+        rec = self._build("AAAAAAAAAA",
+                            [(0, 5, 1, "CDS", "fwd"),
+                             (5, 10, -1, "CDS", "rev")])
+        gff = sc._record_to_gff3(rec)
+        rows = [l.split("\t") for l in gff.splitlines()
+                if l and not l.startswith("##") and l.split("\t")[2] == "CDS"]
+        strands = [r[6] for r in rows]
+        assert "+" in strands and "-" in strands
+
+    def test_wrap_feature_emits_two_rows_same_id(self):
+        # 12-bp circular plasmid with a CDS at [9, 3) (wraps origin).
+        rec = self._build("AAAAAAAAAAAA",
+                            [(9, 3, 1, "CDS", "wrap")])
+        gff = sc._record_to_gff3(rec)
+        rows = [l for l in gff.splitlines()
+                if l and not l.startswith("##") and "CDS" in l]
+        assert len(rows) == 2
+        # Both rows share the same ID attribute.
+        ids = []
+        for r in rows:
+            attrs = r.split("\t")[-1]
+            for kv in attrs.split(";"):
+                if kv.startswith("ID="):
+                    ids.append(kv)
+        assert len(set(ids)) == 1, f"split-feature rows must share ID: {ids}"
+
+    def test_skip_source_feature(self):
+        """The synthesised `region` row covers the whole record, so a
+        GenBank source feature would double-list the span — filter it."""
+        rec = self._build("AAAA", [(0, 4, 1, "source", "src")])
+        gff = sc._record_to_gff3(rec)
+        # Only one row of type "region"; no "source" rows.
+        rows = [l for l in gff.splitlines()
+                if l and not l.startswith("##")]
+        types = {r.split("\t")[2] for r in rows}
+        assert "source" not in types
+        assert "region" in types
+
+    def test_attribute_percent_encoding(self):
+        """A label with `;` or `=` would break the GFF3 attributes
+        column without percent-encoding."""
+        rec = self._build("AAAAAAAA",
+                            [(0, 8, 1, "misc_feature", "weird=label;here")])
+        gff = sc._record_to_gff3(rec)
+        # Raw `;` and `=` from the label must not appear unescaped in
+        # the Name= value.
+        rows = [l for l in gff.splitlines()
+                if l and not l.startswith("##") and "misc_feature" in l]
+        assert len(rows) == 1
+        attrs = rows[0].split("\t")[-1]
+        # Find the Name= attribute and verify the literal `;` / `=`
+        # in the original label are encoded.
+        for kv in attrs.split(";"):
+            if kv.startswith("Name="):
+                assert "weird%3Dlabel%3Bhere" in kv
+
+
+class TestExportGffToPath:
+    def test_writes_file(self, tmp_path):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("ACGT" * 10), id="t", name="t")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, 12, strand=1),
+            type="CDS", qualifiers={"label": ["x"]}
+        ))
+        out = tmp_path / "x.gff3"
+        summary = sc._export_gff_to_path(rec, out)
+        assert out.exists()
+        assert summary["bp"] == 40
+        assert summary["features"] == 1
+        text = out.read_text()
+        assert text.startswith("##gff-version 3")
+
+
 class TestActionExportFasta:
     """Whole-plasmid FASTA export wired in 0.6.0.0: File → Export as
     FASTA pushes `FastaExportModal` pre-populated with the loaded

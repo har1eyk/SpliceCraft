@@ -303,6 +303,131 @@ class TestFeaturesHandler:
                     for f in feats)
 
 
+class TestExportGffHandler:
+    """`_h_export_gff` writes the loaded record to disk as GFF3."""
+
+    def test_no_record_returns_422(self):
+        app = MockApp(record=None)
+        result = sc._h_export_gff(app, {"path": "/tmp/x.gff3"})
+        assert result == ({"error": "no plasmid loaded"}, 422)
+
+    def test_missing_path_returns_400(self, tiny_record):
+        app = MockApp(record=tiny_record)
+        result = sc._h_export_gff(app, {})
+        assert isinstance(result, tuple) and result[1] == 400
+
+    def test_writes_file(self, tiny_record, tmp_path):
+        app = MockApp(record=tiny_record)
+        out = tmp_path / "tiny.gff3"
+        result = sc._h_export_gff(app, {"path": str(out)})
+        assert isinstance(result, dict)
+        assert result["ok"] is True
+        assert out.exists()
+        assert out.read_text().startswith("##gff-version 3")
+
+
+class TestTransferAnnotationsHandler:
+    """`_h_transfer_annotations` walks a source library entry's
+    features and matches them onto the loaded record by sequence
+    identity. Defaults to dry-run so an agent can inspect the
+    proposed transfers before committing."""
+
+    def test_no_record_loaded_returns_422(self):
+        app = MockApp(record=None)
+        result = sc._h_transfer_annotations(app, {"source_id": "x"})
+        assert result == ({"error": "no plasmid loaded"}, 422)
+
+    def test_missing_source_id_returns_400(self, tiny_record):
+        app = MockApp(record=tiny_record)
+        result = sc._h_transfer_annotations(app, {})
+        assert isinstance(result, tuple) and result[1] == 400
+
+    def test_source_not_in_library_returns_404(self, tiny_record,
+                                                  isolated_library):
+        sc._save_library([])
+        app = MockApp(record=tiny_record)
+        result = sc._h_transfer_annotations(
+            app, {"source_id": "ghost"},
+        )
+        assert isinstance(result, tuple) and result[1] == 404
+
+    def test_dry_run_returns_transfers_without_applying(
+        self, tiny_record, isolated_library
+    ):
+        # Source library entry mirrors the loaded record so every
+        # feature finds itself.
+        sc._save_library([{
+            "id":      "src",
+            "name":    "src",
+            "size":    len(tiny_record.seq),
+            "n_feats": len(tiny_record.features),
+            "added":   "2026-05-06",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+        app = MockApp(record=tiny_record)
+        before = len(tiny_record.features)
+        result = sc._h_transfer_annotations(
+            app, {"source_id": "src", "dry_run": True},
+        )
+        assert isinstance(result, dict)
+        assert result["applied"] is False
+        # Transfer count: only the >= min_len features. tiny_record
+        # has a 27-bp CDS and a 30-bp misc_feature; min_len defaults
+        # to 30 so only the misc_feature qualifies. Whatever the
+        # exact count, the record itself must NOT have been mutated.
+        assert len(tiny_record.features) == before
+
+
+class TestDiffPlasmidHandler:
+    """`_h_diff_plasmid` runs `_pairwise_align` between the loaded record
+    and a target library entry. Mirrors the GUI diff flow for agent
+    consumption — the result dict is the same shape `AlignmentScreen`
+    consumes."""
+
+    def test_no_record_loaded_returns_422(self):
+        app = MockApp(record=None)
+        result = sc._h_diff_plasmid(app, {"target_id": "x"})
+        assert result == ({"error": "no plasmid loaded"}, 422)
+
+    def test_missing_target_id_returns_400(self, tiny_record):
+        app = MockApp(record=tiny_record)
+        result = sc._h_diff_plasmid(app, {})
+        assert isinstance(result, tuple) and result[1] == 400
+
+    def test_invalid_mode_rejected(self, tiny_record):
+        app = MockApp(record=tiny_record)
+        result = sc._h_diff_plasmid(app, {"target_id": "x", "mode": "wat"})
+        assert isinstance(result, tuple) and result[1] == 400
+
+    def test_target_not_in_library_returns_404(self, tiny_record,
+                                                  isolated_library):
+        sc._save_library([])
+        app = MockApp(record=tiny_record)
+        result = sc._h_diff_plasmid(app, {"target_id": "ghost"})
+        assert isinstance(result, tuple) and result[1] == 404
+
+    def test_successful_diff_returns_alignment(self, tiny_record,
+                                                  isolated_library):
+        # Load a target into the library; diff against current record.
+        sc._save_library([{
+            "id":      "tgt",
+            "name":    "tgt",
+            "size":    len(tiny_record.seq),
+            "n_feats": 0,
+            "added":   "2026-05-06",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+        app = MockApp(record=tiny_record)
+        result = sc._h_diff_plasmid(app, {"target_id": "tgt"})
+        assert isinstance(result, dict)
+        assert result["ok"] is True
+        assert result["target_id"] == "tgt"
+        # Self-vs-self: 100% identity.
+        r = result["result"]
+        assert r["identity_pct"] == 100.0
+        assert r["n_mismatches"] == 0
+
+
 class TestFindOrfsHandler:
     """`_h_find_orfs` exposes the six-frame ORF scan (added 0.6.0.0).
     Wraps `_find_orfs` — the algorithm itself is covered by

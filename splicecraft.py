@@ -4840,6 +4840,195 @@ def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
 _PAIRWISE_MAX_LEN = 200_000
 
 
+# ── Annotation transfer ─────────────────────────────────────────────────────
+#
+# Given a source plasmid with annotated features and a target plasmid,
+# find every feature whose sequence appears verbatim in the target
+# (forward or reverse-complement) and propose the matched coordinates.
+# Useful when you've assembled a new construct and want to inherit
+# the annotations from the parent backbone without re-annotating by
+# hand. Exact-match only for v1.0 — fuzzy / BLAST-driven matching is
+# a v1.1 candidate; the existing in-process BLAST infra would slot in
+# cleanly behind the same `_find_annotation_transfers` API.
+#
+# Wrap-aware on circular plasmids:
+#   * Wrap-source features (end < start) extract bases as
+#     `seq[start:] + seq[:end]`.
+#   * Wrap-target matches (origin-spanning hits) are detected by
+#     scanning `target + target[:len(feat_bases)-1]` and reported
+#     with `end < start` matching the rest of the codebase.
+
+# Skip features below this length — primer-binding-site-scale
+# matches are noise; the ANNOTATION-PRESERVING workflow is built
+# around larger features (CDSes, origins, regulatory regions).
+_ANNOT_TRANSFER_MIN_LEN = 30
+
+
+def _feature_bases(rec_seq: str, feat: dict, n: int) -> str:
+    """Return the (top-strand) bases that the feature's
+    `(start, end, strand)` covers. Wrap-aware: a feature with
+    `end < start` reads `seq[start:] + seq[:end]`. For
+    `strand == -1` the bases are reverse-complemented so a
+    `feat_bases` lookup against the target's forward strand works
+    for both orientations: a forward-strand match means the source's
+    coding strand matches the target's top strand; a reverse-
+    complement match means the source's coding strand matches the
+    target's bottom strand."""
+    s = int(feat.get("start", 0))
+    e = int(feat.get("end",   0))
+    strand = int(feat.get("strand", 1))
+    if e == s:
+        return ""
+    if e < s:
+        bases = rec_seq[s:] + rec_seq[:e]
+    else:
+        bases = rec_seq[s:e]
+    if strand == -1:
+        bases = _rc(bases)
+    return bases.upper()
+
+
+def _find_annotation_transfers(source_rec, target_rec, *,
+                                  min_len: int = _ANNOT_TRANSFER_MIN_LEN
+                                  ) -> list[dict]:
+    """For every feature in `source_rec` whose sequence appears
+    verbatim in `target_rec` (forward or reverse-complement), return
+    a transfer record:
+        {label, type, source_start, source_end, source_strand,
+         target_start, target_end, target_strand, length, qualifiers}
+
+    `target_start` / `target_end` are forward-strand coords on the
+    target. `target_strand` is +1 for a forward match (feature's
+    coding strand == target top), −1 for a reverse-complement match.
+    Wrap matches on circular targets carry `end < target_start` per
+    the wrap-feature convention.
+
+    Features shorter than `min_len` are skipped — small primer-binding
+    sites generate noise (an 18-mer hits any random ~1 kb sequence
+    by chance); the use case is propagating CDS / origin / regulatory
+    annotations where match length comfortably exceeds 30 bp.
+    """
+    src_seq = str(source_rec.seq).upper()
+    tgt_seq = str(target_rec.seq).upper()
+    n_src = len(src_seq)
+    n_tgt = len(tgt_seq)
+    if n_src == 0 or n_tgt == 0:
+        return []
+
+    is_circular = (
+        (target_rec.annotations or {}).get("topology") == "circular"
+    )
+
+    transfers: list[dict] = []
+    seen_target_spans: set[tuple[int, int, int]] = set()
+
+    for feat in source_rec.features:
+        try:
+            ftype = feat.type
+        except AttributeError:
+            ftype = "?"
+        if ftype == "source":
+            continue
+        # Lift the feature into the dict shape `_feature_bases` expects.
+        try:
+            loc = feat.location
+            f_start = int(loc.start)
+            f_end   = int(loc.end)
+            f_strand = int(loc.strand or 1)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        feat_bases = _feature_bases(
+            src_seq,
+            {"start": f_start, "end": f_end, "strand": f_strand},
+            n_src,
+        )
+        if len(feat_bases) < min_len:
+            continue
+        # Pull a display label off the qualifiers — same precedence
+        # `_record_features` and `AlignmentScreen._body_text` use.
+        label = ""
+        try:
+            for q in ("label", "gene", "product"):
+                v = feat.qualifiers.get(q)
+                if isinstance(v, list) and v:
+                    label = str(v[0])
+                    break
+        except AttributeError:
+            pass
+        if not label:
+            label = ftype
+
+        # Search target on both strands. For circular targets, scan a
+        # tail-extended copy so a feature crossing the origin in the
+        # target is found at the right (forward, wrap) coords.
+        feat_len = len(feat_bases)
+        scan_seqs = [
+            (tgt_seq + (tgt_seq[: feat_len - 1] if is_circular else ""), 1),
+        ]
+        rc_tgt_seq = _rc(tgt_seq)
+        scan_seqs.append((
+            rc_tgt_seq + (rc_tgt_seq[: feat_len - 1] if is_circular else ""),
+            -1,
+        ))
+
+        for scan_seq, t_strand in scan_seqs:
+            start_idx = 0
+            while True:
+                hit = scan_seq.find(feat_bases, start_idx)
+                if hit < 0:
+                    break
+                start_idx = hit + 1
+                if hit >= n_tgt:
+                    # Already visited in the un-wrapped half.
+                    continue
+                # Map hit + length to forward-strand target coords.
+                if t_strand == 1:
+                    t_s = hit
+                    t_e = hit + feat_len
+                else:
+                    # rc match at hit on rc(target) corresponds to a
+                    # forward-strand span [n - (hit + L), n - hit).
+                    t_s = (n_tgt - (hit + feat_len)) % n_tgt \
+                          if is_circular else n_tgt - (hit + feat_len)
+                    t_e = (n_tgt - hit) % n_tgt \
+                          if is_circular else n_tgt - hit
+                if not is_circular and (t_s < 0 or t_e > n_tgt):
+                    continue
+                # Wrap representation: end < start.
+                if is_circular and t_e > n_tgt:
+                    t_e -= n_tgt
+                key = (t_s, t_e, t_strand)
+                if key in seen_target_spans:
+                    continue
+                seen_target_spans.add(key)
+                qual_dict: dict = {}
+                try:
+                    for k, v in feat.qualifiers.items():
+                        # Stringify list values to keep the transfer
+                        # payload JSON-serialisable for the agent path.
+                        if isinstance(v, list):
+                            qual_dict[k] = list(v)
+                        else:
+                            qual_dict[k] = [str(v)]
+                except AttributeError:
+                    pass
+                transfers.append({
+                    "label":          label,
+                    "type":           ftype,
+                    "source_start":   f_start,
+                    "source_end":     f_end,
+                    "source_strand":  f_strand,
+                    "target_start":   t_s,
+                    "target_end":     t_e,
+                    "target_strand":  t_strand,
+                    "length":         feat_len,
+                    "qualifiers":     qual_dict,
+                })
+
+    transfers.sort(key=lambda x: (-x["length"], x["target_start"]))
+    return transfers
+
+
 def _pairwise_align(query_seq: str, target_seq: str,
                      *, mode: str = "global",
                      match: float = 2.0,
@@ -5056,6 +5245,164 @@ def _export_genbank_to_path(record, path) -> dict:
     )
     return {"path": str(p), "bp": len(normalized.seq),
             "features": len(normalized.features)}
+
+
+def _record_to_gff3(record) -> str:
+    """Serialise `record` to GFF3 text (specification 1.26).
+
+    GFF3 columns: seqid, source, type, start, end, score, strand, phase,
+    attributes. Coordinates are 1-based inclusive — note the off-by-one
+    versus SpliceCraft's internal 0-based half-open `[start, end)`. For
+    each feature we emit one line per `FeatureLocation` part so wrap
+    features (origin-spanning `CompoundLocation`) become two
+    same-ID rows joined by a shared `ID=...` attribute, the standard
+    GFF3 convention for split features. Circular records carry
+    `Is_circular=true` on a synthesised top-level region row.
+    """
+    from urllib.parse import quote as _q
+
+    seqid = (record.id or record.name or "plasmid").strip() or "plasmid"
+    # GFF3 reserves a tighter set of seqid characters than GenBank LOCUS;
+    # percent-encode anything outside `[A-Za-z0-9._:^*$@!+_?\-|]`.
+    safe_seqid = _q(seqid, safe=".:_-")
+    n = len(record.seq)
+    is_circular = (
+        (record.annotations or {}).get("topology", "").lower() == "circular"
+    )
+
+    out: list[str] = []
+    out.append("##gff-version 3")
+    if n:
+        out.append(f"##sequence-region {safe_seqid} 1 {n}")
+    # Synthesise a top-level region row so downstream consumers can see
+    # the topology flag — Bio.SeqRecord doesn't surface it through the
+    # features list otherwise. `region` is the GFF3 SO term for this.
+    region_attrs = [f"ID={safe_seqid}"]
+    if is_circular:
+        region_attrs.append("Is_circular=true")
+    if n:
+        out.append("\t".join((
+            safe_seqid, "SpliceCraft", "region",
+            "1", str(n), ".", "+", ".",
+            ";".join(region_attrs),
+        )))
+
+    auto_id = 0
+    for feat in record.features:
+        ftype = (feat.type or "misc_feature").strip() or "misc_feature"
+        if ftype == "source":
+            # Source features map to the synthetic `region` row above;
+            # emitting both would double-list the whole-record span.
+            continue
+        try:
+            strand_int = int(feat.location.strand or 0)
+        except (AttributeError, TypeError, ValueError):
+            strand_int = 0
+        gff_strand = ("+" if strand_int == 1
+                      else "-" if strand_int == -1 else ".")
+        # Pull a display name + extra qualifiers. Same precedence other
+        # parts of the codebase use.
+        name = ""
+        try:
+            for q in ("label", "gene", "product"):
+                v = feat.qualifiers.get(q)
+                if isinstance(v, list) and v:
+                    name = str(v[0])
+                    break
+        except AttributeError:
+            pass
+        auto_id += 1
+        feat_id = f"feat{auto_id}"
+        attr_parts: list[str] = [f"ID={feat_id}"]
+        if name:
+            attr_parts.append(f"Name={_q(name, safe='')}")
+        # All other qualifiers as Note-prefixed key/value, except the
+        # ones we already mapped (label/gene/product) — except gene and
+        # product can convey extra info, so emit them too as proper
+        # GFF3 attributes when present.
+        try:
+            quals = feat.qualifiers
+        except AttributeError:
+            quals = {}
+        for k, vlist in (quals or {}).items():
+            if k in ("label",):
+                continue
+            if not isinstance(vlist, list):
+                vlist = [str(vlist)]
+            joined = ",".join(_q(str(v), safe="") for v in vlist)
+            if k in ("gene", "product"):
+                attr_parts.append(f"{k}={joined}")
+            else:
+                # GFF3 spec is strict — treat any unknown qualifier as
+                # a Note (free-text). Multiple Notes get comma-joined.
+                attr_parts.append(f"Note={_q(k + '=' + ','.join(str(v) for v in vlist), safe='')}")
+        # Phase: CDS features default to 0 unless the qualifier
+        # supplies a codon_start (1-based 1/2/3 → 0/1/2 phase).
+        phase = "."
+        if ftype.upper() == "CDS":
+            try:
+                cs = int((quals.get("codon_start", ["1"]) or ["1"])[0])
+            except (TypeError, ValueError, IndexError):
+                cs = 1
+            phase = str(max(0, min(2, cs - 1)))
+        # Iterate location parts so wrap features get one row per
+        # arc, sharing the same ID — the GFF3 split-feature convention.
+        try:
+            parts = (getattr(feat.location, "parts", None)
+                     or [feat.location])
+        except AttributeError:
+            parts = []
+        for part in parts:
+            try:
+                p_s = int(part.start)
+                p_e = int(part.end)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if p_e <= p_s:
+                continue
+            out.append("\t".join((
+                safe_seqid,
+                "SpliceCraft",
+                ftype,
+                # 1-based inclusive: start = p_s + 1; end = p_e.
+                str(p_s + 1),
+                str(p_e),
+                ".",
+                gff_strand,
+                phase,
+                ";".join(attr_parts),
+            )))
+
+    out.append("")  # trailing newline so cat-friendly tools don't
+                    # complain about a missing final EOL.
+    return "\n".join(out)
+
+
+def _export_gff_to_path(record, path) -> dict:
+    """Write `record` to `path` as GFF3. Atomic write. Returns
+    ``{"path", "bp", "features"}``.
+
+    No round-trip verify (GFF3 has no canonical 1:1 reader in the
+    standard library and Biopython's GFF support lives in BCBio.GFF
+    which is an optional dep). The serialiser is deterministic and
+    test-covered, so the same source record always produces the
+    same output."""
+    from pathlib import Path as _Path
+
+    p = _Path(path).expanduser()
+    text = _record_to_gff3(record)
+    _atomic_write_text(p, text)
+    _log.info(
+        "Exported GFF3 to %s (%d bp, %d features)",
+        p, len(record.seq),
+        len([f for f in record.features if f.type != "source"]),
+    )
+    return {
+        "path":     str(p),
+        "bp":       len(record.seq),
+        "features": len([f for f in record.features
+                          if f.type != "source"]),
+    }
 
 
 def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
@@ -10708,6 +11055,91 @@ class ExportGenBankModal(ModalScreen):
             pass
 
     @on(Button.Pressed, "#btn-cancel-export")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class GffExportModal(ModalScreen):
+    """Prompt for a target path and write `record` as GFF3.
+
+    Dismisses with the summary dict from `_export_gff_to_path`
+    (`path`, `bp`, `features`) or `None` if cancelled. Mirrors the
+    FASTA + GenBank export modal pattern; differs only in file
+    extension validation + which serialiser fires.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    def __init__(self, record, default_path: str = "") -> None:
+        super().__init__()
+        self._record = record
+        self._default_path = default_path
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gff-export-box"):
+            yield Static(" Export as GFF3 ", id="gff-export-title")
+            n = len(self._record.seq) if self._record else 0
+            f = len([fe for fe in (self._record.features or [])
+                     if fe.type != "source"]) if self._record else 0
+            yield Label(
+                f"[{self._record.name or self._record.id or '?'}]  "
+                f"{n} bp · {f} feature(s)"
+            )
+            yield Label("Output path (.gff / .gff3):")
+            yield Input(
+                value=self._default_path,
+                placeholder="/path/to/plasmid.gff3",
+                id="gff-export-path",
+            )
+            with Horizontal(id="gff-export-btns"):
+                yield Button("Export", id="btn-gff-export-ok",
+                             variant="primary")
+                yield Button("Cancel", id="btn-gff-export-cancel")
+            yield Static("", id="gff-export-status", markup=True)
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#gff-export-path", Input).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-gff-export-ok")
+    def _do_export(self) -> None:
+        try:
+            inp    = self.query_one("#gff-export-path", Input)
+            status = self.query_one("#gff-export-status", Static)
+        except NoMatches:
+            return
+        path = inp.value.strip()
+        if not path:
+            status.update("[red]Enter an output path.[/red]")
+            return
+        try:
+            summary = _export_gff_to_path(self._record, path)
+        except OSError as exc:
+            _log.exception("GFF export to %s failed", path)
+            status.update(
+                f"[red]Could not write to {path!r}: "
+                f"{exc.strerror or exc}.  Check the directory exists "
+                f"and you have write permission.[/red]"
+            )
+            return
+        self.dismiss(summary)
+
+    @on(Input.Submitted)
+    def _submitted(self) -> None:
+        try:
+            self.query_one("#btn-gff-export-ok", Button).press()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-gff-export-cancel")
     def _cancel_btn(self) -> None:
         self.dismiss(None)
 
@@ -25113,6 +25545,89 @@ class UnsavedNavigateModal(ModalScreen):
     def action_cancel(self): self.dismiss(None)
 
 
+class AnnotationTransferModal(ModalScreen):
+    """Preview + confirm annotation transfer from a source plasmid
+    onto the loaded record.
+
+    Built from a list of transfer dicts produced by
+    `_find_annotation_transfers` — the table shows feature label /
+    target coords / strand / length so the user can sanity-check
+    before any features land on their construct. "Apply all" adds
+    every listed feature to the current record (the matcher already
+    skipped exact-coord duplicates, so re-running on an already-
+    annotated target is a no-op for visible duplicates).
+
+    Dismiss payload:
+      None       — cancelled
+      list[dict] — the transfers the user accepted (same shape the
+                   modal received). Caller turns them into SeqFeatures
+                   and `_apply_record`s the result.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    def __init__(self, source_label: str, target_label: str,
+                 transfers: list[dict]) -> None:
+        super().__init__()
+        self._source_label = source_label
+        self._target_label = target_label
+        self._transfers    = list(transfers)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="annot-box"):
+            yield Static(" Transfer annotations ", id="annot-title")
+            yield Label(
+                f"From: {self._source_label}    →    "
+                f"Into: {self._target_label}"
+            )
+            yield Label(
+                f"{len(self._transfers)} feature(s) matched by sequence"
+                if self._transfers
+                else "No features matched. Sequences too divergent?"
+            )
+            yield DataTable(id="annot-table", cursor_type="row",
+                            zebra_stripes=True)
+            with Horizontal(id="annot-btns"):
+                yield Button("Apply all", id="btn-annot-apply",
+                             variant="primary",
+                             disabled=not self._transfers)
+                yield Button("Cancel", id="btn-annot-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#annot-table", DataTable)
+        except NoMatches:
+            return
+        t.add_columns("Label", "Type", "Target start",
+                      "Target end", "Strand", "Length (bp)")
+        for tr in self._transfers:
+            wrap = (tr["target_end"] < tr["target_start"])
+            end_disp = (f"{tr['target_end']:,} (wrap)"
+                        if wrap else f"{tr['target_end']:,}")
+            t.add_row(
+                Text(tr["label"], no_wrap=True, overflow="ellipsis"),
+                tr["type"],
+                f"{tr['target_start']:,}",
+                end_disp,
+                "+" if tr["target_strand"] == 1 else "-",
+                f"{tr['length']:,}",
+            )
+
+    @on(Button.Pressed, "#btn-annot-apply")
+    def _apply(self, _) -> None:
+        self.dismiss(self._transfers)
+
+    @on(Button.Pressed, "#btn-annot-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class LibrarySearchModal(ModalScreen):
     """Cross-collection plasmid search.
 
@@ -26982,6 +27497,24 @@ def _h_export_genbank(app, payload):
     return {"ok": True, **result}
 
 
+@_agent_endpoint("export-gff", write=True)
+def _h_export_gff(app, payload):
+    """Write the current record to `path` as GFF3. Body: ``{path}``.
+    Wrap features become two GFF3 rows joined by a shared `ID=...`
+    attribute. Returns ``{ok, path, bp, features}``."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    try:
+        result = _export_gff_to_path(rec, path)
+    except OSError as exc:
+        return ({"error": f"export failed: {exc}"}, 500)
+    return {"ok": True, **result}
+
+
 @_agent_endpoint("export-fasta", write=True)
 def _h_export_fasta(app, payload):
     """Write the current sequence to `path` as FASTA. Body: ``{path}``.
@@ -27130,6 +27663,125 @@ def _h_list_restriction_sites(app, payload):
             "cut_bp":  s.get("top_cut_bp", -1),
         })
     return {"sites": out, "count": len(out)}
+
+
+@_agent_endpoint("transfer-annotations", write=True)
+def _h_transfer_annotations(app, payload):
+    """Transfer features from a source plasmid (`source_id` in the
+    library) onto the loaded record by sequence-identity matching.
+    Body: ``{source_id: str, min_len?: int, dry_run?: bool}``.
+
+    `dry_run=true` (default) returns the proposed transfers without
+    mutating the record — useful for showing the agent a preview
+    before committing. Set `dry_run=false` to actually append the
+    matched features. Returns
+    ``{transfers: [...], applied: bool, count: int}``."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    source_id = _sanitize_label(payload.get("source_id"), max_len=200)
+    if not source_id:
+        return ({"error": "missing 'source_id'"}, 400)
+    raw_min = payload.get("min_len", _ANNOT_TRANSFER_MIN_LEN)
+    min_len, ml_err = _coerce_int(raw_min, name="min_len")
+    if ml_err is not None:
+        return ({"error": ml_err}, 400)
+    if min_len < 1:
+        return ({"error": "'min_len' must be ≥ 1"}, 400)
+    dry_run = bool(payload.get("dry_run", True))
+    source_entry: dict | None = None
+    for e in _load_library():
+        if e.get("id") == source_id:
+            source_entry = e
+            break
+    if source_entry is None:
+        return ({"error": f"no library entry id={source_id!r}"}, 404)
+    gb_text = source_entry.get("gb_text", "")
+    if not gb_text:
+        return ({"error": "source entry has no gb_text"}, 422)
+    try:
+        source_record = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        return ({"error": f"source parse failed: {exc}"}, 500)
+    transfers = _find_annotation_transfers(
+        source_record, rec, min_len=min_len,
+    )
+    if dry_run or not transfers:
+        return {
+            "transfers": transfers,
+            "applied":   False,
+            "count":     len(transfers),
+        }
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        try:
+            app._apply_annotation_transfers(transfers, rec)
+        except Exception as exc:
+            return ({"error": f"apply failed: {exc}"}, 500)
+        return None
+
+    err = app.call_from_thread(_apply)
+    if isinstance(err, tuple):
+        return err
+    return {
+        "transfers": transfers,
+        "applied":   True,
+        "count":     len(transfers),
+    }
+
+
+@_agent_endpoint("diff-plasmid")
+def _h_diff_plasmid(app, payload):
+    """Pairwise alignment of the loaded record against another plasmid
+    in the library. Body: ``{target_id: str, mode?: 'global'|'local'}``.
+    Returns the full result dict from `_pairwise_align`
+    (`{score, identity_pct, aligned_q, aligned_t, n_matches,
+    n_mismatches, n_gaps, q_len, t_len}`) plus `target_name` so an
+    agent can label the comparison without a second round-trip.
+
+    Skips the UI and feeds an agent the same numbers `AlignmentScreen`
+    surfaces — a "how similar are pUC19 and my new construct" question
+    can be answered in one round-trip."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    target_id = _sanitize_label(payload.get("target_id"), max_len=200)
+    if not target_id:
+        return ({"error": "missing 'target_id'"}, 400)
+    mode = payload.get("mode", "global")
+    if mode not in ("global", "local"):
+        return ({"error": "'mode' must be 'global' or 'local'"}, 400)
+    target_entry: dict | None = None
+    for e in _load_library():
+        if e.get("id") == target_id:
+            target_entry = e
+            break
+    if target_entry is None:
+        return ({"error": f"no library entry id={target_id!r}"}, 404)
+    gb_text = target_entry.get("gb_text", "")
+    if not gb_text:
+        return ({"error": "target entry has no gb_text"}, 422)
+    try:
+        target_record = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        return ({"error": f"target parse failed: {exc}"}, 500)
+    try:
+        result = _pairwise_align(
+            str(rec.seq), str(target_record.seq), mode=mode,
+        )
+    except ValueError as exc:
+        return ({"error": f"alignment rejected: {exc}"}, 400)
+    except Exception as exc:
+        return ({"error": f"alignment failed: {exc}"}, 500)
+    return {
+        "ok":          True,
+        "target_id":   target_id,
+        "target_name": target_record.name or target_record.id or "",
+        "result":      result,
+    }
 
 
 @_agent_endpoint("find-orfs")
@@ -28200,6 +28852,18 @@ ExportCommercialSaaSModal { align: center middle; }
 #export-btns Button { margin-right: 1; }
 #export-status { height: 2; margin-top: 1; }
 
+/* ── Export-GFF3 modal ───────────────────────────────────── */
+GffExportModal { align: center middle; }
+#gff-export-box {
+    width: 72; height: auto;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#gff-export-title { background: $primary; padding: 0 1; margin-bottom: 1; }
+#gff-export-box Label { color: $text-muted; margin-top: 1; }
+#gff-export-btns { height: 3; margin-top: 1; }
+#gff-export-btns Button { margin-right: 1; }
+#gff-export-status { height: 2; margin-top: 1; }
+
 /* ── Export-FASTA modal ──────────────────────────────────── */
 FastaExportModal { align: center middle; }
 #fasta-export-box {
@@ -28211,6 +28875,18 @@ FastaExportModal { align: center middle; }
 #fasta-export-btns { height: 3; margin-top: 1; }
 #fasta-export-btns Button { margin-right: 1; }
 #fasta-export-status { height: 2; margin-top: 1; }
+
+/* ── Annotation transfer modal ───────────────────────────── */
+AnnotationTransferModal { align: center middle; }
+#annot-box {
+    width: 110; height: 36;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#annot-title { background: $primary; padding: 0 1; margin-bottom: 1; }
+#annot-box Label { color: $text-muted; margin-top: 1; }
+#annot-table { height: 1fr; margin-top: 1; }
+#annot-btns  { height: 3; margin-top: 1; }
+#annot-btns Button { margin-right: 1; }
 
 /* ── Cross-collection library search modal ──────────────── */
 LibrarySearchModal { align: center middle; }
@@ -30739,6 +31415,35 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_done,
         )
 
+    def action_export_gff(self) -> None:
+        """Prompt for a path and write the loaded record as GFF3.
+
+        Default `<record.name>.gff3` in the cwd. Wrap features become
+        two GFF3 rows joined by a shared `ID=...` attribute (the
+        standard split-feature convention); circular records carry
+        `Is_circular=true` on a synthesised `region` row at the top.
+        """
+        if self._current_record is None:
+            self.notify("No plasmid loaded.", severity="warning")
+            return
+        name = (self._current_record.name
+                or self._current_record.id or "plasmid")
+        default = f"{name}.gff3"
+
+        def _on_done(summary):
+            if not summary:
+                return
+            self._notify_success(
+                f"Exported {summary['features']} feature(s) → "
+                f"{summary['path']}",
+                timeout=8,
+            )
+
+        self.push_screen(
+            GffExportModal(self._current_record, default_path=default),
+            callback=_on_done,
+        )
+
     def action_export_fasta(self) -> None:
         """Prompt for a path and write the current record as FASTA.
 
@@ -30770,6 +31475,222 @@ SpeciesPickerModal { align: center middle; }
             ),
             callback=_on_done,
         )
+
+    def action_transfer_annotations(self) -> None:
+        """Transfer annotations from a library plasmid onto the loaded
+        record by sequence-identity matching.
+
+        Two-step modal flow: pick the source plasmid, then preview the
+        matches. On "Apply all" the matched features are appended to
+        the loaded record's `features` list, the record is rebuilt
+        and re-applied through the existing `_apply_record` path so
+        every panel sees the new annotations.
+        """
+        if self._current_record is None:
+            self.notify("No plasmid loaded — load one first.",
+                        severity="warning")
+            return
+
+        target_record = self._current_record
+        target_label = target_record.name or target_record.id or "target"
+
+        def _on_transfers_done(accepted):
+            if not accepted:
+                return
+            self._apply_annotation_transfers(accepted, target_record)
+
+        def _on_source_picked(entry_id):
+            if not entry_id:
+                return
+            target_entry = None
+            for e in _load_library():
+                if e.get("id") == entry_id:
+                    target_entry = e
+                    break
+            if target_entry is None:
+                self.notify("Library entry not found.", severity="warning")
+                return
+            gb_text = target_entry.get("gb_text", "")
+            if not gb_text:
+                self.notify("Library entry has no embedded sequence.",
+                            severity="warning")
+                return
+            try:
+                source_record = _gb_text_to_record(gb_text)
+            except Exception as exc:
+                _log.exception(
+                    "Annotation source parse failed for %r", entry_id,
+                )
+                self.notify(f"Could not parse source: {exc}",
+                            severity="error")
+                return
+            transfers = _find_annotation_transfers(
+                source_record, target_record,
+            )
+            self.push_screen(
+                AnnotationTransferModal(
+                    source_label=source_record.name
+                                  or source_record.id or "source",
+                    target_label=target_label,
+                    transfers=transfers,
+                ),
+                callback=_on_transfers_done,
+            )
+
+        self.push_screen(
+            PlasmidPickerModal(current_id=target_record.id),
+            callback=_on_source_picked,
+        )
+
+    def _apply_annotation_transfers(self, transfers: list[dict],
+                                       target_record) -> None:
+        """Append the accepted transfers as `SeqFeature`s on
+        `target_record` and rebuild via `_apply_record`. Wrap matches
+        (target_end < target_start) become a `CompoundLocation` of
+        `[start, n) + [0, end)` matching how the rest of the codebase
+        represents wrap features."""
+        from copy import deepcopy
+        from Bio.SeqFeature import (
+            SeqFeature, FeatureLocation, CompoundLocation,
+        )
+        # Push undo BEFORE mutating so Ctrl+Z brings the un-annotated
+        # record back.
+        self._push_undo()
+        new_record = deepcopy(target_record)
+        n = len(new_record.seq)
+        for tr in transfers:
+            t_s = int(tr["target_start"])
+            t_e = int(tr["target_end"])
+            t_strand = int(tr["target_strand"])
+            if t_e < t_s and n > 0:
+                loc = CompoundLocation([
+                    FeatureLocation(t_s, n, strand=t_strand),
+                    FeatureLocation(0, t_e, strand=t_strand),
+                ])
+            else:
+                loc = FeatureLocation(t_s, t_e, strand=t_strand)
+            qual = {}
+            for k, v in (tr.get("qualifiers") or {}).items():
+                if isinstance(v, list):
+                    qual[k] = list(v)
+                else:
+                    qual[k] = [str(v)]
+            qual.setdefault("label", [tr.get("label", "")])
+            new_record.features.append(SeqFeature(
+                loc, type=tr.get("type", "misc_feature"),
+                qualifiers=qual,
+            ))
+        # _apply_record(clear_undo=False) preserves the undo stack and
+        # _source_path so a subsequent Ctrl+S still targets the right
+        # file (per pitfall #7).
+        self._current_record = new_record
+        self._apply_record(new_record, clear_undo=False)
+        self._mark_dirty()
+        self._notify_success(
+            f"Added {len(transfers)} feature(s) from sequence match.",
+            timeout=6,
+        )
+
+    def action_diff_plasmid(self) -> None:
+        """Compare the loaded plasmid against another from the library.
+
+        Pushes `PlasmidPickerModal` to pick the comparison target,
+        runs a pairwise alignment via `_pairwise_align`, then opens
+        `AlignmentScreen` with the result. Mirrors the Plasmidsaurus
+        alignment flow but pulls both sides from the in-process
+        library instead of a sequencing-run zip.
+
+        The alignment runs in a worker thread (`_diff_align_worker`)
+        so a 50–200 kb pair doesn't freeze the UI for the second or
+        two PairwiseAligner spends in C.
+        """
+        if self._current_record is None:
+            self.notify("No plasmid loaded — load one first.",
+                        severity="warning")
+            return
+
+        def _on_picked(entry_id):
+            if not entry_id:
+                return
+            target_entry = None
+            for e in _load_library():
+                if e.get("id") == entry_id:
+                    target_entry = e
+                    break
+            if target_entry is None:
+                self.notify("Library entry not found.", severity="warning")
+                return
+            gb_text = target_entry.get("gb_text", "")
+            if not gb_text:
+                self.notify("Library entry has no embedded sequence.",
+                            severity="warning")
+                return
+            try:
+                target_record = _gb_text_to_record(gb_text)
+            except Exception as exc:
+                _log.exception("Diff target parse failed for %r", entry_id)
+                self.notify(f"Could not parse target: {exc}",
+                            severity="error")
+                return
+            # Sanity guard before kicking off the worker — `_pairwise_align`
+            # itself raises on this, but failing fast here is faster + lets
+            # us surface a friendlier message to the user.
+            q_len = len(self._current_record.seq)
+            t_len = len(target_record.seq)
+            if max(q_len, t_len) > _PAIRWISE_MAX_LEN:
+                self.notify(
+                    f"Plasmid too long for pairwise alignment "
+                    f"(cap {_PAIRWISE_MAX_LEN:,} bp per side; "
+                    f"got {q_len:,} vs {t_len:,}).",
+                    severity="warning", timeout=8,
+                )
+                return
+            self.notify(
+                f"Aligning {self._current_record.name} vs "
+                f"{target_record.name} ({q_len:,} bp × {t_len:,} bp)…",
+                timeout=4,
+            )
+            self._diff_align_worker(self._current_record, target_record)
+
+        self.push_screen(
+            PlasmidPickerModal(current_id=self._current_record.id),
+            callback=_on_picked,
+        )
+
+    @work(thread=True, exclusive=True, group="diff_align")
+    def _diff_align_worker(self, query_record, target_record) -> None:
+        """Worker: run `_pairwise_align` off the UI thread, then push
+        the `AlignmentScreen` on completion. Pairwise alignment of two
+        ~150 kb plasmids takes ~1–2 s in PairwiseAligner; doing it
+        synchronously would freeze the cursor.
+        """
+        try:
+            result = _pairwise_align(
+                str(query_record.seq),
+                str(target_record.seq),
+                mode="global",
+            )
+        except ValueError as exc:
+            self.call_from_thread(
+                self.notify, f"Alignment failed: {exc}", severity="error",
+            )
+            return
+        except Exception as exc:
+            _log.exception("Pairwise alignment worker raised")
+            self.call_from_thread(
+                self.notify, f"Alignment failed: {exc}", severity="error",
+            )
+            return
+
+        def _show():
+            self.push_screen(AlignmentScreen(
+                query_label=query_record.name or query_record.id or "query",
+                target_label=target_record.name or target_record.id or "target",
+                target_record=target_record,
+                result=result,
+            ))
+
+        self.call_from_thread(_show)
 
     def action_find_plasmid(self) -> None:
         """Open the cross-collection plasmid search modal. Pre-fix the
@@ -32168,9 +33089,11 @@ SpeciesPickerModal { align: center middle; }
                 ("---",                          None),
                 ("Add to Library  [^⇧A]",        "add_to_library"),
                 ("Find plasmid (all collections)…", "find_plasmid"),
+                ("Diff with another plasmid…",   "diff_plasmid"),
                 ("Save  [^S]",                   "save"),
                 ("Export as GenBank (.gb)...",   "export_genbank"),
                 ("Export as FASTA (.fa)...",     "export_fasta"),
+                ("Export as GFF3 (.gff3)...",    "export_gff"),
                 ("Export as .dna...", "export_commercialsaas"),
                 ("---",                          None),
                 ("Collections...",               "open_collections"),
@@ -32201,6 +33124,7 @@ SpeciesPickerModal { align: center middle; }
                 ("Delete Feature",                  "delete_feature"),
                 ("---",                             None),
                 ("Find ORFs…",                      "find_orfs"),
+                ("Transfer annotations from…",       "transfer_annotations"),
             ],
             "Enzymes": [
                 (f"[{rs}] Show RE sites  [r]",   "toggle_restr"),

@@ -970,3 +970,130 @@ class TestFindOrfs:
         # The ATG at position 0 should map to exactly one ORF.
         zero_starts = [o for o in orfs if o["start"] == 0 and o["strand"] == 1]
         assert len(zero_starts) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Annotation transfer — exact-match feature propagation between plasmids
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAnnotationTransfer:
+    """`_find_annotation_transfers` matches features by sequence
+    identity and reports their target-strand coords. Exact-match for
+    v1.0; wrap-aware on circular targets."""
+
+    @staticmethod
+    def _rec(seq: str, feats: list[tuple] = (), *,  # type: ignore[assignment]
+              circular: bool = True):
+        """Tiny SeqRecord builder. `feats` is `[(start, end, strand,
+        type, label), ...]`."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq      import Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        rec = SeqRecord(Seq(seq), id="t", name="t")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular" if circular else "linear"
+        for s, e, strand, ftype, label in feats:
+            n = len(seq)
+            if e < s:
+                # Wrap-feature CompoundLocation: [s, n) + [0, e).
+                loc = CompoundLocation([
+                    FeatureLocation(s, n, strand=strand),
+                    FeatureLocation(0, e, strand=strand),
+                ])
+            else:
+                loc = FeatureLocation(s, e, strand=strand)
+            rec.features.append(
+                SeqFeature(loc, type=ftype,
+                            qualifiers={"label": [label]})
+            )
+        return rec
+
+    def test_exact_forward_match(self):
+        """A 60 bp CDS in source A should transfer onto an identical
+        substring in target B."""
+        body = "ATG" + "GCC" * 19 + "TAA"   # 60 bp
+        prefix = "AAAAAAAAAA"                # 10 bp
+        suffix = "AAAAAAAAAA"                # 10 bp
+        src = self._rec(prefix + body + suffix,
+                         feats=[(10, 70, 1, "CDS", "myCDS")])
+        tgt = self._rec("TTTTT" + body + "TTTTT")
+        out = sc._find_annotation_transfers(src, tgt, min_len=30)
+        assert len(out) == 1
+        t = out[0]
+        assert t["label"] == "myCDS"
+        assert t["type"] == "CDS"
+        assert t["target_start"] == 5
+        assert t["target_end"] == 5 + 60
+        assert t["target_strand"] == 1
+        assert t["length"] == 60
+
+    def test_reverse_complement_match(self):
+        """A feature whose RC appears in the target is reported as
+        a reverse-strand match. Target carries the RC of the
+        feature's coding-strand bases; the transfer flips strand and
+        reports the forward-coord span where the RC sits."""
+        body = "ATG" + "GCC" * 19 + "TAA"   # 63 bp
+        src = self._rec("AA" + body + "AA",
+                         feats=[(2, 62, 1, "CDS", "fwdCDS")])
+        # Feature bases = body[0:60] (the slice [2, 62) of "AA"+body+"AA").
+        feat_bases = body[0:60]
+        # Target seq = "TT" + rc(feat_bases) + "TT" so the only hit is
+        # an RC match. n_tgt = 64; rc(feat_bases) sits at [2, 62) on
+        # the forward strand. The bottom-strand feature reads 5'→3'
+        # going right-to-left, so the forward span is [n - 62, n - 2)
+        # = [2, 62).
+        tgt = self._rec("TT" + sc._rc(feat_bases) + "TT")
+        out = sc._find_annotation_transfers(src, tgt, min_len=30)
+        assert len(out) == 1
+        t = out[0]
+        assert t["target_strand"] == -1
+        assert t["target_start"] == 2
+        assert t["target_end"] == 62
+
+    def test_skip_features_below_min_len(self):
+        """Short features (e.g. primer-binding sites) generate noise;
+        scan must skip them at `min_len`."""
+        src = self._rec("AAAAATGCATG" + "AAA" * 30,
+                         feats=[(5, 11, 1, "primer_bind", "tiny")])
+        tgt = self._rec("AAAAATGCATG" + "AAA" * 30)
+        out = sc._find_annotation_transfers(src, tgt, min_len=30)
+        assert out == []
+
+    def test_circular_wrap_target(self):
+        """A feature whose bases cross the origin in the target must
+        be reported with `end < start` (wrap convention)."""
+        body = "ATG" + "GCC" * 19 + "TAA"   # 63 bp
+        # Source feature spans [2, 62) of "AA"+body+"AA"; feat_bases is
+        # body[0:60].
+        src = self._rec("AA" + body + "AA",
+                         feats=[(2, 62, 1, "CDS", "spanCDS")])
+        feat_bases = body[0:60]
+        # Build a 80-bp circular target where feat_bases occupies
+        # forward-strand positions [70, 80) ∪ [0, 50). target_start
+        # should be 70, target_end 50 (wrap).
+        tgt_seq = feat_bases[10:60] + ("G" * 20) + feat_bases[0:10]
+        assert len(tgt_seq) == 80
+        tgt = self._rec(tgt_seq, circular=True)
+        out = sc._find_annotation_transfers(src, tgt, min_len=30)
+        assert len(out) == 1
+        t = out[0]
+        assert t["target_strand"] == 1
+        assert t["target_start"] == 70
+        assert t["target_end"] == 50
+
+    def test_no_match_returns_empty(self):
+        body = "ATG" + "GCC" * 19 + "TAA"
+        src = self._rec("AA" + body + "AA",
+                         feats=[(2, 62, 1, "CDS", "alpha")])
+        tgt = self._rec("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+        assert sc._find_annotation_transfers(src, tgt, min_len=30) == []
+
+    def test_skip_source_feature(self):
+        """`source` features (the GenBank metadata feature spanning the
+        whole record) must not be transferred."""
+        body = "AAAAAAAA" * 10
+        src = self._rec(body,
+                         feats=[(0, len(body), 1, "source", "src")])
+        tgt = self._rec(body)
+        out = sc._find_annotation_transfers(src, tgt, min_len=30)
+        assert out == []

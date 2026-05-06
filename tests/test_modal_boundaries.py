@@ -164,10 +164,17 @@ _MODAL_CASES = [
                                                name="demo",
                                                sequence="ATGCATGC",
                                                default_path="/tmp/demo.fa")),
+    ("GffExportModal",             lambda: sc.GffExportModal(
+                                               _make_record(),
+                                               default_path="/tmp/demo.gff3")),
     ("ORFFinderModal",             lambda: sc.ORFFinderModal(
                                                "ATGGCCGCCGCCGCCTAA" * 5,
                                                circular=True)),
     ("LibrarySearchModal",         lambda: sc.LibrarySearchModal()),
+    ("AnnotationTransferModal",    lambda: sc.AnnotationTransferModal(
+                                               source_label="src",
+                                               target_label="tgt",
+                                               transfers=[])),
     ("CollectionsModal",           lambda: sc.CollectionsModal()),
     ("CollectionNameModal",        lambda: sc.CollectionNameModal(
                                                "New collection", "")),
