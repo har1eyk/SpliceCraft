@@ -1309,13 +1309,13 @@ def _rebuild_scan_catalog() -> None:
 _rebuild_scan_catalog()
 
 
-# Per-record restriction-scan cache. Keyed by `(id(seq), min_len,
+# Per-record restriction-scan cache. Keyed by `(hash(seq), min_len,
 # unique_only, circular)` so the same record + filter combo doesn't
 # re-scan on every panel refresh. Capped at 4 entries (matches the
 # `_BUILD_SEQ_CACHE` policy) — we only need recent active records,
 # not historical ones. Auto-invalidated by sequence edits because
-# `_rebuild_record_with_edit` returns a fresh SeqRecord, hence a new
-# `id(seq)`.
+# `_rebuild_record_with_edit` returns a fresh SeqRecord with a new seq
+# string whose hash differs.
 _RESTR_SCAN_CACHE: "_OD[tuple, list]" = _OD()
 _RESTR_SCAN_CACHE_MAX = 4
 
@@ -1330,11 +1330,14 @@ def _scan_restriction_sites(
     signature + return shape to the inner `_scan_restriction_sites_impl`;
     consults `_RESTR_SCAN_CACHE` first so a `r`-toggle on a 5 Mb record
     drops from ~3 s to ~5 ms after the first scan."""
-    # Cache key uses `id(seq)` since the same SeqRecord's seq is
-    # immutable and string identity is the cheapest stable handle. On
-    # an edit, `_rebuild_record_with_edit` allocates a new SeqRecord
-    # so the id changes and the cache misses cleanly.
-    key = (id(seq), int(min_recognition_len),
+    # Cache key uses `hash(seq)` rather than `id(seq)`: id-based keys
+    # break for transient strings (e.g. unit tests build a fresh seq
+    # per test, GC'd between calls — CPython's allocator can hand the
+    # same address to a later string and produce a stale cache hit).
+    # CPython interns the string hash on the first call, so subsequent
+    # scans of the same seq are still O(1). Same fix applied to
+    # `_ENZYME_CUTS_CACHE`.
+    key = (hash(seq), int(min_recognition_len),
            bool(unique_only), bool(circular))
     hit = _RESTR_SCAN_CACHE.get(key)
     if hit is not None:
@@ -27619,6 +27622,12 @@ class PlasmidApp(App):
     # never hits the network; `main()` flips it to False so the
     # production launch runs the background worker.
     _skip_update_check: bool      = True
+    # First-run NCBI seed of MW463917.1 (pACYC184). Default-True for
+    # tests so the suite never races a live fetch against modal mounts:
+    # the seed worker would otherwise land mid-test, set
+    # `_current_record` to the seeded record, and pollute fixtures that
+    # assume a clean app. `main()` flips this to False for production.
+    _skip_seed: bool              = True
     # Hydrated from the persisted `check_updates` setting in compose();
     # the in-memory mirror is read by the worker and the menu toggle.
     _check_updates: bool          = True
@@ -29048,7 +29057,7 @@ SpeciesPickerModal { align: center middle; }
                             "Auto-load of first library entry %r failed",
                             first.get("name", "?"),
                         )
-            else:
+            elif not getattr(self, "_skip_seed", False):
                 self._seed_default_library()
 
     def _check_data_files(self) -> None:
@@ -32206,6 +32215,10 @@ def main():
     # network). The worker is also gated by the user's persisted
     # `check_updates` setting — both must be true for a fetch.
     app._skip_update_check = False
+    # Production launch also opts in to the first-run NCBI seed of
+    # pACYC184 so users see something on a fresh install. Tests leave
+    # this True (class default) so the suite never hits NCBI.
+    app._skip_seed = False
     if enable_agent_api:
         app._agent_api_port = agent_port
 
