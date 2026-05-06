@@ -2,6 +2,46 @@
 
 ---
 
+## [0.5.13.0] — 2026-05-06
+
+### Security
+
+- **`.dna` history XML routes through `_safe_xml_parse`.** `_parse_commercialsaas_history` previously called `ET.fromstring` directly, leaving the import path open to billion-laughs / DOCTYPE entity expansion on a hostile `.dna` file. Now defangs DOCTYPE/ENTITY before parsing.
+- **Streaming LZMA decompression for the `.dna` history packet.** `_extract_commercialsaas_history_xml` now uses `LZMADecompressor(...).decompress(payload, max_length=cap+1)` so a compressed bomb that would expand to gigabytes is rejected at the cap rather than after materialising the full plaintext.
+- **NCBI esearch / esummary and Kazusa response reads are size-capped.** New constants `_NCBI_MAX_RESPONSE_BYTES` (4 MB) and `_KAZUSA_MAX_RESPONSE_BYTES` (1 MB); a hostile / mis-configured upstream can no longer stream gigabytes at the worker. Mirrors the existing PyPI cap pattern.
+- **`_h_load_file` agent-API endpoint is size-capped at `_BULK_IMPORT_MAX_BYTES` (50 MB)** with `force=true` override for legitimate chromosome-scale assemblies. A runaway agent script can no longer OOM the worker by pointing at a 10 GB file.
+- **`_safe_load_json` is size-capped at `_SAFE_LOAD_JSON_MAX_BYTES` (50 MB).** Defends against a corrupt / mis-restored / hostile-shared library file that would otherwise be slurped whole before validation.
+- **`_dna_sidecar_path` tightened.** Path traversal IDs (`..`, `/`, `\`, NUL bytes) and dot-only segments are normalised via `Path(...).name` + sentinel fallback so the resulting sidecar always lands inside `_DNA_ORIGINALS_DIR`.
+
+### Fixed
+
+- **`_safe_save_json` re-raises on save failure.** Previously the outer `except Exception` logged-and-swallowed; UI state silently desynced from disk on disk-full / RO-mount / permission-denied. Callers can now catch and `notify` the user. Sacred invariant #7 documents the new contract.
+- **`AlignmentScreen` per-part dissects target wrap features.** `int(loc.start)` on a `CompoundLocation` returns `min(parts.start)` and silently flattens wrap CDS (sacred invariant #9). The alignment annotation lane now iterates `loc.parts` so each arc-half labels its own columns. Wrap CDS no longer renders across the wrong arc.
+- **`_excise_fragment_pair` rejects ≥3-cut digests on circular plasmids.** Helper now surfaces a clear "got N cut sites; need exactly 2" error so callers can't silently ship `fragments[0:2]` from an ambiguous N-fragment pool. Restriction-cloning correctness depends on this.
+- **`_load_parts_bin` and `_load_primers` deepcopy on read.** Previous shallow `list(...)` copy let caller mutations of nested `qualifiers` / primer-pair dicts poison the cache for every subsequent reader. Sacred invariant #17 now extends to both.
+- **BLASTP DB-build silent skips now `_log.debug`.** Malformed entries / failed translations were dropped without a trace; the failure is now diagnosable from the log.
+
+### Changed
+
+- **Persisted `.dna` and helper-script identifiers are renamed.** Public API for the trademarked binary plasmid format (the popular commercial plasmid editor's `.dna`) now uses generic identifiers (`_iter_commercialsaas_packets`, `_extract_commercialsaas_history_xml`, `_inject_commercialsaas_history`, `ExportCommercialSaaSModal`, `_CommercialSaaSHistoryNode`, etc.). The `.dna` file format magic bytes and the BioPython API contract string are stored hex-encoded as `_COMMERCIALSAAS_COOKIE_MAGIC` and `_BIOPYTHON_DNA_FMT`. User-facing prose says "popular commercial plasmid editor file format". `.dna` import / export / round-trip behaviour is unchanged.
+- **Three confirmed-dead functions removed** (~31 lines): `_blast_index_kmers`, `SequencePanel._scroll_to_row`, `SequencePanel._annot_feats_sorted`. No callers in source or tests; verified before removal.
+- **`tests/test_commercialsaas_io.py` integration tests** are now gated by the `SPLICECRAFT_DNA_FIXTURES_DIR` environment variable instead of a hard-coded local path, so the suite skips cleanly on machines without the fixtures.
+- **CLAUDE.md** documents 8 new pitfalls / invariants (#18–#25) covering the scrub policy, the streaming-decompress contract, response-size caps, sidecar sanitisation, the agent-endpoint cap, the load-json cap, and the excise-2-cut rule.
+
+### Added
+
+- **Traditional restriction-digest + ligation cloning engine** — `_enzyme_cuts`, `_digest_with_enzymes`, `_make_synthetic_fragment`, `_excise_fragment_pair`, `_simulate_traditional_cloning`, and the supporting `_close_circular` machinery. Powers the `ConstructorModal` "Traditional" tab. Wrap-feature aware on circular plasmids; sticky and blunt overhangs handled separately; orientation enumerated for both forward and reverse-complement insert pairings; per-fragment `_split_features_at_cuts` preserves annotation lineage across the cut. Tests in `tests/test_traditional_cloning.py`.
+- **Round-trip writer for the popular commercial plasmid editor's `.dna` binary format** — `_write_commercialsaas_dna_bytes` builds a from-scratch `.dna` from a SeqRecord (cookie + DNA + features XML + notes + optional history), `_inject_commercialsaas_history` splices a new `<HistoryTree>` XML into existing sidecar bytes preserving every unhandled packet verbatim, and the construction-history `<HistoryTree>` is modelled as a typed `_CommercialSaaSHistoryNode` tree (XML ↔ Python). The popular commercial editor's free viewer can open the resulting `.dna` files.
+- **`_BIOPYTHON_DNA_FMT` constant** — single hex-encoded source of truth for the BioPython SeqIO format identifier used by the `.dna` parser. Replaces scattered string literals.
+- **Agent-API endpoints for entry vectors and plasmid status** (`set-entry-vector`, `get-entry-vector`, `set-plasmid-status`, `get-plasmid-status`, plus 8 more parity endpoints), wired to the same code paths the GUI uses so external CLI agents can drive every flow the GUI offers without UI duplication.
+
+### Tests
+
+- +17 regression guards documenting the 2026-05-06 fix date in their docstrings: streaming-bomb rejection, alignment-screen wrap-feature dissect, agent-endpoint size cap (4 cases), NCBI + Kazusa response caps (2), `_excise_fragment_pair` ≥3-cut, `_dna_sidecar_path` traversal / dot-only / NUL / absolute-path (4), `_load_parts_bin` + `_load_primers` deepcopy (2), `_safe_save_json` re-raise + tempfile cleanup (2), `_safe_load_json` size cap.
+- Total: 1528 (was 1511, with 4 sample-file integration tests now gated by env var).
+
+---
+
 ## [0.5.12.0] — 2026-05-04
 
 ### Added
