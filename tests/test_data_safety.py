@@ -255,6 +255,45 @@ class TestSchemaVersioning:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# `_safe_save_json` must surface failures (regression guard for 2026-05-06 fix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSafeSaveJsonRaisesOnFailure:
+    """`_safe_save_json` previously logged-and-swallowed any save error,
+    which silently desynced the in-memory state from disk. The fix re-raises
+    after logging so the caller can notify the user (or so a worker
+    thread can route a friendly message via `call_from_thread`)."""
+
+    def test_safe_save_propagates_oserror_from_replace(
+            self, tmp_path, monkeypatch):
+        import os as _os
+        p = tmp_path / "boom.json"
+
+        def _boom(*a, **kw):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(_os, "replace", _boom)
+        with pytest.raises(OSError, match="No space left"):
+            sc._safe_save_json(p, [{"id": "X"}], "test")
+
+    def test_safe_save_cleans_tmpfile_on_error(self, tmp_path, monkeypatch):
+        import os as _os
+        p = tmp_path / "boom.json"
+
+        def _boom(*a, **kw):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(_os, "replace", _boom)
+        with pytest.raises(OSError):
+            sc._safe_save_json(p, [{"id": "X"}], "test")
+        # No leftover dotfile tempfile.
+        leftover = list(tmp_path.glob(f".{p.name}.*.tmp"))
+        assert leftover == []
+        # Target was not partially written.
+        assert not p.exists()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Persistence integration — each _load/_save pair through _safe_*
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -302,6 +341,46 @@ class TestPersistenceIntegration:
         monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "nope.json")
         monkeypatch.setattr(sc, "_primers_cache", None)
         assert sc._load_primers() == []
+
+    def test_parts_bin_load_deepcopies_nested_dicts(self, tmp_path, monkeypatch):
+        """Regression guard for 2026-05-06 fix: parts entries carry nested
+        dicts (qualifiers, primer pairs). The previous shallow-copy `list(...)`
+        let caller mutations of the nested dicts poison the cache for every
+        subsequent reader. Sacred invariant #17."""
+        monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "p.json")
+        monkeypatch.setattr(sc, "_parts_bin_cache", None)
+        sc._save_parts_bin([{"name": "p1", "primers": {"fwd": "GAATTC"}}])
+        first = sc._load_parts_bin()
+        first[0]["primers"]["fwd"] = "POISONED"
+        first[0]["name"] = "RENAMED"
+        # Cache still has the original.
+        second = sc._load_parts_bin()
+        assert second[0]["primers"]["fwd"] == "GAATTC"
+        assert second[0]["name"] == "p1"
+
+    def test_primers_load_deepcopies_nested_dicts(self, tmp_path, monkeypatch):
+        """Same guard for the primer library."""
+        monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "pr.json")
+        monkeypatch.setattr(sc, "_primers_cache", None)
+        sc._save_primers([{"name": "pr1", "qualifiers": {"note": "ok"}}])
+        first = sc._load_primers()
+        first[0]["qualifiers"]["note"] = "POISONED"
+        second = sc._load_primers()
+        assert second[0]["qualifiers"]["note"] == "ok"
+
+    def test_safe_load_json_rejects_oversized_file(self, tmp_path, monkeypatch):
+        """Regression guard for 2026-05-06 fix: a corrupted, mis-restored,
+        or hostile-shared library file in the multi-GB range used to be
+        loaded into memory before any validation. Now stat-and-cap defends
+        with a warning return."""
+        monkeypatch.setattr(sc, "_SAFE_LOAD_JSON_MAX_BYTES", 100)
+        big = tmp_path / "huge.json"
+        # Write 200 bytes — over the 100-byte test cap.
+        big.write_text("[" + ", ".join(['"x"'] * 50) + "]")
+        entries, warn = sc._safe_load_json(big, "Test")
+        assert entries == []
+        assert warn is not None
+        assert "cap" in warn.lower()
 
     def test_library_load_recovers_from_corrupt(self, tmp_path, monkeypatch):
         p = tmp_path / "lib.json"

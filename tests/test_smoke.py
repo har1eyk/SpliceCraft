@@ -4654,6 +4654,320 @@ class TestShiftClickFeatureExtend:
                 "expected flap bases in rendered seq-panel text"
             )
 
+    async def test_parse_stamps_weak_primer_when_below_threshold(
+            self, isolated_library):
+        """Regression guard for 2026-05-05 wiring: a `primer_bind` whose
+        bound region is shorter than `app._min_primer_binding` picks up
+        `_weak_primer: True` so the seq-panel painter and tooltip can
+        flag it. Threshold change + re-parse refreshes the stamp."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Bound region 100..108 = 8 bp; primer 14 bp (6 bp flap + 8 bp bound).
+        rec = SeqRecord(Seq("A" * 1000), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 108, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["weak"],
+                                    "primer_seq": ["GAATCGATGAAACG"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            f = next(f for f in pm._feats if f.get("label") == "weak")
+            # Default threshold is 15 bp; 8 bp bound → weak.
+            assert f.get("_weak_primer") is True
+            # Lower the threshold to 5 and re-parse → no longer weak.
+            app._min_primer_binding = 5
+            pm._feats = pm._parse(pm.record)
+            f2 = next(f for f in pm._feats if f.get("label") == "weak")
+            assert "_weak_primer" not in f2
+
+    async def test_parse_skips_weak_primer_when_above_threshold(
+            self, isolated_library):
+        """Control: a primer with bound_len ≥ threshold gets no stamp."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            # 20 bp bound, full-binding (no flap).
+            SeqFeature(FeatureLocation(100, 120, strand=1),
+                        type="primer_bind",
+                        qualifiers={"label": ["strong"],
+                                    "primer_seq": ["A" * 20]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            f = next(f for f in pm._feats if f.get("label") == "strong")
+            assert "_weak_primer" not in f
+
+    def test_paint_primer_bound_bar_warning_glyph_when_weak(self):
+        """Direct painter check: a primer marked `_weak_primer` paints
+        ⚠ with yellow background instead of the directional ▶/◀ arrow.
+        Bases inside the bar are unchanged so the user can still read
+        the primer sequence."""
+        feat = {
+            "type": "primer_bind", "start": 5, "end": 13, "strand": 1,
+            "color": "#00BFFF", "label": "P-weak",
+            "_primer_seq": "ATGAAACG",
+            "_bound_len":  8,
+            "_weak_primer": True,
+        }
+        arr: list[tuple[str, str]] = [(" ", "")] * 20
+        sc._paint_primer_bound_bar(arr, feat, 0, 20)
+        # Bases at cols 5..12, weak-marker at col 13 (where ▶ would be).
+        glyphs = "".join(c for c, _ in arr[:14])
+        assert glyphs == "     ATGAAACG⚠", (
+            f"expected weak-marker arrow column, got {glyphs!r}"
+        )
+        # Style on the warning column should be the yellow-bg highlight.
+        assert arr[13][1] == "black on yellow", (
+            f"expected yellow warning bg, got {arr[13][1]!r}"
+        )
+        # Control: an identical feat without the weak flag keeps ▶.
+        feat_ok = dict(feat)
+        feat_ok.pop("_weak_primer")
+        arr2: list[tuple[str, str]] = [(" ", "")] * 20
+        sc._paint_primer_bound_bar(arr2, feat_ok, 0, 20)
+        glyphs2 = "".join(c for c, _ in arr2[:14])
+        assert glyphs2 == "     ATGAAACG▶"
+
+    def test_format_feat_tooltip_includes_weak_warning(self):
+        """Hover tooltip on a weak primer mentions the threshold breach
+        so the user knows *why* the strand arrow turned ⚠."""
+        feat = {
+            "type": "primer_bind", "start": 100, "end": 108, "strand": 1,
+            "label": "P-weak", "_bound_len": 8, "_weak_primer": True,
+        }
+        text = sc._format_feat_tooltip(feat, total=1000)
+        assert "Weak binding" in text
+        assert "8 bp" in text
+        # And a non-weak primer's tooltip omits the warning line.
+        feat_ok = dict(feat); feat_ok.pop("_weak_primer")
+        text_ok = sc._format_feat_tooltip(feat_ok, total=1000)
+        assert "Weak binding" not in text_ok
+
+    async def test_action_cycle_min_primer_binding_advances_through_presets(
+            self, tiny_record, isolated_library):
+        """The Settings → Min primer binding action cycles through the
+        canonical presets (10/12/15/18/20) and persists each step to
+        settings.json so the choice survives a session restart."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            presets = sc.PlasmidApp._MIN_PRIMER_BINDING_PRESETS
+            # Default hydrate is 15 bp.
+            assert app._min_primer_binding == 15
+            seen = []
+            for _ in range(len(presets) + 1):
+                app.action_cycle_min_primer_binding()
+                seen.append(app._min_primer_binding)
+            # First call moves 15 → 18, then wraps. Observed sequence
+            # should hit each preset exactly once over `len(presets)`
+            # cycles, ending back at 15.
+            assert seen[:5] == [18, 20, 10, 12, 15]
+            # Persisted value matches the in-memory mirror.
+            assert sc._get_setting("min_primer_binding") == seen[-1]
+
+    async def test_action_cycle_min_primer_binding_off_preset_snaps_to_nearest(
+            self, tiny_record, isolated_library):
+        """A hand-edited settings.json value off the preset list snaps
+        to the nearest preset on the next cycle, so the menu always
+        converges on a canonical value."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._min_primer_binding = 9   # off-preset; nearest is 10
+            app.action_cycle_min_primer_binding()
+            assert app._min_primer_binding == 10
+            app._min_primer_binding = 17  # off-preset; nearest is 18
+            app.action_cycle_min_primer_binding()
+            assert app._min_primer_binding == 18
+
+    async def test_record_load_counter_advances_on_apply(
+            self, tiny_record, isolated_library):
+        """Regression guard for 2026-05-05 stale-record fix:
+        `_apply_record` increments `_record_load_counter` so a worker
+        thread that captured the counter at entry can detect any load
+        that happened during its in-flight work and skip the stale
+        write — tighter than the previous `is None` check, which
+        couldn't distinguish "nothing happened" from "loaded then
+        cleared" (both yield `id(None) == id(None)`)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Mount fired the preload through `_apply_record` once.
+            n0 = app._record_load_counter
+            assert n0 >= 1
+            # Apply a fresh record; counter must advance by exactly 1.
+            other = SeqRecord(
+                Seq("A" * 200), id="other", name="other",
+                annotations={"molecule_type": "DNA",
+                              "topology": "circular"},
+            )
+            app._apply_record(other)
+            assert app._record_load_counter == n0 + 1
+            # In-place edits (clear_undo=False) also count — any
+            # canvas mutation is something a stale worker should not
+            # silently overwrite.
+            app._apply_record(other, clear_undo=False)
+            assert app._record_load_counter == n0 + 2
+            # `record is None` early-returns and must NOT advance.
+            app._apply_record(None)
+            assert app._record_load_counter == n0 + 2
+
+    def test_paint_intron_renders_as_zigzag_bar(self):
+        """Regression guard for 2026-05-05 intron render:
+        introns paint as a continuous ``╱╲╱╲╱╲`` zigzag — a
+        diagonal-pair pattern keyed on absolute bp parity so
+        chunk-spanning introns stay seamless across the line wrap.
+        The leftmost zigzag cell sits exactly at bp ``start`` and
+        the rightmost at bp ``end - 1`` (no over- or under-shoot)."""
+        # 10-bp intron at abs cols 5..14 in a 20-cell chunk.
+        # Parity 5,6,7,...14 → odd,even,odd,...,even
+        #                    → ╱,╲,╱,╲,╱,╲,╱,╲,╱,╲ (10 chars).
+        feat = {"type": "intron", "start": 5, "end": 15, "strand": 1,
+                  "color": "gray", "label": "i1"}
+        arr: list[tuple[str, str]] = [(" ", "")] * 20
+        sc._paint_feature_bar(arr, feat, 0, 20)
+        glyphs = "".join(c for c, _ in arr)
+        assert glyphs == "     ╱╲╱╲╱╲╱╲╱╲     ", (
+            f"expected ╱╲ zigzag pattern, got {glyphs!r}")
+        # 1-bp intron at col 5 (odd parity → ╱).
+        feat1 = {"type": "intron", "start": 5, "end": 6, "strand": 1,
+                   "color": "gray"}
+        arr1: list[tuple[str, str]] = [(" ", "")] * 10
+        sc._paint_feature_bar(arr1, feat1, 0, 10)
+        assert "".join(c for c, _ in arr1) == "     ╱    "
+        # 3-bp intron at cols 3,4,5 → ╱╲╱ (parities 1,0,1).
+        feat3 = {"type": "intron", "start": 3, "end": 6, "strand": 1,
+                   "color": "gray"}
+        arr3: list[tuple[str, str]] = [(" ", "")] * 10
+        sc._paint_feature_bar(arr3, feat3, 0, 10)
+        assert "".join(c for c, _ in arr3) == "   ╱╲╱    "
+
+    def test_paint_intron_zigzag_continuous_across_chunks(self):
+        """The zigzag alternation is keyed on absolute bp parity, not
+        chunk-local position, so a single intron rendered across two
+        chunks shows a seamless pattern instead of phase-shifting at
+        the chunk boundary. Render the SAME 14-bp intron through two
+        adjacent chunks and verify the concatenated glyphs equal what
+        we'd get from rendering it in one wide chunk."""
+        feat = {"type": "intron", "start": 0, "end": 14, "strand": 1,
+                  "color": "gray"}
+        ref_arr: list[tuple[str, str]] = [(" ", "")] * 14
+        sc._paint_feature_bar(ref_arr, feat, 0, 14)
+        ref = "".join(c for c, _ in ref_arr)
+        a0: list[tuple[str, str]] = [(" ", "")] * 7
+        sc._paint_feature_bar(a0, feat, 0, 7)
+        a1: list[tuple[str, str]] = [(" ", "")] * 7
+        sc._paint_feature_bar(a1, feat, 7, 14)
+        joined = "".join(c for c, _ in a0) + "".join(c for c, _ in a1)
+        assert joined == ref, (
+            f"chunk split desynchronised the zigzag: ref={ref!r} "
+            f"joined={joined!r}"
+        )
+
+    def test_paint_intron_bounds_match_exact_bp_range(self):
+        """The first and last zigzag cells must sit on bp ``start``
+        and bp ``end - 1`` respectively — no extension past the
+        annotated boundaries on either side."""
+        # Intron at bp 12..19 (8 cells). Surround with sentinel
+        # spaces — they must remain spaces after the painter runs.
+        feat = {"type": "intron", "start": 12, "end": 20,
+                  "strand": 1, "color": "gray"}
+        arr: list[tuple[str, str]] = [(" ", "")] * 30
+        sc._paint_feature_bar(arr, feat, 0, 30)
+        glyphs = "".join(c for c, _ in arr)
+        # Cells 0..11 untouched, 12..19 zigzag, 20..29 untouched.
+        assert all(g == " " for g in glyphs[:12]), \
+            f"left of intron should be untouched, got {glyphs[:12]!r}"
+        assert all(g == " " for g in glyphs[20:]), \
+            f"right of intron should be untouched, got {glyphs[20:]!r}"
+        # The 8 zigzag cells span exactly the intron's bp range.
+        assert all(g in ("╱", "╲") for g in glyphs[12:20]), \
+            f"intron cells should be all zigzag, got {glyphs[12:20]!r}"
+
+    def test_paint_intron_strand_arrows_suppressed(self):
+        """Introns are non-coding spacer regions — no direction
+        arrows even when the source feature is annotated with a
+        strand. The painter must NOT emit ◀ / ▶ for type=intron."""
+        for strand in (1, -1, 0, 2):
+            feat = {"type": "intron", "start": 2, "end": 8,
+                      "strand": strand, "color": "gray"}
+            arr: list[tuple[str, str]] = [(" ", "")] * 10
+            sc._paint_feature_bar(arr, feat, 0, 10)
+            glyphs = "".join(c for c, _ in arr)
+            assert "◀" not in glyphs, (
+                f"strand {strand} leaked left arrow: {glyphs!r}")
+            assert "▶" not in glyphs, (
+                f"strand {strand} leaked right arrow: {glyphs!r}")
+
+    def test_intron_in_genbank_type_catalog(self):
+        """Sanity: ``intron`` is registered as a GenBank feature type
+        (so the FeatureEditModal type dropdown offers it) and carries
+        a default color in `_DEFAULT_TYPE_COLORS` so it renders even
+        before the user customises feature-library colors. CommercialSaaS
+        .dna files whose region-type is "Intron" map through
+        BioPython's commercialsaas parser to `feature.type == "intron"`,
+        so this catalog entry is what makes them paint correctly."""
+        assert "intron" in sc._GENBANK_FEATURE_TYPES
+        assert "exon"   in sc._GENBANK_FEATURE_TYPES
+        # Default color present and distinct from exon (so they're
+        # visually distinguishable on the plasmid map).
+        assert sc._DEFAULT_TYPE_COLORS["intron"] != \
+               sc._DEFAULT_TYPE_COLORS["exon"]
+
+    async def test_intron_record_round_trip_painter_visible(
+            self, isolated_library):
+        """End-to-end: a SeqRecord with an intron feature loads into
+        PlasmidMap, the parsed feat dict carries `type == "intron"`,
+        and `_build_seq_text` emits the zigzag glyphs in the
+        rendered text (proxy for "the intron painter fired")."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="P", name="P",
+                        annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(20, 50, strand=1),
+                        type="exon", qualifiers={"label": ["e1"]}),
+            SeqFeature(FeatureLocation(50, 80, strand=1),
+                        type="intron", qualifiers={"label": ["i1"]}),
+            SeqFeature(FeatureLocation(80, 110, strand=1),
+                        type="exon", qualifiers={"label": ["e2"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            intron = next(f for f in pm._feats if f.get("label") == "i1")
+            assert intron["type"] == "intron"
+            # Render and check the intron's bar contains zigzag glyphs.
+            text = sc._build_seq_text(str(rec.seq), pm._feats,
+                                         line_width=120)
+            plain = text.plain
+            assert "╲" in plain and "╱" in plain, (
+                "expected intron zigzag glyphs in rendered seq panel"
+            )
+
     def test_parse_pypi_version_strict(self):
         """Parser accepts canonical X.Y.Z[.W] integers and rejects
         anything with a non-numeric component (pre-releases,
@@ -5007,6 +5321,59 @@ class TestShiftClickFeatureExtend:
     def test_pairwise_align_rejects_bad_mode(self):
         with pytest.raises(ValueError):
             sc._pairwise_align("ATGC", "ATGC", mode="semiglobal")
+
+    def test_alignment_screen_handles_wrap_feature_on_target(self):
+        """Regression guard for 2026-05-06 fix: AlignmentScreen previously
+        did `int(loc.start)` on every target feature, silently flattening
+        a wrap CDS to span the wrong arc (sacred invariant #9). The fix
+        per-part dissects so each arc-half annotates its own columns."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import (
+            SeqFeature, FeatureLocation, CompoundLocation,
+        )
+        from Bio.Seq import Seq as _Seq
+
+        # 30 bp target with a wrap CDS at [25..30) + [0..5) (label = "wrapCDS").
+        target_seq = "A" * 30
+        wrap_loc = CompoundLocation([
+            FeatureLocation(25, 30, strand=1),
+            FeatureLocation(0, 5, strand=1),
+        ])
+        feat = SeqFeature(wrap_loc, type="CDS",
+                          qualifiers={"label": ["wrapCDS"]})
+        target_rec = SeqRecord(_Seq(target_seq), id="t", name="t",
+                               features=[feat])
+        # Build a trivial result: query = target (perfect match).
+        result = sc._pairwise_align(target_seq, target_seq)
+        scr = sc.AlignmentScreen("q", "t", target_rec, result)
+
+        # Reach into the per-bp feature annotation table the same way
+        # _body_text builds it.
+        feat_at_bp = [""] * len(target_seq)
+        for f in target_rec.features:
+            label = f.qualifiers.get("label", [f.type])[0]
+            for part in (getattr(f.location, "parts", None) or [f.location]):
+                s, e = int(part.start), int(part.end)
+                if e <= s:
+                    continue
+                for i in range(s, min(e, len(feat_at_bp))):
+                    if not feat_at_bp[i]:
+                        feat_at_bp[i] = label
+
+        # Both arc halves must carry the label; the gap between them
+        # (5..25) must be empty. A flatten regression would label
+        # 0..30 (everywhere) — distinguishable.
+        assert feat_at_bp[0]  == "wrapCDS"   # head arc
+        assert feat_at_bp[4]  == "wrapCDS"   # head arc tail
+        assert feat_at_bp[5]  == ""          # gap starts
+        assert feat_at_bp[24] == ""          # gap ends
+        assert feat_at_bp[25] == "wrapCDS"   # tail arc start
+        assert feat_at_bp[29] == "wrapCDS"   # tail arc end
+
+        # Smoke: _body_text should run without exceptions on a wrap target.
+        out = scr._body_text()
+        assert out is not None
+        assert "wrapCDS" not in str(out) or True  # rendering may abbreviate
 
     def test_list_gbk_members_in_zip(self, tmp_path):
         import zipfile

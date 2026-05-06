@@ -67,8 +67,9 @@ about:
     plasmid library with atomic writes and on-disk backups, and provides
     in-process similarity search (BLASTN / BLASTP / HMMscan) via pyhmmer
     against the user's plasmid collections — no external blast+ install.
-    Local .gb / .gbk and CommercialSaaS .dna files load directly; bulk-import
-    a CommercialSaaS archive into a new collection from the panel.
+    Local .gb / .gbk and .dna files (popular commercial plasmid editor
+    format) load directly; bulk-import an archive into a new collection
+    from the panel.
   dev_url: https://github.com/Binomica-Labs/SpliceCraft
   doc_url: https://github.com/Binomica-Labs/SpliceCraft
 

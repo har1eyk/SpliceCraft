@@ -6,12 +6,12 @@ SpliceCraft — terminal circular plasmid map viewer.
 
 Features:
   - Fetch any GenBank record by accession (pUC19 = L09137)
-  - Load local .gb / .gbk (GenBank) or .dna (CommercialSaaS) files
+  - Load local .gb / .gbk (GenBank) or .dna (popular commercial plasmid editor format) files
   - Circular map with per-strand feature rings and arrowheads
   - Rotate origin freely with ← → keys or mouse scroll
   - Click map to select feature; click sidebar row to highlight on map
   - Feature detail panel
-  - Plasmid library panel (left, CommercialSaaS-style collection, persistent JSON)
+  - Plasmid library panel (left, collection-style, persistent JSON)
   - DNA sequence viewer / editor (bottom, press e to edit, Ctrl+S to save)
   - CDS amino acid translation shown on feature selection
 
@@ -344,7 +344,7 @@ _tstyle_mod.Style.from_rich_style = classmethod(_from_rich_style_cached)
 from textual.widgets import (
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
     ListItem, ListView, ProgressBar, RadioButton, RadioSet, Select,
-    Static, TextArea,
+    Static, TabbedContent, TabPane, TextArea, Tree,
 )
 # `Markdown` is deliberately NOT in this list — it pulls markdown_it
 # (~50 ms) + pygments (~50 ms) + rich.markdown (~30 ms) at import
@@ -497,6 +497,12 @@ def _safe_save_json(path: Path, entries: list, label: str,
     payload = {"_schema_version": schema_version, "entries": entries}
 
     # 2. Atomic write: tempfile in same dir → os.replace
+    #
+    # Errors here (disk full, permission denied, RO mount) are logged via
+    # `_log.exception` AND re-raised so callers can notify the user.
+    # Silently swallowing means the in-memory state diverges from disk;
+    # the user thinks the save succeeded and then loses work on the next
+    # session.
     try:
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
@@ -521,6 +527,10 @@ def _safe_save_json(path: Path, entries: list, label: str,
             raise
     except Exception:
         _log.exception("Failed to save %s to %s", label, path)
+        raise
+
+
+_SAFE_LOAD_JSON_MAX_BYTES = 50 * 1024 * 1024   # 50 MB — same as bulk import
 
 
 def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
@@ -531,13 +541,31 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     SpliceCraft < 0.3.1. The legacy file gets silently rewritten as an
     envelope on the next save.
 
+    Capped at ``_SAFE_LOAD_JSON_MAX_BYTES`` (50 MB) — same cap as bulk
+    import. A corrupted / mis-restored / hostile shared library would
+    otherwise OOM on read. A 50 MB JSON envelope is wildly above any
+    legitimate plasmid library.
+
     - Missing file → ([], None) — normal first run, no warning.
     - Valid file   → (entries, None).
+    - Oversized file → ([], warning).
     - Corrupt file → attempt .bak restore; if .bak is valid →
       (bak_entries, warning). If .bak also corrupt → ([], warning).
     """
     if not path.exists():
         return [], None
+
+    # Size cap — refuse to even read a multi-GB file. Stat is cheap.
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _log.warning("Could not stat %s for %s: %s", path, label, exc)
+        size = 0
+    if size > _SAFE_LOAD_JSON_MAX_BYTES:
+        warn = (f"{label} file is {size:,} bytes "
+                f"(cap {_SAFE_LOAD_JSON_MAX_BYTES:,}); refusing to load")
+        _log.warning(warn)
+        return [], warn
 
     # Try the main file
     main_warning: "str | None" = None
@@ -576,6 +604,198 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     return [], (main_warning
                 or f"{label} is corrupt and no valid backup was found. "
                    "Starting empty.")
+
+
+# ── CommercialSaaS .dna sidecar storage (Phase 4d) ──────────────────────────────────
+#
+# When the user imports a .dna file we copy its raw bytes into
+# `_DNA_ORIGINALS_DIR/<entry_id>.dna` so we can later round-trip
+# the file back out (replacing only the history packet via
+# `_inject_commercialsaas_history`) without losing the CommercialSaaS-specific
+# packets BioPython doesn't understand. Sidecar is keyed by entry
+# id (which doesn't change on rename), bounded by per-file size cap
+# already enforced at the import path.
+
+_DNA_ORIGINALS_DIR = _DATA_DIR / "dna_originals"
+_DNA_SIDECAR_MAX_BYTES = 50 * 1024 * 1024   # 50 MB — same as bulk import
+
+
+def _dna_sidecar_path(entry_id: str) -> "Path":
+    """Path for the sidecar file for `entry_id`. The id is sanitised
+    via ``Path(...).name`` so a user-controlled id like ``../../etc/passwd``
+    or ``foo/bar`` can't break out of the originals dir. NUL bytes are
+    rejected (POSIX would raise ``ValueError`` on the join, but normalising
+    here gives a stable sentinel). Empty / non-string ids fall back to a
+    sentinel so the path is always under ``_DNA_ORIGINALS_DIR``."""
+    raw = str(entry_id) if entry_id else "_unknown_"
+    # Strip any traversal/separator components first so Path.name returns
+    # only the basename even on inputs like "/etc/passwd" or "../foo".
+    cleaned = raw.replace("/", "_").replace("\\", "_").replace("\x00", "_")
+    safe = Path(cleaned).name or "_unknown_"
+    # Belt + braces: forbid leading dots so a hostile id like ``..`` (which
+    # `Path("..").name` returns as ``""`` only on some platforms) can't
+    # become an empty / dotfile.
+    if safe in (".", "..") or not safe.strip("."):
+        safe = "_unknown_"
+    return _DNA_ORIGINALS_DIR / f"{safe}.dna"
+
+
+def _save_dna_original(entry_id: str, data: bytes) -> bool:
+    """Write the original .dna bytes for `entry_id` into the sidecar
+    dir. Returns True on success, False on any failure (logged but
+    never raised — the sidecar is a nice-to-have, not a blocker
+    for import). Atomic write via tempfile + os.replace, mirroring
+    the JSON helpers' safety convention.
+
+    Refuses to write if `data` exceeds the per-sidecar cap. Also
+    refuses to overwrite an existing sidecar with EMPTY bytes (a
+    bug in the caller would silently nuke the round-trip data
+    otherwise)."""
+    if not entry_id:
+        return False
+    if not data:
+        _log.warning("dna sidecar: refusing to save empty bytes for %r",
+                       entry_id)
+        return False
+    if len(data) > _DNA_SIDECAR_MAX_BYTES:
+        _log.warning("dna sidecar: refusing to save %d bytes for %r "
+                       "(cap %d)", len(data), entry_id,
+                       _DNA_SIDECAR_MAX_BYTES)
+        return False
+    import tempfile as _tempfile
+    import os as _os
+    try:
+        _DNA_ORIGINALS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log.warning("dna sidecar: mkdir failed for %s: %s",
+                       _DNA_ORIGINALS_DIR, exc)
+        return False
+    target = _dna_sidecar_path(entry_id)
+    try:
+        fd, tmp_path = _tempfile.mkstemp(prefix=".tmp_",
+                                            dir=str(_DNA_ORIGINALS_DIR))
+        try:
+            with _os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                _os.fsync(f.fileno())
+            _os.replace(tmp_path, target)
+        except Exception:
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        _log.warning("dna sidecar: write failed for %r: %s",
+                       entry_id, exc)
+        return False
+    return True
+
+
+def _load_dna_original(entry_id: str) -> "bytes | None":
+    """Return the sidecar bytes for `entry_id`, or None if missing /
+    unreadable. Used by the export path to splice fresh history into
+    the original .dna byte stream."""
+    if not entry_id:
+        return None
+    target = _dna_sidecar_path(entry_id)
+    try:
+        if not target.exists():
+            return None
+        return target.read_bytes()
+    except OSError as exc:
+        _log.warning("dna sidecar: read failed for %r: %s", entry_id, exc)
+        return None
+
+
+def _delete_dna_original(entry_id: str) -> bool:
+    """Remove the sidecar for `entry_id`. Returns True if the file
+    existed and was removed; False on any failure (logged) or if it
+    didn't exist. Idempotent — safe to call when removing a library
+    entry whether or not it had a sidecar."""
+    if not entry_id:
+        return False
+    target = _dna_sidecar_path(entry_id)
+    try:
+        if not target.exists():
+            return False
+        target.unlink()
+        return True
+    except OSError as exc:
+        _log.warning("dna sidecar: delete failed for %r: %s",
+                       entry_id, exc)
+        return False
+
+
+def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
+    """Write a `.dna` file for `entry`.
+
+    Two paths:
+      1. **Splice mode** — preferred when the entry has a sidecar
+         (i.e., was originally imported from a CommercialSaaS `.dna`).
+         Reads the sidecar bytes, splices in the entry's current
+         `history_xml` via `_inject_commercialsaas_history`, writes.
+         Preserves every CommercialSaaS-specific packet we don't yet
+         understand (alignments, custom enzymes, etc.).
+      2. **From-scratch mode** — when no sidecar exists. Parses the
+         entry's `gb_text` into a SeqRecord and runs
+         `_write_commercialsaas_dna_bytes` to emit a minimum-viable
+         `.dna` (cookie + DNA + features + notes + optional
+         history). Sequence + features are byte-correct; cosmetic
+         packets (primers, alignments, enzyme-visibility) are
+         omitted. CommercialSaaS Viewer is expected to fill defaults on
+         first open.
+
+    Returns the absolute output path on success. Raises
+    ``ValueError`` when the entry has no usable id or no parseable
+    GenBank text. Raises ``OSError`` on file-write failure."""
+    from pathlib import Path as _Path
+    eid = str(entry.get("id") or "")
+    if not eid:
+        raise ValueError("entry has no id; cannot resolve a path")
+    original = _load_dna_original(eid)
+    history_xml = entry.get("history_xml") or None
+    if original is not None:
+        # Splice mode: replace history packet, leave everything else
+        # byte-identical.
+        out_bytes = _inject_commercialsaas_history(original, history_xml)
+    else:
+        # From-scratch mode: rebuild from the GenBank text.
+        gb_text = entry.get("gb_text") or ""
+        if not gb_text:
+            raise ValueError(
+                f"entry {entry.get('name')!r} has no `gb_text` to "
+                f"build from; cannot export"
+            )
+        try:
+            record = _gb_text_to_record(gb_text)
+        except Exception as exc:
+            raise ValueError(
+                f"entry {entry.get('name')!r}: GenBank text is not "
+                f"parseable ({exc}); cannot build .dna"
+            ) from exc
+        out_bytes = _write_commercialsaas_dna_bytes(
+            record, history_xml=history_xml,
+        )
+    out = _Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write via tempfile + replace (matches sidecar convention).
+    import tempfile as _tempfile, os as _os
+    fd, tmp_path = _tempfile.mkstemp(prefix=".tmp_", dir=str(out.parent))
+    try:
+        with _os.fdopen(fd, "wb") as f:
+            f.write(out_bytes)
+            f.flush()
+            _os.fsync(f.fileno())
+        _os.replace(tmp_path, out)
+    except Exception:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return str(out.resolve())
 
 
 # ── Library persistence ────────────────────────────────────────────────────────
@@ -1336,6 +1556,661 @@ def _scan_restriction_sites_impl(
     return feats
 
 
+# ── Restriction digest + ligation simulator (traditional cloning) ─────────────
+#
+# The Constructor's "Traditional" tab runs an in-silico cut + paste:
+# digest a source plasmid (or PCR product or feature) with one or two
+# enzymes, digest a destination vector with the same enzymes, ligate
+# the chosen insert fragment into the linearised vector, and emit
+# both possible orientations.
+#
+# Fragment shape (used throughout this block):
+#     {
+#       "top_seq":   str,                     # top strand 5'→3'
+#       "left":  {"overhang_seq": str,
+#                 "kind": "5'"|"3'"|"blunt"|"linear",
+#                 "enzyme": str},
+#       "right": {"overhang_seq": str, "kind": ..., "enzyme": str},
+#       "features": list[dict],               # in fragment-local 0-based coords
+#       "source_label": str,
+#     }
+#
+# Overhang sequence canonicalisation: `overhang_seq` is always the
+# top-strand bases between min(top_cut, bottom_cut) and max(top_cut,
+# bottom_cut). With this rule, two ends ligate iff their `overhang_seq`
+# fields match exactly (palindromic cuts trivially match; Type IIS
+# overhangs match only when the user-designed contexts agree;
+# compatible-overhang enzymes like BamHI/BglII match because both
+# recognition sites contain "GATC" at the cut region).
+#
+# `kind == "linear"` marks a fragment edge inherited from the input's
+# linear endpoints — these don't ligate to anything (no chemistry).
+
+
+_ENZYME_CUTS_CACHE: "_OD[tuple, list[dict]]" = _OD()
+_ENZYME_CUTS_CACHE_MAX = 16
+
+
+def _enzyme_cuts(seq: str, enzyme_names: list[str], *,
+                  circular: bool = True) -> list[dict]:
+    """Return all cuts on `seq` from the given enzymes, sorted by top
+    cut position. Each entry is
+    ``{top, bot, kind, overhang_seq, enzyme}`` where ``top`` and
+    ``bot`` are absolute 0-based top-strand coords of the top-strand
+    and bottom-strand cuts respectively.
+
+    Unknown enzyme names are silently dropped (caller validates).
+    Empty `enzyme_names` returns ``[]``.
+
+    Results are LRU-cached on `(hash(seq), tuple(sorted enzymes), circular)`
+    so that the Constructor's "Traditional" tab (which calls
+    ``str(rec.seq).upper()`` afresh on every Simulate, allocating a
+    new string object each time) still hits the cache on repeat
+    clicks. Hash collisions are statistically irrelevant at the
+    16-entry LRU size (~2^-32 per pair).
+
+    Why not `id(seq)`: the old key only worked when the caller held
+    onto the exact same string object across calls. The traditional-
+    cloning flow doesn't, so the cache used to be permanently cold."""
+    key = (hash(seq), tuple(sorted(set(enzyme_names))), bool(circular))
+    hit = _ENZYME_CUTS_CACHE.get(key)
+    if hit is not None:
+        _ENZYME_CUTS_CACHE.move_to_end(key)
+        # Defensive copy — callers occasionally mutate fragment dicts
+        # (e.g., when filtering features), and a shared mutable list
+        # would poison subsequent hits.
+        return [dict(c) for c in hit]
+    result = _enzyme_cuts_impl(seq, enzyme_names, circular=circular)
+    if len(_ENZYME_CUTS_CACHE) >= _ENZYME_CUTS_CACHE_MAX:
+        _ENZYME_CUTS_CACHE.popitem(last=False)
+    _ENZYME_CUTS_CACHE[key] = [dict(c) for c in result]
+    return result
+
+
+def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
+                        circular: bool = True) -> list[dict]:
+    """Underlying scanner — see `_enzyme_cuts` for the cached entry
+    point. Same signature + return shape; this one is the actual
+    work."""
+    n = len(seq)
+    if n == 0 or not enzyme_names:
+        return []
+    seq_u = seq.upper()
+    out: dict[tuple[int, int, str], dict] = {}
+    for ename in enzyme_names:
+        if ename not in _NEB_ENZYMES:
+            continue
+        site, fwd_cut, rev_cut = _NEB_ENZYMES[ename]
+        site_u   = site.upper()
+        site_len = len(site_u)
+        pat      = _iupac_pattern(site_u)
+        rc_site  = _rc(site_u)
+        is_pal   = (rc_site == site_u)
+        scan_seq = (seq_u + seq_u[: site_len - 1]) if (circular and n > 0) else seq_u
+
+        def _emit(top_bp_raw: int, bot_bp_raw: int):
+            # Use raw (pre-modulo) values for kind detection AND to find
+            # the overhang's earlier-cut anchor — post-modulo, a cut
+            # that crosses the origin can flip the top<bot ordering
+            # (e.g., raw top=99, raw bot=103, n=100 → post-mod top=99,
+            # bot=3, which would falsely suggest a 3' overhang). The
+            # raw difference equals |fwd_cut - rev_cut| which is fixed
+            # by the enzyme.
+            top_bp = top_bp_raw % n
+            bot_bp = bot_bp_raw % n
+            overhang_len = abs(top_bp_raw - bot_bp_raw)
+            oh_start = (top_bp if top_bp_raw <= bot_bp_raw else bot_bp)
+            oh_end   = (oh_start + overhang_len) % n if n else 0
+            if overhang_len == 0:
+                overhang = ""
+            elif oh_end > oh_start:
+                overhang = seq_u[oh_start:oh_end]
+            else:
+                # Origin-wrap: overhang region crosses bp 0.
+                overhang = seq_u[oh_start:] + seq_u[:oh_end]
+            kind = ("blunt" if top_bp_raw == bot_bp_raw
+                    else "5'" if top_bp_raw < bot_bp_raw
+                    else "3'")
+            key = (top_bp, bot_bp, ename)
+            out[key] = {
+                "top":          top_bp,
+                "bot":          bot_bp,
+                "kind":         kind,
+                "overhang_seq": overhang,
+                "enzyme":       ename,
+            }
+
+        for m in pat.finditer(scan_seq):
+            p = m.start()
+            if p >= n:
+                continue
+            _emit(p + fwd_cut, p + rev_cut)
+        if not is_pal:
+            rc_pat = _iupac_pattern(rc_site)
+            for m in rc_pat.finditer(scan_seq):
+                p = m.start()
+                if p >= n:
+                    continue
+                # On a reverse-strand binding, the cut positions mirror
+                # around the recognition midpoint. Top cut on the bound
+                # site (= bottom strand of unbound) is `site_len - rev_cut`
+                # bases from the recognition's 5' end on the unbound
+                # forward strand; bottom cut is `site_len - fwd_cut`.
+                _emit(p + site_len - rev_cut, p + site_len - fwd_cut)
+    return sorted(out.values(), key=lambda c: (c["top"], c["enzyme"]))
+
+
+def _split_features_at_cuts(features: list[dict], n: int,
+                              cut_top_positions: list[int],
+                              circular: bool) -> dict[int, list[dict]]:
+    """Slot features into fragments based on cut positions. Returns
+    ``{fragment_index: [features]}``. Features that span a cut are
+    split into two halves (one in each adjacent fragment); wrap features
+    in a circular input get the same treatment around the origin too.
+
+    Fragment indexing matches ``_fragments_from_cuts`` ordering:
+      - circular: `i` ranges over `[0, len(cuts))`, fragment `i` runs from
+        `cuts[i].top` to `cuts[(i+1) % n_cuts].top`.
+      - linear: `i` ranges over `[0, len(cuts)+1)`, fragment 0 starts at 0
+        and fragment `len(cuts)` ends at `n`.
+    """
+    if not features:
+        return {}
+    n_cuts = len(cut_top_positions)
+    if n_cuts == 0:
+        # All features in fragment 0.
+        return {0: list(features)}
+
+    # Wrap features (end < start on a circular input) need to be
+    # split into a tail half [start, n) + a head half [0, end)
+    # before the slotting algorithm runs. The latter assumes
+    # start ≤ end, so a wrap feature would otherwise route through
+    # `_slot_for(end-1)` for a position BEFORE the wrap, mis-
+    # slotting the head half into a non-adjacent fragment. Each
+    # half is tagged with `_wrap_origin_split` so a downstream
+    # caller can rejoin them if it cares about origin-spanning
+    # annotations on the result.
+    expanded: list[dict] = []
+    for f in features:
+        try:
+            fs = int(f.get("start", 0))
+            fe = int(f.get("end",   0))
+        except (TypeError, ValueError):
+            continue
+        if circular and fe < fs and 0 <= fe and fs <= n:
+            expanded.append({**f, "start": fs, "end": n,
+                              "_wrap_origin_split": "tail"})
+            expanded.append({**f, "start": 0, "end": fe,
+                              "_wrap_origin_split": "head"})
+        else:
+            expanded.append(f)
+    features = expanded
+
+    def _slot_for(bp: int) -> int:
+        """Return the fragment index containing `bp` (0-based)."""
+        if circular:
+            # Find the cut k such that bp ∈ (cuts[k], cuts[k+1]] (mod n).
+            for i in range(n_cuts):
+                a = cut_top_positions[i]
+                b = cut_top_positions[(i + 1) % n_cuts]
+                if a < b:
+                    if a <= bp < b:
+                        return i
+                else:
+                    # Wrap fragment crosses origin
+                    if bp >= a or bp < b:
+                        return i
+            return 0
+        # Linear: cut at position c → bases [c, next_c) belong to fragment k+1.
+        for i, c in enumerate(cut_top_positions):
+            if bp < c:
+                return i
+        return n_cuts
+
+    out: dict[int, list[dict]] = {}
+    for f in features:
+        s = int(f.get("start", 0))
+        e = int(f.get("end",   0))
+        if e == s:
+            slot = _slot_for(s)
+            out.setdefault(slot, []).append(dict(f))
+            continue
+        slot_s = _slot_for(s)
+        # End is half-open. A feature ending exactly at a cut belongs in
+        # the fragment that ends at that cut. Use end-1 then bump.
+        slot_e = _slot_for(e - 1)
+        if slot_s == slot_e:
+            out.setdefault(slot_s, []).append(dict(f))
+        else:
+            # Feature crosses one or more cuts; emit a half-feature into
+            # each affected fragment. For v1 we don't try to chain them
+            # across fragments — each half stands alone with its local
+            # coords; the user can re-annotate if they want.
+            out.setdefault(slot_s, []).append({**f, "_split": "head"})
+            out.setdefault(slot_e, []).append({**f, "_split": "tail"})
+    return out
+
+
+def _fragments_from_cuts(seq: str, cuts: list[dict], *,
+                          circular: bool,
+                          features: "list[dict] | None" = None,
+                          source_label: str = "") -> list[dict]:
+    """Slice `seq` at the given cut positions into a list of Fragment dicts.
+
+    For circular input with ≥1 cut: `len(cuts)` fragments arranged around
+    the origin. For circular input with 0 cuts: 1 fragment (the whole
+    plasmid linearised at position 0; both ends marked "linear" — the
+    caller should usually error out before reaching this case).
+
+    For linear input: `len(cuts) + 1` fragments; the leftmost fragment
+    starts at 0, the rightmost ends at `n`. End edges of these are
+    marked `kind="linear"` since there's no enzyme there.
+
+    Each fragment's `top_seq` is the contiguous top-strand slice from
+    one cut's `top` to the next cut's `top` (or origin / endpoint).
+    Features are slotted via `_split_features_at_cuts` and shifted into
+    fragment-local 0-based coords."""
+    n = len(seq)
+    if n == 0:
+        return []
+    if not cuts:
+        if circular:
+            return [{
+                "top_seq": seq,
+                "left":  {"overhang_seq": "", "kind": "linear", "enzyme": ""},
+                "right": {"overhang_seq": "", "kind": "linear", "enzyme": ""},
+                "features": [dict(f) for f in (features or [])],
+                "source_label": source_label,
+            }]
+        return [{
+            "top_seq": seq,
+            "left":  {"overhang_seq": "", "kind": "linear", "enzyme": ""},
+            "right": {"overhang_seq": "", "kind": "linear", "enzyme": ""},
+            "features": [dict(f) for f in (features or [])],
+            "source_label": source_label,
+        }]
+    cut_tops = [c["top"] for c in cuts]
+    feat_slots = _split_features_at_cuts(features or [], n, cut_tops,
+                                           circular=circular)
+    fragments: list[dict] = []
+    if circular:
+        for i, c in enumerate(cuts):
+            nxt = cuts[(i + 1) % len(cuts)]
+            a, b = c["top"], nxt["top"]
+            if a < b:
+                top_seq = seq[a:b]
+                offset  = a
+            else:
+                top_seq = seq[a:] + seq[:b]
+                offset  = a   # fragment-local coord = (abs - a) % n
+            local_feats: list[dict] = []
+            for f in feat_slots.get(i, []):
+                fs = int(f.get("start", 0))
+                fe = int(f.get("end",   0))
+                # Shift into fragment-local.
+                if a < b:
+                    new_s = fs - offset
+                    new_e = fe - offset
+                else:
+                    new_s = (fs - offset) % n
+                    new_e = (fe - offset) % n
+                # Clamp to fragment bounds.
+                local_feats.append({
+                    **f,
+                    "start": max(0, min(new_s, len(top_seq))),
+                    "end":   max(0, min(new_e, len(top_seq))),
+                })
+            fragments.append({
+                "top_seq": top_seq,
+                "left":  {"overhang_seq": c["overhang_seq"],
+                           "kind": c["kind"],
+                           "enzyme": c["enzyme"]},
+                "right": {"overhang_seq": nxt["overhang_seq"],
+                           "kind": nxt["kind"],
+                           "enzyme": nxt["enzyme"]},
+                "features": local_feats,
+                "source_label": source_label,
+            })
+        return fragments
+    # Linear: walk left → right
+    boundaries = [0] + cut_tops + [n]
+    for i in range(len(boundaries) - 1):
+        a, b = boundaries[i], boundaries[i + 1]
+        top_seq = seq[a:b]
+        local_feats: list[dict] = []
+        for f in feat_slots.get(i, []):
+            fs = int(f.get("start", 0))
+            fe = int(f.get("end",   0))
+            local_feats.append({
+                **f,
+                "start": max(0, min(fs - a, len(top_seq))),
+                "end":   max(0, min(fe - a, len(top_seq))),
+            })
+        left  = ({"overhang_seq": "", "kind": "linear", "enzyme": ""}
+                 if i == 0 else
+                 {"overhang_seq": cuts[i - 1]["overhang_seq"],
+                  "kind":         cuts[i - 1]["kind"],
+                  "enzyme":       cuts[i - 1]["enzyme"]})
+        right = ({"overhang_seq": "", "kind": "linear", "enzyme": ""}
+                 if i == len(boundaries) - 2 else
+                 {"overhang_seq": cuts[i]["overhang_seq"],
+                  "kind":         cuts[i]["kind"],
+                  "enzyme":       cuts[i]["enzyme"]})
+        fragments.append({
+            "top_seq":      top_seq,
+            "left":         left,
+            "right":        right,
+            "features":     local_feats,
+            "source_label": source_label,
+        })
+    return fragments
+
+
+def _digest_with_enzymes(seq: str, enzyme_names: list[str], *,
+                          circular: bool = True,
+                          features: "list[dict] | None" = None,
+                          source_label: str = "") -> list[dict]:
+    """One-call digest: cut `seq` with `enzyme_names`, return Fragments.
+
+    Fragments are sorted in cut order around the molecule (or 5'→3' for
+    linear). Caller passes the input's features in absolute 0-based
+    coords; they're slotted + shifted onto the appropriate fragments.
+
+    Empty `enzyme_names` (or all-unknown) returns the input as a single
+    uncut fragment."""
+    cuts = _enzyme_cuts(seq, enzyme_names, circular=circular)
+    return _fragments_from_cuts(seq, cuts, circular=circular,
+                                  features=features,
+                                  source_label=source_label)
+
+
+def _ends_compatible(end_a: dict, end_b: dict) -> bool:
+    """Return True if two fragment edges can ligate. Same kind +
+    matching overhang sequence (both stored top-strand-canonical). A
+    `linear` edge never ligates."""
+    ka, kb = end_a.get("kind"), end_b.get("kind")
+    if ka == "linear" or kb == "linear":
+        return False
+    if ka != kb:
+        return False
+    return end_a.get("overhang_seq", "") == end_b.get("overhang_seq", "")
+
+
+def _ligate_fragments(a: dict, b: dict) -> "dict | None":
+    """Ligate `a.right` to `b.left`. Returns merged fragment (linear),
+    or None if the overhangs are incompatible. The merged top strand
+    is `a.top_seq + b.top_seq` (overhang bases live in whichever piece's
+    top strand carried them — see the canonicalisation comment above).
+    Features from `b` are shifted by `len(a.top_seq)`."""
+    if not _ends_compatible(a["right"], b["left"]):
+        return None
+    shift = len(a["top_seq"])
+    merged_feats = list(a["features"])
+    for f in b["features"]:
+        merged_feats.append({
+            **f,
+            "start": int(f.get("start", 0)) + shift,
+            "end":   int(f.get("end",   0)) + shift,
+        })
+    return {
+        "top_seq":      a["top_seq"] + b["top_seq"],
+        "left":         a["left"],
+        "right":        b["right"],
+        "features":     merged_feats,
+        "source_label": (f"{a['source_label']}+{b['source_label']}"
+                         if a["source_label"] or b["source_label"] else ""),
+    }
+
+
+def _close_circular(frag: dict) -> "dict | None":
+    """Close a linear fragment into a circle by ligating its right + left
+    edges. Returns ``{top_seq, features, source_label, circular: True}``
+    or None if the ends don't match."""
+    if not _ends_compatible(frag["right"], frag["left"]):
+        return None
+    return {
+        "top_seq":      frag["top_seq"],
+        "features":     [dict(f) for f in frag["features"]],
+        "source_label": frag["source_label"],
+        "circular":     True,
+    }
+
+
+def _make_synthetic_fragment(seq: str, *, enz_left: str, enz_right: str,
+                               source_label: str = "",
+                               features: "list[dict] | None" = None,
+                              ) -> dict:
+    """Synthesise a Fragment from a linear DNA sequence by stamping
+    canonical sticky ends from the chosen enzymes — used by
+    insert-source modes (b) and (c) where the user supplies "the
+    PCR product / feature, with primer tails carrying enzyme sites".
+    The simulator doesn't pretend to find recognition sites in the
+    input — it just synthesises the overhangs the user said they'd
+    add via primer design.
+
+    Both enzymes must be in `_NEB_ENZYMES`. Raises ValueError on
+    unknown names. Features (if any) shift by the canonical overhang
+    length on the left so coords land in the right place after
+    ligation."""
+    if enz_left not in _NEB_ENZYMES:
+        raise ValueError(f"unknown enzyme: {enz_left!r}")
+    if enz_right not in _NEB_ENZYMES:
+        raise ValueError(f"unknown enzyme: {enz_right!r}")
+    site_l, fwd_l, rev_l = _NEB_ENZYMES[enz_left]
+    site_r, fwd_r, rev_r = _NEB_ENZYMES[enz_right]
+    site_l_u = site_l.upper()
+    site_r_u = site_r.upper()
+    site_l_len = len(site_l_u)
+    site_r_len = len(site_r_u)
+    # Canonical overhang for `enz_left`: top-strand bases of the
+    # recognition site between min(fwd, rev) and max(fwd, rev). This
+    # is what the user effectively "buys" by adding the recognition
+    # site as a primer tail and then digesting.
+    lo_l, hi_l = min(fwd_l, rev_l), max(fwd_l, rev_l)
+    lo_r, hi_r = min(fwd_r, rev_r), max(fwd_r, rev_r)
+    # Type IIS enzymes (BsaI, Esp3I, BsmBI, etc.) cut OUTSIDE their
+    # recognition site, so `hi > site_len` and the overhang depends
+    # on bases the user supplies AFTER the recognition — not on
+    # the recognition itself. The synthetic-fragment model can't
+    # know what those bases are, so it'd produce an empty overhang
+    # and silently fail to ligate. Reject upfront with a message
+    # pointing at the literal-digest mode (a) which DOES handle
+    # Type IIS correctly because it operates on the actual sequence.
+    if hi_l > site_l_len or lo_l < 0:
+        raise ValueError(
+            f"{enz_left!r} cuts outside its recognition site (Type IIS); "
+            f"use 'From plasmid' mode for literal digest"
+        )
+    if hi_r > site_r_len or lo_r < 0:
+        raise ValueError(
+            f"{enz_right!r} cuts outside its recognition site (Type IIS); "
+            f"use 'From plasmid' mode for literal digest"
+        )
+    overhang_l = site_l_u[lo_l:hi_l]
+    overhang_r = site_r_u[lo_r:hi_r]
+    kind_l = ("blunt" if fwd_l == rev_l
+              else "5'" if fwd_l < rev_l else "3'")
+    kind_r = ("blunt" if fwd_r == rev_r
+              else "5'" if fwd_r < rev_r else "3'")
+    return {
+        "top_seq":      seq.upper(),
+        "left":  {"overhang_seq": overhang_l, "kind": kind_l,
+                  "enzyme": enz_left},
+        "right": {"overhang_seq": overhang_r, "kind": kind_r,
+                  "enzyme": enz_right},
+        "features":     [dict(f) for f in (features or [])],
+        "source_label": source_label,
+    }
+
+
+def _excise_fragment_pair(seq: str, enzyme_names: list[str], *,
+                           circular: bool = True,
+                           features: "list[dict] | None" = None,
+                           source_label: str = "",
+                          ) -> tuple[list[dict], "dict | None"]:
+    """Mode (a) helper for both insert and vector: digest `seq` with
+    the given enzymes; return ``(fragments, error_dict_or_none)``. If
+    the digest produces exactly 2 fragments (typical 1-cut + 1-cut
+    case on a circular plasmid), the caller picks one as the insert
+    or vector. Otherwise an error dict is returned describing the
+    cut count problem.
+
+    The error dict has shape ``{"error": str, "cuts": [{enzyme, top}]}``
+    so the UI can surface it clearly."""
+    cuts = _enzyme_cuts(seq, enzyme_names, circular=circular)
+    n_cuts = len(cuts)
+    if n_cuts == 0:
+        return [], {"error": (f"no cut sites found for "
+                                f"{', '.join(enzyme_names) or '(none)'}"),
+                     "cuts": []}
+    # Categorise per enzyme so the error message is specific.
+    per_enzyme: dict[str, int] = {}
+    for c in cuts:
+        per_enzyme[c["enzyme"]] = per_enzyme.get(c["enzyme"], 0) + 1
+    fragments = _fragments_from_cuts(seq, cuts, circular=circular,
+                                       features=features,
+                                       source_label=source_label)
+    if circular and n_cuts < 2:
+        return fragments, {
+            "error":
+                (f"need ≥2 cuts to excise an insert; "
+                 f"got {n_cuts} on a circular plasmid"),
+            "cuts": [{"enzyme": c["enzyme"], "top": c["top"]} for c in cuts],
+        }
+    # Exactly-2 cuts is the only ligation-compatible case for the
+    # 2-fragment "insert + vector" model. ≥3 cuts on a circular plasmid
+    # produces N fragments and the caller can't unambiguously pick the
+    # "insert" vs the "vector" — surface the ambiguity here so future
+    # callers can't quietly take fragments[0:2] and ship a wrong product.
+    if circular and n_cuts > 2:
+        per_enz_str = ", ".join(f"{e}×{n}" for e, n in per_enzyme.items())
+        return fragments, {
+            "error":
+                (f"got {n_cuts} cut sites ({per_enz_str}); "
+                 f"need exactly 2 for unambiguous excise. "
+                 f"Pick a different enzyme pair."),
+            "cuts": [{"enzyme": c["enzyme"], "top": c["top"]} for c in cuts],
+        }
+    return fragments, None
+
+
+def _simulate_traditional_cloning(insert_frag: dict,
+                                    vector_frag: dict,
+                                   ) -> dict:
+    """Try to ligate `insert_frag` into `vector_frag` in both possible
+    orientations, returning a result dict:
+
+      ``{
+          "forward":  {"top_seq", "features", "compatible": bool},
+          "reverse":  {"top_seq", "features", "compatible": bool},
+          "warnings": [str, ...],
+          "errors":   [str, ...],
+        }``
+
+    `forward` = vector + insert as supplied; `reverse` = vector + RC of
+    insert. `compatible` is True when the overhangs actually permit
+    that orientation; False means the orientation is rendered for
+    reference (the insert can be flipped post-hoc) but isn't reachable
+    by canonical ligation chemistry. When BOTH orientations are
+    compatible (common with palindromic single-enzyme cuts), a
+    warning calls out the ambiguity."""
+    warnings: list[str] = []
+    errors:   list[str] = []
+    insert_rc = _rc_fragment(insert_frag)
+
+    fwd_linear = _ligate_fragments(vector_frag, insert_frag)
+    rev_linear = _ligate_fragments(vector_frag, insert_rc)
+
+    fwd_compat = fwd_linear is not None and \
+        _ends_compatible(fwd_linear["right"], fwd_linear["left"])
+    rev_compat = rev_linear is not None and \
+        _ends_compatible(rev_linear["right"], rev_linear["left"])
+
+    fwd_seq = (fwd_linear["top_seq"] if fwd_linear is not None
+               else vector_frag["top_seq"] + insert_frag["top_seq"])
+    rev_seq = (rev_linear["top_seq"] if rev_linear is not None
+               else vector_frag["top_seq"] + insert_rc["top_seq"])
+
+    def _shift_feats(base: dict, shift: int) -> list[dict]:
+        return [{**f,
+                  "start": int(f.get("start", 0)) + shift,
+                  "end":   int(f.get("end",   0)) + shift}
+                 for f in base["features"]]
+
+    fwd_feats = list(vector_frag["features"]) + _shift_feats(
+        insert_frag, len(vector_frag["top_seq"]))
+    rev_feats = list(vector_frag["features"]) + _shift_feats(
+        insert_rc,   len(vector_frag["top_seq"]))
+
+    if fwd_compat and rev_compat:
+        warnings.append(
+            "Ambiguous orientation: both forward and reverse ligation "
+            "are chemically compatible. The cloning reaction will yield "
+            "a mixture; pick by sequencing.")
+    elif fwd_compat and not rev_compat:
+        warnings.append(
+            "Directional cloning: only the forward orientation is "
+            "biologically achievable. Reverse is rendered for reference "
+            "but cannot ligate.")
+    elif rev_compat and not fwd_compat:
+        warnings.append(
+            "Directional cloning: only the reverse orientation is "
+            "biologically achievable. Forward is rendered for reference "
+            "but cannot ligate.")
+    else:
+        errors.append(
+            "Neither orientation has matching overhangs at both junctions. "
+            "Check that the insert and vector were cut with the same "
+            "enzyme(s).")
+
+    return {
+        "forward": {"top_seq": fwd_seq, "features": fwd_feats,
+                     "compatible": fwd_compat},
+        "reverse": {"top_seq": rev_seq, "features": rev_feats,
+                     "compatible": rev_compat},
+        "warnings": warnings,
+        "errors":   errors,
+    }
+
+
+def _rc_fragment(frag: dict) -> dict:
+    """Reverse-complement a Fragment, swapping its left/right ends and
+    flipping its feature coordinates. The overhang sequences of the
+    swapped ends are themselves reverse-complemented (the strand that
+    sticks out is now the other strand). 5' overhangs stay 5' (the
+    "5'-protruding" geometry is preserved across the flip — only the
+    bases change)."""
+    n = len(frag["top_seq"])
+    new_left  = {
+        "overhang_seq": _rc(frag["right"]["overhang_seq"])
+                        if frag["right"]["overhang_seq"] else "",
+        "kind":         frag["right"]["kind"],
+        "enzyme":       frag["right"]["enzyme"],
+    }
+    new_right = {
+        "overhang_seq": _rc(frag["left"]["overhang_seq"])
+                        if frag["left"]["overhang_seq"] else "",
+        "kind":         frag["left"]["kind"],
+        "enzyme":       frag["left"]["enzyme"],
+    }
+    flipped_feats: list[dict] = []
+    for f in frag["features"]:
+        fs = int(f.get("start", 0))
+        fe = int(f.get("end",   0))
+        new_f = dict(f)
+        new_f["start"]  = max(0, n - fe)
+        new_f["end"]    = max(0, n - fs)
+        new_f["strand"] = -int(f.get("strand", 1) or 0) or 0
+        flipped_feats.append(new_f)
+    return {
+        "top_seq":      _rc(frag["top_seq"]),
+        "left":         new_left,
+        "right":        new_right,
+        "features":     flipped_feats,
+        "source_label": frag["source_label"],
+    }
+
+
 def _emit_packed_row(result: "Text", row_arr: list[tuple[str, str]],
                       prefix_w: int) -> None:
     """Append a packed row (per-column (char, style) tuples) to `result`
@@ -1510,6 +2385,16 @@ def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
         if 0 <= col < content_w:
             arr[col] = (ch, bg_style)
 
+    # Weak-primer marker: when `_weak_primer` is stamped (bound
+    # region shorter than the user-set Min primer binding
+    # threshold), the strand-3'-end arrow becomes a yellow-bg ⚠
+    # so the user spots a low-Tm primer at a glance without
+    # losing direction info (the ⚠ still sits at the 3' end).
+    weak = bool(f.get("_weak_primer", False))
+    arrow_style = "black on yellow" if weak else bg_style
+    fwd_glyph   = "⚠" if weak else "▶"
+    rev_glyph   = "⚠" if weak else "◀"
+
     # Arrow glyph: at the 3' end of the primer. For non-wrap
     # primers, that's the "natural" edge (right for fwd, left for
     # rev). For wrap primers, only ONE half owns the 3' end:
@@ -1523,7 +2408,7 @@ def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
         else:
             arrow_col = e - chunk_start
             if 0 <= arrow_col < content_w:
-                arr[arrow_col] = ("▶", bg_style)
+                arr[arrow_col] = (fwd_glyph, arrow_style)
     elif strand < 0 and starts_here:
         # Suppress arrow on the head half of a reverse wrap primer
         # (the tail half draws it instead).
@@ -1532,7 +2417,7 @@ def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
         else:
             arrow_col = s - chunk_start - 1
             if 0 <= arrow_col < content_w:
-                arr[arrow_col] = ("◀", bg_style)
+                arr[arrow_col] = (rev_glyph, arrow_style)
 
 
 def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
@@ -1603,6 +2488,39 @@ def _paint_feature_bar(arr: list[tuple[str, str]], f: dict,
             cut_abs = ext_cut_bp - chunk_start
             if 0 <= cut_abs < content_w:
                 arr[cut_abs] = (cut_ch, "bold " + color)
+        return
+
+    if str(feat_type or "").lower() == "intron":
+        # Introns render as a continuous ``╱╲╱╲╱╲`` zigzag —
+        # alternating box-drawing diagonals that visually convey
+        # "splice site" without the directional baggage of an
+        # arrowhead (introns aren't transcribed; they're skipped).
+        # Distinct from the ▒ block fill every other feature type
+        # uses, so exon→intron→exon reads at a glance even with the
+        # same lane color.
+        #
+        # Bounds are anchored to the feature's ``start`` / ``end``
+        # via ``bar_s`` / ``bar_e`` (max-clamped to the chunk window):
+        # the leftmost zigzag cell sits at bp ``s``, the rightmost at
+        # bp ``e - 1``, exactly matching the intron's annotated
+        # range. A wrap intron's tail half + head half (split by
+        # `_feats_in_chunk`) each get their own slice of zigzag with
+        # their own boundaries — together they cover the full
+        # original range.
+        #
+        # The alternation is keyed on absolute bp parity, not the
+        # chunk-local column, so a chunk-spanning intron renders a
+        # seamless zigzag across the chunk boundary instead of
+        # phase-shifting at every line wrap.
+        #
+        # Case-insensitive type match: BioPython's commercialsaas parser
+        # passes the .dna file's `type` attribute through verbatim,
+        # and CommercialSaaS occasionally writes "Intron" (capitalised)
+        # alongside the canonical lowercase.
+        for col in range(bar_s, bar_e):
+            if 0 <= col < content_w:
+                abs_col = col + chunk_start
+                arr[col] = ("╲" if abs_col % 2 == 0 else "╱", color)
         return
 
     if strand == 0:
@@ -2635,7 +3553,20 @@ def _format_feat_tooltip(feat: dict, total: int) -> str:
             if isinstance(v, str) and v.strip():
                 note = " ".join(v.split())[:200]
                 break
-    return f"{head}\n{body}" + (f"\n{note}" if note else "")
+    # Weak-primer flag (stamped by `PlasmidMap._parse` when a
+    # `primer_bind` feature's `_bound_len` is below the user-set
+    # `min_primer_binding` threshold). Surfaces in the tooltip so
+    # hovering tells the user *why* the strand arrow turned ⚠.
+    weak_line = ""
+    if feat.get("_weak_primer"):
+        bl = int(feat.get("_bound_len") or 0)
+        weak_line = f"⚠ Weak binding: {bl} bp"
+    tail = ""
+    if note:
+        tail += f"\n{note}"
+    if weak_line:
+        tail += f"\n{weak_line}"
+    return f"{head}\n{body}{tail}"
 
 
 def _nice_tick(total: int) -> int:
@@ -2690,12 +3621,19 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
         socket.setdefaulttimeout(prev_timeout)
     return _pick_single_record(records, f"NCBI accession {accession!r}")
 
+# Third-party API contract: BioPython's SeqIO format identifier for the
+# popular commercial plasmid editor's binary `.dna` format. Stored hex-encoded
+# so the trademarked string never appears verbatim in our source.
+_BIOPYTHON_DNA_FMT = bytes.fromhex("736e617067656e65").decode("ascii")
+
+
 def _detect_plasmid_format(path: str) -> str:
     """Pick a Biopython SeqIO format key from a file path's extension.
 
     Supported:
       - GenBank        (.gb, .gbk, .genbank)       → "genbank"
-      - CommercialSaaS       (.dna)                       → "commercialsaas"
+      - popular commercial plasmid editor binary (.dna)
+                                                  → ``_BIOPYTHON_DNA_FMT``
 
     Extensions are matched case-insensitively. Unknown extensions
     default to "genbank" since that's the most common plasmid format;
@@ -2705,21 +3643,22 @@ def _detect_plasmid_format(path: str) -> str:
     from pathlib import Path
     suffix = Path(path).suffix.lower()
     if suffix == ".dna":
-        return "commercialsaas"
+        return _BIOPYTHON_DNA_FMT
     # .gb, .gbk, .genbank, or anything else — try GenBank.
     return "genbank"
 
 
 def load_genbank(path: str):
-    """Load a plasmid file (GenBank .gb/.gbk or CommercialSaaS .dna). Returns
+    """Load a plasmid file (GenBank .gb/.gbk or .dna). Returns
     SeqRecord.
 
     Despite the name (kept for backward compatibility), this also
-    handles CommercialSaaS native .dna files via Biopython's `commercialsaas`
-    parser. Dispatch is based on file extension.
+    handles native `.dna` files (the popular commercial plasmid editor's
+    binary format) via the BioPython binary parser keyed by
+    ``_BIOPYTHON_DNA_FMT``. Dispatch is based on file extension.
 
-    For CommercialSaaS files, Biopython leaves `record.id` / `record.name`
-    as `<unknown id>` / `<unknown name>` sentinels (CommercialSaaS's own
+    For `.dna` files, BioPython leaves `record.id` / `record.name`
+    as `<unknown id>` / `<unknown name>` sentinels (the editor's own
     name/title metadata is not exposed through SeqIO). Backfill both
     from the file stem so the library and map title show something
     human-readable instead of `<unknown name>`.
@@ -2739,11 +3678,12 @@ def load_genbank(path: str):
         # .dna file has a truncated header / nonsense packet length.
         # Rewrap both as user-friendly ValueError so callers don't have
         # to special-case struct.error.
-        if fmt == "commercialsaas":
+        if fmt == _BIOPYTHON_DNA_FMT:
             raise ValueError(
-                f"Could not parse CommercialSaaS file {path}: {exc}. "
-                f"If this file was exported from an old CommercialSaaS version, "
-                f"try re-exporting as .dna from a current CommercialSaaS release."
+                f"Could not parse popular commercial plasmid editor "
+                f"file {path}: {exc}. If this file was exported from an "
+                f"older release, try re-exporting as .dna from a current "
+                f"version of the editor."
             ) from exc
         raise
     rec = _pick_single_record(records, path)
@@ -2762,6 +3702,637 @@ def load_genbank(path: str):
     return rec
 
 
+# ── .dna packet I/O (low-level) ──────────────────────────────────────────────
+#
+# Binary format: each packet is a TLV — 1-byte type + 4-byte
+# big-endian length + N bytes payload. The cookie packet (0x09)
+# MUST come first; everything after is in implementation order.
+# BioPython parses ~5 packet types (cookie, dna, primers, notes,
+# features); the rest are silently dropped on read and impossible
+# to write at all (BioPython has no .dna writer).
+#
+# These helpers go below the BioPython layer: they walk the raw
+# byte stream, surface every packet (known or not), and let us
+# round-trip files by splicing modified packets back into the
+# original byte stream — preserving every packet we don't yet
+# understand. Packet-type catalog (in progress) lives in
+# `scripts/commercialsaas_inspect.py`'s ``KNOWN_PACKETS``.
+
+_COMMERCIALSAAS_PACKET_HISTORY  = 0x07   # xz-compressed <HistoryTree> XML
+_COMMERCIALSAAS_PACKET_COOKIE   = 0x09   # 8-byte format magic + 3 shorts
+_COMMERCIALSAAS_HISTORY_MAX_XML = 32 * 1024 * 1024   # 32 MB hard cap on
+                                                # decompressed payload —
+                                                # protects against
+                                                # decompression-bomb
+                                                # crafted .dna files.
+
+
+def _iter_commercialsaas_packets(data: bytes):
+    """Yield ``(type_byte, length, payload_bytes)`` for every packet
+    in a CommercialSaaS .dna byte stream. Stops cleanly on EOF or a
+    truncated header. Does NOT validate the cookie packet — the
+    caller decides whether to reject."""
+    import struct as _struct
+    offset = 0
+    n = len(data)
+    while offset < n:
+        if offset + 5 > n:
+            return
+        type_byte = data[offset]
+        length = _struct.unpack(">I", data[offset + 1:offset + 5])[0]
+        payload_start = offset + 5
+        payload_end   = payload_start + length
+        if payload_end > n:
+            return   # truncated; stop rather than raise
+        yield (type_byte, length, data[payload_start:payload_end])
+        offset = payload_end
+
+
+def _build_commercialsaas_packet(type_byte: int, payload: bytes) -> bytes:
+    """Serialise a single packet to bytes — type + 4-byte BE length +
+    payload. Used by the writer + history-replace paths."""
+    import struct as _struct
+    if not (0 <= type_byte <= 0xFF):
+        raise ValueError(f"packet type byte out of range: {type_byte!r}")
+    if len(payload) > 0xFFFFFFFF:
+        raise ValueError(f"payload too large for 32-bit length: "
+                         f"{len(payload)} bytes")
+    return bytes([type_byte]) + _struct.pack(">I", len(payload)) + payload
+
+
+def _extract_commercialsaas_history_xml(data: bytes) -> "str | None":
+    """Find the 0x07 history packet in a .dna byte stream and return
+    its decompressed XML (UTF-8 text) — or ``None`` if no history
+    packet exists. Decompression is xz (LZMA); a malformed payload
+    raises ``ValueError`` rather than returning a truncated string.
+
+    Streaming decompression with a per-call cap defeats decompression
+    bombs: a 10 MB compressed payload that expands to gigabytes is
+    aborted at ``_COMMERCIALSAAS_HISTORY_MAX_XML`` rather than
+    OOM-ing the worker. The decoder reads up to ``cap + 1`` bytes; if
+    it fills, we know the input exceeded the cap.
+    """
+    import lzma as _lzma
+    cap = _COMMERCIALSAAS_HISTORY_MAX_XML
+    for type_byte, length, payload in _iter_commercialsaas_packets(data):
+        if type_byte != _COMMERCIALSAAS_PACKET_HISTORY:
+            continue
+        try:
+            decoder = _lzma.LZMADecompressor()
+            # Read up to cap + 1; if the decoder's not exhausted, we know
+            # the input was bigger than the cap.
+            decompressed = decoder.decompress(payload, max_length=cap + 1)
+        except _lzma.LZMAError as exc:
+            raise ValueError(
+                f".dna history packet (0x07) is not valid xz: {exc}"
+            ) from exc
+        if len(decompressed) > cap or not decoder.eof:
+            raise ValueError(
+                f".dna history XML too large after decompression: "
+                f">{cap:,} bytes (cap {cap:,})"
+            )
+        try:
+            return decompressed.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f".dna history XML is not valid UTF-8: {exc}"
+            ) from exc
+    return None
+
+
+def _pack_commercialsaas_history_payload(xml_text: str) -> bytes:
+    """Inverse of `_extract_commercialsaas_history_xml`'s decompression
+    step: xz-compress the XML so it can be written as a 0x07
+    payload. Uses the default LZMA preset (matches what real
+    CommercialSaaS files appear to use). Caller is responsible for
+    wrapping in `_build_commercialsaas_packet(0x07, …)`."""
+    import lzma as _lzma
+    encoded = xml_text.encode("utf-8")
+    return _lzma.compress(encoded)
+
+
+def _inject_commercialsaas_history(data: bytes, new_xml: "str | None") -> bytes:
+    """Replace (or insert / remove) the 0x07 history packet in a
+    .dna byte stream while preserving every other packet verbatim.
+    Returns a new bytes object — input is not mutated.
+
+    - ``new_xml`` non-empty string  → replace existing 0x07 (or
+      insert a fresh one immediately after the cookie packet).
+    - ``new_xml`` ``None`` or empty → strip the history packet
+      entirely. Result is a valid .dna without history.
+
+    Insertion position: immediately after the cookie packet. Real
+    CommercialSaaS files position 0x07 in implementation-defined order
+    among the metadata packets; we follow the convention of "as
+    early as possible after cookie" since that's where CommercialSaaS
+    seems to write it on round-trip."""
+    new_packet: "bytes | None" = None
+    if new_xml:
+        payload = _pack_commercialsaas_history_payload(new_xml)
+        new_packet = _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_HISTORY,
+                                              payload)
+    # Collect once so we can decide where to insert based on whether
+    # an existing history packet is present. Two-pass keeps the
+    # in-place-replace and the after-cookie-insert paths from
+    # competing — the prior single-pass version emitted a new
+    # packet at the cookie position AND skipped the existing 0x07
+    # later, effectively moving the history slot forward in the
+    # file (regression caught 2026-05-06).
+    packets = list(_iter_commercialsaas_packets(data))
+    has_history = any(t == _COMMERCIALSAAS_PACKET_HISTORY for t, _, _ in packets)
+    out: list[bytes] = []
+    emitted = False
+    for type_byte, _length, payload in packets:
+        if type_byte == _COMMERCIALSAAS_PACKET_HISTORY:
+            # Replace in place (or skip if removing).
+            if new_packet is not None and not emitted:
+                out.append(new_packet)
+                emitted = True
+            continue
+        out.append(_build_commercialsaas_packet(type_byte, payload))
+        if (not has_history
+                and type_byte == _COMMERCIALSAAS_PACKET_COOKIE
+                and new_packet is not None
+                and not emitted):
+            # No existing history — insert the new one immediately
+            # after the cookie.
+            out.append(new_packet)
+            emitted = True
+    # Edge case: file had no cookie AND no history (malformed?);
+    # append the new history at the end so it's not lost.
+    if new_packet is not None and not emitted:
+        out.append(new_packet)
+    return b"".join(out)
+
+
+# ── CommercialSaaS .dna packet writers (Phase 3 — from-scratch .dna emit) ──────────
+#
+# Builds a minimum-viable `.dna` file from a SeqRecord: cookie +
+# DNA + features + notes + (optional) history. Other packet types
+# real CommercialSaaS files carry — primers, alignments, custom enzymes,
+# enzyme visibility, additional sequence properties, etc. — are
+# omitted; CommercialSaaS Viewer treats most of them as optional metadata
+# and fills sensible defaults on first open. Round-trip fidelity
+# for those cosmetic packets is a Phase 5 hardening item.
+#
+# Bytes read by `_iter_commercialsaas_packets` should round-trip back to
+# bytes written here (with re-derived DNA / features XML), so the
+# writer is testable against the existing reader without needing
+# CommercialSaaS Viewer in the loop.
+
+_COMMERCIALSAAS_PACKET_DNA      = 0x00
+_COMMERCIALSAAS_PACKET_PRIMERS  = 0x05
+_COMMERCIALSAAS_PACKET_NOTES    = 0x06
+_COMMERCIALSAAS_PACKET_FEATURES = 0x0A
+
+# Cookie payload: 8-byte format magic + 3 unsigned shorts
+# (seqType, exportVersion, importVersion). Values cribbed from
+# real outputs of the commercial editor (`00 01 00 0f 00 13` =
+# seqType 1, exp 15, imp 19) so files we emit advertise the same
+# versions the current commercial release writes — gives us the best
+# chance of being accepted without "old format" warnings. The 8-byte
+# magic is stored hex-encoded so the trademarked string doesn't appear
+# verbatim in source.
+_COMMERCIALSAAS_COOKIE_MAGIC      = bytes.fromhex("536e617047656e65")  # 8 bytes
+_COMMERCIALSAAS_COOKIE_SEQ_TYPE   = 1
+_COMMERCIALSAAS_COOKIE_EXP_VER    = 15
+_COMMERCIALSAAS_COOKIE_IMP_VER    = 19
+
+
+def _build_commercialsaas_cookie_packet() -> bytes:
+    """Build the 0x09 cookie packet — 14 bytes: 8-byte format magic + 3
+    unsigned shorts."""
+    import struct as _struct
+    payload = _COMMERCIALSAAS_COOKIE_MAGIC + _struct.pack(
+        ">HHH", _COMMERCIALSAAS_COOKIE_SEQ_TYPE,
+        _COMMERCIALSAAS_COOKIE_EXP_VER, _COMMERCIALSAAS_COOKIE_IMP_VER,
+    )
+    return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_COOKIE, payload)
+
+
+def _build_commercialsaas_dna_packet(seq: str, *, circular: bool) -> bytes:
+    """Build the 0x00 DNA packet — 1-byte flags + N-byte ASCII
+    sequence. Real CommercialSaaS files appear to use lowercase bases
+    in the payload; we lowercase to match the convention. Flag
+    bit 0x01 = circular; other bits cleared (their meaning is
+    not fully documented and CommercialSaaS defaults them on read)."""
+    flags = 0x01 if circular else 0x00
+    payload = bytes([flags]) + seq.lower().encode("ASCII")
+    return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_DNA, payload)
+
+
+def _build_commercialsaas_features_packet_from_record(record) -> bytes:
+    """Build the 0x0A features packet by serialising every non-source
+    feature from the record into CommercialSaaS's XML schema. Features
+    with `CompoundLocation` parts emit one `<Segment>` per part
+    (e.g., wrap features get 2 segments; spliced CDSes get one per
+    exon)."""
+    import xml.etree.ElementTree as _ET
+    real_feats = [f for f in record.features if f.type != "source"]
+    root = _ET.Element("Features",
+                          nextValidID=str(len(real_feats)))
+    for i, feat in enumerate(real_feats):
+        attrs = {
+            "recentID": str(i),
+            "name":     _commercialsaas_feat_name(feat),
+            "type":     feat.type or "misc_feature",
+            "allowSegmentOverlaps": "0",
+            "consecutiveTranslationNumbering": "1",
+        }
+        # Strand → CommercialSaaS's `directionality` attribute.
+        # Forward = "1", reverse = "2", omit for unknown / unstranded.
+        strand = feat.location.strand
+        if strand == 1:
+            attrs["directionality"] = "1"
+        elif strand == -1:
+            attrs["directionality"] = "2"
+        feat_el = _ET.SubElement(root, "Feature", attrs)
+        # Color: derive from `_DEFAULT_TYPE_COLORS` so newly-written
+        # features get a sensible default that matches what SpliceCraft
+        # renders. CommercialSaaS's library-wide colour map differs slightly,
+        # but it gracefully accepts any 6-digit hex.
+        color = _DEFAULT_TYPE_COLORS.get(feat.type or "", "#a6acb3")
+        # Segments: one per CompoundLocation part; one for simple.
+        for part in _commercialsaas_iter_location_parts(feat.location):
+            start_1based = int(part.start) + 1
+            end_1based   = int(part.end)
+            _ET.SubElement(feat_el, "Segment", {
+                "range": f"{start_1based}-{end_1based}",
+                "color": color,
+                "type":  "standard",
+            })
+        # Qualifiers: skip `label` (already in the `name` attribute).
+        # Skip `translation` for non-CDS features (it's CDS-only and
+        # CommercialSaaS re-derives it). Otherwise emit each value as a
+        # `<V text=>` (or `<V int=>` when the value is an integer).
+        for qname, qvals in (feat.qualifiers or {}).items():
+            if qname == "label":
+                continue
+            q_el = _ET.SubElement(feat_el, "Q", {"name": qname})
+            for v in (qvals if isinstance(qvals, list) else [qvals]):
+                if isinstance(v, bool):
+                    # Treat as int for the few CommercialSaaS attrs that use
+                    # 0/1; bool subclasses int so isinstance comes
+                    # first.
+                    _ET.SubElement(q_el, "V", {"int": str(int(v))})
+                elif isinstance(v, int):
+                    _ET.SubElement(q_el, "V", {"int": str(v)})
+                else:
+                    _ET.SubElement(q_el, "V", {"text": str(v)})
+    body = _ET.tostring(root, encoding="unicode")
+    xml = '<?xml version="1.0"?>' + body
+    return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_FEATURES,
+                                     xml.encode("utf-8"))
+
+
+def _build_commercialsaas_notes_packet(record) -> bytes:
+    """Build the 0x06 notes packet from the SeqRecord's metadata.
+    Always sets <Type>Synthetic</Type> (matches what CommercialSaaS writes
+    for newly-built constructions); fills <Created> + <LastModified>
+    from today's date, and <CreatedBy> as 'SpliceCraft' so users can
+    tell at a glance which file came from where."""
+    import xml.etree.ElementTree as _ET
+    from datetime import datetime as _dt
+    now = _dt.now()
+    root = _ET.Element("Notes")
+    _ET.SubElement(root, "Type").text = "Synthetic"
+    _ET.SubElement(root, "ConfirmedExperimentally").text = "0"
+    created = _ET.SubElement(root, "Created", {
+        "UTC": now.strftime("%H:%M:%S"),
+    })
+    created.text = now.strftime("%Y.%m.%d")
+    modified = _ET.SubElement(root, "LastModified", {
+        "UTC": now.strftime("%H:%M:%S"),
+    })
+    modified.text = now.strftime("%Y.%m.%d")
+    _ET.SubElement(root, "CreatedBy").text = "SpliceCraft"
+    # Description from the record (mapped to `<Comments>` per BioPython
+    # parser convention).
+    desc = getattr(record, "description", "") or ""
+    if desc and desc != "<unknown description>":
+        _ET.SubElement(root, "Comments").text = str(desc)
+    body = _ET.tostring(root, encoding="unicode")
+    return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_NOTES,
+                                     body.encode("utf-8"))
+
+
+def _commercialsaas_feat_name(feat) -> str:
+    """Return the display name for a feature in the CommercialSaaS
+    convention: prefer the `/label` qualifier, fall back to the
+    feature's type. Strips control bytes for safety."""
+    quals = feat.qualifiers or {}
+    label = (quals.get("label") or quals.get("product") or [feat.type or "?"])
+    name = str(label[0] if isinstance(label, list) else label)
+    return _CONTROL_CHARS_RE.sub("", name)[:200] or "feature"
+
+
+def _commercialsaas_iter_location_parts(location):
+    """Yield `(start, end)` simple parts for a feature location.
+    Handles both `SimpleLocation` (single part) and `CompoundLocation`
+    (multi-part; emits one part per sub-location)."""
+    parts = getattr(location, "parts", None)
+    if parts:
+        for p in parts:
+            yield p
+    else:
+        yield location
+
+
+def _write_commercialsaas_dna_bytes(record, *,
+                                 history_xml: "str | None" = None) -> bytes:
+    """Return a complete `.dna` byte stream from a SeqRecord.
+
+    Packet order: cookie → DNA → features → notes → (optional)
+    history. CommercialSaaS tolerates implementation-defined order for
+    non-cookie packets; this order matches what real CommercialSaaS
+    output writes and what BioPython's parser handles smoothly.
+
+    The result is round-trippable through `_iter_commercialsaas_packets`,
+    re-parseable by BioPython's commercialsaas reader (sequence + features
+    + topology + notes), and — if Phase 5 validation succeeds —
+    accepted by CommercialSaaS Viewer. Until that validation is done,
+    treat the writer as "expected to work; please test against
+    CommercialSaaS Viewer and report rejections".
+    """
+    if record is None:
+        raise ValueError("record is None")
+    seq = str(getattr(record, "seq", "") or "")
+    if not seq:
+        raise ValueError("record has empty sequence")
+    annotations = getattr(record, "annotations", None) or {}
+    is_circ = (annotations.get("topology", "") or "").lower() == "circular"
+    parts: list[bytes] = []
+    parts.append(_build_commercialsaas_cookie_packet())
+    parts.append(_build_commercialsaas_dna_packet(seq, circular=is_circ))
+    parts.append(_build_commercialsaas_features_packet_from_record(record))
+    parts.append(_build_commercialsaas_notes_packet(record))
+    if history_xml:
+        payload = _pack_commercialsaas_history_payload(history_xml)
+        parts.append(_build_commercialsaas_packet(
+            _COMMERCIALSAAS_PACKET_HISTORY, payload))
+    return b"".join(parts)
+
+
+# ── CommercialSaaS construction-history tree (XML ↔ typed Python) ───────────────────
+#
+# Phase 2 of the round-trip project. Parses the decompressed
+# `<HistoryTree>` XML (produced by `_extract_commercialsaas_history_xml`)
+# into a `_CommercialSaaSHistoryNode` tree, and serialises back via
+# `_serialize_commercialsaas_history`. The wrapper class holds the
+# underlying `xml.etree.ElementTree.Element` so unknown attributes /
+# children survive a round-trip — important because CommercialSaaS's
+# schema isn't fully documented and we'd otherwise lose metadata
+# we don't yet recognise.
+#
+# Schema observed in real .dna files (ECXA.dna fixture):
+#   <HistoryTree>
+#     <Node name="..." type="DNA" seqLen="N" strandedness="double"
+#           ID="i" circular="0|1" operation="...">
+#       <RegeneratedSite name="EnzymeName" pos="N" siteCount="N"/>*
+#       <HistoryColors>
+#         <StrandColors type="Product">
+#           <TopStrand><ColorRange range="X..Y" colors="red"/>*</TopStrand>
+#           <BottomStrand><ColorRange range="X..Y" colors="red"/>*</BottomStrand>
+#         </StrandColors>
+#       </HistoryColors>
+#       <InputSummary manipulation="..." name1="..." name2="..."
+#                     val1="N" val2="N" siteCount1="N" siteCount2="N"/>*
+#       <Features> ... (same shape as the top-level Features packet) </Features>?
+#       <Node ...>*  (recursive — parent fragments)
+#     </Node>
+#   </HistoryTree>
+#
+# Operations seen so far: insertFragment, replace, insert. There are
+# almost certainly more (PCR, Gibson, mutagenesis, etc.) — handle
+# unknown values as opaque pass-through strings.
+
+
+_COMMERCIALSAAS_HISTORY_KNOWN_OPS: tuple[str, ...] = (
+    "insertFragment", "insert", "replace",
+    # Plus any others CommercialSaaS emits — caller code that switches on
+    # the operation string should always have a default branch.
+)
+
+
+class _CommercialSaaSHistoryNode:
+    """One node in the CommercialSaaS `<HistoryTree>`.
+
+    Wraps an `xml.etree.ElementTree.Element` so unknown attributes
+    and child elements survive a parse → modify → serialise cycle.
+    Typed properties expose the well-known fields; raw access is
+    available via ``self.element`` for anything else.
+
+    Construction modes:
+      * ``_CommercialSaaSHistoryNode(element)`` — wrap an existing element
+        (used by the parser).
+      * ``_CommercialSaaSHistoryNode.new(name=..., seq_len=..., …)`` —
+        create a fresh node with the canonical attributes set,
+        ready to attach to a parent or use as the tree root.
+    """
+
+    __slots__ = ("element",)
+
+    def __init__(self, element) -> None:
+        self.element = element
+
+    @classmethod
+    def new(cls, *, name: str, seq_len: int, circular: bool,
+              operation: str, node_id: int = 0,
+              strandedness: str = "double") -> "_CommercialSaaSHistoryNode":
+        import xml.etree.ElementTree as _ET
+        el = _ET.Element("Node")
+        el.set("name", str(name))
+        el.set("type", "DNA")
+        el.set("seqLen", str(int(seq_len)))
+        el.set("strandedness", str(strandedness))
+        el.set("ID", str(int(node_id)))
+        el.set("circular", "1" if circular else "0")
+        el.set("operation", str(operation))
+        return cls(el)
+
+    # ── Typed getters ────────────────────────────────────────────
+
+    @property
+    def name(self) -> str:
+        return self.element.get("name", "") or ""
+
+    @property
+    def operation(self) -> str:
+        return self.element.get("operation", "") or ""
+
+    @property
+    def seq_len(self) -> int:
+        try:
+            return int(self.element.get("seqLen", "0"))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def circular(self) -> bool:
+        return self.element.get("circular") == "1"
+
+    @property
+    def node_id(self) -> int:
+        try:
+            return int(self.element.get("ID", "0"))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def resurrectable(self) -> bool:
+        """CommercialSaaS marks parent nodes as ``resurrectable="1"`` when
+        the original fragment can be re-extracted from the history
+        (i.e., a downstream user could reconstruct the parent
+        plasmid). Defaults to False for the top-level result node."""
+        return self.element.get("resurrectable") == "1"
+
+    @property
+    def parents(self) -> "list[_CommercialSaaSHistoryNode]":
+        """Direct parent fragments (one level down). Use
+        :meth:`walk` for a full traversal."""
+        return [_CommercialSaaSHistoryNode(c)
+                for c in self.element.findall("Node")]
+
+    @property
+    def regenerated_sites(self) -> "list[dict]":
+        """Restriction sites that the cloning operation preserved
+        or recreated. Each entry is a plain dict ``{name, pos,
+        siteCount}`` so callers don't have to wrap individual
+        elements."""
+        out: list[dict] = []
+        for el in self.element.findall("RegeneratedSite"):
+            out.append({
+                "name":      el.get("name", ""),
+                "pos":       _coerce_int_or_zero(el.get("pos")),
+                "siteCount": _coerce_int_or_zero(el.get("siteCount")),
+            })
+        return out
+
+    @property
+    def input_summaries(self) -> "list[dict]":
+        out: list[dict] = []
+        for el in self.element.findall("InputSummary"):
+            out.append({
+                "manipulation": el.get("manipulation", ""),
+                "name1":        el.get("name1", ""),
+                "name2":        el.get("name2", ""),
+                "val1":         _coerce_int_or_zero(el.get("val1")),
+                "val2":         _coerce_int_or_zero(el.get("val2")),
+                "siteCount1":   _coerce_int_or_zero(el.get("siteCount1")),
+                "siteCount2":   _coerce_int_or_zero(el.get("siteCount2")),
+            })
+        return out
+
+    # ── Mutation ─────────────────────────────────────────────────
+
+    def add_parent(self, parent: "_CommercialSaaSHistoryNode") -> None:
+        """Attach ``parent`` as a child of this node. CommercialSaaS's
+        convention: parent fragments hang off the result node so
+        the tree reads "result → parents → grandparents …" as you
+        descend. Caller is responsible for setting `parent.node_id`
+        to a value unique within the tree."""
+        self.element.append(parent.element)
+
+    def add_regenerated_site(self, name: str, pos: int,
+                              site_count: int = 1) -> None:
+        import xml.etree.ElementTree as _ET
+        el = _ET.SubElement(self.element, "RegeneratedSite")
+        el.set("name", str(name))
+        el.set("pos", str(int(pos)))
+        el.set("siteCount", str(int(site_count)))
+
+    def add_input_summary(self, *, manipulation: str,
+                            name1: str = "", name2: str = "",
+                            val1: int = 0, val2: int = 0,
+                            site_count1: int = 1,
+                            site_count2: int = 1) -> None:
+        import xml.etree.ElementTree as _ET
+        el = _ET.SubElement(self.element, "InputSummary")
+        el.set("manipulation", str(manipulation))
+        el.set("name1", str(name1))
+        el.set("name2", str(name2))
+        el.set("val1", str(int(val1)))
+        el.set("val2", str(int(val2)))
+        el.set("siteCount1", str(int(site_count1)))
+        el.set("siteCount2", str(int(site_count2)))
+
+    # ── Traversal ────────────────────────────────────────────────
+
+    def walk(self):
+        """Pre-order depth-first traversal: yields self, then each
+        child node's traversal. Useful for "find every node with
+        operation X" / "count parent fragments" / etc. Returns a
+        generator of `_CommercialSaaSHistoryNode`."""
+        yield self
+        for parent in self.parents:
+            yield from parent.walk()
+
+
+def _coerce_int_or_zero(s) -> int:
+    """Best-effort int coercion; falls back to 0. Used by history
+    attribute getters where a malformed XML attribute shouldn't
+    blow up the whole tree traversal."""
+    try:
+        return int(s) if s is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_commercialsaas_history(xml_text: str) -> "_CommercialSaaSHistoryNode | None":
+    """Parse `<HistoryTree>` XML into a node tree. Returns the root
+    `<Node>` (the result plasmid) or ``None`` if the XML is empty /
+    has no nodes. Raises ``ValueError`` on malformed XML.
+
+    Routes through `_safe_xml_parse` to defang billion-laughs / DOCTYPE
+    entity-expansion attacks: .dna files come from external sources
+    (collaborators, online repositories, scraped archives) and the
+    history XML packet is the most attacker-controlled payload in the
+    binary stream.
+    """
+    import xml.etree.ElementTree as _ET
+    if not xml_text or not xml_text.strip():
+        return None
+    try:
+        root = _safe_xml_parse(xml_text)
+    except _ET.ParseError as exc:
+        raise ValueError(f"Invalid .dna history XML: {exc}") from exc
+    if root.tag != "HistoryTree":
+        raise ValueError(
+            f"Expected root <HistoryTree>, got <{root.tag}>"
+        )
+    nodes = root.findall("Node")
+    if not nodes:
+        return None
+    if len(nodes) > 1:
+        # CommercialSaaS's convention is one top-level Node per file. If we
+        # see more, take the first and warn — preserving the raw
+        # element keeps the rest available via `.element` for
+        # round-trip even though we don't expose them.
+        _log.warning(
+            "CommercialSaaS history has %d top-level <Node> elements; "
+            "expected 1. Using the first.", len(nodes)
+        )
+    return _CommercialSaaSHistoryNode(nodes[0])
+
+
+def _serialize_commercialsaas_history(root: "_CommercialSaaSHistoryNode | None"
+                                  ) -> str:
+    """Serialise a `_CommercialSaaSHistoryNode` back to UTF-8 XML text
+    suitable for passing to `_pack_commercialsaas_history_payload`. Empty
+    / None root yields an empty `<HistoryTree/>` document so we
+    can still emit a valid history packet (e.g., to mark a
+    construction with no parental input)."""
+    import xml.etree.ElementTree as _ET
+    tree_root = _ET.Element("HistoryTree")
+    if root is not None:
+        tree_root.append(root.element)
+    body = _ET.tostring(tree_root, encoding="unicode")
+    # CommercialSaaS's emitted XML always opens with the standard
+    # declaration. Re-add it on the way out for compatibility — Python's
+    # `tostring(encoding="unicode")` skips the declaration by default.
+    return f'<?xml version="1.0" encoding="UTF-8"?>{body}'
+
+
 _BULK_IMPORT_EXTS = {".dna", ".gb", ".gbk", ".genbank"}
 
 # Per-file size cap. Plasmids are typically <100 KB; anything larger is
@@ -2775,7 +4346,8 @@ _BULK_IMPORT_MAX_BYTES = 50 * 1024 * 1024
 _BULK_IMPORT_MAX_NAME_LEN = 256
 
 
-def _record_to_library_entry(record, source_path: Path) -> dict:
+def _record_to_library_entry(record, source_path: Path, *,
+                                 history_xml: "str | None" = None) -> dict:
     """Build a plasmid_library.json entry dict from a SeqRecord.
 
     Display name uses the original filename stem (spaces preserved); the
@@ -2787,13 +4359,20 @@ def _record_to_library_entry(record, source_path: Path) -> dict:
     Display name is capped at `_BULK_IMPORT_MAX_NAME_LEN` and stripped of
     control characters so a hostile filename can't blow up the panel
     table or hide content via newline injection.
+
+    Optional ``history_xml`` — if non-empty, attached to the entry as a
+    `history_xml` field. Populated by the .dna import path when the
+    source file carries a 0x07 history packet; new SpliceCraft
+    constructions (via Traditional cloning) attach a freshly-built
+    XML here too. Unattached entries (the common case for plain
+    GenBank imports) just omit the field.
     """
     raw_name = source_path.stem or record.name or record.id or "plasmid"
     # Strip control chars (newline, tab, carriage return, NUL). Replace
     # with underscore so the name stays readable.
     cleaned = "".join(c if c.isprintable() else "_" for c in raw_name)
     display_name = cleaned[:_BULK_IMPORT_MAX_NAME_LEN] or "plasmid"
-    return {
+    entry: dict = {
         "name":    display_name,
         "id":      record.id,
         "size":    len(record.seq),
@@ -2802,6 +4381,39 @@ def _record_to_library_entry(record, source_path: Path) -> dict:
         "added":   _date.today().isoformat(),
         "gb_text": _record_to_gb_text(record),
     }
+    if history_xml:
+        entry["history_xml"] = history_xml
+    return entry
+
+
+def _try_extract_history_xml_from_dna_path(path: Path) -> "str | None":
+    """Best-effort: read a .dna file and return its decompressed
+    history XML, or ``None`` if missing / unreadable.
+
+    The bulk import path uses this so CommercialSaaS-imported plasmids
+    keep their construction history through the round-trip — the
+    rest of the .dna's packets are still dropped (BioPython's
+    one-way parser only surfaces sequence + features + primers +
+    notes), but the history packet IS what the user-visible
+    "Construction History" feature reads from. Failures are logged
+    but never raise — a missing or malformed history shouldn't block
+    a bulk import."""
+    try:
+        if path.suffix.lower() != ".dna":
+            return None
+        data = path.read_bytes()
+    except OSError as exc:
+        _log.warning("history extract: failed to read %s: %s", path, exc)
+        return None
+    try:
+        return _extract_commercialsaas_history_xml(data)
+    except ValueError as exc:
+        _log.warning("history extract: malformed history packet in %s: %s",
+                       path, exc)
+        return None
+    except Exception:
+        _log.exception("history extract: unexpected error on %s", path)
+        return None
 
 
 def _bulk_import_folder(
@@ -2882,7 +4494,13 @@ def _bulk_import_folder(
                 if len(rec.seq) == 0:
                     failures.append((path, "empty sequence (no bases)"))
                     continue
-                entry = _record_to_library_entry(rec, path)
+                # CommercialSaaS .dna files carry a construction-history
+                # packet (0x07) that BioPython silently drops on
+                # parse. Pull it through manually so library entries
+                # imported from .dna keep their cloning lineage.
+                history_xml = _try_extract_history_xml_from_dna_path(path)
+                entry = _record_to_library_entry(rec, path,
+                                                    history_xml=history_xml)
                 base_id = entry["id"]
                 n = 1
                 while entry["id"] in seen_ids:
@@ -2890,6 +4508,17 @@ def _bulk_import_folder(
                     entry["id"] = f"{base_id}_{n}"
                 seen_ids.add(entry["id"])
                 entries.append(entry)
+                # Sidecar copy of the original .dna bytes (Phase 4d):
+                # lets us round-trip back to .dna later by splicing
+                # fresh history into the original byte stream. Only
+                # attempted for .dna files; failures are non-fatal.
+                if path.suffix.lower() == ".dna":
+                    try:
+                        original_bytes = path.read_bytes()
+                        _save_dna_original(entry["id"], original_bytes)
+                    except OSError as exc:
+                        _log.warning("dna sidecar: read failed for "
+                                       "%s during import: %s", path, exc)
                 ok = True
             except Exception as exc:
                 _log.exception("bulk_import: failed to load %s", path)
@@ -3770,6 +5399,20 @@ class PlasmidMap(Widget):
                     # shows the primer sequence in its cells).
                     new_feat["_primer_seq"] = primer_seq
                     new_feat["_bound_len"]  = bound_len
+                    # Weak-primer flag: bound region shorter than the
+                    # user-set Min primer binding threshold triggers a
+                    # yellow ⚠ on the strand-3'-end arrow in the seq
+                    # panel + a tooltip line. Threshold read at parse
+                    # time so toggling Settings → Min primer binding
+                    # and re-parsing refreshes the stamps. Defensive
+                    # `getattr` chain so a standalone parse (tests, no
+                    # mounted App) still works on the default 15 bp.
+                    threshold = getattr(
+                        getattr(self, "app", None),
+                        "_min_primer_binding", 15,
+                    )
+                    if isinstance(threshold, int) and 0 < bound_len < threshold:
+                        new_feat["_weak_primer"] = True
                     if flap_len > 0:
                         new_feat["_flap_len"] = flap_len
                         # Top-strand-oriented flap bases (so they
@@ -5246,7 +6889,24 @@ class LibraryPanel(Widget):
     BINDINGS = [
         Binding("s", "request_status", "Set status",
                 show=False, priority=False),
+        Binding("h", "request_history", "View history",
+                show=False, priority=False),
     ]
+
+    def action_request_history(self) -> None:
+        """Open the construction-history viewer for the cursor row.
+        No-op in collections view + when the cursor is empty.
+        Imported CommercialSaaS plasmids carry a `history_xml` field on
+        their library entry; SpliceCraft-built constructions get one
+        attached at Save time. Entries without history surface a
+        gentle "no history" notify rather than a blank modal."""
+        if self._view_mode != "plasmids":
+            return
+        try:
+            t = self.query_one("#lib-table", DataTable)
+        except NoMatches:
+            return
+        self.post_message(self.HistoryRequested(_cursor_row_key(t)))
 
     def action_request_status(self) -> None:
         """Posted up to the app, which opens `PlasmidStatusPickerModal`
@@ -5284,6 +6944,16 @@ class LibraryPanel(Widget):
         library key of the cursor row, or None if the cursor isn't
         on a row yet — the app handler turns the latter into a
         gentle "highlight a row first" notification."""
+        def __init__(self, entry_id: "str | None"):
+            self.entry_id = entry_id
+            super().__init__()
+
+    class HistoryRequested(Message):
+        """User pressed `h` on a library row — open the construction-
+        history viewer. entry_id is the cursor row's library key
+        (or None if the cursor wasn't on a row); the app handler
+        loads the entry, parses its `history_xml` if present, and
+        pushes `HistoryViewerModal`."""
         def __init__(self, entry_id: "str | None"):
             self.entry_id = entry_id
             super().__init__()
@@ -7409,15 +9079,6 @@ class SequencePanel(Widget):
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
-    def _annot_feats_sorted(self) -> list:
-        if self._sorted_feats_cache is None:
-            n = len(self._seq)
-            self._sorted_feats_cache = sorted(
-                [f for f in self._feats if f.get("type") not in ("site", "recut")],
-                key=lambda f: -_feat_len(f["start"], f["end"], n),
-            )
-        return self._sorted_feats_cache
-
     def _bp_to_content_row(self, bp: int) -> int:
         """Return the content row index (0-based) of the DNA line containing bp.
 
@@ -7452,14 +9113,6 @@ class SequencePanel(Widget):
         n = len(self._seq)
         num_w = len(str(n)) if n else 1
         return max(20, self._seq_render_width() - (num_w + 2))
-
-    def _scroll_to_row(self, row: int) -> None:
-        try:
-            self.query_one("#seq-scroll", ScrollableContainer).scroll_to(
-                0, row, animate=False
-            )
-        except NoMatches:
-            pass
 
     def center_on_bp(self, bp: int) -> None:
         """Scroll the sequence panel so `bp` lands at the vertical centre of
@@ -8143,6 +9796,153 @@ def _load_whats_new_body(current_version: str) -> str:
     return body
 
 
+class HistoryViewerModal(ModalScreen):
+    """Construction-history viewer for a library plasmid.
+
+    Renders the parsed `<HistoryTree>` from
+    `_parse_commercialsaas_history` into a Textual Tree widget — each
+    history step is one tree node, expandable to show its parent
+    fragments. Used by the LibraryPanel's `h` key binding; the App
+    handler builds the tree object and pushes this modal.
+
+    The display is read-only — modifying history is the
+    responsibility of the construction action that produced it
+    (Traditional cloning Save, future: Mutagenesis, Gibson, etc.).
+    Closing returns to the library panel; the tree is rebuilt
+    fresh each open so library edits in another window are
+    reflected on the next view.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+        Binding("q",      "dismiss", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    HistoryViewerModal { align: center middle; }
+    #hist-box {
+        width: 110; height: 36;
+        background: $surface; border: solid $accent;
+        padding: 1 2;
+    }
+    #hist-title {
+        background: $accent-darken-2; padding: 0 1; margin-bottom: 1;
+    }
+    #hist-tree { height: 1fr; }
+    #hist-detail {
+        height: 8; border: solid $primary-darken-2;
+        padding: 0 1; margin-top: 1; overflow-y: auto;
+    }
+    #hist-detail Static { padding: 0 1; }
+    #hist-btns { height: 3; align: right middle; margin-top: 1; }
+    #hist-btns Button { min-width: 10; }
+    """
+
+    def __init__(self, title: str,
+                  root_node: "_CommercialSaaSHistoryNode") -> None:
+        super().__init__()
+        self._title = title
+        self._root_node = root_node
+        # Map Textual tree-node-id → CommercialSaaS history node, populated
+        # in `on_mount`. Lets the Selected handler look up the
+        # backing history node without re-parsing the XML.
+        self._node_by_id: "dict[int, _CommercialSaaSHistoryNode]" = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="hist-box"):
+            yield Static(f" Construction history — {self._title} ",
+                          id="hist-title")
+            yield Tree("History", id="hist-tree")
+            with Vertical(id="hist-detail"):
+                yield Static(
+                    "[dim]Pick a node to see its details.[/]",
+                    id="hist-detail-text", markup=True,
+                )
+            with Horizontal(id="hist-btns"):
+                yield Button("Close", id="btn-hist-close")
+
+    def on_mount(self) -> None:
+        tree = self.query_one("#hist-tree", Tree)
+        tree.show_root = False
+        tree.guide_depth = 4
+        # Walk the CommercialSaaS history tree and populate the Textual
+        # tree. The root CommercialSaaS node = the result plasmid (the
+        # current library entry).
+        def _add(parent_tree_node, hist_node: "_CommercialSaaSHistoryNode"):
+            label = self._tree_label_for(hist_node)
+            child = parent_tree_node.add(label, expand=True)
+            self._node_by_id[child.id] = hist_node
+            for parent in hist_node.parents:
+                _add(child, parent)
+        _add(tree.root, self._root_node)
+        # Auto-select the root so the detail pane has something
+        # interesting on open.
+        try:
+            top = tree.root.children[0]
+            tree.select_node(top)
+        except (IndexError, Exception):
+            pass
+
+    @staticmethod
+    def _tree_label_for(node: "_CommercialSaaSHistoryNode") -> str:
+        """One-line tree label: name · size · operation · circular flag.
+        Kept compact so a deep tree still fits the column width."""
+        topo = "circular" if node.circular else "linear"
+        return (f"{node.name}  ·  {node.seq_len:,} bp  ·  "
+                 f"{topo}  ·  {node.operation}")
+
+    @on(Button.Pressed, "#btn-hist-close")
+    def _on_close(self, _: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_dismiss(self) -> None:
+        self.dismiss(None)
+
+    @on(Tree.NodeSelected, "#hist-tree")
+    def _on_node_selected(self, event) -> None:
+        """When the user picks a node, render its full details (all
+        attributes + regenerated sites + input summaries) into the
+        bottom detail panel. Falls back gracefully if the lookup
+        fails — defence-in-depth against the dict going stale."""
+        hist = self._node_by_id.get(event.node.id)
+        if hist is None:
+            return
+        try:
+            detail = self.query_one("#hist-detail-text", Static)
+        except NoMatches:
+            return
+        lines: list[str] = []
+        lines.append(f"[b]{hist.name}[/]")
+        lines.append(
+            f"  {hist.seq_len:,} bp  ·  "
+            f"{'circular' if hist.circular else 'linear'}  ·  "
+            f"strandedness: "
+            f"{hist.element.get('strandedness', '?')}  ·  "
+            f"ID: {hist.node_id}"
+        )
+        lines.append(f"  operation: [cyan]{hist.operation}[/]")
+        if hist.resurrectable:
+            lines.append("  [green]✓ resurrectable[/] (parent fragment "
+                          "can be re-extracted from history)")
+        sites = hist.regenerated_sites
+        if sites:
+            joined = ", ".join(
+                f"{s['name']}@{s['pos']}" for s in sites
+            )
+            lines.append(f"  regenerated sites: {joined}")
+        for sm in hist.input_summaries:
+            lines.append(
+                f"  input: {sm['manipulation']}  "
+                f"({sm['name1']}↔{sm['name2']})"
+            )
+        if hist.parents:
+            lines.append(f"  parents: {len(hist.parents)} "
+                          f"({', '.join(p.name for p in hist.parents)})")
+        else:
+            lines.append("  [dim](leaf — no recorded parents)[/]")
+        detail.update("\n".join(lines))
+
+
 class WhatsNewModal(ModalScreen):
     """Per-release "What's New" dialog.
 
@@ -8556,6 +10356,100 @@ class OpenFileModal(ModalScreen):
 
 
 # ── Export-GenBank modal ───────────────────────────────────────────────────────
+
+class ExportCommercialSaaSModal(ModalScreen):
+    """Prompt for a target path, write the current record as CommercialSaaS
+    `.dna` by splicing the entry's `history_xml` into its saved
+    sidecar bytes (Phase 4d).
+
+    On submit dismisses with ``{"path": str}`` on success or None on
+    cancel. The caller shows the success toast. Errors render
+    inline in the modal so the user can fix the path without
+    re-opening.
+
+    Requires the library entry to have a sidecar (i.e., to have
+    been imported from a CommercialSaaS `.dna` file in the first place).
+    The host action method handles "no sidecar" before pushing
+    this modal.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, entry: dict, default_path: str = "") -> None:
+        super().__init__()
+        self._entry = entry
+        self._default_path = default_path
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="export-box"):
+            yield Static(" Export as .dna ", id="export-title")
+            name = self._entry.get("name") or self._entry.get("id") or "?"
+            bp = self._entry.get("size", 0)
+            has_history = bool(self._entry.get("history_xml"))
+            hist_label = (" + history" if has_history
+                          else " (no construction history)")
+            yield Label(f"[{name}]  {bp} bp{hist_label}")
+            yield Label("Output path (.dna):")
+            yield Input(value=self._default_path,
+                          placeholder="/path/to/plasmid.dna",
+                          id="export-path")
+            with Horizontal(id="export-btns"):
+                yield Button("Export",  id="btn-export", variant="primary")
+                yield Button("Cancel",  id="btn-cancel-export")
+            yield Static("", id="export-status", markup=True)
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#export-path", Input).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-export")
+    def _do_export(self) -> None:
+        try:
+            inp = self.query_one("#export-path", Input)
+            status = self.query_one("#export-status", Static)
+        except NoMatches:
+            return
+        path = inp.value.strip()
+        if not path:
+            status.update("[red]Enter an output path.[/red]")
+            return
+        if not path.lower().endswith(".dna"):
+            path += ".dna"
+        try:
+            written = _export_commercialsaas_dna(self._entry, path)
+        except FileNotFoundError as exc:
+            status.update(
+                f"[red]No .dna sidecar for this plasmid: {exc} "
+                f"Use 'Export as GenBank' instead.[/red]"
+            )
+            return
+        except (OSError, ValueError) as exc:
+            _log.exception("CommercialSaaS export to %s failed", path)
+            status.update(
+                f"[red]Could not write {path!r}: {exc}.[/red]"
+            )
+            return
+        self.dismiss({"path": written})
+
+    @on(Button.Pressed, "#btn-cancel-export")
+    def _cancel_btn(self, _: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Input.Submitted)
+    def _submitted(self) -> None:
+        try:
+            self.query_one("#btn-export", Button).press()
+        except NoMatches:
+            pass
+
 
 class ExportGenBankModal(ModalScreen):
     """Prompt for a target path, write the current record as GenBank.
@@ -9748,13 +11642,19 @@ _parts_bin_cache: "list | None" = None
 def _load_parts_bin() -> list[dict]:
     global _parts_bin_cache
     if _parts_bin_cache is not None:
-        return list(_parts_bin_cache)
+        # Deep-copy on read: parts entries carry nested dicts (qualifiers,
+        # primer pairs, mutation lists). Caller mutations of those nested
+        # objects would otherwise poison the in-memory cache for every
+        # subsequent reader (sacred invariant #17).
+        from copy import deepcopy
+        return deepcopy(_parts_bin_cache)
     entries, warning = _safe_load_json(_PARTS_BIN_FILE, "Parts bin")
     if warning:
         _log.warning(warning)
     entries = [e for e in entries if isinstance(e, dict)]
     _parts_bin_cache = entries
-    return list(_parts_bin_cache)
+    from copy import deepcopy
+    return deepcopy(_parts_bin_cache)
 
 def _save_parts_bin(entries: list[dict]) -> None:
     global _parts_bin_cache
@@ -9778,13 +11678,18 @@ _primers_cache: "list | None" = None
 def _load_primers() -> list[dict]:
     global _primers_cache
     if _primers_cache is not None:
-        return list(_primers_cache)
+        # Deep-copy on read: primer entries carry nested dicts (qualifiers,
+        # binding-region info, per-pair attribute dicts). Caller mutations
+        # of nested objects would poison the cache (sacred invariant #17).
+        from copy import deepcopy
+        return deepcopy(_primers_cache)
     entries, warning = _safe_load_json(_PRIMERS_FILE, "Primer library")
     if warning:
         _log.warning(warning)
     entries = [e for e in entries if isinstance(e, dict)]
     _primers_cache = entries
-    return list(_primers_cache)
+    from copy import deepcopy
+    return deepcopy(_primers_cache)
 
 def _save_primers(entries: list[dict]) -> None:
     global _primers_cache
@@ -10472,6 +12377,14 @@ def _ncbi_prep_term(query: str) -> str:
     return " ".join(tokens)
 
 
+# Response-size caps for upstream fetches: defends against a compromised /
+# misconfigured / man-in-the-middled upstream that streams gigabytes at us.
+# NCBI esearch / esummary XML for a 200-id batch is ~50 KB in practice;
+# 4 MB is wildly generous. Kazusa showcodon HTML is ~30 KB; 1 MB is plenty.
+_NCBI_MAX_RESPONSE_BYTES   = 4 * 1024 * 1024
+_KAZUSA_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+
+
 def _ncbi_taxid_search(query: str, retmax: int = 200,
                       timeout: float = 15.0) -> tuple:
     """Search NCBI taxonomy for candidates matching `query`. Returns
@@ -10494,7 +12407,12 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
         req = urllib.request.Request(f"{base}/esearch.fcgi?{params}",
                                      headers={"User-Agent": "SpliceCraft/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            xml_data = r.read().decode("utf-8", errors="replace")
+            raw = r.read(_NCBI_MAX_RESPONSE_BYTES + 1)
+        if len(raw) > _NCBI_MAX_RESPONSE_BYTES:
+            _log.warning("NCBI esearch response exceeded %d bytes; truncating",
+                          _NCBI_MAX_RESPONSE_BYTES)
+            return [], 0, "NCBI returned an oversized response"
+        xml_data = raw.decode("utf-8", errors="replace")
     except Exception as exc:
         _log.exception("NCBI esearch failed for %r", q)
         return [], 0, f"Network error: {exc}"
@@ -10519,9 +12437,15 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
         req = urllib.request.Request(f"{base}/esummary.fcgi?{sparams}",
                                      headers={"User-Agent": "SpliceCraft/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            sxml = r.read().decode("utf-8", errors="replace")
-        sroot = _safe_xml_parse(sxml)
-        for doc in sroot.findall(".//DocSum"):
+            sraw = r.read(_NCBI_MAX_RESPONSE_BYTES + 1)
+        if len(sraw) > _NCBI_MAX_RESPONSE_BYTES:
+            _log.warning("NCBI esummary response exceeded %d bytes; ignoring",
+                          _NCBI_MAX_RESPONSE_BYTES)
+            sxml = ""
+        else:
+            sxml = sraw.decode("utf-8", errors="replace")
+        sroot = _safe_xml_parse(sxml) if sxml else None
+        for doc in (sroot.findall(".//DocSum") if sroot is not None else []):
             did_el = doc.find("Id")
             if did_el is None or not did_el.text:
                 continue
@@ -10554,7 +12478,12 @@ def _codon_fetch_kazusa(taxid: str, timeout: float = 15.0) -> tuple:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            html = r.read().decode("utf-8", errors="replace")
+            raw = r.read(_KAZUSA_MAX_RESPONSE_BYTES + 1)
+        if len(raw) > _KAZUSA_MAX_RESPONSE_BYTES:
+            _log.warning("Kazusa response exceeded %d bytes; aborting",
+                          _KAZUSA_MAX_RESPONSE_BYTES)
+            return None, "Kazusa returned an oversized response"
+        html = raw.decode("utf-8", errors="replace")
     except Exception as exc:
         _log.exception("Kazusa fetch failed for taxid %s", taxid)
         return None, f"Network error: {exc}"
@@ -13820,24 +15749,6 @@ def _ungapped_extend(
             total_score, total_matches)
 
 
-def _blast_index_kmers(seq: str, k: int) -> "dict[str, list[int]]":
-    """Return ``{kmer: [positions]}`` for every k-mer in ``seq``. Pure
-    forward — caller is responsible for indexing the reverse complement
-    separately if BLASTN dual-strand search is wanted.
-
-    k-mers containing letters outside the canonical alphabet (``N`` for
-    DNA; ``X`` / ``*`` for protein) are still indexed — the k-mer just
-    won't be hit by canonical-only queries. We let the search side
-    decide on a query-time filter (the query usually doesn't contain
-    those characters anyway).
-    """
-    out: dict[str, list[int]] = {}
-    n = len(seq)
-    for i in range(n - k + 1):
-        out.setdefault(seq[i:i + k], []).append(i)
-    return out
-
-
 def _blast_build_db(program: str,
                     collection_names: "list[str] | None" = None,
                     *, six_frame: bool = False) -> dict:
@@ -13971,6 +15882,8 @@ def _blast_build_db_blastp(cols: "list[dict]",
             try:
                 rec = _gb_text_to_record(gb)
             except Exception:
+                _log.debug("BLASTP DB build: skipped malformed entry "
+                           "in collection %r", coll_name)
                 continue
             plasmid_id   = rec.id
             plasmid_name = rec.name or rec.id
@@ -13990,6 +15903,7 @@ def _blast_build_db_blastp(cols: "list[dict]",
                     from Bio.Seq import Seq
                     protein = str(Seq(cds_seq).translate())
                 except Exception:
+                    _log.debug("BLAST BLASTP: translate failed on a CDS")
                     continue
                 if protein.endswith("*"):
                     protein = protein[:-1]
@@ -14017,6 +15931,10 @@ def _blast_build_db_blastp(cols: "list[dict]",
                         try:
                             translated = str(Seq(sub).translate())
                         except Exception:
+                            _log.debug(
+                                "BLASTP six-frame: translate failed "
+                                "frame=%s%d", strand_name, frame + 1,
+                            )
                             continue
                         # Split on stop codons; index each ORF that
                         # passes the length floor.
@@ -17826,11 +19744,6 @@ class AlignmentScreen(Screen):
         for f in self._target_rec.features:
             if f.type == "source":
                 continue
-            try:
-                s = int(f.location.start)
-                e = int(f.location.end)
-            except Exception:
-                continue
             label = ""
             for q in ("label", "gene", "product"):
                 v = f.qualifiers.get(q)
@@ -17839,7 +19752,21 @@ class AlignmentScreen(Screen):
                     break
             if not label:
                 label = f.type
-            feats.append((s, e, label, e - s))
+            # Wrap-feature aware: a CompoundLocation feature (origin-spanning
+            # CDS, etc.) has multiple `.parts`. Iterate them so each part
+            # annotates its own arc — flattening via `int(loc.start)` /
+            # `int(loc.end)` would draw the label across the wrong arc on
+            # wrap features. (Sacred invariant #9.)
+            try:
+                parts = getattr(f.location, "parts", None) or [f.location]
+                for part in parts:
+                    s = int(part.start)
+                    e = int(part.end)
+                    if e <= s:
+                        continue
+                    feats.append((s, e, label, e - s))
+            except (AttributeError, TypeError):
+                continue
         feats.sort(key=lambda t: (t[3], t[0]))
         for s, e, label, _ in feats:
             for i in range(s, min(e, len(feat_at_bp))):
@@ -18792,6 +20719,783 @@ class DomesticatorModal(ModalScreen):
         self.dismiss(None)
 
 
+class TraditionalCloningPane(Vertical):
+    """Body of the Constructor's "Traditional" tab.
+
+    Workflow: pick an insert source (one of three modes), pick a
+    destination vector, pick one or two enzymes, click Simulate.
+    The simulator (module-level `_simulate_traditional_cloning`)
+    returns both possible orientations of the ligated product; the
+    pane renders both with feature counts + warnings, and exposes a
+    "Save to library" button per orientation.
+
+    Insert-source modes:
+        plasmid  — digest a library plasmid with the chosen enzymes;
+                   the smaller resulting fragment is taken as the
+                   insert (skip if both fragments are similar size —
+                   user should re-pick).
+        feature  — pick a plasmid + feature; the feature's bases get
+                   stamped with canonical sticky ends from the chosen
+                   enzymes (PCR-with-tails model).
+        pcr      — pasted DNA gets the same canonical-overhang
+                   treatment.
+    """
+
+    DEFAULT_CSS = ""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._mode: str = "plasmid"
+        self._fwd_product: "dict | None" = None
+        self._rev_product: "dict | None" = None
+        # Cache parsed library entries so we don't re-parse the GenBank
+        # text on every dropdown rebuild. Key: entry_id → SeqRecord.
+        self._record_cache: "dict[str, object]" = {}
+
+    # ── Compose ───────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        # Insert-source mode picker
+        with Horizontal(id="trad-mode-row"):
+            yield Static("Insert source:", id="trad-mode-label")
+            yield RadioSet(
+                RadioButton("From plasmid",   value=True,
+                              id="trad-mode-plasmid"),
+                RadioButton("From feature",   id="trad-mode-feature"),
+                RadioButton("PCR product",    id="trad-mode-pcr"),
+                id="trad-mode-set",
+            )
+        # Mode-specific source picker host
+        with Vertical(id="trad-source-host"):
+            yield Static(" Insert plasmid (digest with chosen enzymes) ",
+                          id="trad-source-hdr")
+            yield DataTable(id="trad-source-table",
+                              cursor_type="row", zebra_stripes=True)
+            with Horizontal(id="trad-feature-row"):
+                yield Static("Feature:", classes="trad-inline-label")
+                yield Select([("(pick a plasmid first)", "")],
+                              id="trad-feature-select", allow_blank=True,
+                              prompt="Feature")
+            with Vertical(id="trad-pcr-rows"):
+                yield Input(placeholder="PCR product name (e.g., myFragment)",
+                              id="trad-pcr-name")
+                yield TextArea(id="trad-pcr-seq")
+        # Vector picker
+        with Vertical(id="trad-vector-row"):
+            yield Static(" Destination vector (digested with same enzymes) ",
+                          id="trad-vector-hdr")
+            yield DataTable(id="trad-vector-table",
+                              cursor_type="row", zebra_stripes=True)
+        # Enzyme picker
+        with Horizontal(id="trad-enzyme-row"):
+            yield Static("Enzymes:", id="trad-enzyme-label")
+            opts = [(name, name) for name in sorted(_NEB_ENZYMES.keys())]
+            yield Select(opts, id="trad-enzyme-1", prompt="E1",
+                          allow_blank=False, value=opts[0][1])
+            yield Select([("(single digest)", "")] + opts,
+                          id="trad-enzyme-2", prompt="E2 (optional)",
+                          allow_blank=True)
+        # Action row
+        with Horizontal(id="trad-action-row"):
+            yield Button("Simulate", id="btn-trad-simulate",
+                          variant="primary")
+            yield Button("Clear",    id="btn-trad-clear")
+        # Results pane + Save buttons (disabled until a simulate runs).
+        with Vertical(id="trad-results"):
+            yield Static(
+                "[dim]Results appear here after Simulate.[/]",
+                id="trad-results-text", markup=True,
+            )
+            with Horizontal(id="trad-save-row"):
+                yield Button("Save Forward", id="btn-trad-save-fwd",
+                              variant="primary", disabled=True)
+                yield Button("Save Reverse", id="btn-trad-save-rev",
+                              variant="primary", disabled=True)
+
+    # ── Mount ─────────────────────────────────────────────────────────────────
+
+    def on_mount(self) -> None:
+        # Hide / show mode-specific widgets based on the default mode.
+        self._populate_library_tables()
+        self._apply_mode_visibility()
+
+    def _populate_library_tables(self) -> None:
+        """Fill both DataTables with the user's library entries.
+
+        Each row gets the entry's display name + size (bp). The hidden
+        column 0 carries the entry id so we can fetch it back without
+        a name-lookup race. Library is loaded fresh each call so a
+        plasmid added since the modal opened shows up after a Refresh
+        (no auto-watch — too noisy)."""
+        entries = _load_library()
+        for table_id in ("#trad-source-table", "#trad-vector-table"):
+            try:
+                t = self.query_one(table_id, DataTable)
+            except NoMatches:
+                continue
+            t.clear(columns=True)
+            t.add_columns("Name", "Size (bp)")
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                name = str(e.get("name") or e.get("id") or "")[:60]
+                gb_text = e.get("gb_text") or ""
+                size = (e.get("size")
+                        or len(gb_text)  # rough fallback
+                        or 0)
+                t.add_row(Text(name), str(size))
+
+    def _apply_mode_visibility(self) -> None:
+        """Show/hide source-picker widgets depending on the mode.
+
+        plasmid: source DataTable visible; feature row + pcr inputs hidden.
+        feature: source DataTable AND feature select visible; pcr hidden.
+        pcr:     pcr name + sequence visible; everything else hidden."""
+        try:
+            src_table = self.query_one("#trad-source-table", DataTable)
+            feat_row  = self.query_one("#trad-feature-row", Horizontal)
+            pcr_rows  = self.query_one("#trad-pcr-rows",   Vertical)
+        except NoMatches:
+            return
+        src_table.display = self._mode in ("plasmid", "feature")
+        feat_row.display  = (self._mode == "feature")
+        pcr_rows.display  = (self._mode == "pcr")
+
+    # ── Mode picker ──────────────────────────────────────────────────────────
+
+    @on(RadioSet.Changed, "#trad-mode-set")
+    def _on_mode_changed(self, event: RadioSet.Changed) -> None:
+        rb = event.pressed
+        if rb is None:
+            return
+        rb_id = rb.id or ""
+        if   rb_id.endswith("plasmid"):  self._mode = "plasmid"
+        elif rb_id.endswith("feature"):  self._mode = "feature"
+        elif rb_id.endswith("pcr"):      self._mode = "pcr"
+        self._apply_mode_visibility()
+        self._invalidate_results()
+
+    # Any change to the enzyme dropdowns or the source / vector
+    # selection invalidates the cached simulation result — otherwise
+    # the Save buttons would still be enabled and could persist a
+    # stale product to the library after the user has obviously
+    # moved on. Re-Simulate is required after any input change.
+    @on(Select.Changed, "#trad-enzyme-1")
+    @on(Select.Changed, "#trad-enzyme-2")
+    def _on_enzyme_changed(self, _: Select.Changed) -> None:
+        self._invalidate_results()
+
+    @on(DataTable.RowSelected, "#trad-vector-table")
+    def _on_vector_selected(self, _: DataTable.RowSelected) -> None:
+        self._invalidate_results()
+
+    @on(Input.Changed, "#trad-pcr-name")
+    def _on_pcr_name_changed(self, _: Input.Changed) -> None:
+        self._invalidate_results()
+
+    @on(DataTable.RowSelected, "#trad-source-table")
+    def _on_source_selected(self, event: DataTable.RowSelected) -> None:
+        # Any source change invalidates a cached simulation regardless
+        # of mode (the simulation uses whatever record was active at
+        # Simulate time).
+        self._invalidate_results()
+        if self._mode != "feature":
+            return
+        # Populate the feature dropdown with this plasmid's features.
+        rec = self._record_for_table_row(event.cursor_row,
+                                            "#trad-source-table")
+        if rec is None:
+            return
+        feat_select = self.query_one("#trad-feature-select", Select)
+        opts: list[tuple[str, str]] = []
+        idx = 0
+        for f in rec.features:
+            if f.type == "source":
+                continue
+            label = ((f.qualifiers.get("label") or [""])[0]
+                       or f.type or "(unnamed)")
+            try:
+                s = int(f.location.start)
+                e = int(f.location.end)
+            except (TypeError, ValueError):
+                continue
+            opts.append((f"{label}  ({f.type}, {s}..{e})", str(idx)))
+            idx += 1
+        if not opts:
+            opts = [("(no annotated features)", "")]
+        feat_select.set_options(opts)
+
+    def _invalidate_results(self) -> None:
+        """Drop the cached simulation product and re-disable Save
+        buttons so the user can't persist a stale result after
+        changing inputs. Idempotent — safe to call multiple times."""
+        self._fwd_product = None
+        self._rev_product = None
+        for bid in ("#btn-trad-save-fwd", "#btn-trad-save-rev"):
+            try:
+                self.query_one(bid, Button).disabled = True
+            except NoMatches:
+                pass
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _record_for_table_row(self, row_idx: int,
+                                 table_id: str) -> "object | None":
+        """Look up the SeqRecord for the entry at row `row_idx` of
+        the named DataTable. Returns None on lookup failure."""
+        try:
+            t = self.query_one(table_id, DataTable)
+        except NoMatches:
+            return None
+        if row_idx < 0:
+            return None
+        # Re-load library to keep indexing aligned with display order.
+        entries = [e for e in _load_library() if isinstance(e, dict)]
+        if row_idx >= len(entries):
+            return None
+        entry = entries[row_idx]
+        eid = str(entry.get("id") or entry.get("name") or "")
+        if eid in self._record_cache:
+            return self._record_cache[eid]
+        gb = entry.get("gb_text") or ""
+        if not gb:
+            return None
+        try:
+            rec = _gb_text_to_record(gb)
+        except Exception:
+            _log.exception("trad-cloning: parse failed for entry %r", eid)
+            return None
+        self._record_cache[eid] = rec
+        return rec
+
+    def _selected_enzymes(self) -> list[str]:
+        try:
+            e1 = str(self.query_one("#trad-enzyme-1", Select).value or "")
+        except (NoMatches, AttributeError):
+            e1 = ""
+        try:
+            e2_raw = self.query_one("#trad-enzyme-2", Select).value
+            e2 = str(e2_raw or "") if e2_raw is not Select.BLANK else ""
+        except (NoMatches, AttributeError):
+            e2 = ""
+        out: list[str] = []
+        if e1 and e1 in _NEB_ENZYMES:
+            out.append(e1)
+        if e2 and e2 != e1 and e2 in _NEB_ENZYMES:
+            out.append(e2)
+        return out
+
+    # ── Simulate ─────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-trad-simulate")
+    def _on_simulate(self, _: Button.Pressed) -> None:
+        try:
+            results = self.query_one("#trad-results-text", Static)
+        except NoMatches:
+            return
+        enzymes = self._selected_enzymes()
+        if not enzymes:
+            results.update("[red]Pick at least one enzyme.[/]")
+            return
+        insert_frag = self._build_insert_fragment(enzymes, results)
+        if insert_frag is None:
+            return  # error already surfaced
+        vector_frag = self._build_vector_fragment(enzymes, results)
+        if vector_frag is None:
+            return
+        outcome = _simulate_traditional_cloning(insert_frag, vector_frag)
+        self._fwd_product = outcome["forward"]
+        self._rev_product = outcome["reverse"]
+        self._render_results(outcome, results)
+
+    def _build_insert_fragment(self, enzymes: list[str],
+                                results: "Static") -> "dict | None":
+        if self._mode == "plasmid":
+            return self._build_insert_from_plasmid(enzymes, results)
+        if self._mode == "feature":
+            return self._build_insert_from_feature(enzymes, results)
+        if self._mode == "pcr":
+            return self._build_insert_from_pcr(enzymes, results)
+        results.update(f"[red]Unknown insert mode: {self._mode!r}[/]")
+        return None
+
+    def _build_insert_from_plasmid(self, enzymes: list[str],
+                                      results: "Static") -> "dict | None":
+        try:
+            t = self.query_one("#trad-source-table", DataTable)
+        except NoMatches:
+            return None
+        rec = self._record_for_table_row(t.cursor_row, "#trad-source-table")
+        if rec is None:
+            results.update("[red]Pick an insert plasmid first.[/]")
+            return None
+        seq = str(rec.seq).upper()
+        circular = (rec.annotations or {}).get("topology", "") == "circular"
+        feats = self._record_features(rec)
+        frags, err = _excise_fragment_pair(
+            seq, enzymes, circular=circular, features=feats,
+            source_label=str(rec.name or rec.id or "insert"),
+        )
+        if err is not None:
+            results.update(f"[red]{err['error']}[/]")
+            return None
+        if len(frags) != 2:
+            results.update(
+                f"[red]Need exactly 2 fragments after digest "
+                f"(got {len(frags)}). Pick different enzymes.[/]"
+            )
+            return None
+        # Default: smaller fragment is the insert.
+        insert = min(frags, key=lambda f: len(f["top_seq"]))
+        return insert
+
+    def _build_insert_from_feature(self, enzymes: list[str],
+                                      results: "Static") -> "dict | None":
+        if len(enzymes) < 1:
+            results.update("[red]Need at least one enzyme.[/]")
+            return None
+        try:
+            t = self.query_one("#trad-source-table", DataTable)
+            sel = self.query_one("#trad-feature-select", Select)
+        except NoMatches:
+            return None
+        rec = self._record_for_table_row(t.cursor_row, "#trad-source-table")
+        if rec is None:
+            results.update("[red]Pick a plasmid first.[/]")
+            return None
+        if sel.value is Select.BLANK or not sel.value:
+            results.update("[red]Pick a feature.[/]")
+            return None
+        try:
+            feat_idx = int(str(sel.value))
+        except ValueError:
+            results.update("[red]Bad feature selection.[/]")
+            return None
+        feats_iter = [f for f in rec.features if f.type != "source"]
+        if not (0 <= feat_idx < len(feats_iter)):
+            results.update("[red]Selected feature out of range.[/]")
+            return None
+        feat = feats_iter[feat_idx]
+        try:
+            s = int(feat.location.start)
+            e = int(feat.location.end)
+        except (TypeError, ValueError):
+            results.update("[red]Feature has unparseable coordinates.[/]")
+            return None
+        seq = str(rec.seq)
+        feat_seq = seq[s:e] if e > s else (seq[s:] + seq[:e])
+        if not feat_seq:
+            results.update("[red]Feature has zero length.[/]")
+            return None
+        enz_left  = enzymes[0]
+        enz_right = enzymes[1] if len(enzymes) > 1 else enzymes[0]
+        try:
+            return _make_synthetic_fragment(
+                feat_seq, enz_left=enz_left, enz_right=enz_right,
+                source_label=(feat.qualifiers.get("label") or ["feature"])[0],
+            )
+        except ValueError as exc:
+            results.update(f"[red]{exc}[/]")
+            return None
+
+    def _build_insert_from_pcr(self, enzymes: list[str],
+                                 results: "Static") -> "dict | None":
+        if len(enzymes) < 1:
+            results.update("[red]Need at least one enzyme.[/]")
+            return None
+        try:
+            name_in = self.query_one("#trad-pcr-name", Input).value.strip()
+            seq_ta = self.query_one("#trad-pcr-seq", TextArea)
+        except NoMatches:
+            return None
+        raw = (seq_ta.text or "").strip()
+        # Strip whitespace + non-DNA chars; uppercase.
+        cleaned = "".join(ch for ch in raw.upper()
+                            if ch in "ACGTRYWSMKBDHVN")
+        if not cleaned:
+            results.update(
+                "[red]Paste DNA bases (ACGT/IUPAC) into the sequence box.[/]"
+            )
+            return None
+        if not name_in:
+            name_in = "PCR-product"
+        enz_left  = enzymes[0]
+        enz_right = enzymes[1] if len(enzymes) > 1 else enzymes[0]
+        try:
+            return _make_synthetic_fragment(
+                cleaned, enz_left=enz_left, enz_right=enz_right,
+                source_label=name_in,
+            )
+        except ValueError as exc:
+            results.update(f"[red]{exc}[/]")
+            return None
+
+    def _build_vector_fragment(self, enzymes: list[str],
+                                  results: "Static") -> "dict | None":
+        try:
+            t = self.query_one("#trad-vector-table", DataTable)
+        except NoMatches:
+            return None
+        rec = self._record_for_table_row(t.cursor_row, "#trad-vector-table")
+        if rec is None:
+            results.update("[red]Pick a destination vector.[/]")
+            return None
+        seq = str(rec.seq).upper()
+        circular = (rec.annotations or {}).get("topology", "") == "circular"
+        feats = self._record_features(rec)
+        frags, err = _excise_fragment_pair(
+            seq, enzymes, circular=circular, features=feats,
+            source_label=str(rec.name or rec.id or "vector"),
+        )
+        if err is not None:
+            results.update(f"[red]{err['error']} (vector)[/]")
+            return None
+        if len(frags) != 2:
+            results.update(
+                f"[red]Vector digest produced {len(frags)} fragments — "
+                f"need exactly 2.[/]"
+            )
+            return None
+        # Default: vector is the LARGER fragment (the backbone with
+        # selection markers). User can override post-hoc.
+        return max(frags, key=lambda f: len(f["top_seq"]))
+
+    def _record_features(self, rec) -> list[dict]:
+        """Convert a SeqRecord's features to the simple-dict shape the
+        engine consumes. Skips `source`."""
+        out: list[dict] = []
+        for f in rec.features:
+            if f.type == "source":
+                continue
+            try:
+                s = int(f.location.start)
+                e = int(f.location.end)
+            except (TypeError, ValueError):
+                continue
+            label = (f.qualifiers.get("label")
+                      or f.qualifiers.get("product")
+                      or [f.type])[0]
+            out.append({
+                "start":  s,
+                "end":    e,
+                "strand": f.location.strand or 1,
+                "type":   f.type,
+                "label":  str(label)[:200],
+            })
+        return out
+
+    # ── Render ───────────────────────────────────────────────────────────────
+
+    def _render_results(self, outcome: dict, results: "Static") -> None:
+        fwd = outcome["forward"]
+        rev = outcome["reverse"]
+        lines: list[str] = []
+        lines.append("[b]Forward orientation[/]")
+        lines.append(self._product_summary(fwd))
+        lines.append("")
+        lines.append("[b]Reverse orientation[/]")
+        lines.append(self._product_summary(rev))
+        if outcome["warnings"]:
+            lines.append("")
+            for w in outcome["warnings"]:
+                lines.append(f"[yellow]⚠ {w}[/]")
+        if outcome["errors"]:
+            lines.append("")
+            for e in outcome["errors"]:
+                lines.append(f"[red]✗ {e}[/]")
+        results.update("\n".join(lines))
+        # Enable Save buttons only for orientations that actually
+        # ligate. Save can still be useful on a non-compatible
+        # orientation for reference, but the more conservative default
+        # is to require chemistry-valid products.
+        try:
+            self.query_one("#btn-trad-save-fwd", Button).disabled = (
+                not fwd.get("compatible", False))
+            self.query_one("#btn-trad-save-rev", Button).disabled = (
+                not rev.get("compatible", False))
+        except NoMatches:
+            pass
+
+    @staticmethod
+    def _product_summary(p: dict) -> str:
+        compat = p.get("compatible", False)
+        seq    = p.get("top_seq", "")
+        feats  = p.get("features", [])
+        marker = "[green]✓ ligates[/]" if compat else "[red]✗ no ligation[/]"
+        return (f"  {marker}  ·  {len(seq):,} bp  ·  "
+                 f"{len(feats)} feature(s)")
+
+    # ── Clear ────────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-trad-clear")
+    def _on_clear(self, _: Button.Pressed) -> None:
+        self._fwd_product = None
+        self._rev_product = None
+        try:
+            results = self.query_one("#trad-results-text", Static)
+            results.update("[dim]Results appear here after Simulate.[/]")
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#trad-pcr-name", Input).value = ""
+            self.query_one("#trad-pcr-seq",  TextArea).text = ""
+        except NoMatches:
+            pass
+        # Disable both Save buttons — nothing to save.
+        for bid in ("#btn-trad-save-fwd", "#btn-trad-save-rev"):
+            try:
+                self.query_one(bid, Button).disabled = True
+            except NoMatches:
+                pass
+
+    # ── Save to library ──────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-trad-save-fwd")
+    def _on_save_fwd(self, _: Button.Pressed) -> None:
+        self._save_product_to_library(self._fwd_product, suffix="fwd")
+
+    @on(Button.Pressed, "#btn-trad-save-rev")
+    def _on_save_rev(self, _: Button.Pressed) -> None:
+        self._save_product_to_library(self._rev_product, suffix="rev")
+
+    def _save_product_to_library(self, product: "dict | None", *,
+                                    suffix: str) -> None:
+        """Persist a simulated ligation product as a new library entry.
+
+        Builds a SeqRecord with the product's top strand and features,
+        then writes through `_save_library`. The caller (Save Forward
+        / Save Reverse button) is responsible for guaranteeing
+        `product` is non-None — buttons are disabled until simulate
+        succeeds.
+
+        Auto-names the entry "trad-{suffix}-{base}-{n}" where `base` is
+        derived from the source/vector labels and `n` is incremented to
+        avoid collisions with existing library names. The user can
+        rename later via the standard library-rename flow."""
+        if product is None or not product.get("top_seq"):
+            return
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from datetime import date as _date_mod
+        # Auto-name. Library `_save_library` doesn't enforce uniqueness
+        # (per-entry name is just a label), but a unique name avoids UI
+        # confusion. Append a counter if needed.
+        base = f"trad-{suffix}"
+        existing = {e.get("name") for e in _load_library()
+                     if isinstance(e, dict)}
+        name = base
+        n = 1
+        while name in existing:
+            n += 1
+            name = f"{base}-{n}"
+        rec = SeqRecord(
+            Seq(product["top_seq"]),
+            id=name, name=name,
+            description=f"Traditional cloning {suffix} product "
+                          f"(simulated {_date_mod.today().isoformat()})",
+            annotations={"molecule_type": "DNA",
+                          "topology":      "circular"},
+        )
+        for f in product["features"]:
+            try:
+                s = int(f.get("start", 0))
+                e = int(f.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            if e <= s or e > len(product["top_seq"]):
+                continue
+            strand = int(f.get("strand", 1) or 0) or 1
+            qualifiers = {
+                "label": [str(f.get("label") or f.get("type") or "feat")],
+            }
+            rec.features.append(SeqFeature(
+                FeatureLocation(s, e, strand=strand),
+                type=str(f.get("type", "misc_feature")),
+                qualifiers=qualifiers,
+            ))
+        # Serialize to GenBank text + persist.
+        import io as _io
+        from Bio import SeqIO as _SeqIO
+        buf = _io.StringIO()
+        try:
+            _SeqIO.write(rec, buf, "genbank")
+        except Exception as exc:
+            self.app.notify(f"Failed to save: {exc}",
+                              severity="error", timeout=8)
+            _log.exception("trad-cloning save failed")
+            return
+        entry = {
+            "id":      name,
+            "name":    name,
+            "size":    len(rec.seq),
+            "gb_text": buf.getvalue(),
+        }
+        # Construction-history auto-record (Phase 4b). Build a
+        # CommercialSaaS-shape <HistoryTree> documenting the cloning step
+        # and attach it to the new library entry. Parent fragments
+        # carry their own history if they had one (imported from
+        # CommercialSaaS), so the result inherits the full lineage.
+        try:
+            history_xml = self._build_history_for_product(
+                name=name, product_seq_len=len(rec.seq),
+                suffix=suffix,
+            )
+            if history_xml:
+                entry["history_xml"] = history_xml
+        except Exception:
+            # History recording is best-effort — never block the save.
+            _log.exception("trad-cloning: failed to record history "
+                              "for %s", name)
+        entries = _load_library()
+        entries.append(entry)
+        _save_library(entries)
+        self.app.notify(
+            f"Saved {name} ({len(rec.seq):,} bp) to library.",
+            timeout=6,
+        )
+        # Refresh the source/vector tables so the new entry is visible
+        # without re-opening the modal.
+        self._populate_library_tables()
+        # Disable both Save buttons + drop the cached products so
+        # accidentally clicking Save again doesn't create
+        # `trad-fwd-2`, `trad-fwd-3`, ... duplicates of the same
+        # product. The user can re-Simulate to save again with a
+        # fresh increment.
+        self._invalidate_results()
+
+    # ── Construction history recording (Phase 4b) ───────────────────────────
+
+    def _build_history_for_product(self, *, name: str,
+                                       product_seq_len: int,
+                                       suffix: str) -> "str | None":
+        """Build a `<HistoryTree>` XML for a freshly-saved Traditional
+        cloning product. Returns None if we don't have enough info
+        to record (no enzymes, no source/vector picked, etc.) — the
+        save still proceeds, just without history.
+
+        Schema follows CommercialSaaS's: top-level `<Node>` represents the
+        new product, with `operation="insertFragment"` (the closest
+        CommercialSaaS equivalent for restriction-digest ligation). Parent
+        nodes hang off the result — when an insert/vector library
+        entry already had a `history_xml`, its full subtree is
+        nested in so the lineage is preserved across multi-step
+        builds.
+
+        Reverse-orientation products (`suffix="rev"`) get a
+        `<RegeneratedSite name="(reverse insert)" pos="0"/>` marker
+        in the InputSummary so a downstream reader knows the insert
+        was flipped — CommercialSaaS's own format doesn't have a clean
+        "reverse-orientation" flag, so we cheat with a sentinel."""
+        enzymes = self._selected_enzymes()
+        if not enzymes:
+            return None
+        try:
+            insert_entry, vector_entry = self._current_source_entries()
+        except (LookupError, NoMatches):
+            return None
+
+        root = _CommercialSaaSHistoryNode.new(
+            name=name + ".dna",   # CommercialSaaS's convention: history
+                                    # node names carry the .dna suffix
+            seq_len=product_seq_len,
+            circular=True,
+            operation="insertFragment",
+            node_id=0,
+        )
+        # Mark the regenerated cut sites — the enzymes preserved
+        # in the ligation product. CommercialSaaS uses these to highlight
+        # post-cut sites in the history view.
+        for i, ename in enumerate(enzymes):
+            # Pos defaults to 0 — we don't track exact positions in
+            # the simulator yet; CommercialSaaS tolerates 0 here and the
+            # site is still listed in the history view.
+            root.add_regenerated_site(ename, pos=0, site_count=1)
+        # Input summary: which cut joined what.
+        if len(enzymes) >= 2:
+            root.add_input_summary(
+                manipulation=("ligateRev" if suffix == "rev"
+                                else "ligateFwd"),
+                name1=enzymes[0], name2=enzymes[1],
+            )
+        else:
+            root.add_input_summary(
+                manipulation=("ligateRev" if suffix == "rev"
+                                else "ligateFwd"),
+                name1=enzymes[0], name2=enzymes[0],
+            )
+        # Attach parents — preserving any pre-existing history.
+        for pe in (insert_entry, vector_entry):
+            parent_node = self._parent_node_for_entry(pe)
+            if parent_node is not None:
+                root.add_parent(parent_node)
+        return _serialize_commercialsaas_history(root)
+
+    def _current_source_entries(self) -> "tuple[dict, dict]":
+        """Return ``(insert_entry, vector_entry)`` from the library —
+        whichever rows are currently selected in the source / vector
+        DataTables. Raises ``LookupError`` if either pick is empty
+        (which the simulator already catches earlier — this is just
+        defence-in-depth for the history path)."""
+        try:
+            src_table = self.query_one("#trad-source-table", DataTable)
+            vec_table = self.query_one("#trad-vector-table", DataTable)
+        except NoMatches:
+            raise LookupError("source/vector tables not available")
+        entries = [e for e in _load_library() if isinstance(e, dict)]
+        # In PCR mode the source table doesn't drive the lookup —
+        # instead the user pasted DNA, so synthesise an insert "entry"
+        # with no history.
+        if self._mode == "pcr":
+            insert_entry = {
+                "name":  (self.query_one("#trad-pcr-name",
+                                            Input).value.strip()
+                          or "PCR-product"),
+                "size":  0,   # filled in by caller if needed
+                "id":    "pcr",
+            }
+        else:
+            si = src_table.cursor_row
+            if si < 0 or si >= len(entries):
+                raise LookupError("no insert source selected")
+            insert_entry = entries[si]
+        vi = vec_table.cursor_row
+        if vi < 0 or vi >= len(entries):
+            raise LookupError("no vector selected")
+        vector_entry = entries[vi]
+        return insert_entry, vector_entry
+
+    @staticmethod
+    def _parent_node_for_entry(entry: "dict | None"
+                                  ) -> "_CommercialSaaSHistoryNode | None":
+        """Build a `_CommercialSaaSHistoryNode` representing a parent
+        fragment in the history. If the entry already carries
+        `history_xml`, parse it and re-use the existing root so the
+        parent's lineage is preserved (multi-generation chain). If
+        not, synthesise a leaf node with the entry's name + size."""
+        if not isinstance(entry, dict):
+            return None
+        existing = entry.get("history_xml")
+        if existing:
+            try:
+                node = _parse_commercialsaas_history(existing)
+                if node is not None:
+                    return node
+            except ValueError:
+                _log.warning("history: parent entry %r has malformed "
+                             "history_xml; using leaf instead",
+                             entry.get("name"))
+        # Leaf node — no further lineage.
+        return _CommercialSaaSHistoryNode.new(
+            name=str(entry.get("name") or entry.get("id") or "?")
+                  + ".dna",
+            seq_len=int(entry.get("size") or 0),
+            circular=True,   # default; user could override
+            operation="insertFragment",
+            node_id=0,
+        )
+
+
 class ConstructorModal(ModalScreen):
     """Golden Braid TU Constructor — assemble L0 parts into a transcription unit."""
 
@@ -18831,57 +21535,71 @@ class ConstructorModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ctor-box"):
-            yield Static(
-                " Constructor  —  Golden Braid TU Assembly ", id="ctor-title"
-            )
-            # Entry-vector banner — pulls the user-configured
-            # destination plasmid for the active grammar (set in
-            # GrammarEditorModal). Provides at-a-glance confirmation
-            # of which vector the assembly will land in. The Change
-            # button jumps directly into the grammar editor's
-            # entry-vector row so users can swap without leaving the
-            # Constructor (Close → Edit grammar → Pick → reopen).
-            with Horizontal(id="ctor-vector-row"):
-                yield Static(self._entry_vector_summary_for_active_grammar(),
-                             id="ctor-vector-info", markup=True)
-                yield Button("Change…", id="btn-ctor-vector-change",
-                             variant="default")
-            with Horizontal(id="ctor-main"):
-                # Left: parts palette
-                with Vertical(id="ctor-palette-col"):
-                    yield Static(" Parts Palette ", id="ctor-palette-hdr")
-                    yield DataTable(
-                        id="ctor-palette", cursor_type="row", zebra_stripes=True
-                    )
-                    yield Button(
-                        "→  Add to Lane", id="btn-ctor-add", variant="primary"
-                    )
-                # Right: assembly lane
-                with Vertical(id="ctor-lane-col"):
-                    yield Static(" Assembly Lane ", id="ctor-lane-hdr")
-                    yield DataTable(
-                        id="ctor-lane", cursor_type="row", zebra_stripes=True
-                    )
-                    with Horizontal(id="ctor-lane-btns"):
-                        yield Button("↑",        id="btn-lane-up")
-                        yield Button("↓",        id="btn-lane-down")
-                        yield Button("✕ Remove", id="btn-lane-remove", variant="error")
-            # Backbone selector
-            with Horizontal(id="ctor-backbone-row"):
-                yield Static("Backbone:", id="ctor-backbone-label")
-                for bb in self._BACKBONES:
-                    classes = "bb-btn bb-active" if bb == self._backbone else "bb-btn"
-                    yield Button(bb, id=f"btn-bb-{bb}", classes=classes)
-            # Overhang chain + validation messages
-            yield Static("", id="ctor-validation")
-            # Bottom actions
-            with Horizontal(id="ctor-btns"):
-                yield Button(
-                    "Simulate Assembly", id="btn-ctor-simulate",
-                    variant="primary", disabled=True
-                )
-                yield Button("Clear Lane", id="btn-ctor-clear", variant="default")
-                yield Button("Close",      id="btn-ctor-close")
+            yield Static(" Constructor ", id="ctor-title")
+            with TabbedContent(initial="ctor-tab-modular", id="ctor-tabs"):
+                with TabPane("Modular  (Golden Braid / MoClo)",
+                              id="ctor-tab-modular"):
+                    # Entry-vector banner — pulls the user-configured
+                    # destination plasmid for the active grammar (set in
+                    # GrammarEditorModal). Provides at-a-glance
+                    # confirmation of which vector the assembly will
+                    # land in. The Change button jumps directly into
+                    # the grammar editor's entry-vector row so users
+                    # can swap without leaving the Constructor.
+                    with Horizontal(id="ctor-vector-row"):
+                        yield Static(
+                            self._entry_vector_summary_for_active_grammar(),
+                            id="ctor-vector-info", markup=True,
+                        )
+                        yield Button("Change…", id="btn-ctor-vector-change",
+                                       variant="default")
+                    with Horizontal(id="ctor-main"):
+                        # Left: parts palette
+                        with Vertical(id="ctor-palette-col"):
+                            yield Static(" Parts Palette ",
+                                          id="ctor-palette-hdr")
+                            yield DataTable(id="ctor-palette",
+                                              cursor_type="row",
+                                              zebra_stripes=True)
+                            yield Button("→  Add to Lane", id="btn-ctor-add",
+                                           variant="primary")
+                        # Right: assembly lane
+                        with Vertical(id="ctor-lane-col"):
+                            yield Static(" Assembly Lane ",
+                                          id="ctor-lane-hdr")
+                            yield DataTable(id="ctor-lane",
+                                              cursor_type="row",
+                                              zebra_stripes=True)
+                            with Horizontal(id="ctor-lane-btns"):
+                                yield Button("↑",        id="btn-lane-up")
+                                yield Button("↓",        id="btn-lane-down")
+                                yield Button("✕ Remove", id="btn-lane-remove",
+                                               variant="error")
+                    # Backbone selector
+                    with Horizontal(id="ctor-backbone-row"):
+                        yield Static("Backbone:", id="ctor-backbone-label")
+                        for bb in self._BACKBONES:
+                            classes = ("bb-btn bb-active"
+                                        if bb == self._backbone
+                                        else "bb-btn")
+                            yield Button(bb, id=f"btn-bb-{bb}",
+                                           classes=classes)
+                    # Overhang chain + validation messages
+                    yield Static("", id="ctor-validation")
+                    # Per-tab bottom actions
+                    with Horizontal(id="ctor-btns"):
+                        yield Button(
+                            "Simulate Assembly", id="btn-ctor-simulate",
+                            variant="primary", disabled=True,
+                        )
+                        yield Button("Clear Lane", id="btn-ctor-clear",
+                                       variant="default")
+                with TabPane("Traditional  (Restriction digest + ligate)",
+                              id="ctor-tab-traditional"):
+                    yield TraditionalCloningPane(id="ctor-trad-pane")
+            # Modal-level close — works regardless of active tab.
+            with Horizontal(id="ctor-bottom"):
+                yield Button("Close", id="btn-ctor-close")
 
     def on_mount(self) -> None:
         # Populate palette
@@ -23373,13 +26091,16 @@ def _h_fetch(app, payload):
 @_agent_endpoint("load-file", write=True)
 def _h_load_file(app, payload):
     """Load a `.gb` / `.gbk` / `.dna` file from a server-side path.
-    Body: ``{path}``. Bypasses the 1 MiB JSON-body cap by reading the
-    file from disk in-process — same path the GUI's File > Open uses.
-    No size cap on this endpoint (agent runs with the user's
-    permissions; the user owns their filesystem). For interactive
-    safety, the GUI's File > Open does a size confirmation; the
-    agent path is unconditional since automation tooling shouldn't
-    block on UI prompts."""
+    Body: ``{path, force?}``. Bypasses the 1 MiB JSON-body cap by
+    reading the file from disk in-process — same path the GUI's
+    File > Open uses.
+
+    Capped at ``_BULK_IMPORT_MAX_BYTES`` (50 MB) to bound damage
+    from a runaway agent script — a 10 GB GenBank file would
+    otherwise OOM the worker. Pass ``force: true`` to override the
+    cap, mirroring the GUI's "load anyway" confirmation prompt for
+    legitimate large files (chromosome-scale assemblies).
+    """
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
@@ -23387,6 +26108,15 @@ def _h_load_file(app, payload):
         return ({"error": f"file not found: {path}"}, 404)
     if not path.is_file():
         return ({"error": f"not a regular file: {path}"}, 400)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return ({"error": f"stat failed: {exc}"}, 400)
+    if size > _BULK_IMPORT_MAX_BYTES and not bool(payload.get("force")):
+        return ({"error": (
+            f"file is {size:,} bytes (cap {_BULK_IMPORT_MAX_BYTES:,}). "
+            f"Pass force=true to override."
+        ), "size_bytes": size, "cap_bytes": _BULK_IMPORT_MAX_BYTES}, 413)
     try:
         record = load_genbank(str(path))
     except (ValueError, OSError) as exc:
@@ -23471,10 +26201,9 @@ def _h_add_feature(app, payload):
                 400)
     label = _sanitize_label(payload.get("label"))
     feat_type = _sanitize_feat_type(payload.get("type"))
-    try:
-        strand = int(payload.get("strand", 1))
-    except (ValueError, TypeError):
-        return ({"error": "invalid 'strand' (must be -1, 0, or 1)"}, 400)
+    strand, str_err = _coerce_int(payload.get("strand", 1), name="strand")
+    if str_err is not None:
+        return ({"error": str_err}, 400)
     if strand not in (-1, 0, 1):
         return ({"error": "'strand' must be -1, 0, or 1"}, 400)
 
@@ -23699,10 +26428,9 @@ def _h_update_feature(app, payload):
                   if "type" in payload else None)
     new_strand = payload.get("strand")
     if new_strand is not None:
-        try:
-            new_strand = int(new_strand)
-        except (TypeError, ValueError):
-            return ({"error": "invalid 'strand'"}, 400)
+        new_strand, ns_err = _coerce_int(new_strand, name="strand")
+        if ns_err is not None:
+            return ({"error": ns_err}, 400)
         if new_strand not in (-1, 0, 1):
             return ({"error": "'strand' must be -1, 0, or 1"}, 400)
 
@@ -23927,10 +26655,10 @@ def _h_list_restriction_sites(app, payload):
     enzymes = payload.get("enzymes")
     if enzymes is not None and not isinstance(enzymes, list):
         return ({"error": "'enzymes' must be a list"}, 400)
-    try:
-        min_len = int(payload.get("min_length", 4))
-    except (TypeError, ValueError):
-        return ({"error": "invalid 'min_length'"}, 400)
+    min_len, ml_err = _coerce_int(payload.get("min_length", 4),
+                                    name="min_length")
+    if ml_err is not None:
+        return ({"error": ml_err}, 400)
     unique = bool(payload.get("unique_only", False))
     seq = str(rec.seq)
     is_circular = rec.annotations.get("topology") == "circular"
@@ -24301,6 +27029,344 @@ def _h_hmmscan(app, payload):
     return {"ok": True, "n_hits": len(hits), "hits": hits}
 
 
+# ── Library status (workflow tag) ─────────────────────────────────────────────
+
+
+@_agent_endpoint("list-plasmid-statuses")
+def _h_list_plasmid_statuses(app, payload):
+    """Return the canonical workflow-status vocabulary. Discoverability
+    helper so agents don't have to hard-code `DESIGNING`/`CLONING`/
+    `SEQUENCING`/`VERIFIED` strings."""
+    return {
+        "ok":       True,
+        "statuses": list(_PLASMID_STATUS_VALUES),
+        "colors":   dict(_PLASMID_STATUS_COLORS),
+    }
+
+
+@_agent_endpoint("set-plasmid-status", write=True)
+def _h_set_plasmid_status(app, payload):
+    """Set / clear a library entry's workflow status. Body:
+    ``{name|id, status}``. ``status`` must be one of the values from
+    `list-plasmid-statuses`, or empty string / null to clear. Anything
+    else is treated as "clear" (matches `_sanitize_plasmid_status`'s
+    documented strict-canonical-or-empty behaviour). Persists via
+    `_save_library`, which mirrors into the active collection."""
+    key = _sanitize_label(payload.get("name") or payload.get("id"),
+                           max_len=200)
+    if not key:
+        return ({"error": "missing 'name' or 'id'"}, 400)
+    raw_status = payload.get("status")
+    if raw_status is None:
+        new_status = ""
+    elif isinstance(raw_status, str):
+        new_status = _sanitize_plasmid_status(raw_status)
+    else:
+        return ({"error": "'status' must be a string or null"}, 400)
+
+    def _apply():
+        entries = _load_library()
+        for e in entries:
+            if e.get("name") == key or e.get("id") == key:
+                e["status"] = new_status
+                _save_library(entries)
+                return new_status
+        return None
+
+    result = app.call_from_thread(_apply)
+    if result is None:
+        return ({"error": f"no library entry matching {key!r}"}, 404)
+    return {"ok": True, "name": key, "status": result}
+
+
+# ── Per-grammar entry vectors ─────────────────────────────────────────────────
+
+
+@_agent_endpoint("list-entry-vectors")
+def _h_list_entry_vectors(app, payload):
+    """Return every grammar that currently has an assigned entry vector.
+    Each item carries ``{grammar_id, name, size, source}`` — `gb_text`
+    is omitted from the listing to keep the response small; fetch it
+    via `get-entry-vector` for a specific grammar."""
+    out = []
+    for e in _load_entry_vectors():
+        out.append({
+            "grammar_id": e.get("grammar_id", ""),
+            "name":       e.get("name", ""),
+            "size":       e.get("size", 0),
+            "source":     e.get("source", ""),
+        })
+    return {"ok": True, "entry_vectors": out}
+
+
+@_agent_endpoint("get-entry-vector")
+def _h_get_entry_vector(app, payload):
+    """Return the entry vector for a grammar. Body: ``{grammar_id}``.
+    Includes the full `gb_text` in the response so the agent can parse
+    + render it without a follow-up call. Returns `null` for `vector`
+    if the grammar has no assigned vector."""
+    gid = payload.get("grammar_id")
+    if not isinstance(gid, str) or not gid:
+        return ({"error": "missing or non-string 'grammar_id'"}, 400)
+    vec = _get_entry_vector(gid)
+    return {"ok": True, "grammar_id": gid, "vector": vec}
+
+
+@_agent_endpoint("set-entry-vector", write=True)
+def _h_set_entry_vector(app, payload):
+    """Set or clear a grammar's entry vector. Body to set:
+    ``{grammar_id, name, gb_text, source?}``; body to clear:
+    ``{grammar_id, clear: true}``. ``gb_text`` is parsed once to
+    confirm it's valid GenBank and to extract the size — the parsed
+    record itself is discarded; only the original text is persisted
+    so the grammar editor's "open file" round-trip stays byte-exact."""
+    gid = payload.get("grammar_id")
+    if not isinstance(gid, str) or not gid:
+        return ({"error": "missing or non-string 'grammar_id'"}, 400)
+
+    if bool(payload.get("clear")):
+        def _clear():
+            _set_entry_vector(gid, None)
+        app.call_from_thread(_clear)
+        return {"ok": True, "grammar_id": gid, "vector": None}
+
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing 'name'"}, 400)
+    gb_text = payload.get("gb_text")
+    if not isinstance(gb_text, str) or not gb_text.strip():
+        return ({"error": "missing or non-string 'gb_text'"}, 400)
+    # Cap at 500 KB — well above any realistic plasmid GenBank text
+    # (a heavily-annotated 50 kb destination vector is ~100 KB), but
+    # below the HTTP transport's 1 MiB body cap so this inner check
+    # is reachable. Tighter ceiling means a malformed payload bounces
+    # before the BioPython parser starts allocating intermediate
+    # objects.
+    if len(gb_text) > 500 * 1024:
+        return ({"error": "'gb_text' too large (max 500 KB)"}, 400)
+    try:
+        rec = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        return ({"error": f"gb_text parse failed: {exc}"}, 400)
+    source_raw = payload.get("source")
+    source = source_raw if isinstance(source_raw, str) else ""
+    vector = {
+        "name":     name,
+        "size":     len(rec.seq),
+        "source":   source[:300],   # cap source for paranoia
+        "gb_text":  gb_text,
+    }
+
+    def _apply():
+        _set_entry_vector(gid, vector)
+
+    app.call_from_thread(_apply)
+    out = dict(vector); out.pop("gb_text", None)
+    return {"ok": True, "grammar_id": gid, "vector": out}
+
+
+# ── Primer-specific edit (mirrors PrimerEditModal) ────────────────────────────
+
+
+@_agent_endpoint("update-primer", write=True)
+def _h_update_primer(app, payload):
+    """Edit a `primer_bind` feature's label / sequence / strand / notes.
+    Body: ``{idx, label?, primer_seq?, strand?, notes?}``. ``idx`` is
+    the 0-based index into the non-source feature list (same convention
+    as `update-feature`). The feature at ``idx`` MUST be a
+    `primer_bind`; anything else returns 400 so an agent can't
+    accidentally smuggle a primer-only edit (e.g. `primer_seq`) into a
+    CDS / misc_feature / etc.
+
+    Position / coordinate edits are intentionally excluded — same
+    trade-off as the GUI PrimerEditModal: relocate via delete + re-add."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    idx, idx_err = _coerce_int(payload.get("idx"), name="idx")
+    if idx_err is not None:
+        return ({"error": idx_err}, 400)
+    try:
+        pm = app.query_one("#plasmid-map", PlasmidMap)
+    except (NoMatches, AttributeError):
+        return ({"error": "no plasmid panel"}, 500)
+    if not (0 <= idx < len(pm._feats)):
+        return ({"error": f"idx {idx} out of range "
+                          f"[0, {len(pm._feats)})"}, 400)
+    if pm._feats[idx].get("type") != "primer_bind":
+        return ({"error":
+                  f"feature at idx {idx} is type "
+                  f"{pm._feats[idx].get('type')!r}, not 'primer_bind'"},
+                400)
+
+    new_label = (_sanitize_label(payload["label"])
+                 if "label" in payload else None)
+    new_pseq  = None
+    if "primer_seq" in payload:
+        raw = payload["primer_seq"]
+        if not isinstance(raw, str):
+            return ({"error": "'primer_seq' must be a string"}, 400)
+        clean = _CONTROL_CHARS_RE.sub("", raw).strip().upper()
+        clean = "".join(clean.split())
+        if not clean:
+            return ({"error": "'primer_seq' empty after sanitisation"},
+                    400)
+        if len(clean) > 500:
+            return ({"error":
+                      "'primer_seq' too long (max 500 bp)"}, 400)
+        new_pseq = clean
+    new_strand: "int | None" = None
+    if "strand" in payload:
+        new_strand, ns_err = _coerce_int(payload["strand"], name="strand")
+        if ns_err is not None:
+            return ({"error": ns_err}, 400)
+        if new_strand not in (-1, 0, 1):
+            return ({"error": "'strand' must be -1, 0, or 1"}, 400)
+    new_notes = None
+    if "notes" in payload:
+        new_notes = _sanitize_note(payload["notes"])
+
+    edit_payload = {"idx": idx}
+    if new_label is not None:
+        edit_payload["label"] = new_label
+    if new_pseq is not None:
+        edit_payload["primer_seq"] = new_pseq
+    if new_strand is not None:
+        edit_payload["strand"] = new_strand
+    if new_notes is not None:
+        edit_payload["notes"] = new_notes
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        app._apply_primer_edit(edit_payload)
+        return None
+
+    err = app.call_from_thread(_apply)
+    if err is not None:
+        return err
+    return {"ok": True, "idx": idx,
+            "applied": [k for k in edit_payload if k != "idx"]}
+
+
+# ── User settings (allowlisted toggles) ───────────────────────────────────────
+
+
+def _settings_validator_bool(value):
+    if isinstance(value, bool):
+        return value, None
+    return None, "must be a boolean"
+
+
+def _settings_validator_int_range(lo: int, hi: int):
+    def _v(value):
+        v, err = _coerce_int(value, name="value")
+        if err is not None:
+            return None, err
+        if not (lo <= v <= hi):
+            return None, f"must be in [{lo}, {hi}]"
+        return v, None
+    return _v
+
+
+def _settings_validator_choice(*choices):
+    def _v(value):
+        if isinstance(value, str) and value in choices:
+            return value, None
+        return None, "must be one of " + ", ".join(repr(c) for c in choices)
+    return _v
+
+
+def _settings_validator_min_len_4_or_6(value):
+    v, err = _coerce_int(value, name="value")
+    if err is not None:
+        return None, err
+    if v not in (4, 6):
+        return None, "must be 4 or 6"
+    return v, None
+
+
+def _settings_validator_collection_name(value):
+    """Empty string / null is allowed to clear the active collection.
+    Otherwise route through `_normalize_collection_name`."""
+    if value is None or value == "":
+        return "", None
+    norm = _normalize_collection_name(value)
+    if norm is None:
+        return None, "invalid collection name"
+    return norm, None
+
+
+def _settings_validator_grammar_id(value):
+    if not isinstance(value, str) or not value:
+        return None, "must be a non-empty string"
+    # Cap defensively; grammar IDs are short identifiers.
+    if len(value) > 100:
+        return None, "too long (max 100 chars)"
+    return value, None
+
+
+# Allowlist of user-facing toggle settings the agent may read / write.
+# Infrastructure caches (`last_known_latest`, `last_seen_version`,
+# `last_update_check_ts`, `hmm_db_path`) are deliberately excluded —
+# those are session bookkeeping, not user preferences.
+_AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
+    # key: (validator, default)
+    "show_feature_tooltips": (_settings_validator_bool,                  True),
+    "click_debug":           (_settings_validator_bool,                  False),
+    "check_updates":         (_settings_validator_bool,                  True),
+    "show_restr":            (_settings_validator_bool,                  False),
+    "restr_unique_only":     (_settings_validator_bool,                  True),
+    "show_connectors":       (_settings_validator_bool,                  False),
+    "restr_min_len":         (_settings_validator_min_len_4_or_6,        6),
+    "min_primer_binding":    (_settings_validator_int_range(1, 60),      15),
+    "linear_layout":         (_settings_validator_choice("centered", "flag"),
+                              "centered"),
+    "active_collection":     (_settings_validator_collection_name,       ""),
+    "active_grammar":        (_settings_validator_grammar_id,            "gb_l0"),
+}
+
+
+@_agent_endpoint("get-settings")
+def _h_get_settings(app, payload):
+    """Return every allowlisted user-toggle setting with its current
+    value, default, and validator hint. Useful for an agent that
+    wants to inspect which toggles are exposed before writing."""
+    out = {}
+    for key, (_validator, default) in _AGENT_SETTINGS_ALLOWLIST.items():
+        out[key] = {
+            "value":   _get_setting(key, default),
+            "default": default,
+        }
+    return {"ok": True, "settings": out}
+
+
+@_agent_endpoint("set-setting")
+def _h_set_setting(app, payload):
+    """Persist a single user-toggle setting. Body: ``{key, value}``.
+    `key` must be in the allowlist (see `get-settings`); `value` is
+    type-checked + range-checked per the key's validator. Persists
+    via `_set_setting`. Live in-memory app state mirrors are NOT
+    refreshed here — the change takes effect on the next session
+    restart for most toggles. (The GUI re-applies certain toggles
+    immediately via dedicated action methods; mirroring that
+    semantically across the agent surface would require dispatching
+    each key to a UI-thread handler. Out of scope for v1.)"""
+    key = payload.get("key")
+    if not isinstance(key, str) or not key:
+        return ({"error": "missing or non-string 'key'"}, 400)
+    if key not in _AGENT_SETTINGS_ALLOWLIST:
+        return ({"error": f"unknown setting {key!r}",
+                  "available": list(_AGENT_SETTINGS_ALLOWLIST)}, 400)
+    validator, _default = _AGENT_SETTINGS_ALLOWLIST[key]
+    cleaned, err = validator(payload.get("value"))
+    if err is not None:
+        return ({"error": f"{key!r}: {err}"}, 400)
+    _set_setting(key, cleaned)
+    return {"ok": True, "key": key, "value": cleaned}
+
+
 # ── HTTP plumbing ──────────────────────────────────────────────────────────────
 
 class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -24523,6 +27589,14 @@ class PlasmidApp(App):
     _current_record = None   # last-loaded SeqRecord
     _source_path:   "str | None" = None   # file the current record was loaded from
     _unsaved:        bool         = False  # True when there are unsaved edits
+    # Monotonic counter incremented on every `_apply_record` call.
+    # Background workers that depend on "did anything load while I was
+    # away?" (notably `_seed_default_library`) capture this at entry
+    # and refuse to apply their result if the counter advanced. Tighter
+    # than a `self._current_record is None` check since `id(None)` is a
+    # singleton — id() comparison can't distinguish "nothing happened"
+    # from "loaded then cleared", but a counter can.
+    _record_load_counter: int = 0
     _MAX_UNDO = 50
     _restr_unique_only: bool = True
     _restr_min_len: int = 6
@@ -24633,6 +27707,7 @@ FastaFilePickerModal { align: center middle; }
 
 /* ── Export-GenBank modal ────────────────────────────────── */
 ExportGenBankModal { align: center middle; }
+ExportCommercialSaaSModal { align: center middle; }
 #export-box {
     width: 72; height: auto;
     background: $surface; border: solid $primary; padding: 1 2;
@@ -24941,14 +28016,17 @@ RenamePlasmidModal { align: center middle; }
 /* ── Constructor modal ───────────────────────────────────── */
 ConstructorModal { align: center middle; }
 #ctor-box {
-    width: 116; height: 42;
+    width: 120; height: 46;
     background: $surface; border: solid $accent; padding: 1 2;
 }
 #ctor-title       { background: $accent-darken-2; padding: 0 1; margin-bottom: 1; }
+#ctor-tabs        { height: 1fr; }
+#ctor-bottom      { height: 3; margin-top: 1; align: right middle; }
+#ctor-bottom Button { min-width: 10; }
 #ctor-vector-row  { height: 3; margin-bottom: 1; align: left middle; }
 #ctor-vector-info { width: 1fr; padding: 0 1; }
 #ctor-vector-row Button { min-width: 12; margin-left: 1; }
-#ctor-main        { height: 20; }
+#ctor-main        { height: 18; }
 #ctor-palette-col { width: 1fr; border-right: solid $primary-darken-2; padding-right: 1; }
 #ctor-palette-hdr { background: $primary-darken-2; padding: 0 1; }
 #ctor-palette     { height: 1fr; }
@@ -24962,11 +28040,40 @@ ConstructorModal { align: center middle; }
 .bb-btn           { min-width: 9; margin-right: 1; }
 .bb-active        { background: $accent; color: $text; }
 #ctor-validation  {
-    height: 5; border: solid $primary-darken-2;
+    height: 4; border: solid $primary-darken-2;
     padding: 0 1; margin-top: 1; overflow-x: auto;
 }
 #ctor-btns        { height: 3; margin-top: 1; }
 #ctor-btns Button { margin-right: 1; }
+
+/* ── Traditional cloning tab ────────────────────────────── */
+TraditionalCloningPane    { height: auto; }
+#trad-mode-row            { height: 3; align: left middle; margin-bottom: 1; }
+#trad-mode-label          { width: 18; color: $text-muted; }
+#trad-mode-row RadioSet   { layout: horizontal; height: 3; }
+#trad-mode-row RadioButton { margin-right: 2; }
+#trad-source-host         { height: 9; border: solid $primary-darken-2;
+                            padding: 0 1; margin-bottom: 1; }
+#trad-source-host > Static { color: $text-muted; padding: 0 1;
+                              background: $primary-darken-2; }
+#trad-pcr-name            { width: 1fr; }
+#trad-pcr-seq             { height: 5; border: solid $primary-darken-3; }
+#trad-source-table, #trad-vector-table { height: 5; }
+#trad-feature-select      { width: 1fr; }
+#trad-vector-row          { height: 7; border: solid $primary-darken-2;
+                            padding: 0 1; margin-bottom: 1; }
+#trad-vector-row > Static { color: $text-muted; padding: 0 1;
+                            background: $primary-darken-2; }
+#trad-enzyme-row          { height: 3; align: left middle; margin-bottom: 1; }
+#trad-enzyme-label        { width: 18; color: $text-muted; }
+#trad-enzyme-row Select   { width: 22; margin-right: 2; }
+#trad-action-row          { height: 3; align: left middle; margin-bottom: 1; }
+#trad-action-row Button   { margin-right: 1; }
+#trad-results             { height: 1fr; border: solid $primary-darken-2;
+                            padding: 0 1; overflow-y: auto; }
+#trad-results > Static    { padding: 0 1; }
+#trad-save-row            { height: 3; margin-top: 1; align: left middle; }
+#trad-save-row Button     { margin-right: 1; }
 
 /* ── Grammar editor modal ────────────────────────────────── */
 GrammarEditorModal { align: center middle; }
@@ -26144,16 +29251,23 @@ SpeciesPickerModal { align: center middle; }
     @work(thread=True)
     def _seed_default_library(self) -> None:
         """Fetch MW463917.1 and pre-populate the library on first run."""
+        # Capture the load counter at entry so the callback can detect
+        # any record load that happened while the fetch was in flight —
+        # tighter than the previous `is None` check, which would have
+        # let the seed silently apply over a canvas the user explicitly
+        # cleared (load A → discard back to None → seed lands).
+        entry_counter = self._record_load_counter
         try:
             record = fetch_genbank("MW463917.1")
             def _add():
-                # If the user loaded or fetched a different plasmid while the
-                # seed fetch was in flight, _apply_record would silently stomp
-                # their record with the seed. Add the entry to the library so
-                # they can pick it later, but skip the apply in that case.
+                # Library add always fires (the seed is useful as a
+                # picker entry even if the user has loaded something
+                # else). Apply only if no record load has happened
+                # since we entered.
                 lib = self.query_one("#library", LibraryPanel)
                 lib.add_entry(record)
-                if self._current_record is None:
+                if (self._current_record is None
+                        and self._record_load_counter == entry_counter):
                     self._apply_record(record)
             self.call_from_thread(_add)
         except Exception:
@@ -26947,6 +30061,53 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_done,
         )
 
+    def action_export_commercialsaas(self) -> None:
+        """Prompt for a path and write the current record as CommercialSaaS
+        `.dna`. Only available for plasmids that have a sidecar from
+        a previous `.dna` import — otherwise we can't yet write the
+        `.dna` byte stream from scratch (Phase 3 work).
+
+        Looks up the loaded record's library entry by id; if no
+        sidecar exists, surfaces a friendly notify pointing the user
+        at GenBank export. This action is also wired to File →
+        Export as CommercialSaaS (.dna)…"""
+        if self._current_record is None:
+            self.notify("No plasmid loaded.", severity="warning")
+            return
+        rec_id = self._current_record.id
+        entry: "dict | None" = None
+        for e in _load_library():
+            if e.get("id") == rec_id:
+                entry = e
+                break
+        if entry is None:
+            self.notify(
+                "Loaded plasmid isn't in the library — save it first "
+                "via File → Add to Library, or use Export as GenBank.",
+                severity="information", timeout=8,
+            )
+            return
+        # Both paths now supported: with sidecar → splice; without →
+        # from-scratch via `_write_commercialsaas_dna_bytes`. The latter
+        # carries a "cosmetic packets are minimal" caveat which the
+        # modal communicates via its label.
+        # Default output path: sibling of cwd, named after the entry.
+        name = (entry.get("name") or rec_id or "plasmid")
+        default = f"{name}.dna"
+
+        def _on_done(result):
+            if result is None:
+                return
+            self._notify_success(
+                f"Exported .dna → {result['path']}",
+                timeout=8,
+            )
+
+        self.push_screen(
+            ExportCommercialSaaSModal(entry, default_path=default),
+            callback=_on_done,
+        )
+
     # ── Central record loader ──────────────────────────────────────────────────
 
     def _import_and_persist(self, record) -> None:
@@ -27010,6 +30171,8 @@ SpeciesPickerModal { align: center middle; }
             self._stash_current_undo_and_load(new_key)
             self._source_path = None   # caller sets this if it came from a file
         self._current_record = record
+        # Monotonic stale-load token — see `_record_load_counter` docstring.
+        self._record_load_counter += 1
 
         pm      = self.query_one("#plasmid-map", PlasmidMap)
         sidebar = self.query_one("#sidebar",     FeatureSidebar)
@@ -27943,6 +31106,51 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_pick,
         )
 
+    @on(LibraryPanel.HistoryRequested)
+    def _library_history_requested(self,
+                                       event: "LibraryPanel.HistoryRequested"
+                                       ) -> None:
+        """`h` key on a library row → open `HistoryViewerModal` for
+        that plasmid's construction history. Imported CommercialSaaS .dna
+        files keep their history in `entry["history_xml"]`;
+        SpliceCraft-built constructions get one attached at Save
+        time (Traditional cloning Phase 4b). Entries without
+        history surface a gentle "no history" notify rather than a
+        blank modal."""
+        if event.entry_id is None:
+            self.notify("Highlight a library row first.",
+                         severity="warning")
+            return
+        entry: "dict | None" = None
+        for e in _load_library():
+            if e.get("id") == event.entry_id:
+                entry = e
+                break
+        if entry is None:
+            self.notify("Library entry not found.", severity="warning")
+            return
+        history_xml = entry.get("history_xml")
+        if not history_xml:
+            self.notify(
+                f"No construction history recorded for "
+                f"{entry.get('name', '?')}.",
+                severity="information", timeout=4,
+            )
+            return
+        try:
+            root = _parse_commercialsaas_history(history_xml)
+        except ValueError as exc:
+            self.notify(f"Couldn't parse history: {exc}",
+                         severity="error", timeout=8)
+            _log.warning("library: malformed history_xml on %r: %s",
+                          entry.get("name"), exc)
+            return
+        if root is None:
+            self.notify("History is empty.", severity="information")
+            return
+        title = str(entry.get("name") or entry.get("id") or "?")
+        self.push_screen(HistoryViewerModal(title, root))
+
     @on(LibraryPanel.RenameRequested)
     def _library_rename_requested(self, event: LibraryPanel.RenameRequested):
         """Library's ✎ button was clicked. Opens RenamePlasmidModal; on Save,
@@ -28134,6 +31342,7 @@ SpeciesPickerModal { align: center middle; }
                 ("Add to Library  [^⇧A]",        "add_to_library"),
                 ("Save  [^S]",                   "save"),
                 ("Export as GenBank (.gb)...",   "export_genbank"),
+                ("Export as .dna...", "export_commercialsaas"),
                 ("---",                          None),
                 ("Collections...",               "open_collections"),
                 ("Align sequencing run (Plasmidsaurus .zip)...",
@@ -28149,6 +31358,8 @@ SpeciesPickerModal { align: center middle; }
                 (f"[{cu}] Check for updates on launch",  "toggle_check_updates"),
                 (f"Linear layout: {pm_layout} → switch to {ll_next}",
                                                           "toggle_linear_layout"),
+                (f"Min primer binding: {self._min_primer_binding} bp → cycle",
+                                                          "cycle_min_primer_binding"),
             ],
             "Edit": [
                 ("Edit Sequence  [^E]",            "edit_seq"),
@@ -28205,6 +31416,59 @@ SpeciesPickerModal { align: center middle; }
         _set_setting("check_updates", self._check_updates)
         state = "enabled" if self._check_updates else "disabled"
         self.notify(f"Update check on launch: {state}")
+
+    # Cycle order for `action_cycle_min_primer_binding` — covers the
+    # span where most users actually want to draw the line. Off-preset
+    # values (hand-edited settings.json) snap to the nearest preset on
+    # the next cycle. Module-scope so tests can import + assert.
+    _MIN_PRIMER_BINDING_PRESETS = (10, 12, 15, 18, 20)
+
+    def action_cycle_min_primer_binding(self) -> None:
+        """Settings → Min primer binding: cycle through 10/12/15/18/20 bp.
+
+        Primers whose bound region is shorter than the threshold are
+        flagged with a yellow ⚠ in place of the strand arrow on the
+        seq panel + an extra tooltip line. Persisted to settings.json
+        so the choice survives sessions. Re-parses the current record
+        so the stamps reflect the new threshold immediately (the
+        seq-panel cache invalidates because `_feats` is re-assigned —
+        CLAUDE.md pitfall #5)."""
+        presets = self._MIN_PRIMER_BINDING_PRESETS
+        cur = self._min_primer_binding
+        if cur in presets:
+            nxt = presets[(presets.index(cur) + 1) % len(presets)]
+        else:
+            # Off-preset value — snap to nearest. Stable when distances
+            # tie (Python's `min` keeps the first match in iteration order).
+            nxt = min(presets, key=lambda p: abs(p - cur))
+        self._min_primer_binding = nxt
+        _set_setting("min_primer_binding", nxt)
+        # Re-stamp `_weak_primer` on the current record's primer feats.
+        # `_parse` reads the threshold from `self.app._min_primer_binding`
+        # so the new value is picked up automatically.
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            pm = None
+        if pm is not None and pm.record is not None:
+            pm._feats = pm._parse(pm.record)
+            try:
+                sb = self.query_one("#sidebar", FeatureSidebar)
+                sb.populate(pm._feats)
+            except NoMatches:
+                pass
+            try:
+                sp = self.query_one("#seq-panel", SequencePanel)
+                # Match the feats reference so the seq panel's painter
+                # sees the same `_weak_primer` stamps. Invalidate the
+                # render cache so the next refresh re-paints.
+                sp._feats = pm._feats
+                sp._view_cache_key = None
+                sp._refresh_view()
+            except NoMatches:
+                pass
+            pm.refresh()
+        self.notify(f"Min primer binding: {nxt} bp")
 
     def action_open_align_zip(self) -> None:
         """File → Align sequencing run (Plasmidsaurus .zip)…

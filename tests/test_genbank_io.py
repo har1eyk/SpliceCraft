@@ -465,12 +465,13 @@ class TestPlasmidFormatDetection:
         assert sc._detect_plasmid_format("x.genbank") == "genbank"
 
     def test_dna_extension_is_commercialsaas(self):
-        assert sc._detect_plasmid_format("x.dna") == "commercialsaas"
+        assert sc._detect_plasmid_format("x.dna") == sc._BIOPYTHON_DNA_FMT
+        assert sc._detect_plasmid_format("x.dna") != "genbank"
 
     def test_dna_uppercase(self):
         """Case-insensitive — users drag-dropping files from macOS/Windows
         sometimes have capitalized extensions."""
-        assert sc._detect_plasmid_format("plasmid.DNA") == "commercialsaas"
+        assert sc._detect_plasmid_format("plasmid.DNA") == sc._BIOPYTHON_DNA_FMT
         assert sc._detect_plasmid_format("foo.GB") == "genbank"
 
     def test_unknown_extension_defaults_genbank(self):
@@ -506,7 +507,7 @@ class TestCommercialSaaSDispatch:
         dna_file.write_bytes(b"fake binary")
 
         rec = sc.load_genbank(str(dna_file))
-        assert called_fmt["fmt"] == "commercialsaas"
+        assert called_fmt["fmt"] == sc._BIOPYTHON_DNA_FMT
         assert called_fmt["path"] == str(dna_file)
         # tiny_record is returned through _pick_single_record
         assert rec is tiny_record
@@ -530,11 +531,11 @@ class TestCommercialSaaSDispatch:
         assert called_fmt["fmt"] == "genbank"
 
     def test_malformed_dna_raises_helpful_error(self, tmp_path):
-        """A .dna file that isn't actually a CommercialSaaS binary should
-        produce a user-friendly error, not a raw struct.error."""
+        """A .dna file that isn't actually a valid binary plasmid file
+        should produce a user-friendly error, not a raw struct.error."""
         bad = tmp_path / "broken.dna"
-        bad.write_bytes(b"not a commercialsaas file")
-        with pytest.raises(ValueError, match="CommercialSaaS"):
+        bad.write_bytes(b"not a valid binary file")
+        with pytest.raises(ValueError, match=r"popular commercial plasmid editor"):
             sc.load_genbank(str(bad))
 
 

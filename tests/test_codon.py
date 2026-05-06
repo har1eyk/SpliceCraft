@@ -283,15 +283,22 @@ class TestKazusaParse:
 # ── NCBI taxid lookup ─────────────────────────────────────────────────────────
 
 class _FakeResponse:
-    """Minimal urlopen() context-manager stand-in that yields canned bytes."""
+    """Minimal urlopen() context-manager stand-in that yields canned bytes.
+
+    Mirrors `http.client.HTTPResponse.read(amt=None)`: when the caller
+    passes a max-byte hint (the response-size cap pattern), return at
+    most that many bytes.
+    """
     def __init__(self, body: bytes):
         self._body = body
     def __enter__(self):
         return self
     def __exit__(self, *exc):
         return False
-    def read(self):
-        return self._body
+    def read(self, amt=None):
+        if amt is None:
+            return self._body
+        return self._body[:amt]
 
 
 class TestNcbiPrepTerm:
@@ -440,6 +447,41 @@ class TestNcbiSearch:
         assert len(hits) == 1
         assert hits[0]["taxid"] == "4932"
         assert "(taxid 4932)" in hits[0]["name"]
+
+    def test_oversized_response_rejected(self, monkeypatch):
+        """Regression guard for 2026-05-06 fix: a compromised / MITM'd
+        upstream that streams gigabytes at us must not OOM the worker.
+        Response is capped at `_NCBI_MAX_RESPONSE_BYTES`."""
+        monkeypatch.setattr(sc, "_NCBI_MAX_RESPONSE_BYTES", 100)
+        # Build a response well over the cap.
+        big_xml = b"<?xml?><eSearchResult>" + (b"<Id>1</Id>" * 1000) + b"</eSearchResult>"
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResponse(big_xml)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        hits, total, msg = sc._ncbi_taxid_search("a")
+        assert hits == []
+        assert total == 0
+        assert "oversized" in msg.lower()
+
+
+class TestKazusaSizeCap:
+    def test_kazusa_oversized_response_rejected(self, monkeypatch):
+        """Regression guard for 2026-05-06 fix: cap Kazusa's HTML
+        response size to bound worker memory."""
+        monkeypatch.setattr(sc, "_KAZUSA_MAX_RESPONSE_BYTES", 100)
+        big_html = b"<html>" + (b"X" * 10_000) + b"</html>"
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResponse(big_html)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        raw, msg = sc._codon_fetch_kazusa("83333")
+        assert raw is None
+        assert "oversized" in msg.lower()
 
 
 # ── Integration with _mut_design_inner ────────────────────────────────────────

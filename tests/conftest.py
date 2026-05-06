@@ -65,6 +65,11 @@ def _protect_user_data(tmp_path, monkeypatch):
     # Crash-recovery autosave dir: redirect so tests can't leave files in
     # the user's real _DATA_DIR/crash_recovery on disk.
     monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", tmp_path / "crash_recovery")
+    # CommercialSaaS .dna sidecar storage (Phase 4d): tests that import .dna
+    # files would otherwise create copies in the user's real
+    # _DATA_DIR/dna_originals on disk. Same isolation pattern.
+    monkeypatch.setattr(sc, "_DNA_ORIGINALS_DIR",
+                          tmp_path / "dna_originals")
 
     # Skip the launch splash for every test by default — the splash modal
     # blocks input until dismissed, which would break every `pilot.click`

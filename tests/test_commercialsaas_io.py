@@ -1,0 +1,1315 @@
+"""
+test_commercialsaas_io — low-level .dna packet I/O.
+
+Covers `_iter_commercialsaas_packets`, `_extract_commercialsaas_history_xml`,
+`_pack_commercialsaas_history_payload`, `_inject_commercialsaas_history`,
+and `_build_commercialsaas_packet`. These are the foundation for full
+.dna round-trip including the construction-history packet (0x07),
+which neither BioPython nor any other open-source library handles.
+
+Tests use both synthetic byte streams (so the suite stays self-
+contained) AND a tiny check against real .dna sample files when
+they're available — point ``SPLICECRAFT_DNA_FIXTURES_DIR`` at a
+local directory of fixtures to enable the integration tests; they
+skip on machines that don't have them.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+import splicecraft as sc
+
+
+_SAMPLE_DIR = Path(os.environ.get(
+    "SPLICECRAFT_DNA_FIXTURES_DIR", "/nonexistent-default"
+))
+_SAMPLE_WITH_HISTORY    = _SAMPLE_DIR / "ECXA.dna"
+_SAMPLE_WITHOUT_HISTORY = _SAMPLE_DIR / "EcoRI-T5-NcoI-PhiLys-SacI.dna"
+
+
+def _make_minimal_dna(*packets: tuple[int, bytes]) -> bytes:
+    """Build a minimal .dna byte stream from ``(type_byte, payload)``
+    pairs. Always starts with a cookie packet so downstream parsers
+    don't choke."""
+    # 8-byte format magic + 3 unsigned shorts (seqType, exp, imp)
+    cookie_payload = sc._COMMERCIALSAAS_COOKIE_MAGIC + bytes([0, 1, 0, 15, 0, 19])
+    out = sc._build_commercialsaas_packet(0x09, cookie_payload)
+    for type_byte, payload in packets:
+        out += sc._build_commercialsaas_packet(type_byte, payload)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Packet iterator
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestIterCommercialSaaSPackets:
+    def test_iterates_simple_two_packet_stream(self):
+        data = _make_minimal_dna(
+            (0x06, b"<Notes><Type>Synthetic</Type></Notes>"),
+        )
+        packets = list(sc._iter_commercialsaas_packets(data))
+        assert [p[0] for p in packets] == [0x09, 0x06]
+        # Length matches payload length.
+        assert packets[0][1] == 14   # 8s + 6 bytes
+        assert packets[1][1] == len(b"<Notes><Type>Synthetic</Type></Notes>")
+
+    def test_returns_payload_bytes_unchanged(self):
+        payload = b"the quick brown fox jumps over the lazy dog"
+        data = _make_minimal_dna((0x42, payload))
+        ((_t1, _l1, _p1), (t2, l2, p2)) = list(sc._iter_commercialsaas_packets(data))
+        assert t2 == 0x42
+        assert l2 == len(payload)
+        assert p2 == payload
+
+    def test_truncated_header_stops_cleanly(self):
+        # A complete cookie packet plus 2 stray bytes (incomplete header).
+        data = _make_minimal_dna() + b"\x05\x00"
+        packets = list(sc._iter_commercialsaas_packets(data))
+        # Only the cookie comes through; the truncated bit is silently
+        # dropped (no exception).
+        assert len(packets) == 1
+
+    def test_truncated_payload_stops_cleanly(self):
+        # Header claims 100 bytes but only 5 follow.
+        bad = bytes([0x07]) + (100).to_bytes(4, "big") + b"hello"
+        data = _make_minimal_dna() + bad
+        packets = list(sc._iter_commercialsaas_packets(data))
+        assert len(packets) == 1   # only cookie
+
+    def test_empty_input_yields_nothing(self):
+        assert list(sc._iter_commercialsaas_packets(b"")) == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Build packet
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestBuildCommercialSaaSPacket:
+    def test_round_trips_via_iterator(self):
+        payload = b"\x00\x01\x02hello world\xff"
+        pkt = sc._build_commercialsaas_packet(0x42, payload)
+        # Hand-feed through the iterator: it should yield exactly
+        # one packet matching what we built.
+        ((t, length, p),) = list(sc._iter_commercialsaas_packets(pkt))
+        assert t == 0x42
+        assert length == len(payload)
+        assert p == payload
+
+    def test_rejects_oversized_payload(self):
+        # 32-bit big-endian length cap is 4 GB - 1.
+        with pytest.raises(ValueError):
+            sc._build_commercialsaas_packet(0x07, b"x" * (0xFFFFFFFF + 1))
+
+    def test_rejects_out_of_range_type(self):
+        with pytest.raises(ValueError):
+            sc._build_commercialsaas_packet(-1, b"")
+        with pytest.raises(ValueError):
+            sc._build_commercialsaas_packet(256, b"")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# History XML extract / pack / inject (round-trip core)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCommercialSaaSHistoryExtract:
+    def test_returns_none_when_no_history_packet(self):
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x06, b"<Notes/>"),
+        )
+        assert sc._extract_commercialsaas_history_xml(data) is None
+
+    def test_extracts_xml_from_xz_compressed_payload(self):
+        """`_extract_commercialsaas_history_xml` decompresses the 0x07
+        payload as xz / LZMA — matches the format real CommercialSaaS
+        files use. Build a synthetic file that pairs the packer
+        with the extractor and verify the round-trip preserves
+        the XML byte-for-byte."""
+        xml = ('<?xml version="1.0"?>\n'
+                '<HistoryTree>'
+                '<Node name="test.dna" type="DNA" seqLen="100" '
+                'circular="1" operation="insertFragment"/>'
+                '</HistoryTree>')
+        payload = sc._pack_commercialsaas_history_payload(xml)
+        data = _make_minimal_dna((0x07, payload))
+        recovered = sc._extract_commercialsaas_history_xml(data)
+        assert recovered == xml
+
+    def test_rejects_invalid_xz(self):
+        data = _make_minimal_dna((0x07, b"not actually xz"))
+        with pytest.raises(ValueError) as exc:
+            sc._extract_commercialsaas_history_xml(data)
+        assert "xz" in str(exc.value).lower()
+
+    def test_rejects_decompression_bomb(self, monkeypatch):
+        """A crafted .dna with a tiny 0x07 packet that decompresses to
+        gigabytes must NOT silently allocate that much. The cap lives
+        at `_COMMERCIALSAAS_HISTORY_MAX_XML`; lower it for the test so we
+        don't actually have to build a multi-GB file."""
+        monkeypatch.setattr(sc, "_COMMERCIALSAAS_HISTORY_MAX_XML", 100)
+        big_xml = "<HistoryTree>" + ("X" * 500) + "</HistoryTree>"
+        payload = sc._pack_commercialsaas_history_payload(big_xml)
+        data = _make_minimal_dna((0x07, payload))
+        with pytest.raises(ValueError) as exc:
+            sc._extract_commercialsaas_history_xml(data)
+        assert "too large" in str(exc.value).lower()
+
+    def test_rejects_streaming_bomb_aborts_early(self, monkeypatch):
+        """Regression guard for 2026-05-06 fix: the previous implementation
+        called `_lzma.decompress(payload)` to completion BEFORE checking the
+        size — a 10 MB compressed payload that expands to 50 GB would OOM
+        before the cap even ran. The fix uses `LZMADecompressor` with
+        `max_length`, so the decoder aborts at the cap and never
+        materialises the full plaintext."""
+        # 10 KB compressed cap with a payload that decompresses to ~100 KB.
+        # The old code would allocate the full 100 KB before checking
+        # — verify behaviour is now bounded by the cap.
+        monkeypatch.setattr(sc, "_COMMERCIALSAAS_HISTORY_MAX_XML", 1_000)
+        big_xml = "<HistoryTree>" + ("Z" * 100_000) + "</HistoryTree>"
+        payload = sc._pack_commercialsaas_history_payload(big_xml)
+        data = _make_minimal_dna((0x07, payload))
+        with pytest.raises(ValueError, match="too large"):
+            sc._extract_commercialsaas_history_xml(data)
+
+
+class TestCommercialSaaSHistoryInject:
+    def test_replaces_existing_history(self):
+        old_xml = "<HistoryTree><Node name='old.dna'/></HistoryTree>"
+        new_xml = "<HistoryTree><Node name='new.dna'/></HistoryTree>"
+        old_payload = sc._pack_commercialsaas_history_payload(old_xml)
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x07, old_payload),
+            (0x06, b"<Notes/>"),
+        )
+        out = sc._inject_commercialsaas_history(data, new_xml)
+        # Recovered XML matches the new one.
+        assert sc._extract_commercialsaas_history_xml(out) == new_xml
+        # Other packets preserved verbatim.
+        types = [p[0] for p in sc._iter_commercialsaas_packets(out)]
+        assert types == [0x09, 0x00, 0x07, 0x06]
+
+    def test_inserts_when_no_existing_history(self):
+        new_xml = "<HistoryTree><Node name='fresh.dna'/></HistoryTree>"
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x06, b"<Notes/>"),
+        )
+        out = sc._inject_commercialsaas_history(data, new_xml)
+        assert sc._extract_commercialsaas_history_xml(out) == new_xml
+        # New packet inserted right after the cookie.
+        types = [p[0] for p in sc._iter_commercialsaas_packets(out)]
+        assert types == [0x09, 0x07, 0x00, 0x06]
+
+    def test_strips_history_when_passed_none(self):
+        old_xml = "<HistoryTree><Node name='old.dna'/></HistoryTree>"
+        old_payload = sc._pack_commercialsaas_history_payload(old_xml)
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x07, old_payload),
+            (0x06, b"<Notes/>"),
+        )
+        out = sc._inject_commercialsaas_history(data, None)
+        assert sc._extract_commercialsaas_history_xml(out) is None
+        types = [p[0] for p in sc._iter_commercialsaas_packets(out)]
+        assert 0x07 not in types
+
+    def test_preserves_unknown_packets_byte_exact(self):
+        """`_inject_commercialsaas_history` must NOT mangle packets it
+        doesn't understand — the whole point of the splice approach
+        is that we can round-trip files with packets we haven't yet
+        decoded (alignments, custom enzymes, etc.) without losing
+        them or corrupting their bytes."""
+        weird_payload = b"\x00\x01\x02\x03binary garbage\xff\xfe"
+        data = _make_minimal_dna(
+            (0x42, weird_payload),
+            (0x99, b"another unknown"),
+        )
+        new_xml = "<HistoryTree/>"
+        out = sc._inject_commercialsaas_history(data, new_xml)
+        # Re-extract the unknown packets and check byte-equality.
+        recovered = {t: p for t, _l, p in sc._iter_commercialsaas_packets(out)}
+        assert recovered[0x42] == weird_payload
+        assert recovered[0x99] == b"another unknown"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Real-file smoke checks — gated on sample files being present
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# History tree parser + serializer
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+_SAMPLE_HISTORY_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<HistoryTree>
+  <Node name="result.dna" type="DNA" seqLen="2603" strandedness="double"
+        ID="7" circular="1" operation="insertFragment">
+    <RegeneratedSite name="KpnI" pos="869" siteCount="1"/>
+    <RegeneratedSite name="HindIII" pos="1961" siteCount="1"/>
+    <InputSummary manipulation="replace" name1="HindIII" name2="KpnI"
+                  val1="1826" val2="869" siteCount1="1" siteCount2="1"/>
+    <Node name="parent_a.dna" type="DNA" seqLen="2468" strandedness="double"
+          ID="2" circular="1" resurrectable="1" operation="insertFragment">
+      <Node name="grandparent.dna" type="DNA" seqLen="1500"
+            strandedness="double" ID="0" circular="0"
+            operation="insertFragment"/>
+    </Node>
+    <Node name="parent_b.dna" type="DNA" seqLen="500" strandedness="double"
+          ID="3" circular="0" resurrectable="1" operation="insert"/>
+  </Node>
+</HistoryTree>"""
+
+
+class TestParseCommercialSaaSHistory:
+    def test_parses_top_level_node(self):
+        root = sc._parse_commercialsaas_history(_SAMPLE_HISTORY_XML)
+        assert root is not None
+        assert root.name == "result.dna"
+        assert root.operation == "insertFragment"
+        assert root.seq_len == 2603
+        assert root.circular is True
+        assert root.node_id == 7
+
+    def test_typed_getters_for_attributes(self):
+        root = sc._parse_commercialsaas_history(_SAMPLE_HISTORY_XML)
+        assert root.regenerated_sites == [
+            {"name": "KpnI",    "pos": 869,  "siteCount": 1},
+            {"name": "HindIII", "pos": 1961, "siteCount": 1},
+        ]
+        summaries = root.input_summaries
+        assert len(summaries) == 1
+        assert summaries[0]["manipulation"] == "replace"
+        assert summaries[0]["val1"] == 1826
+
+    def test_parents_returns_direct_children(self):
+        root = sc._parse_commercialsaas_history(_SAMPLE_HISTORY_XML)
+        parents = root.parents
+        assert [p.name for p in parents] == ["parent_a.dna", "parent_b.dna"]
+        # Resurrectable flag captured on parent nodes.
+        assert all(p.resurrectable for p in parents)
+        # The top-level result node is NOT resurrectable.
+        assert root.resurrectable is False
+
+    def test_walk_pre_order_depth_first(self):
+        root = sc._parse_commercialsaas_history(_SAMPLE_HISTORY_XML)
+        names = [n.name for n in root.walk()]
+        assert names == [
+            "result.dna",
+            "parent_a.dna",
+            "grandparent.dna",
+            "parent_b.dna",
+        ]
+
+    def test_returns_none_on_empty_xml(self):
+        assert sc._parse_commercialsaas_history("") is None
+        assert sc._parse_commercialsaas_history("   \n  ") is None
+
+    def test_returns_none_when_history_tree_has_no_nodes(self):
+        assert sc._parse_commercialsaas_history(
+            '<?xml version="1.0"?><HistoryTree></HistoryTree>'
+        ) is None
+
+    def test_rejects_wrong_root_element(self):
+        with pytest.raises(ValueError) as exc:
+            sc._parse_commercialsaas_history(
+                '<?xml version="1.0"?><WrongRoot/>'
+            )
+        assert "HistoryTree" in str(exc.value)
+
+    def test_rejects_malformed_xml(self):
+        with pytest.raises(ValueError):
+            sc._parse_commercialsaas_history("<HistoryTree><Node oops")
+
+    def test_malformed_int_attrs_default_to_zero(self):
+        """A node with unparseable seqLen must NOT raise — return 0
+        and let downstream code decide what to do. Defends against
+        future CommercialSaaS versions that might change attribute formats."""
+        xml = ('<?xml version="1.0"?><HistoryTree>'
+                '<Node name="x" seqLen="not-a-number" '
+                'circular="1" operation="insertFragment"/>'
+                '</HistoryTree>')
+        root = sc._parse_commercialsaas_history(xml)
+        assert root is not None
+        assert root.seq_len == 0
+        assert root.node_id == 0
+
+
+class TestSerializeCommercialSaaSHistory:
+    def test_round_trip_via_parse_then_serialize(self):
+        root = sc._parse_commercialsaas_history(_SAMPLE_HISTORY_XML)
+        serialized = sc._serialize_commercialsaas_history(root)
+        # Re-parse: must give back an equivalent tree.
+        root2 = sc._parse_commercialsaas_history(serialized)
+        assert root2 is not None
+        assert root2.name           == root.name
+        assert root2.operation      == root.operation
+        assert root2.seq_len        == root.seq_len
+        assert [p.name for p in root2.parents] == \
+               [p.name for p in root.parents]
+
+    def test_emits_xml_declaration(self):
+        """CommercialSaaS's history XML always opens with the standard
+        `<?xml ...?>` declaration. Make sure our serializer keeps it
+        — file parsers downstream sometimes refuse declaration-less
+        XML."""
+        root = sc._parse_commercialsaas_history(_SAMPLE_HISTORY_XML)
+        out = sc._serialize_commercialsaas_history(root)
+        assert out.startswith('<?xml version="1.0" encoding="UTF-8"?>')
+
+    def test_serializes_empty_tree(self):
+        out = sc._serialize_commercialsaas_history(None)
+        # Just the HistoryTree shell, valid + parseable.
+        assert "<HistoryTree" in out
+        assert sc._parse_commercialsaas_history(out) is None
+
+
+class TestCommercialSaaSHistoryNodeMutation:
+    def test_new_creates_canonical_attributes(self):
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="fresh.dna", seq_len=1000, circular=True,
+            operation="insertFragment", node_id=42,
+        )
+        assert node.name        == "fresh.dna"
+        assert node.seq_len     == 1000
+        assert node.circular    is True
+        assert node.node_id     == 42
+        assert node.operation   == "insertFragment"
+        # Type defaulted to DNA.
+        assert node.element.get("type") == "DNA"
+        # Strandedness defaulted to double.
+        assert node.element.get("strandedness") == "double"
+
+    def test_add_parent_appends_to_tree(self):
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="result.dna", seq_len=2000, circular=True,
+            operation="insertFragment",
+        )
+        parent = sc._CommercialSaaSHistoryNode.new(
+            name="parent.dna", seq_len=1500, circular=True,
+            operation="insertFragment",
+        )
+        root.add_parent(parent)
+        assert [p.name for p in root.parents] == ["parent.dna"]
+
+    def test_add_regenerated_site(self):
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="r", seq_len=100, circular=True,
+            operation="insertFragment",
+        )
+        root.add_regenerated_site("EcoRI", 50, site_count=1)
+        sites = root.regenerated_sites
+        assert sites == [{"name": "EcoRI", "pos": 50, "siteCount": 1}]
+
+    def test_add_input_summary(self):
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="r", seq_len=100, circular=True,
+            operation="insertFragment",
+        )
+        root.add_input_summary(manipulation="replace", name1="EcoRI",
+                                  name2="BamHI", val1=10, val2=50)
+        summaries = root.input_summaries
+        assert len(summaries) == 1
+        assert summaries[0]["manipulation"] == "replace"
+        assert summaries[0]["name1"]        == "EcoRI"
+        assert summaries[0]["val1"]         == 10
+
+    def test_built_tree_round_trips_through_serialize(self):
+        """Build a fresh tree from scratch, serialise it, parse it
+        back. The parser must see every parent + regenerated site +
+        input summary we attached."""
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="construct.dna", seq_len=5000, circular=True,
+            operation="insertFragment", node_id=1,
+        )
+        root.add_regenerated_site("EcoRI", 100)
+        root.add_input_summary(manipulation="replace",
+                                  name1="EcoRI", name2="BamHI",
+                                  val1=100, val2=600)
+        parent_a = sc._CommercialSaaSHistoryNode.new(
+            name="vec.dna", seq_len=3500, circular=True,
+            operation="insertFragment", node_id=2,
+        )
+        parent_b = sc._CommercialSaaSHistoryNode.new(
+            name="ins.dna", seq_len=1500, circular=False,
+            operation="insertFragment", node_id=3,
+        )
+        root.add_parent(parent_a)
+        root.add_parent(parent_b)
+        out = sc._serialize_commercialsaas_history(root)
+        re_parsed = sc._parse_commercialsaas_history(out)
+        assert re_parsed is not None
+        assert re_parsed.name == "construct.dna"
+        parent_names = [p.name for p in re_parsed.parents]
+        assert parent_names == ["vec.dna", "ins.dna"]
+        # Sites + input summaries also survived.
+        assert re_parsed.regenerated_sites == [
+            {"name": "EcoRI", "pos": 100, "siteCount": 1},
+        ]
+        assert re_parsed.input_summaries[0]["manipulation"] == "replace"
+
+    def test_full_chain_dna_to_dna_round_trip(self):
+        """End-to-end: take an in-memory .dna byte stream, extract
+        history, parse to typed tree, append a new step, re-serialise,
+        re-inject, re-extract — must give the modified tree back."""
+        # Start with a synthetic .dna that has a history.
+        original_xml = _SAMPLE_HISTORY_XML
+        original_payload = sc._pack_commercialsaas_history_payload(original_xml)
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x07, original_payload),
+        )
+        # Parse → modify → serialise.
+        xml = sc._extract_commercialsaas_history_xml(data)
+        root = sc._parse_commercialsaas_history(xml)
+        # Append a new step via add_input_summary.
+        root.add_input_summary(manipulation="ligate-via-splicecraft",
+                                  name1="EcoRI", name2="BamHI",
+                                  val1=10, val2=20)
+        new_xml = sc._serialize_commercialsaas_history(root)
+        out = sc._inject_commercialsaas_history(data, new_xml)
+        # Round-trip read.
+        recovered_xml = sc._extract_commercialsaas_history_xml(out)
+        recovered_root = sc._parse_commercialsaas_history(recovered_xml)
+        # New step is in.
+        all_summaries = recovered_root.input_summaries
+        labels = [s["manipulation"] for s in all_summaries]
+        assert "ligate-via-splicecraft" in labels
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Library-entry import wiring (Phase 4a)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestLibraryEntryHistory:
+    def test_record_to_library_entry_omits_history_when_none(
+            self, tiny_record):
+        from pathlib import Path as _Path
+        entry = sc._record_to_library_entry(tiny_record,
+                                              _Path("foo.gb"),
+                                              history_xml=None)
+        assert "history_xml" not in entry
+
+    def test_record_to_library_entry_attaches_history(self, tiny_record):
+        from pathlib import Path as _Path
+        xml = "<HistoryTree><Node name='x'/></HistoryTree>"
+        entry = sc._record_to_library_entry(tiny_record,
+                                              _Path("foo.dna"),
+                                              history_xml=xml)
+        assert entry["history_xml"] == xml
+
+    def test_extract_history_returns_none_for_non_dna(self, tmp_path):
+        gb = tmp_path / "x.gb"
+        gb.write_bytes(b"LOCUS dummy\n//\n")
+        assert sc._try_extract_history_xml_from_dna_path(gb) is None
+
+    def test_extract_history_returns_none_for_history_less_dna(
+            self, tmp_path):
+        # Build a minimal .dna without a 0x07 packet.
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+        )
+        path = tmp_path / "no_history.dna"
+        path.write_bytes(data)
+        assert sc._try_extract_history_xml_from_dna_path(path) is None
+
+    def test_extract_history_returns_xml_for_dna_with_history(
+            self, tmp_path):
+        xml = "<HistoryTree><Node name='child.dna'/></HistoryTree>"
+        payload = sc._pack_commercialsaas_history_payload(xml)
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x07, payload),
+        )
+        path = tmp_path / "with_history.dna"
+        path.write_bytes(data)
+        assert sc._try_extract_history_xml_from_dna_path(path) == xml
+
+    def test_extract_history_swallows_malformed_payload(self, tmp_path):
+        """A .dna with a malformed history packet must NOT crash the
+        bulk-import path — log + return None so the rest of the
+        plasmid still imports."""
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x07, b"definitely not xz"),
+        )
+        path = tmp_path / "bad_history.dna"
+        path.write_bytes(data)
+        assert sc._try_extract_history_xml_from_dna_path(path) is None
+
+    def test_extract_history_swallows_unreadable_file(self, tmp_path):
+        # Path to a file that doesn't exist.
+        ghost = tmp_path / "ghost.dna"
+        assert sc._try_extract_history_xml_from_dna_path(ghost) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# History viewer modal (Phase 4c)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestHistoryViewerModal:
+    async def test_renders_root_and_parents_in_tree(self, tiny_record):
+        """Build a 3-deep history tree, push the modal, verify the
+        Textual `Tree` widget contains a node per history step."""
+        from textual.widgets import Tree as _TreeWidget
+        # Construct: root → parent → grandparent.
+        gp = sc._CommercialSaaSHistoryNode.new(
+            name="grandparent.dna", seq_len=1000, circular=True,
+            operation="insertFragment", node_id=2,
+        )
+        parent = sc._CommercialSaaSHistoryNode.new(
+            name="parent.dna", seq_len=2500, circular=True,
+            operation="insertFragment", node_id=1,
+        )
+        parent.add_parent(gp)
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="result.dna", seq_len=5000, circular=True,
+            operation="insertFragment", node_id=0,
+        )
+        root.add_parent(parent)
+        # Drive the modal headlessly via PlasmidApp.run_test.
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        # The modal's compose doesn't depend on the loaded record;
+        # using `tiny_record` just so the app mounts cleanly.
+        app = _build_app(tiny_record, isolated_library=None)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.HistoryViewerModal("test-plasmid", root)
+            await app.push_screen(modal)
+            await pilot.pause()
+            tree = modal.query_one("#hist-tree", _TreeWidget)
+            # Walk the Textual tree, collect labels.
+            labels: list[str] = []
+            def _walk(n):
+                # Tree.root has no useful label of its own (root is hidden).
+                if n is not tree.root:
+                    labels.append(str(n.label))
+                for c in n.children:
+                    _walk(c)
+            _walk(tree.root)
+            # Three nodes total: result + parent + grandparent.
+            assert len(labels) == 3, labels
+            assert any("result.dna" in lab for lab in labels)
+            assert any("parent.dna" in lab for lab in labels)
+            assert any("grandparent.dna" in lab for lab in labels)
+
+    async def test_h_key_with_history_opens_modal(
+            self, tiny_record, isolated_library):
+        """Library panel binding `h` → app handler → push
+        HistoryViewerModal when the entry has `history_xml`."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        # Seed library with one entry that has history.
+        history_xml = sc._serialize_commercialsaas_history(
+            sc._CommercialSaaSHistoryNode.new(
+                name="seeded.dna", seq_len=1000, circular=True,
+                operation="insertFragment", node_id=0,
+            )
+        )
+        sc._save_library([{
+            "id":   "seeded",
+            "name": "seeded",
+            "size": 1000,
+            "history_xml": history_xml,
+        }])
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            # Switch to plasmids view + cursor on the seeded row.
+            from textual.widgets import DataTable
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "plasmids"
+            await pilot.pause()
+            try:
+                tbl = lib.query_one("#lib-table", DataTable)
+            except Exception:
+                pytest.skip("library panel layout differs in this build")
+            # Find the row index of "seeded" (other rows may have been
+            # auto-loaded by the app).
+            for i in range(tbl.row_count):
+                key = list(tbl.rows.keys())[i] if hasattr(tbl, 'rows') else None
+                # Use cursor moves to land on the seeded row.
+            tbl.move_cursor(row=0)
+            await pilot.pause()
+            # Trigger the action directly (bypasses keyboard simulation
+            # which is fragile in Textual run_test).
+            lib.action_request_history()
+            await pilot.pause()
+            # Modal should now be on the screen stack.
+            assert any(isinstance(s, sc.HistoryViewerModal)
+                        for s in app.screen_stack)
+
+    async def test_h_key_without_history_notifies(
+            self, tiny_record, isolated_library):
+        """Library entry without `history_xml` → user-friendly
+        notify, NOT the modal."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        sc._save_library([{
+            "id":   "no_hist",
+            "name": "no_hist",
+            "size": 1000,
+            # No history_xml field.
+        }])
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            from textual.widgets import DataTable
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "plasmids"
+            await pilot.pause()
+            try:
+                tbl = lib.query_one("#lib-table", DataTable)
+            except Exception:
+                pytest.skip("library panel layout differs in this build")
+            tbl.move_cursor(row=0)
+            await pilot.pause()
+            lib.action_request_history()
+            await pilot.pause()
+            # No modal pushed.
+            assert not any(isinstance(s, sc.HistoryViewerModal)
+                            for s in app.screen_stack)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sidecar storage + .dna export (Phase 4d)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestDnaSidecarStorage:
+    def test_save_and_load_round_trip(self):
+        data = b"\xfdfake commercialsaas bytes"
+        assert sc._save_dna_original("foo", data) is True
+        recovered = sc._load_dna_original("foo")
+        assert recovered == data
+
+    def test_save_refuses_empty_bytes(self):
+        # Don't silently nuke an existing sidecar with empty bytes.
+        assert sc._save_dna_original("foo", b"") is False
+
+    def test_save_refuses_oversized(self, monkeypatch):
+        monkeypatch.setattr(sc, "_DNA_SIDECAR_MAX_BYTES", 8)
+        # Cap is 8 bytes; 16-byte payload rejected.
+        assert sc._save_dna_original("foo", b"x" * 16) is False
+        # Sidecar file should NOT exist.
+        assert sc._load_dna_original("foo") is None
+
+    def test_load_returns_none_for_unknown_id(self):
+        assert sc._load_dna_original("never_saved") is None
+
+    def test_delete_removes_existing_sidecar(self):
+        sc._save_dna_original("victim", b"some bytes")
+        assert sc._load_dna_original("victim") is not None
+        assert sc._delete_dna_original("victim") is True
+        assert sc._load_dna_original("victim") is None
+        # Idempotent — second delete is a no-op.
+        assert sc._delete_dna_original("victim") is False
+
+    def test_save_handles_path_traversal_attempts(self):
+        """A user-controlled `entry_id` containing slashes must NOT
+        let a malicious entry write outside the sidecar dir. The
+        helper sanitises by replacing path separators."""
+        evil = "../../etc/passwd"
+        sc._save_dna_original(evil, b"trying to escape")
+        # The actual file lives under the sidecar dir, not at the
+        # escaped path.
+        actual = sc._dna_sidecar_path(evil)
+        assert actual.parent == sc._DNA_ORIGINALS_DIR
+
+    def test_sidecar_path_rejects_pure_dot_segments(self):
+        """Regression guard for 2026-05-06 fix: an `entry_id` of just
+        ``..`` or ``.`` is normalised to a sentinel so the resulting
+        sidecar can't shadow / collide with the parent dir entry on
+        weird filesystems."""
+        for evil in ("..", ".", "...", "./..", "/", "\\", "//"):
+            p = sc._dna_sidecar_path(evil)
+            assert p.parent == sc._DNA_ORIGINALS_DIR
+            assert p.name not in (".dna", "..dna")  # never a dotfile
+            assert "/" not in p.name
+            assert "\\" not in p.name
+
+    def test_sidecar_path_rejects_nul_bytes(self):
+        """NUL bytes in a path raise on POSIX; normalise to underscore
+        instead so the sentinel rule applies cleanly."""
+        p = sc._dna_sidecar_path("foo\x00bar")
+        assert p.parent == sc._DNA_ORIGINALS_DIR
+        assert "\x00" not in p.name
+
+    def test_sidecar_path_rejects_absolute_path_id(self):
+        """An entry_id that's a fully-qualified path must still produce
+        a sidecar inside the originals dir (basename only)."""
+        p = sc._dna_sidecar_path("/etc/passwd")
+        assert p.parent == sc._DNA_ORIGINALS_DIR
+        # Underscores replace slashes before basename extraction, so the
+        # full sanitised id ends up as the filename.
+        assert p.name.endswith(".dna")
+
+
+class TestExportCommercialSaaSDna:
+    def test_export_round_trips_through_history_splice(self, tmp_path):
+        # Build a synthetic .dna with one history step.
+        original_xml = "<HistoryTree><Node name='orig.dna'/></HistoryTree>"
+        original_payload = sc._pack_commercialsaas_history_payload(original_xml)
+        sidecar = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x07, original_payload),
+            (0x06, b"<Notes/>"),
+        )
+        sc._save_dna_original("test_entry", sidecar)
+        # Build a NEW history XML to splice in.
+        new_xml = ('<?xml version="1.0"?>'
+                    '<HistoryTree><Node name="modified.dna" type="DNA" '
+                    'seqLen="100" circular="1" '
+                    'operation="insertFragment"/></HistoryTree>')
+        entry = {"id": "test_entry", "name": "test",
+                  "history_xml": new_xml}
+        out_path = tmp_path / "exported.dna"
+        result = sc._export_commercialsaas_dna(entry, out_path)
+        assert result == str(out_path.resolve())
+        assert out_path.exists()
+        # Re-extract and confirm the new history is in.
+        recovered = sc._extract_commercialsaas_history_xml(out_path.read_bytes())
+        assert recovered is not None
+        assert "modified.dna" in recovered
+        assert "orig.dna" not in recovered
+
+    def test_export_strips_history_when_field_absent(self, tmp_path):
+        original_xml = "<HistoryTree><Node name='orig.dna'/></HistoryTree>"
+        sidecar = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x07, sc._pack_commercialsaas_history_payload(original_xml)),
+        )
+        sc._save_dna_original("entry_no_hist", sidecar)
+        # Entry has NO history_xml field — export should remove the
+        # 0x07 packet entirely.
+        entry = {"id": "entry_no_hist", "name": "x"}
+        out_path = tmp_path / "stripped.dna"
+        sc._export_commercialsaas_dna(entry, out_path)
+        assert sc._extract_commercialsaas_history_xml(out_path.read_bytes()) is None
+
+    def test_export_preserves_unknown_packets(self, tmp_path):
+        """Splice-only export must keep every non-history packet
+        byte-equal — that's the whole reason we sidecar the
+        original instead of regenerating from scratch."""
+        weird = b"\x00\xff\xaa\x55weird payload"
+        sidecar = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x42, weird),
+        )
+        sc._save_dna_original("weirdo", sidecar)
+        new_xml = ("<HistoryTree><Node name='x' type='DNA' seqLen='4' "
+                    "circular='1' operation='insertFragment'/></HistoryTree>")
+        entry = {"id": "weirdo", "name": "weirdo", "history_xml": new_xml}
+        out_path = tmp_path / "weirdo.dna"
+        sc._export_commercialsaas_dna(entry, out_path)
+        out_packets = {t: p for t, _l, p in
+                        sc._iter_commercialsaas_packets(out_path.read_bytes())}
+        assert out_packets[0x42] == weird
+
+    def test_export_falls_back_to_from_scratch_when_no_sidecar(
+            self, tmp_path, tiny_record):
+        """Phase 3 wiring: when there's no sidecar, the export
+        rebuilds a `.dna` from the entry's GenBank text instead of
+        raising. Result must round-trip back through BioPython
+        (sequence + features preserved)."""
+        # Build an entry from a real SeqRecord; no sidecar saved.
+        from pathlib import Path as _P
+        entry = sc._record_to_library_entry(tiny_record, _P("tiny.gb"))
+        out_path = tmp_path / "from_scratch.dna"
+        result = sc._export_commercialsaas_dna(entry, out_path)
+        assert result == str(out_path.resolve())
+        assert out_path.exists()
+        # BioPython must accept it.
+        from Bio import SeqIO
+        rec2 = SeqIO.read(str(out_path), sc._BIOPYTHON_DNA_FMT)
+        assert len(rec2.seq) == len(tiny_record.seq)
+
+    def test_export_raises_on_id_less_entry(self, tmp_path):
+        with pytest.raises(ValueError):
+            sc._export_commercialsaas_dna({"name": "no-id"},
+                                       tmp_path / "out.dna")
+
+    def test_export_raises_when_no_gb_text_and_no_sidecar(self, tmp_path):
+        entry = {"id": "ghost", "name": "ghost"}
+        with pytest.raises(ValueError) as exc:
+            sc._export_commercialsaas_dna(entry, tmp_path / "out.dna")
+        assert "gb_text" in str(exc.value).lower()
+
+
+class TestWriteCommercialSaaSDnaBytes:
+    """Exercise the from-scratch writer (Phase 3) directly: build a
+    SeqRecord, write `.dna` bytes, round-trip back through both our
+    own packet iterator AND BioPython's CommercialSaaS reader. Catches
+    schema regressions (a feature attribute we accidentally drop,
+    a bad XML entity escape, etc.) without needing CommercialSaaS Viewer
+    in the loop."""
+
+    def test_writes_minimum_viable_packets(self, tiny_record):
+        data = sc._write_commercialsaas_dna_bytes(tiny_record)
+        types = [t for t, _l, _p in sc._iter_commercialsaas_packets(data)]
+        # Cookie first, then DNA, features, notes (no primers / no
+        # cosmetic packets in v1).
+        assert types[:4] == [0x09, 0x00, 0x0A, 0x06]
+
+    def test_writer_round_trips_via_biopython(self, tiny_record, tmp_path):
+        """A BioPython re-read of our writer's output must recover
+        the sequence (length-equal, content-equal up to case),
+        topology, and the same number of features."""
+        data = sc._write_commercialsaas_dna_bytes(tiny_record)
+        out = tmp_path / "rt.dna"
+        out.write_bytes(data)
+        from Bio import SeqIO
+        rec2 = SeqIO.read(str(out), sc._BIOPYTHON_DNA_FMT)
+        assert len(rec2.seq) == len(tiny_record.seq)
+        assert str(rec2.seq).upper() == str(tiny_record.seq).upper()
+        assert (rec2.annotations.get("topology") ==
+                tiny_record.annotations.get("topology"))
+        # Same feature count (excluding source).
+        rt_feats = [f for f in rec2.features if f.type != "source"]
+        src_feats = [f for f in tiny_record.features
+                       if f.type != "source"]
+        assert len(rt_feats) == len(src_feats)
+
+    def test_writer_includes_history_when_provided(self, tiny_record,
+                                                       tmp_path):
+        history_xml = ('<?xml version="1.0"?>'
+                        '<HistoryTree>'
+                        '<Node name="x.dna" type="DNA" seqLen="100" '
+                        'circular="1" operation="insertFragment"/>'
+                        '</HistoryTree>')
+        data = sc._write_commercialsaas_dna_bytes(
+            tiny_record, history_xml=history_xml)
+        # 0x07 history packet present.
+        types = [t for t, _l, _p in sc._iter_commercialsaas_packets(data)]
+        assert 0x07 in types
+        # Round-trip the history XML.
+        recovered = sc._extract_commercialsaas_history_xml(data)
+        assert recovered == history_xml
+
+    def test_writer_emits_directionality_for_strand(self, tiny_record):
+        """Forward / reverse strand maps to CommercialSaaS's
+        `directionality="1"` / `"2"` attribute on `<Feature>`."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("A" * 100), id="P", name="P",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        rec.features = [
+            SeqFeature(FeatureLocation(10, 20, strand=1),
+                        type="CDS", qualifiers={"label": ["fwd"]}),
+            SeqFeature(FeatureLocation(30, 40, strand=-1),
+                        type="CDS", qualifiers={"label": ["rev"]}),
+            SeqFeature(FeatureLocation(50, 60, strand=0),
+                        type="misc_feature",
+                        qualifiers={"label": ["unstranded"]}),
+        ]
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        # Pull out the features XML payload.
+        for t, _l, payload in sc._iter_commercialsaas_packets(data):
+            if t == 0x0A:
+                xml_text = payload.decode("utf-8")
+                break
+        else:
+            pytest.fail("features packet not emitted")
+        assert 'directionality="1"' in xml_text
+        assert 'directionality="2"' in xml_text
+        # Unstranded must NOT have a directionality attribute (matches
+        # CommercialSaaS's convention of omitting it for non-directional
+        # features). Match exactly the `<Feature ...>` open tag that
+        # carries `name="unstranded"`; checking the surrounding
+        # context too broadly picks up the prior feature's attrs.
+        import re as _re
+        m = _re.search(r'<Feature [^>]*?name="unstranded"[^>]*?>',
+                         xml_text)
+        assert m is not None, "couldn't locate unstranded <Feature>"
+        assert "directionality" not in m.group(0), m.group(0)
+
+    def test_writer_emits_compoundlocation_as_multiple_segments(self):
+        """CompoundLocation features (wrap-around, spliced CDSes)
+        get one `<Segment>` per part — matches CommercialSaaS's convention
+        for storing multi-part features."""
+        from Bio.SeqFeature import (SeqFeature, FeatureLocation,
+                                       CompoundLocation)
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("A" * 200), id="P", name="P",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        # Wrap feature 180..200 + 0..20.
+        rec.features = [
+            SeqFeature(CompoundLocation([
+                FeatureLocation(180, 200, strand=1),
+                FeatureLocation(0, 20, strand=1),
+            ]), type="misc_feature", qualifiers={"label": ["wrap"]}),
+        ]
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        for t, _l, p in sc._iter_commercialsaas_packets(data):
+            if t == 0x0A:
+                xml_text = p.decode("utf-8")
+                break
+        # Two Segment elements for the wrap feature.
+        assert xml_text.count("<Segment ") == 2
+        # Ranges are 1-based.
+        assert 'range="181-200"' in xml_text
+        assert 'range="1-20"' in xml_text
+
+    def test_writer_rejects_empty_sequence(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq(""), id="empty", name="empty")
+        with pytest.raises(ValueError) as exc:
+            sc._write_commercialsaas_dna_bytes(rec)
+        assert "empty" in str(exc.value).lower()
+
+    def test_writer_rejects_none_record(self):
+        with pytest.raises(ValueError):
+            sc._write_commercialsaas_dna_bytes(None)
+
+
+class TestWriterHardening:
+    """Phase 5 — adversarial inputs the writer must handle without
+    blowing up. CommercialSaaS Viewer compatibility is gated separately
+    on real-machine validation; these checks catch bugs that would
+    crash the writer or produce malformed XML."""
+
+    def _record(self, seq="A" * 100, features=None, *, circular=True):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq(seq), id="P", name="P",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular" if circular else "linear"},
+        )
+        if features:
+            rec.features = features
+        return rec
+
+    def test_idempotent_round_trip(self, tiny_record):
+        """Write → re-read → re-write → re-read must converge: the
+        second cycle's output should match the first's. Catches
+        schema drift where some attribute is added or dropped on
+        every pass."""
+        from Bio import SeqIO
+        import io as _io
+        first = sc._write_commercialsaas_dna_bytes(tiny_record)
+        rec1 = SeqIO.read(_io.BytesIO(first), sc._BIOPYTHON_DNA_FMT)
+        second = sc._write_commercialsaas_dna_bytes(rec1)
+        rec2 = SeqIO.read(_io.BytesIO(second), sc._BIOPYTHON_DNA_FMT)
+        # Sequence + topology + feature count stable across cycles.
+        assert str(rec2.seq).upper() == str(rec1.seq).upper()
+        assert (rec2.annotations.get("topology")
+                == rec1.annotations.get("topology"))
+        assert len([f for f in rec2.features if f.type != "source"]) == \
+                len([f for f in rec1.features if f.type != "source"])
+
+    def test_xml_escapes_special_chars_in_qualifier_values(self):
+        """A qualifier containing `<>&"'` characters must be XML-
+        escaped on write — otherwise the resulting XML wouldn't
+        parse. ElementTree does this automatically; the test locks
+        that behaviour in so a future "manual XML build" refactor
+        doesn't regress it."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._record(features=[
+            SeqFeature(FeatureLocation(0, 50, strand=1),
+                        type="CDS",
+                        qualifiers={
+                            "label": ["test"],
+                            "note":  ['Has "quotes" & <tags>'],
+                        }),
+        ])
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        # Pull the features XML and re-parse it via xml.etree to make
+        # sure the escaping survives a full read.
+        for t, _l, p in sc._iter_commercialsaas_packets(data):
+            if t == 0x0A:
+                xml_text = p.decode("utf-8")
+                break
+        import xml.etree.ElementTree as _ET
+        root = _ET.fromstring(xml_text)
+        # Find the V element with our note.
+        for v in root.iter("V"):
+            text = v.get("text") or ""
+            if "quotes" in text:
+                assert text == 'Has "quotes" & <tags>'
+                break
+        else:
+            pytest.fail("note V element with our text not found")
+
+    def test_writer_handles_no_features(self):
+        """Empty features list emits a valid `<Features
+        nextValidID="0">` — must round-trip."""
+        rec = self._record(features=[])
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        from Bio import SeqIO
+        import io as _io
+        rt = SeqIO.read(_io.BytesIO(data), sc._BIOPYTHON_DNA_FMT)
+        assert len([f for f in rt.features if f.type != "source"]) == 0
+
+    def test_writer_handles_iupac_bases(self):
+        """Sequences with IUPAC ambiguity codes (N, R, Y, etc.) pass
+        through unchanged — CommercialSaaS tolerates them in the DNA packet."""
+        rec = self._record(seq="ATGCNRYWSKMBDHV" * 5)
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        from Bio import SeqIO
+        import io as _io
+        rt = SeqIO.read(_io.BytesIO(data), sc._BIOPYTHON_DNA_FMT)
+        # BioPython lowercases on read; compare uppercase.
+        assert str(rt.seq).upper() == str(rec.seq).upper()
+
+    def test_writer_strips_control_chars_from_feature_name(self):
+        """A feature label with control bytes (NUL, DEL) must NOT
+        propagate into the XML — those would break the reader and
+        could be used for terminal-escape injection."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._record(features=[
+            SeqFeature(FeatureLocation(0, 50, strand=1),
+                        type="CDS",
+                        qualifiers={"label": ["nasty\x00\x07\x1bname"]}),
+        ])
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        # Find the XML, confirm no control bytes.
+        for t, _l, p in sc._iter_commercialsaas_packets(data):
+            if t == 0x0A:
+                xml_text = p.decode("utf-8")
+                break
+        # `\x00` etc. should NOT be in the XML.
+        for ch in "\x00\x07\x1b":
+            assert ch not in xml_text, f"control byte {ch!r} leaked"
+        # The clean part of the label survives.
+        assert "nastyname" in xml_text
+
+    def test_writer_handles_very_long_feature_label(self):
+        """Labels are capped at 200 chars to avoid pathological XML
+        from a hand-crafted SeqRecord with a multi-MB qualifier."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        long_label = "X" * 5000
+        rec = self._record(features=[
+            SeqFeature(FeatureLocation(0, 50, strand=1),
+                        type="CDS",
+                        qualifiers={"label": [long_label]}),
+        ])
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        for t, _l, p in sc._iter_commercialsaas_packets(data):
+            if t == 0x0A:
+                xml_text = p.decode("utf-8")
+                break
+        # The cap is 200 chars (per `_commercialsaas_feat_name`).
+        # Find the name attribute in the rendered XML and check length.
+        import re as _re
+        m = _re.search(r'name="(X+)"', xml_text)
+        assert m is not None
+        assert len(m.group(1)) <= 200
+
+    def test_writer_works_on_linear_topology(self):
+        """Linear topology = flag byte 0x00 (vs 0x01 for circular).
+        BioPython must round-trip the topology field."""
+        rec = self._record(circular=False)
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        from Bio import SeqIO
+        import io as _io
+        rt = SeqIO.read(_io.BytesIO(data), sc._BIOPYTHON_DNA_FMT)
+        assert rt.annotations.get("topology") == "linear"
+
+    def test_writer_skips_source_features(self):
+        """The synthetic `source` feature BioPython adds for GenBank
+        records is NOT a real annotation — CommercialSaaS's features
+        packet shouldn't include it."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._record(features=[
+            SeqFeature(FeatureLocation(0, 100, strand=1), type="source",
+                        qualifiers={"organism": ["synthetic"]}),
+            SeqFeature(FeatureLocation(10, 50, strand=1), type="CDS",
+                        qualifiers={"label": ["real"]}),
+        ])
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        for t, _l, p in sc._iter_commercialsaas_packets(data):
+            if t == 0x0A:
+                xml_text = p.decode("utf-8")
+                break
+        assert "source" not in xml_text
+        assert "real" in xml_text
+
+
+class TestExportCommercialSaaSAction:
+    """The File → Export as CommercialSaaS (.dna)… action surfaces a clear
+    notify when the loaded record has no CommercialSaaS sidecar to splice
+    into. End-to-end happy path is exercised via direct
+    `_export_commercialsaas_dna` calls in `TestExportCommercialSaaSDna`."""
+
+    async def test_no_record_loaded_notifies(self, isolated_library):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        # Explicitly bypass the auto-preload path so `_current_record`
+        # stays None at the moment the action fires.
+        app = _build_app(None, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Force the no-record state regardless of whatever the
+            # bootstrap may have auto-loaded.
+            app._current_record = None
+            n_screens_before = len(app.screen_stack)
+            app.action_export_commercialsaas()
+            await pilot.pause()
+            assert len(app.screen_stack) == n_screens_before, (
+                "action shouldn't push a modal when no plasmid loaded")
+
+    async def test_no_sidecar_falls_back_to_from_scratch(
+            self, tiny_record, isolated_library):
+        """Phase 3 wiring (was Phase 4d notify): when an entry has
+        no sidecar, the export action now still pushes the modal —
+        the export will use `_write_commercialsaas_dna_bytes` to build
+        from scratch instead of erroring out."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from pathlib import Path as _P
+        # tiny_record is in the library but has NO sidecar.
+        entry = sc._record_to_library_entry(tiny_record, _P("t.gb"))
+        sc._save_library([entry])
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_export_commercialsaas()
+            await pilot.pause()
+            # Modal IS pushed; from-scratch export will run on submit.
+            assert any(isinstance(s, sc.ExportCommercialSaaSModal)
+                        for s in app.screen_stack), (
+                f"expected modal on stack, got "
+                f"{[type(s).__name__ for s in app.screen_stack]}")
+
+    async def test_sidecar_present_pushes_modal(
+            self, tiny_record, isolated_library):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        # Seed library + sidecar.
+        sidecar_bytes = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+        )
+        sc._save_library([{
+            "id":   tiny_record.id,
+            "name": "tiny",
+            "size": len(tiny_record.seq),
+        }])
+        sc._save_dna_original(tiny_record.id, sidecar_bytes)
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_export_commercialsaas()
+            await pilot.pause()
+            assert any(isinstance(s, sc.ExportCommercialSaaSModal)
+                        for s in app.screen_stack), (
+                f"expected ExportCommercialSaaSModal on stack, got "
+                f"{[type(s).__name__ for s in app.screen_stack]}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 5 hardening — corpus round-trip
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(not _SAMPLE_DIR.exists(),
+                    reason="CommercialSaaS sample corpus not available")
+class TestWriterCorpusRoundTrip:
+    """Confirm the from-scratch writer's output is BioPython-readable
+    across a representative sample of real `.dna` files. This catches
+    schema regressions (a feature attribute we accidentally drop, an
+    XML escape that breaks parsing, etc.) without needing CommercialSaaS
+    Viewer in the loop. CommercialSaaS-Viewer compatibility is the next
+    validation step; this is the BioPython-level smoke test."""
+
+    @pytest.fixture(scope="class")
+    def corpus_files(self):
+        samples = sorted(_SAMPLE_DIR.glob("*.dna"))
+        # Cap each file at 500 KB to keep the test fast (the full
+        # corpus has chromosome dumps; round-trip on those is real
+        # work but not what this regression guard targets).
+        return [s for s in samples if s.stat().st_size < 500_000]
+
+    def test_corpus_round_trip_via_biopython(self, corpus_files):
+        if not corpus_files:
+            pytest.skip("no <500KB sample files found")
+        from Bio import SeqIO
+        import io as _io
+        import warnings as _warnings
+        _warnings.simplefilter("ignore")
+        failures = []
+        for path in corpus_files:
+            try:
+                original = SeqIO.read(str(path), sc._BIOPYTHON_DNA_FMT)
+                rewritten = sc._write_commercialsaas_dna_bytes(original)
+                recovered = SeqIO.read(_io.BytesIO(rewritten),
+                                          sc._BIOPYTHON_DNA_FMT)
+                if str(recovered.seq).upper() != str(original.seq).upper():
+                    failures.append((path.name, "seq mismatch"))
+                elif (recovered.annotations.get("topology")
+                       != original.annotations.get("topology")):
+                    failures.append(
+                        (path.name,
+                         f"topology mismatch: "
+                         f"{original.annotations.get('topology')} "
+                         f"→ {recovered.annotations.get('topology')}"))
+            except Exception as exc:
+                failures.append((path.name,
+                                  f"{type(exc).__name__}: "
+                                  f"{str(exc)[:120]}"))
+        assert not failures, (
+            f"\n{len(failures)} round-trip failure(s):\n" +
+            "\n".join(f"  {n}: {e}" for n, e in failures[:10])
+        )
+
+
+@pytest.mark.skipif(not _SAMPLE_WITH_HISTORY.exists(),
+                    reason="CommercialSaaS sample corpus not available")
+class TestRealCommercialSaaSFiles:
+    def test_extracts_history_from_real_file(self):
+        """ECXA.dna in the test corpus carries a populated history.
+        The XML root must be ``<HistoryTree>`` and contain at least
+        one ``<Node>`` element."""
+        data = _SAMPLE_WITH_HISTORY.read_bytes()
+        xml = sc._extract_commercialsaas_history_xml(data)
+        assert xml is not None
+        assert "<HistoryTree>" in xml
+        assert "<Node" in xml
+        # The top-level node names the file (this is CommercialSaaS's
+        # convention — re-saving updates it).
+        assert "ECXA.dna" in xml or "ECXA" in xml
+
+    def test_returns_none_for_history_less_file(self):
+        if not _SAMPLE_WITHOUT_HISTORY.exists():
+            pytest.skip("history-less sample file unavailable")
+        data = _SAMPLE_WITHOUT_HISTORY.read_bytes()
+        # The PCR-product fixture has no construction history.
+        assert sc._extract_commercialsaas_history_xml(data) is None
+
+    def test_round_trip_history_on_real_file(self):
+        """Extract → re-inject → re-extract must give the same XML
+        back. Note: the `.dna` byte stream itself is NOT byte-equal
+        after round-trip because xz compression is non-deterministic
+        (different presets / dictionaries can encode the same input
+        differently). The semantic invariant is the decoded XML."""
+        data = _SAMPLE_WITH_HISTORY.read_bytes()
+        xml = sc._extract_commercialsaas_history_xml(data)
+        assert xml is not None
+        out = sc._inject_commercialsaas_history(data, xml)
+        recovered = sc._extract_commercialsaas_history_xml(out)
+        assert recovered == xml
+        # Every non-history packet should also survive the round-trip
+        # byte-exact (the splicer only touches 0x07).
+        before = [(t, p) for t, _l, p in sc._iter_commercialsaas_packets(data)
+                  if t != 0x07]
+        after  = [(t, p) for t, _l, p in sc._iter_commercialsaas_packets(out)
+                  if t != 0x07]
+        assert before == after

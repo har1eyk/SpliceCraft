@@ -11,8 +11,9 @@
 viewer, sequence editor, primer + mutagenesis designer, Golden Braid /
 MoClo cloning workbench, and in-process BLAST / HMMscan engine — all
 rendered as crisp Unicode braille graphics in any modern terminal.
-Fetch from NCBI, load `.gb` / `.gbk` / CommercialSaaS `.dna` files (single or
-in bulk), organize plasmids into named collections, design diagnostic /
+Fetch from NCBI, load `.gb` / `.gbk` files or `.dna` files from the
+popular commercial plasmid editor file format (single or in bulk),
+organize plasmids into named collections, design diagnostic /
 cloning / Golden Braid primers via Primer3, run SOE-PCR site-directed
 mutagenesis on any CDS, and search your own plasmid library by sequence
 similarity — without ever leaving the shell.
@@ -66,8 +67,9 @@ constraints:
 - **Refusal to start in a tiny terminal.** Below 100×30, SpliceCraft
   prints a friendly resize-and-retry message and exits with code 2
   rather than rendering a clipped, broken UI.
-- **Bulk-import with per-file failure isolation.** The bulk CommercialSaaS /
-  GenBank importer caps per-file size at 50 MB, skips zero-length
+- **Bulk-import with per-file failure isolation.** The bulk
+  importer (GenBank or popular commercial plasmid editor file format)
+  caps per-file size at 50 MB, skips zero-length
   records, catches `OSError` / `PermissionError` / `struct.error`
   per-file, and dedups colliding ids by suffix. One bad file in a
   500-plasmid archive does not abort the batch.
@@ -92,7 +94,7 @@ constraints:
 pipx install splicecraft
 splicecraft                      # empty canvas
 splicecraft L09137               # fetch pUC19 from NCBI on launch
-splicecraft myplasmid.gb         # local GenBank (.gb/.gbk) or CommercialSaaS (.dna) file
+splicecraft myplasmid.gb         # local GenBank (.gb/.gbk) or .dna (popular commercial plasmid editor format)
 ```
 
 `pipx` creates an isolated virtual environment for SpliceCraft and its
@@ -189,8 +191,8 @@ Press `?` once running for the full keyboard-shortcut reference.
   type a name, and pick a folder via the embedded directory tree.
   Every `.dna` / `.gb` / `.gbk` / `.genbank` file inside is loaded
   independently into a new collection; failures are isolated per file
-  and surfaced in a notify summary. Designed for migrating a CommercialSaaS
-  archive in one shot.
+  and surfaced in a notify summary. Designed for migrating a
+  popular-commercial-plasmid-editor archive in one shot.
 - **Library fuzzy search** — subsequence match (case-insensitive,
   non-contiguous) against the visible table.
 - **Feature library** — reusable feature snippets (per-entry colour

@@ -153,7 +153,7 @@ The 180× win on warm `_refresh_view` is what makes holding an arrow key feel sn
   2. **Double-click** on a sidebar row (`Click.chain >= 2` captured in `_on_table_click` and consumed in `_row_selected`, which then posts `RowOpened` instead of the highlight-only `RowActivated`).
   3. **Enter** while the SequencePanel has focus and the plasmid map has a selected feature.
 - **Layout fix.** Title docks top, action buttons (`Edit` / `Save` / `Cancel`) and status row dock bottom — both **always visible** regardless of body height. The form fields, sequence box, and notes box live in a `1fr` ScrollableContainer in between, so dense content scrolls inside the dialog instead of pushing the buttons off-screen. Resolves the "buttons out of viewport" bug from the prior layout, where `height: auto` on the dialog combined with `max-height: 28` on the body let the modal grow past the visible area on certain terminal sizes.
-- Save flow mirrors the agent-API `_h_update_feature` endpoint so the UI and the API can't drift — both rebuild the SeqRecord via `deepcopy` + per-feature mutation, push undo, and refresh all panels. Color persists via CommercialSaaS/Benchling `ApEinfo_fwdcolor` / `ApEinfo_revcolor`; notes via the standard GenBank `/note` qualifier.
+- Save flow mirrors the agent-API `_h_update_feature` endpoint so the UI and the API can't drift — both rebuild the SeqRecord via `deepcopy` + per-feature mutation, push undo, and refresh all panels. Color persists via the de-facto-standard `ApEinfo_fwdcolor` / `ApEinfo_revcolor` qualifiers (used by Benchling and the popular commercial plasmid editor); notes via the standard GenBank `/note` qualifier.
 
 ### Tests
 
@@ -272,7 +272,7 @@ The 180× win on warm `_refresh_view` is what makes holding an arrow key feel sn
 
 ### Added
 
-- **Bulk CommercialSaaS / GenBank import** — clicking `+` on the LibraryPanel collections view opens a redesigned `NewCollectionModal` with an embedded `DirectoryTree`; pick a folder, click "Create", and every `.dna` / `.gb` / `.gbk` / `.genbank` file inside is loaded into a fresh collection. Per-file failures isolated; notify summary calls out counts. Designed so a CommercialSaaS archive migrates in one shot.
+- **Bulk import (GenBank or popular commercial plasmid editor format)** — clicking `+` on the LibraryPanel collections view opens a redesigned `NewCollectionModal` with an embedded `DirectoryTree`; pick a folder, click "Create", and every `.dna` / `.gb` / `.gbk` / `.genbank` file inside is loaded into a fresh collection. Per-file failures isolated; notify summary calls out counts. Designed so an archive from the popular commercial plasmid editor migrates in one shot.
 - **Headless bulk-import CLI** — `scripts/bulk_import.py` is a thin wrapper around the same `_bulk_import_folder` core for very large archives / CI / automation.
 - **Min-size guard on launch** — `main()` checks `shutil.get_terminal_size()` before `app.run()`; below 100×30 SpliceCraft prints a friendly resize-and-retry message and exits with code 2 rather than rendering a clipped UI.
 - **Agent-API parity** — eight new endpoints so external CLI agents can drive every flow the GUI offers:
@@ -544,12 +544,13 @@ CHANGELOG release before structured logging began at [0.4.5]._
 
 ### Added
 
-- **CommercialSaaS (.dna) file import** — `File → Open` and the `o` hotkey
-  now accept CommercialSaaS's native binary `.dna` format via Biopython's
-  built-in parser. No manual GenBank export step required. Files are
-  dispatched by extension (`.gb`, `.gbk`, `.genbank` → GenBank;
-  `.dna` → CommercialSaaS), case-insensitively. Malformed `.dna` files
-  produce a user-friendly error pointing to the likely cause.
+- **`.dna` file import (popular commercial plasmid editor format)** —
+  `File → Open` and the `o` hotkey now accept the native binary `.dna`
+  format via Biopython's built-in parser. No manual GenBank export step
+  required. Files are dispatched by extension (`.gb`, `.gbk`,
+  `.genbank` → GenBank; `.dna` → binary parser), case-insensitively.
+  Malformed `.dna` files produce a user-friendly error pointing to the
+  likely cause.
 
 ### Fixed
 

@@ -207,6 +207,20 @@ _MODAL_CASES = [
                                                 total=2686,
                                                 sequence="ATG" * 100,
                                                 notes="See [Bolivar 1977](https://doi.org/10.1016/0378-1119(77)90000-2)")),
+    ("HistoryViewerModal",           lambda: sc.HistoryViewerModal(
+                                                "pUC19",
+                                                sc._CommercialSaaSHistoryNode.new(
+                                                    name="pUC19.dna",
+                                                    seq_len=2686,
+                                                    circular=True,
+                                                    operation="insertFragment",
+                                                    node_id=0))),
+    ("ExportCommercialSaaSModal",          lambda: sc.ExportCommercialSaaSModal(
+                                                {"id": "ex", "name": "ex",
+                                                 "size": 2686,
+                                                 "history_xml":
+                                                     "<HistoryTree/>"},
+                                                default_path="/tmp/ex.dna")),
 ]
 
 

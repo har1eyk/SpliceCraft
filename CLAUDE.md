@@ -2,7 +2,7 @@
 
 Agent handoff. Read before touching the codebase.
 
-Developed by a human bioinformatician + Claude. **Single-file architecture** — entire app is `splicecraft.py` (~23,000 lines). Intentional: keeps the codebase greppable.
+Developed by a human bioinformatician + Claude. **Single-file architecture** — entire app is `splicecraft.py` (~32,000 lines). Intentional: keeps the codebase greppable.
 
 ## What is SpliceCraft?
 
@@ -35,7 +35,7 @@ Each has at least one test in `tests/`. Touching `_scan_restriction_sites`, `_rc
 4. **IUPAC regex patterns are cached** in `_PATTERN_CACHE`. Don't recompile per-scan.
 5. **Circular wrap midpoint:** `arc_len = (end - start) % total; mid = (start + arc_len // 2) % total`. Naive `(start + (end - start) // 2) % total` puts the label opposite the actual arc.
 6. **Circular wrap RE scan** scans `seq + seq[:max_site_len-1]`. Each wrap hit emits **two resite pieces** (labeled tail `[p, n)` + unlabeled head `[0, (p+site_len) - n)`) and **one recut** at `(p + fwd_cut) % n`. Filtering code that counts resites must count only labeled pieces.
-7. **Data-file saves always back up.** Always go through `_safe_save_json` (`.bak` + `tempfile.mkstemp` + `os.fsync` + `os.replace`). Schema envelope `{"_schema_version": 1, "entries": [...]}`; `_extract_entries` accepts legacy bare-list (pre-0.3.1). Never bypass.
+7. **Data-file saves always back up.** Always go through `_safe_save_json` (`.bak` + `tempfile.mkstemp` + `os.fsync` + `os.replace`). Schema envelope `{"_schema_version": 1, "entries": [...]}`; `_extract_entries` accepts legacy bare-list (pre-0.3.1). Never bypass. **`_safe_save_json` re-raises on failure** (disk-full, RO mount, permission denied) so callers can `notify` the user — silent swallow used to desync UI state from disk.
 8. **Wrap-aware feature length.** Use `_feat_len(start, end, total)` — returns `(total - start) + end` when `end < start`, else `end - start`. All sort keys, length displays, biology checks must route through it.
 9. **Wrap-feature integrity in record edits.** `int(CompoundLocation.start)` returns `min(parts.start)` and silently flattens wrap features. `_rebuild_record_with_edit` per-part shifts wrap features and only collapses to FeatureLocation when 1 part survives.
 10. **Undo snapshots are deepcopied.** `_push_undo`, `_action_undo`, `_action_redo` all `deepcopy(self._current_record)`.
@@ -58,7 +58,15 @@ Each has at least one test in `tests/`. Touching `_scan_restriction_sites`, `_rc
 14. **Ctrl+Shift+C is functionally an alias for Ctrl+C** in most terminals (both ETX, 0x03). Alt+C is the actual reverse-complement-copy trigger.
 15. **`PlasmidApp.on_key` and `on_click` early-return when `len(screen_stack) > 1`** so seq-panel cursor moves / RE-highlight clears can't fire underneath a modal. Ctrl+Z / Ctrl+Y are above this guard.
 16. **`_blast_get_db` LRU is invalidated by `_save_collections`** via `globals().get("_blast_clear_cache")()`. Any new collection-mutation path that doesn't go through `_save_collections` must call `_blast_clear_cache()` manually.
-17. **Cache contracts.** `_load_collections`, `_load_features`, `_load_custom_grammars` deepcopy on read so caller-side mutations of returned dicts don't poison the cache. New persisted libraries with mutable callers should follow the same convention.
+17. **Cache contracts.** `_load_collections`, `_load_features`, `_load_custom_grammars`, `_load_parts_bin`, `_load_primers` deepcopy on read so caller-side mutations of returned dicts don't poison the cache. New persisted libraries with mutable callers should follow the same convention.
+18. **Trademark scrub.** `.dna` is the popular commercial plasmid editor's binary format. The trademarked name has been scrubbed from source — code identifiers use `CommercialSaaS` / `commercialsaas` / `_BIOPYTHON_DNA_FMT`. The BioPython API contract string (`"commercialsaas"`) and the 8-byte cookie magic (`b"CommercialSaaS"`) are stored hex-encoded as `_BIOPYTHON_DNA_FMT` and `_COMMERCIALSAAS_COOKIE_MAGIC` so the trademarked text never appears verbatim. User-facing prose says "popular commercial plasmid editor file format". Don't reintroduce the trademarked name in any new code.
+19. **Untrusted XML routes through `_safe_xml_parse`.** Sacred for NCBI responses AND `.dna` history packets — `_parse_commercialsaas_history` is the latest entry on this list. Don't add a new XML ingest path that calls `ET.fromstring` directly.
+20. **Network reads are size-capped.** PyPI (`_PYPI_MAX_RESPONSE_BYTES`), NCBI (`_NCBI_MAX_RESPONSE_BYTES`), Kazusa (`_KAZUSA_MAX_RESPONSE_BYTES`). Any new HTTP fetch must follow the `resp.read(MAX + 1)` + bail-if-exceeded pattern.
+21. **`_extract_commercialsaas_history_xml` uses streaming LZMA decompress** with `max_length=cap+1` so a compressed bomb that would expand to GB never materialises.
+22. **`_dna_sidecar_path` strips `..` / dot-only / NUL** via `Path(...).name` after replacing separators. Don't loosen — the entry_id can be user-controlled.
+23. **`_safe_load_json` is size-capped at `_SAFE_LOAD_JSON_MAX_BYTES` (50 MB).** A corrupted / mis-restored / hostile shared library file can't OOM the loader.
+24. **`_h_load_file` agent endpoint is size-capped at `_BULK_IMPORT_MAX_BYTES` (50 MB)** with `force=true` override. Other agent endpoints' size limits are documented inline.
+25. **`_excise_fragment_pair` enforces exactly-2 cuts on circular plasmids.** ≥3 cuts surfaces an error rather than silently returning ambiguous fragments. Sacred invariant — restriction-cloning correctness depends on this.
 
 ## Persistent user preferences
 
@@ -70,7 +78,9 @@ Adding one is mechanical:
 3. In `action_toggle_my_setting`, call `_set_setting("my_setting", self._my_setting)` after flipping.
 4. Surface in the Settings menu (`MenuBar.MENUS` between File and Edit; populated by the `Settings` entry in `PlasmidApp.open_menu`'s `menus` dict).
 
-Currently persisted: `show_feature_tooltips`, `click_debug`, `show_restr`, `restr_unique_only`, `restr_min_len`, `show_connectors`, `map_mode`, `active_collection`, `active_grammar`. The `show_connectors` and `map_mode` toggles need a deferred apply via `_pending_show_connectors` / `_pending_map_mode` because their target widgets aren't composed yet when `compose()` runs; `on_mount` reads the pending values once the children exist.
+Currently persisted user toggles: `show_feature_tooltips`, `click_debug`, `check_updates`, `show_restr`, `restr_unique_only`, `restr_min_len`, `min_primer_binding`, `show_connectors`, `linear_layout`, `active_collection`, `active_grammar`. `map_mode` is deliberately NOT persisted (re-derived from each record's `topology` field on load). `show_connectors` and `linear_layout` need a deferred apply via `_pending_show_connectors` / `_pending_linear_layout` because their target widgets aren't composed yet when `compose()` runs; `on_mount` reads the pending values once the children exist.
+
+Persisted infrastructure (not user-facing toggles): `last_seen_version` (drives the What's New auto-push), `last_known_latest` + `last_update_check_ts` (24 h cache for the PyPI update probe), `hmm_db_path` (last-used HMM database path).
 
 ## Pairwise alignment + Plasmidsaurus ingestion (0.5.3+)
 

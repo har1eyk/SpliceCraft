@@ -794,12 +794,12 @@ class TestBulkImportHardening:
     def test_struct_error_on_truncated_dna_rewrapped_as_value_error(
         self, tmp_path
     ):
-        # Truncated CommercialSaaS file — Biopython raises struct.error when
+        # Truncated .dna file — Biopython raises struct.error when
         # the binary header doesn't add up. load_genbank must rewrap as
         # ValueError so callers get the friendly message.
         truncated = tmp_path / "truncated.dna"
         truncated.write_bytes(b"\x09\x00not enough bytes")
-        with pytest.raises(ValueError, match="CommercialSaaS"):
+        with pytest.raises(ValueError, match=r"popular commercial plasmid editor"):
             sc.load_genbank(str(truncated))
 
     def test_repopulate_uses_text_so_markup_in_name_renders_literal(self):

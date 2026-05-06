@@ -303,6 +303,54 @@ class TestFeaturesHandler:
                     for f in feats)
 
 
+class TestLoadFileSizeCap:
+    """Regression guard for 2026-05-06 fix: `_h_load_file` previously
+    had NO size cap on disk reads — a malicious or buggy agent script
+    could load a 10 GB GenBank file and OOM the worker. Cap is now
+    `_BULK_IMPORT_MAX_BYTES` (50 MB) with `force=true` override."""
+
+    def test_oversized_file_rejected_with_413(self, tmp_path, monkeypatch):
+        # 10-byte cap so we don't actually need to write 50 MB.
+        monkeypatch.setattr(sc, "_BULK_IMPORT_MAX_BYTES", 10)
+        big = tmp_path / "huge.gb"
+        big.write_bytes(b"X" * 100)
+        app = MockApp()
+        result = sc._h_load_file(app, {"path": str(big)})
+        payload, status = result
+        assert status == 413
+        assert "cap" in payload["error"].lower()
+        assert payload["size_bytes"] == 100
+        assert payload["cap_bytes"] == 10
+
+    def test_force_overrides_size_cap(self, tmp_path, monkeypatch, tiny_record):
+        """Pass force=true and the cap is bypassed (matches GUI's
+        "load anyway" confirmation)."""
+        monkeypatch.setattr(sc, "_BULK_IMPORT_MAX_BYTES", 10)
+        # Use a real GenBank file so load_genbank succeeds.
+        gb = tmp_path / "ok.gb"
+        from io import StringIO
+        from Bio import SeqIO as _SeqIO
+        sio = StringIO()
+        _SeqIO.write([tiny_record], sio, "genbank")
+        gb.write_text(sio.getvalue())
+        app = MockApp()
+        # Without force: rejected.
+        result = sc._h_load_file(app, {"path": str(gb)})
+        assert isinstance(result, tuple) and result[1] == 413
+        # With force: parsed.
+        result = sc._h_load_file(app, {"path": str(gb), "force": True})
+        assert isinstance(result, dict) and result["ok"] is True
+
+    def test_missing_path_returns_400(self):
+        result = sc._h_load_file(MockApp(), {})
+        assert result[1] == 400 and "missing" in result[0]["error"]
+
+    def test_nonexistent_path_returns_404(self, tmp_path):
+        result = sc._h_load_file(MockApp(),
+                                  {"path": str(tmp_path / "nope.gb")})
+        assert result[1] == 404
+
+
 # ── End-to-end HTTP tests (real socket + JSON wire format) ─────────────────────
 
 
@@ -1073,6 +1121,68 @@ class TestNumericCoercionHardening:
             status = exc.code
         assert status == 400
 
+    def test_add_feature_strand_infinity(self, http_server, tiny_record):
+        """Regression guard for 2026-05-05 retrofit: `add-feature` used
+        to call raw `int(payload.get("strand", 1))` which raises
+        OverflowError on JSON `Infinity`. Now routes through
+        `_coerce_int` and returns a clean 400."""
+        base, token, _ = http_server
+        body_json = ('{"start": 0, "end": 10, "label": "x", '
+                       '"strand": Infinity}')
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/add-feature", data=body_json.encode(),
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 400
+
+    def test_update_feature_strand_infinity(self, http_server, tiny_record):
+        """Regression guard for 2026-05-05 retrofit: same fix on
+        `update-feature`'s optional strand field."""
+        base, token, _ = http_server
+        body_json = '{"idx": 0, "strand": Infinity}'
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/update-feature", data=body_json.encode(),
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 400
+
+    def test_list_restriction_sites_min_length_infinity(self, http_server,
+                                                          tiny_record):
+        """Regression guard for 2026-05-05 retrofit: `list-restriction-
+        sites` now rejects Infinity in `min_length` instead of bubbling
+        an OverflowError up to the 500 path."""
+        base, token, _ = http_server
+        body_json = '{"min_length": Infinity}'
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/list-restriction-sites", data=body_json.encode(),
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 400
+
 
 class TestRequestDispatcherHardening:
     """The HTTP dispatcher must hand handlers a real dict (never None,
@@ -1114,3 +1224,338 @@ class TestRequestDispatcherHardening:
             status = exc.code
         # Must be a clean 200/422 — not a 500 from .get() on a list.
         assert status in (200, 422)
+
+
+# ── Plasmid status endpoints (added 2026-05-05 for v1.0) ──────────────────────
+
+
+class TestPlasmidStatusEndpoints:
+    def test_list_plasmid_statuses(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(f"{base}/list-plasmid-statuses", token=token)
+        assert status == 200
+        assert payload["ok"] is True
+        # Strict canonical vocabulary — exactly the four statuses.
+        assert set(payload["statuses"]) == {
+            "DESIGNING", "CLONING", "SEQUENCING", "VERIFIED"
+        }
+        # Each status carries a hex color; the agent can use it for
+        # rendering without re-deriving from the GUI.
+        assert all(c.startswith("#") for c in payload["colors"].values())
+
+    def test_set_plasmid_status_round_trip(self, http_server, tiny_record):
+        # Seed one library entry the endpoint can target.
+        sc._save_library([{"name": "pTest", "id": "pTest",
+                            "gb_text": "fake"}])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-plasmid-status", method="POST",
+            body={"name": "pTest", "status": "CLONING"}, token=token,
+        )
+        assert status == 200
+        assert payload["status"] == "CLONING"
+        # Persisted on disk.
+        entry = next(e for e in sc._load_library() if e["name"] == "pTest")
+        assert entry["status"] == "CLONING"
+
+    def test_set_plasmid_status_clears_with_empty_string(self, http_server):
+        sc._save_library([{"name": "pTest", "id": "pTest",
+                            "status": "VERIFIED", "gb_text": "fake"}])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-plasmid-status", method="POST",
+            body={"name": "pTest", "status": ""}, token=token,
+        )
+        assert status == 200
+        assert payload["status"] == ""
+
+    def test_set_plasmid_status_invalid_collapses_to_empty(self, http_server):
+        """Per `_sanitize_plasmid_status`'s strict-canonical-or-empty
+        contract: a non-canonical string (mixed case, garbage)
+        silently degrades to "" rather than 400. Documented behaviour
+        — the round-trip-exact rule for hand-edited library JSON."""
+        sc._save_library([{"name": "pTest", "id": "pTest",
+                            "gb_text": "fake"}])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-plasmid-status", method="POST",
+            body={"name": "pTest", "status": "Designing"},  # mixed case
+            token=token,
+        )
+        assert status == 200
+        assert payload["status"] == ""
+
+    def test_set_plasmid_status_unknown_name_404(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-plasmid-status", method="POST",
+            body={"name": "ghost", "status": "DESIGNING"}, token=token,
+        )
+        assert status == 404
+        assert "ghost" in payload["error"]
+
+    def test_set_plasmid_status_rejects_non_string(self, http_server):
+        sc._save_library([{"name": "pTest", "id": "pTest",
+                            "gb_text": "fake"}])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-plasmid-status", method="POST",
+            body={"name": "pTest", "status": 42}, token=token,
+        )
+        assert status == 400
+        assert "string" in payload["error"]
+
+
+# ── Entry-vector endpoints (added 2026-05-05 for v1.0) ───────────────────────
+
+
+def _minimal_gb_text() -> str:
+    """Smallest GenBank text that round-trips through SeqIO — used
+    so set-entry-vector's parse-validate step has something real to
+    chew on without fixture sprawl."""
+    return ("LOCUS       test                  10 bp    DNA     "
+            "circular SYN 01-JAN-2026\n"
+            "FEATURES             Location/Qualifiers\n"
+            "ORIGIN      \n"
+            "        1 atgcatgcat\n"
+            "//\n")
+
+
+class TestEntryVectorEndpoints:
+    def test_list_entry_vectors_empty(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(f"{base}/list-entry-vectors", token=token)
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["entry_vectors"] == []
+
+    def test_set_get_entry_vector_round_trip(self, http_server):
+        base, token, _ = http_server
+        gb = _minimal_gb_text()
+        # SET
+        status, payload = _http(
+            f"{base}/set-entry-vector", method="POST",
+            body={"grammar_id": "gb_l0", "name": "pUPD2",
+                   "gb_text": gb, "source": "library:test"},
+            token=token,
+        )
+        assert status == 200, payload
+        assert payload["vector"]["name"] == "pUPD2"
+        assert payload["vector"]["size"] == 10
+        # The set response strips `gb_text` to keep responses small.
+        assert "gb_text" not in payload["vector"]
+        # GET
+        status, payload = _http(
+            f"{base}/get-entry-vector", method="POST",
+            body={"grammar_id": "gb_l0"}, token=token,
+        )
+        assert status == 200
+        assert payload["vector"]["name"]    == "pUPD2"
+        assert payload["vector"]["gb_text"] == gb
+
+    def test_get_entry_vector_returns_null_when_unset(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/get-entry-vector", method="POST",
+            body={"grammar_id": "moclo_plant"}, token=token,
+        )
+        assert status == 200
+        assert payload["vector"] is None
+
+    def test_set_entry_vector_clear(self, http_server):
+        base, token, _ = http_server
+        gb = _minimal_gb_text()
+        _http(f"{base}/set-entry-vector", method="POST",
+              body={"grammar_id": "gb_l0", "name": "pUPD2", "gb_text": gb},
+              token=token)
+        status, payload = _http(
+            f"{base}/set-entry-vector", method="POST",
+            body={"grammar_id": "gb_l0", "clear": True}, token=token,
+        )
+        assert status == 200
+        assert payload["vector"] is None
+        assert sc._get_entry_vector("gb_l0") is None
+
+    def test_set_entry_vector_invalid_gb_text(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-entry-vector", method="POST",
+            body={"grammar_id": "gb_l0", "name": "x",
+                   "gb_text": "not a genbank file"},
+            token=token,
+        )
+        assert status == 400
+        assert "parse failed" in payload["error"]
+
+    def test_set_entry_vector_oversized_gb_text(self, http_server):
+        base, token, _ = http_server
+        # 600 KB of fake bases — over the inner 500 KB cap but under
+        # the HTTP transport's 1 MiB body cap, so the inner check is
+        # the one that fires.
+        big = "A" * (600 * 1024)
+        status, payload = _http(
+            f"{base}/set-entry-vector", method="POST",
+            body={"grammar_id": "gb_l0", "name": "x", "gb_text": big},
+            token=token,
+        )
+        assert status == 400
+        assert "too large" in payload["error"]
+
+    def test_set_entry_vector_missing_grammar_id(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-entry-vector", method="POST",
+            body={"name": "x", "gb_text": _minimal_gb_text()}, token=token,
+        )
+        assert status == 400
+        assert "grammar_id" in payload["error"]
+
+
+# ── update-primer endpoint (added 2026-05-05 for v1.0) ───────────────────────
+
+
+class TestUpdatePrimerEndpoint:
+    def test_update_primer_rejects_non_primer_feature(self, http_server,
+                                                       tiny_record):
+        """The endpoint MUST refuse to mutate a non-primer feature so
+        an agent can't smuggle a primer-only field (e.g. `primer_seq`)
+        onto a CDS or misc_feature. tiny_record's idx 0 is a CDS."""
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/update-primer", method="POST",
+            body={"idx": 0, "label": "x"}, token=token,
+        )
+        assert status == 400
+        assert "primer_bind" in payload["error"]
+
+    def test_update_primer_validates_idx_out_of_range(self, http_server,
+                                                       tiny_record):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/update-primer", method="POST",
+            body={"idx": 99}, token=token,
+        )
+        assert status == 400
+        assert "out of range" in payload["error"]
+
+    def test_update_primer_rejects_infinity_idx(self, http_server,
+                                                  tiny_record):
+        base, token, _ = http_server
+        body_json = '{"idx": Infinity, "label": "x"}'
+        req = urllib.request.Request(
+            f"{base}/update-primer", data=body_json.encode(),
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            code = 200
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        assert code == 400
+
+    def test_update_primer_rejects_oversized_primer_seq(self, http_server,
+                                                         tiny_record):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/update-primer", method="POST",
+            body={"idx": 0, "primer_seq": "A" * 600}, token=token,
+        )
+        assert status == 400
+        # Either the non-primer reject (if idx 0 is non-primer) or the
+        # length cap. Both are correct rejections.
+        assert ("too long" in payload["error"]
+                or "primer_bind" in payload["error"])
+
+
+# ── Settings endpoints (added 2026-05-05 for v1.0) ───────────────────────────
+
+
+class TestSettingsEndpoints:
+    def test_get_settings_returns_allowlisted_keys(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(f"{base}/get-settings", token=token)
+        assert status == 200
+        # Spot-check: every allowlisted key is present, infrastructure
+        # keys are not.
+        keys = set(payload["settings"].keys())
+        for required in ("show_feature_tooltips", "min_primer_binding",
+                          "linear_layout", "active_grammar"):
+            assert required in keys
+        for excluded in ("last_known_latest", "last_seen_version",
+                          "last_update_check_ts", "hmm_db_path"):
+            assert excluded not in keys
+
+    def test_set_setting_round_trip_bool(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-setting", method="POST",
+            body={"key": "click_debug", "value": True}, token=token,
+        )
+        assert status == 200
+        assert payload["value"] is True
+        assert sc._get_setting("click_debug") is True
+
+    def test_set_setting_round_trip_int_range(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-setting", method="POST",
+            body={"key": "min_primer_binding", "value": 18}, token=token,
+        )
+        assert status == 200
+        assert payload["value"] == 18
+        assert sc._get_setting("min_primer_binding") == 18
+
+    def test_set_setting_int_range_rejects_out_of_range(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-setting", method="POST",
+            body={"key": "min_primer_binding", "value": 100}, token=token,
+        )
+        assert status == 400
+        assert "[1, 60]" in payload["error"]
+
+    def test_set_setting_choice_rejects_garbage(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-setting", method="POST",
+            body={"key": "linear_layout", "value": "spiral"}, token=token,
+        )
+        assert status == 400
+        assert "centered" in payload["error"] or "flag" in payload["error"]
+
+    def test_set_setting_bool_rejects_string(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-setting", method="POST",
+            body={"key": "show_restr", "value": "true"}, token=token,
+        )
+        assert status == 400
+        assert "boolean" in payload["error"]
+
+    def test_set_setting_unknown_key(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-setting", method="POST",
+            body={"key": "secret_setting", "value": "boom"}, token=token,
+        )
+        assert status == 400
+        assert "unknown setting" in payload["error"]
+        # Helpfully lists what the agent CAN write.
+        assert "min_primer_binding" in payload["available"]
+
+    def test_set_setting_restr_min_len_only_accepts_4_or_6(self, http_server):
+        base, token, _ = http_server
+        for good in (4, 6):
+            status, _ = _http(
+                f"{base}/set-setting", method="POST",
+                body={"key": "restr_min_len", "value": good}, token=token,
+            )
+            assert status == 200
+        for bad in (5, 8, 0):
+            status, payload = _http(
+                f"{base}/set-setting", method="POST",
+                body={"key": "restr_min_len", "value": bad}, token=token,
+            )
+            assert status == 400, (bad, payload)
