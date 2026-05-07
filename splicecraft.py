@@ -9682,6 +9682,20 @@ class SequencePanel(Widget):
             new = dict(f)
             new["start"] = (s - o) % n
             new["end"]   = (e - o) % n
+            # Shift resite cut bp fields too. Pre-2026-05-08 only
+            # `start` / `end` rotated; the absolute cut markers
+            # (`top_cut_bp`, `bottom_cut_bp`, `ext_cut_bp`) stayed
+            # in the original frame and pointed at the wrong
+            # display position after rotation — visible as a cut
+            # arrow stranded far from its parens, or a Type IIS
+            # dashed bridge stretched across the whole panel.
+            # Same modular shift as the recognition bounds keeps
+            # all four bp coordinates self-consistent in the
+            # rotated frame.
+            for k in ("top_cut_bp", "bottom_cut_bp", "ext_cut_bp"):
+                v = f.get(k)
+                if isinstance(v, int) and v >= 0:
+                    new[k] = (v - o) % n
             rot_feats.append(new)
         self._rotated_cache_key = key
         self._rotated_seq       = rot_seq
@@ -10134,7 +10148,23 @@ class SequencePanel(Widget):
         resite = self._last_resite_click
         self._last_resite_click = None
         if resite is not None:
-            self._re_highlight = self._resite_highlight_dict(resite)
+            # `resite` came from the rotated `disp_feats` list, so
+            # its bp fields are in DISPLAY coords. The renderer
+            # expects `_re_highlight` in ABSOLUTE coords (mirroring
+            # `_cursor_pos` etc.) — `_refresh_view` shifts to
+            # display via `_abs_to_disp` at render time. Convert
+            # back to absolute here so the highlight survives a
+            # later origin rotation cleanly: the same resite click
+            # at a different origin will produce the same absolute
+            # `_re_highlight`, and the refresh shifts it to the
+            # rotated display.
+            abs_resite = dict(resite)
+            for k in ("start", "end",
+                      "top_cut_bp", "bottom_cut_bp", "ext_cut_bp"):
+                v = resite.get(k)
+                if isinstance(v, int) and v >= 0:
+                    abs_resite[k] = self._disp_to_abs(v)
+            self._re_highlight = self._resite_highlight_dict(abs_resite)
             self._sel_range  = None
             self._user_sel   = None
             self._cursor_pos = -1
@@ -10932,6 +10962,18 @@ class SequencePanel(Widget):
             disp_re_hi["end"]           = self._abs_to_disp(self._re_highlight["end"])
             disp_re_hi["top_cut_bp"]    = self._abs_to_disp(self._re_highlight.get("top_cut_bp", -1))
             disp_re_hi["bottom_cut_bp"] = self._abs_to_disp(self._re_highlight.get("bottom_cut_bp", -1))
+            # `rec_start` / `rec_end` are the original recognition
+            # bounds (used by the per-region renderer to distinguish
+            # recognition from spacer/overhang). Without shifting
+            # these the renderer would compare display-coord `i`
+            # against absolute-coord `rec_*` and mis-classify every
+            # base under non-zero rotation.
+            disp_re_hi["rec_start"] = self._abs_to_disp(
+                self._re_highlight.get("rec_start", -1)
+            )
+            disp_re_hi["rec_end"]   = self._abs_to_disp(
+                self._re_highlight.get("rec_end", -1)
+            )
         disp_aa_hi: "dict | None" = None
         if self._aa_highlight is not None:
             disp_aa_hi = dict(self._aa_highlight)

@@ -1728,6 +1728,60 @@ class TestTypeIISCutRegionHighlight:
             f"expected gray (spacer) bg; styles: {styles_used}"
         )
 
+    def test_rotation_shifts_resite_cut_positions(self):
+        """When the user rotates the plasmid origin, the cut bp
+        fields on resite features (`top_cut_bp`, `bottom_cut_bp`,
+        `ext_cut_bp`) must shift by the same modular offset as the
+        recognition bounds. Pre-2026-05-08 only `start` / `end` got
+        rotated — the cut markers stayed in absolute coords and
+        the cut arrows / Type IIS dashed bridges pointed to the
+        wrong column after rotation, looking stretched and
+        misrepresenting where the enzyme would actually cut.
+        """
+        seq = "A" * 20 + "GGTCTC" + "N" * 10 + "A" * 64
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        bsai = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "BsaI"
+        )
+        # Sanity: BsaI cuts at 27 (top) / 31 (bot) for site at 20.
+        assert bsai["top_cut_bp"]    == 27
+        assert bsai["bottom_cut_bp"] == 31
+
+        sp = sc.SequencePanel()
+        sp._seq   = seq
+        sp._feats = [bsai]
+        # Unrotated: rotated state = original.
+        seq_d, feats_d = sp._get_rotated_state()
+        assert feats_d[0]["start"]         == 20
+        assert feats_d[0]["top_cut_bp"]    == 27
+        assert feats_d[0]["bottom_cut_bp"] == 31
+
+        # Rotate origin to bp 5: every bp coord on the resite
+        # should shift by -5 (mod n). Recognition + both cut bps
+        # must move together so the visual stays consistent.
+        sp._view_origin_bp = 5
+        sp._rotated_cache_key = None
+        sp._rotated_seq = sp._rotated_feats = None
+        seq_d, feats_d = sp._get_rotated_state()
+        n = len(seq)
+        assert feats_d[0]["start"]         == (20 - 5) % n
+        assert feats_d[0]["end"]           == (26 - 5) % n
+        assert feats_d[0]["top_cut_bp"]    == (27 - 5) % n
+        assert feats_d[0]["bottom_cut_bp"] == (31 - 5) % n
+
+        # Rotation deep enough to wrap the cut around the origin:
+        # set origin so the top_cut wraps under modular arithmetic.
+        # The fields stay self-consistent (no negative values).
+        sp._view_origin_bp = 28
+        sp._rotated_cache_key = None
+        sp._rotated_seq = sp._rotated_feats = None
+        seq_d, feats_d = sp._get_rotated_state()
+        # top_cut(27) - 28 = -1 → wraps to n-1.
+        assert feats_d[0]["top_cut_bp"] == (27 - 28) % n
+        # bottom_cut(31) - 28 = 3 → no wrap.
+        assert feats_d[0]["bottom_cut_bp"] == 3
+
     def test_typeiip_recognition_split_blue_upstream_red_downstream(self):
         """Inside the recognition the per-base colour signals which
         fragment the base ends up on after cutting: blue = upstream,
