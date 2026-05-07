@@ -592,6 +592,75 @@ class TestRestrictionScan:
         assert eco[0]["start"] == 8 and eco[0]["end"] == 14
 
 
+class TestResiteLabelWidth:
+    """Resite parens widen to fit the full enzyme short-form name.
+
+    Per user spec 2026-05-08: "make sure the full enzyme name fits
+    the enzyme label i.e EcoRI not (EcoR). Do not scale the
+    parentheses width to the recognition site width. Keep it just
+    wide enough to fit the full shorthand enzyme name."
+    """
+
+    @staticmethod
+    def _paint(label: str, rec_len: int, *, rec_start: int = 10):
+        # Build a synthetic resite. `rec_start` defaults to 10 so a
+        # long name's parens can extend a few cols left of the
+        # recognition without falling off the chunk's left edge.
+        f = {
+            "type":   "resite",
+            "start":  rec_start,
+            "end":    rec_start + rec_len,
+            "strand": 1,
+            "color":  "white",
+            "label":  label,
+            "cut_col": None,
+            "ext_cut_bp": None,
+            "top_cut_bp": -1,
+            "bottom_cut_bp": -1,
+        }
+        chunk_w = 60
+        arr = [(" ", "")] * chunk_w
+        sc._paint_feature_label(arr, f, 0, chunk_w)
+        return "".join(ch for ch, _ in arr).rstrip()
+
+    def test_5char_name_on_6bp_recognition_fits_full_name(self):
+        # EcoRI = 5 chars on GAATTC = 6 bp. Pre-fix the parens
+        # bracketed the 6-bp recognition exactly, leaving 4 cols
+        # interior — too narrow for "EcoRI" (truncated to "EcoR").
+        # Now paren width = max(rec_len=6, len(name)+2=7) = 7.
+        rendered = self._paint("EcoRI", rec_len=6).lstrip()
+        assert "EcoRI" in rendered, (
+            f"full name must fit the label; got {rendered!r}"
+        )
+        assert rendered.startswith("("), rendered
+        assert ")" in rendered, rendered
+
+    def test_4char_name_on_6bp_recognition_uses_recognition_width(self):
+        # BsaI = 4 chars on GGTCTC = 6 bp. Paren width =
+        # max(6, 4+2=6) = 6 — same as recognition. Label centered.
+        rendered = self._paint("BsaI", rec_len=6).lstrip()
+        assert "BsaI" in rendered, rendered
+        assert rendered.startswith("("), rendered
+        assert ")" in rendered, rendered
+
+    def test_paren_width_does_not_scale_with_recognition(self):
+        # 4-char name on a HUGE recognition (10 bp) — paren width
+        # SHOULD scale to recognition (so the parens still bracket
+        # the recognition span as a position cue), label centered.
+        rendered = self._paint("BsaI", rec_len=10).lstrip()
+        assert "BsaI" in rendered, rendered
+        # Per spec: paren width = max(rec_len=10, 4+2=6) = 10.
+        assert rendered.startswith("(")
+        assert ")" in rendered
+
+    def test_long_name_widens_paren_past_recognition(self):
+        # Hypothetical 8-char name on a 4-bp recognition. Paren
+        # width = max(4, 8+2=10) = 10. The parens extend past the
+        # recognition's right edge so the full name fits.
+        rendered = self._paint("MyLongNm", rec_len=4).lstrip()
+        assert "MyLongNm" in rendered, rendered
+
+
 class TestRestrictionScanLinearVsCircular:
     """Linear records must NOT scan past their end. Pre-2026-05-08
     every caller of `_scan_restriction_sites` defaulted to

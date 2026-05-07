@@ -2648,37 +2648,62 @@ def _paint_feature_label(arr: list[tuple[str, str]], f: dict,
     content_w = chunk_end - chunk_start
 
     if feat_type == "resite":
-        if starts_here and bar_len >= 1:
-            arr[bar_s] = ("(", color)
-        if ends_here and bar_len >= 1:
-            arr[bar_s + bar_len - 1] = (")", color)
-        interior_start = (1 if starts_here else 0)
-        interior_end   = (bar_len - 1 if ends_here else bar_len)
-        interior_len   = interior_end - interior_start
+        # Pre-2026-05-08 the parens were anchored to recognition
+        # bounds, so a 6-bp recognition like `GAATTC` had only 4
+        # cols of interior — too narrow to fit "EcoRI" (5 chars),
+        # truncating to "EcoR". Per user spec: "Keep [the parens]
+        # just wide enough to fit the full shorthand enzyme name."
+        # Now the paren span centers on the recognition midpoint
+        # with `width = max(rec_len, len(label) + 2)` so a 5-char
+        # name on a 6-bp recognition gets a 7-wide paren block,
+        # extending one column past the recognition right edge.
+        # The biological recognition position is still cued by
+        # the cut arrow + the colored bar in the strand row.
         label = f.get("label", "")
+        rec_len = (e - s) if e >= s else max(1, bar_len)
+        # Wrap continuations carry an empty label and shouldn't
+        # try to fit a name — keep them at piece bounds.
+        if label:
+            desired_w = max(rec_len, len(label) + 2)
+        else:
+            desired_w = rec_len
+        # Center on recognition midpoint (absolute bp coords).
+        rec_mid_abs = s + rec_len // 2
+        paren_l_abs = rec_mid_abs - desired_w // 2
+        paren_r_abs = paren_l_abs + desired_w - 1
+        # Convert to chunk-local; only render parts visible in
+        # this chunk (handles seq-panel line wrapping).
+        paren_l = paren_l_abs - chunk_start
+        paren_r = paren_r_abs - chunk_start
+        if 0 <= paren_l < content_w:
+            arr[paren_l] = ("(", color)
+        if 0 <= paren_r < content_w:
+            arr[paren_r] = (")", color)
+        # Render the label centered between the parens.
         is_active_re = (re_highlight_se is not None
                         and f["start"] == re_highlight_se[0]
                         and f["end"]   == re_highlight_se[1])
         name_sty = "bold green" if is_active_re else "bold white"
-        if interior_len > 0 and label:
-            name_str  = label[:interior_len]
-            name_pad  = interior_len - len(name_str)
+        if label:
+            interior_w = desired_w - 2
+            name_pad  = max(0, interior_w - len(label))
             name_lpad = name_pad // 2
-            for j, ch in enumerate(name_str):
-                pos = bar_s + interior_start + name_lpad + j
-                if 0 <= pos < content_w:
-                    arr[pos] = (ch, name_sty)
+            name_l_abs = paren_l_abs + 1 + name_lpad
+            for j, ch in enumerate(label[:interior_w]):
+                col_local = name_l_abs - chunk_start + j
+                if 0 <= col_local < content_w:
+                    arr[col_local] = (ch, name_sty)
         # Type-IIS dashed bridge in the parens row, between the
-        # recognition and the cut column.
+        # parens and the external cut column.
         ext_cut_bp = f.get("ext_cut_bp")
         if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
             cut_abs = ext_cut_bp - chunk_start
-            if cut_abs >= bar_s + bar_len:
-                for j in range(bar_s + bar_len, cut_abs):
+            if cut_abs > paren_r:
+                for j in range(paren_r + 1, cut_abs):
                     if 0 <= j < content_w and arr[j][0] == " ":
                         arr[j] = ("╌", color)
-            elif cut_abs < bar_s:
-                for j in range(cut_abs + 1, bar_s):
+            elif cut_abs < paren_l:
+                for j in range(cut_abs + 1, paren_l):
                     if 0 <= j < content_w and arr[j][0] == " ":
                         arr[j] = ("╌", color)
         return
@@ -3269,6 +3294,15 @@ def _build_seq_inputs(seq: str, feats: list[dict]) -> tuple[list[str], list[dict
     n = len(seq)
     styles = ["color(252)"] * n
     for f in reversed(feats):          # reversed so first feature wins
+        # Resite / recut features (restriction-site overlay) must
+        # NOT pre-colour the DNA strand text. Their colour belongs
+        # in the lane art only — tinting the actual base characters
+        # makes the strand harder to read AND collides with the
+        # resite-click highlight palette. Per the 2026-05-08 user
+        # request: "Do not pre-color the actual basepairs of the
+        # sequence row for any enzyme."
+        if f.get("type") in ("resite", "recut"):
+            continue
         col = f["color"]
         if f["end"] >= f["start"]:
             for i in range(f["start"], min(f["end"], n)):
@@ -3690,71 +3724,62 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                 fwd_sty = "black on white bold"
                 rev_sty = fwd_sty
             elif in_re:
-                # RE highlight (2026-05-08 region-aware palette):
-                #   Recognition + left of both cuts:  blue bg (left fragment)
-                #   Recognition + right of both cuts: red bg  (right fragment)
-                #   Spacer (paired, outside recognition, not in
-                #          overhang region): gray bg
-                #   Overhang region (between top and bot cuts):
-                #          top strand → green bg (single-stranded
-                #          on right fragment); bot strand → yellow
-                #          bg (single-stranded on left fragment)
-                # Distinguishing recognition / spacer / overhang
-                # makes the cut footprint legible at a glance —
-                # pre-2026-05-08 a Type IIS click painted everything
-                # blue/red and the user had to count bases to find
-                # the spacer + overhang.
-                #
+                # RE highlight (2026-05-08 final palette):
+                #   Recognition base:        top blue / bot red
+                #   Spacer (Type IIS only):  gray bg both strands
+                #   Type IIS overhang:       top green / bot orange
+                #   Type IIP / palindromic
+                #   overhang (cut inside
+                #   recognition):            top blue / bot red
+                #                            (= recognition treatment;
+                #                             no special overhang colours
+                #                             because the recognition is
+                #                             still the recognition)
                 # All overlays use bold + black foreground so the
-                # base letter stays legible against the bright
-                # backgrounds.
+                # base letter stays legible against the bright bg.
                 in_recognition = (
                     reh_rec_s >= 0 and reh_rec_s <= i < reh_rec_e
                 )
-                # Overhang region = bases between the two cuts.
-                # For 5' overhangs (e.g. EcoRI, BsaI): top_cut < bot_cut.
-                # For 3' overhangs (e.g. MmeI's TCCRAC(20/18), PstI):
-                #   top_cut > bot_cut. The unpaired bases sit on the
-                #   OPPOSITE strands compared to 5' overhangs (top
-                #   strand on the LEFT fragment, bot on the RIGHT)
-                #   but the bp range is still `[min_cut, max_cut)`.
-                # Pre-2026-05-08 used `top_cut <= i < bot_cut` which
-                # never matched for 3' overhangs and dropped the
-                # overhang highlight entirely on MmeI (and reverse-
-                # strand hits where cut order flips). min/max
-                # handles both sticky-end directions uniformly.
+                # Overhang region = bases between the two cuts. Use
+                # min/max so 5' AND 3' overhangs resolve uniformly
+                # (BsaI: top<bot; MmeI: top>bot).
                 if reh_top_cut >= 0 and reh_bot_cut >= 0:
                     lo_cut = min(reh_top_cut, reh_bot_cut)
                     hi_cut = max(reh_top_cut, reh_bot_cut)
                     in_overhang = (lo_cut <= i < hi_cut)
+                    # "Cuts inside recognition" = palindromic /
+                    # Type IIP (EcoRI / HindIII / BamHI). For these
+                    # the overhang is INSIDE the recognition; the
+                    # user reads it as "the recognition", not as a
+                    # separate sticky-end region — so we keep the
+                    # blue/red recognition treatment instead of the
+                    # green/orange Type IIS treatment.
+                    cuts_inside_rec = (
+                        reh_rec_s >= 0
+                        and reh_rec_s <= reh_top_cut < reh_rec_e
+                        and reh_rec_s <= reh_bot_cut < reh_rec_e
+                    )
                 else:
                     in_overhang = False
-                if in_overhang:
+                    cuts_inside_rec = False
+                if in_overhang and not cuts_inside_rec:
+                    # Type IIS overhang: top single-stranded on
+                    # right fragment (5' OH) or left (3' OH) etc.
+                    # Per the user's spec, top → green, bot →
+                    # orange1 (Rich's named orange).
                     fwd_sty = "black on green bold"
-                    rev_sty = "black on yellow bold"
-                elif not in_recognition:
-                    # Spacer: paired, outside recognition, not in
-                    # overhang. Same gray on both strands since
-                    # neither strand is single-stranded yet.
+                    rev_sty = "black on orange1 bold"
+                elif in_recognition:
+                    # Recognition: top blue, bot red. Always.
+                    # Conveys "this is the binding site" + which
+                    # strand reads 5'→3' as the canonical recog.
+                    fwd_sty = "black on blue bold"
+                    rev_sty = "black on red bold"
+                else:
+                    # Spacer (Type IIS): paired, outside recognition,
+                    # not in overhang. Both strands gray.
                     fwd_sty = "black on grey50 bold"
                     rev_sty = fwd_sty
-                else:
-                    # Recognition base, not in overhang — always
-                    # blue. Pre-2026-05-08 the recognition split
-                    # into blue (left of cut) / red (right of cut),
-                    # which gave reverse-strand Type IIS hits an
-                    # asymmetric look: the recognition rendered red
-                    # because both cuts sit before it. The user
-                    # reads "the recognition site" identically
-                    # whether bound on forward or reverse strand,
-                    # so the colour should be the same too. Cut
-                    # direction info is already conveyed by the
-                    # location of the green/yellow overhang
-                    # relative to the recognition; the per-strand
-                    # cut markers (reverse video) inside the span
-                    # mark the precise cut boundaries.
-                    fwd_sty = "black on blue bold"
-                    rev_sty = "black on blue bold"
             elif in_usr:
                 fwd_sty = "black on white"
                 rev_sty = fwd_sty

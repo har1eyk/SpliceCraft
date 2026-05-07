@@ -1672,10 +1672,12 @@ class TestTypeIISCutRegionHighlight:
         """The 2026-05-08 region-aware palette paints recognition,
         spacer, and overhang in distinct colours so the cut footprint
         reads at a glance:
-          * recognition (left of both cuts) — blue bg
-          * spacer (paired, outside recognition, not in overhang) — gray bg
-          * overhang top strand — green bg (single-stranded)
-          * overhang bot strand — yellow bg (single-stranded)
+          * recognition top strand — blue bg, bot strand — red bg
+          * spacer (Type IIS only) — gray bg both strands
+          * Type IIS overhang top — green bg, bot — orange bg
+          * Type IIP overhang (cut inside recognition) — keeps the
+            recognition treatment (top blue, bot red); the overhang
+            colours apply only when the cut sits OUTSIDE recognition.
         Black foreground on every overlay so the base letter stays
         legible against the bright bg.
         """
@@ -1719,12 +1721,54 @@ class TestTypeIISCutRegionHighlight:
         assert "green"  in sty_blob, (
             f"expected `green` (overhang top) bg; styles: {styles_used}"
         )
-        assert "yellow" in sty_blob, (
+        assert "orange" in sty_blob, (
             f"expected `yellow` (overhang bot) bg; styles: {styles_used}"
         )
         assert "grey50" in sty_blob or "grey" in sty_blob, (
             f"expected gray (spacer) bg; styles: {styles_used}"
         )
+
+    def test_typeiip_overhang_keeps_blue_red_recognition_treatment(self):
+        """When the enzyme cuts INSIDE its recognition (Type IIP /
+        palindromic — EcoRI, HindIII, BamHI), the bases between
+        the two cuts ARE part of the recognition. Per user spec
+        2026-05-08: "Do not do overhang visualization coloring if
+        the enzyme cuts where it binds. If it cuts where it binds,
+        show the top overhang blue and bottom overhang red."
+
+        That's the same treatment as the rest of the recognition,
+        so the green/orange Type IIS overhang palette must NOT
+        appear on EcoRI / HindIII / BamHI clicks.
+        """
+        seq = "A" * 10 + "GAATTC" + "A" * 84
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        ecori = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "EcoRI"
+        )
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        text = sc._build_seq_text(
+            seq, [ecori], line_width=80,
+            re_highlight=sp._resite_highlight_dict(ecori),
+        )
+        styles_used = {str(span.style or "") for span in text.spans}
+        sty_blob = " ".join(styles_used).lower()
+        # Type IIP: should NOT use the Type IIS overhang palette.
+        # Check for `on green` / `on orange` BACKGROUNDS specifically
+        # — the resite's active label uses `bold green` foreground
+        # which is unrelated to the overhang region.
+        assert "on green"  not in sty_blob, (
+            f"EcoRI cuts INSIDE recognition — must NOT paint "
+            f"green-bg; got styles: {sorted(styles_used)}"
+        )
+        assert "on orange" not in sty_blob, (
+            f"EcoRI cuts INSIDE recognition — must NOT paint "
+            f"orange-bg; got styles: {sorted(styles_used)}"
+        )
+        # Should use the recognition palette (blue bg + red bg).
+        assert "on blue" in sty_blob
+        assert "on red"  in sty_blob
 
     def test_3prime_overhang_mmei_overhang_renders_green_yellow(self):
         """MmeI is `TCCRAC(20/18)` — top cut (20) sits FURTHER
@@ -1765,8 +1809,8 @@ class TestTypeIISCutRegionHighlight:
             f"3' overhang MmeI must paint top strand green; "
             f"got styles: {sorted(styles_used)}"
         )
-        assert "yellow" in sty_blob, (
-            f"3' overhang MmeI must paint bot strand yellow; "
+        assert "orange" in sty_blob, (
+            f"3' overhang MmeI must paint bot strand orange; "
             f"got styles: {sorted(styles_used)}"
         )
 
@@ -1808,7 +1852,7 @@ class TestTypeIISCutRegionHighlight:
             f"Reverse MmeI must paint overhang top strand green; "
             f"got styles: {sorted(styles_used)}"
         )
-        assert "yellow" in sty_blob, (
+        assert "orange" in sty_blob, (
             f"Reverse MmeI must paint overhang bot strand yellow; "
             f"got styles: {sorted(styles_used)}"
         )
