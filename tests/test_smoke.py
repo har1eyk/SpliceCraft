@@ -3562,11 +3562,12 @@ class TestShiftClickFeatureExtend:
             assert app.query_one("#sidebar").display is True
             assert app.query_one("#seq-panel").display is True
             assert app.query_one("#top-row").display is True
-            # Width restoration: library back to 26 cells, sidebar to 32.
+            # Width restoration: library back to 25 cells (2026-05-06:
+            # was 26; shrunk to button-row width), sidebar to 32.
             lib = app.query_one("#library")
             sb  = app.query_one("#sidebar")
             sp  = app.query_one("#seq-panel")
-            assert int(lib.styles.width.value) == 26
+            assert int(lib.styles.width.value) == 25
             assert int(sb.styles.width.value) == 32
             # Seq-panel height also restored to the canonical 14 rows
             # (the override-to-1fr that F4 applies must not stick).
@@ -3664,7 +3665,7 @@ class TestShiftClickFeatureExtend:
             for sel in ("#library", "#plasmid-map", "#sidebar",
                         "#seq-panel", "#top-row"):
                 assert app.query_one(sel).display is True, sel
-            assert int(app.query_one("#library").styles.width.value) == 26
+            assert int(app.query_one("#library").styles.width.value) == 25
             assert int(app.query_one("#sidebar").styles.width.value) == 32
 
     async def test_feature_edit_modal_opens_read_only(

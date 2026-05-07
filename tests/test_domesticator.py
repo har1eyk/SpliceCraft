@@ -3446,6 +3446,11 @@ class TestSettingsPersistence:
 
     def test_round_trip_through_disk(self):
         sc._set_setting("active_grammar", "moclo_plant")
+        # `_set_setting` defers the disk write to a daemon thread so
+        # toggle-heavy UI flows don't block on fsync. Wait for the
+        # flush before clearing the cache, otherwise we'd race the
+        # background writer.
+        sc._settings_flush_sync()
         # Force a re-read from disk — the cache must agree with what
         # was written.
         sc._settings_cache = None

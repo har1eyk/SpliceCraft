@@ -29,6 +29,7 @@ import platform
 import re
 import shutil
 import sys
+import threading
 import uuid as _uuid
 from collections import OrderedDict as _OD
 from datetime import date as _date, datetime as _datetime
@@ -500,7 +501,13 @@ def _spill_lost_entries(path: Path, lost: list, label: str) -> "Path | None":
         lost_dir.mkdir(parents=True, exist_ok=True)
         ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
         out = lost_dir / f"{path.stem}-{ts}.json"
-        out.write_text(
+        # Route through `_atomic_write_text` so a mid-write crash
+        # (disk full, RO mount, power loss) leaves either nothing or
+        # a complete recovery dump — never a half-written file that
+        # masquerades as evidence. This is the safety-net for the
+        # safety-net, but a corrupt spill is worse than no spill.
+        _atomic_write_text(
+            out,
             json.dumps({
                 "_schema_version": _CURRENT_SCHEMA_VERSION,
                 "_label":          label,
@@ -508,7 +515,6 @@ def _spill_lost_entries(path: Path, lost: list, label: str) -> "Path | None":
                 "_recovered_at":   ts,
                 "entries":         lost,
             }, indent=2),
-            encoding="utf-8",
         )
         return out
     except Exception:
@@ -3124,7 +3130,11 @@ def _chunk_lane_groups(
 # only depend on sequence and features, not on cursor/selection/line_width.
 # Cache holds (styles_list, annot_feats_sorted). Invalidated by id — lists
 # are reassigned on load, never mutated in place (see CLAUDE.md).
-_BUILD_SEQ_CACHE: dict = {}
+# LRU via OrderedDict — same idiom as `_RESTR_SCAN_CACHE`. The pre-2026-05-06
+# blanket-`.clear()` policy threw away the working set every Nth call,
+# which hurt users hopping between several open plasmids.
+_BUILD_SEQ_CACHE: _OD = _OD()
+_BUILD_SEQ_CACHE_MAX = 4
 
 
 # Per-(seq_id, feats_id, line_width) cache for chunk decomposition. Keyed
@@ -3140,7 +3150,8 @@ _BUILD_SEQ_CACHE: dict = {}
 #   prefix_lanes — list[int]: total lane pairs (above+below) up to chunk i.
 # Total rows before chunk i for arbitrary rpg:
 #   prefix_dna2[i] + (rpg - 2) * prefix_lanes[i]
-_CHUNK_LAYOUT_CACHE: dict = {}
+_CHUNK_LAYOUT_CACHE: _OD = _OD()
+_CHUNK_LAYOUT_CACHE_MAX = 4
 
 
 # Per-(seq_id, feats_id, line_width, show_connectors) cache of pre-rendered
@@ -3149,8 +3160,10 @@ _CHUNK_LAYOUT_CACHE: dict = {}
 # other ~1500 chunks of a 200 kb BAC are reused from this cache. Profile-
 # driven: lane-art rendering was 78% of cursor-move time on a 150 kb
 # plasmid; lane art is fully deterministic per chunk so caching it
-# eliminates that hot path. Stored as `dict[key, list[Text|None]]`.
-_CHUNK_STATIC_CACHE: dict = {}
+# eliminates that hot path. Stored as `OrderedDict[key, list[Text|None]]`
+# with LRU touch on every read so a frequently-rendered plasmid stays hot.
+_CHUNK_STATIC_CACHE: _OD = _OD()
+_CHUNK_STATIC_CACHE_MAX = 16
 
 # Per-(static_key, selection-state) cache of overlay-painted chunks.
 # Holds the version of each chunk with `_user_sel` / `_sel_range` /
@@ -3160,7 +3173,8 @@ _CHUNK_STATIC_CACHE: dict = {}
 # (so a different feature pick repopulates), but the static cache
 # survives — chunks the new selection doesn't intersect still hit
 # STATIC_CACHE on the same render pass.
-_CHUNK_OVERLAY_CACHE: dict = {}
+_CHUNK_OVERLAY_CACHE: _OD = _OD()
+_CHUNK_OVERLAY_CACHE_MAX = 16
 
 # Threshold above which seq-panel rendering should switch to a
 # viewport-aware lazy mode (= only render visible chunks, emit blank
@@ -3228,6 +3242,7 @@ def _build_seq_inputs(seq: str, feats: list[dict]) -> tuple[list[str], list[dict
     key = (hash(seq), id(feats), len(seq), len(feats))
     hit = _BUILD_SEQ_CACHE.get(key)
     if hit is not None:
+        _BUILD_SEQ_CACHE.move_to_end(key)
         return hit
     n = len(seq)
     styles = ["color(252)"] * n
@@ -3247,10 +3262,8 @@ def _build_seq_inputs(seq: str, feats: list[dict]) -> tuple[list[str], list[dict
     # caller's insertion order so `_pack_features_2d` can pack
     # newest-on-top by walking the list in order.
     annot_feats = [f for f in feats if f.get("type") not in ("site", "recut")]
-    # Cap the cache at 4 entries (one active + a few stale) — we're keying
-    # on id() so size stays tiny; this is just belt-and-braces.
-    if len(_BUILD_SEQ_CACHE) >= 4:
-        _BUILD_SEQ_CACHE.clear()
+    if len(_BUILD_SEQ_CACHE) >= _BUILD_SEQ_CACHE_MAX:
+        _BUILD_SEQ_CACHE.popitem(last=False)
     _BUILD_SEQ_CACHE[key] = (styles, annot_feats)
     return styles, annot_feats
 
@@ -3279,6 +3292,7 @@ def _chunk_layout(seq: str, feats: list[dict], line_width: int):
     key = (hash(seq), id(feats), line_width, n, len(feats))
     hit = _CHUNK_LAYOUT_CACHE.get(key)
     if hit is not None:
+        _CHUNK_LAYOUT_CACHE.move_to_end(key)
         return hit
 
     # Reuse _build_seq_inputs' filtered+sorted annot_feats so cache hits
@@ -3290,6 +3304,8 @@ def _chunk_layout(seq: str, feats: list[dict], line_width: int):
     prefix_lanes = [0]
     if n == 0 or line_width <= 0:
         layout = (chunks, prefix_dna2, prefix_lanes)
+        if len(_CHUNK_LAYOUT_CACHE) >= _CHUNK_LAYOUT_CACHE_MAX:
+            _CHUNK_LAYOUT_CACHE.popitem(last=False)
         _CHUNK_LAYOUT_CACHE[key] = layout
         return layout
 
@@ -3313,8 +3329,8 @@ def _chunk_layout(seq: str, feats: list[dict], line_width: int):
         prefix_lanes.append(prefix_lanes[-1] + above_rows + below_rows)
 
     layout = (chunks, prefix_dna2, prefix_lanes)
-    if len(_CHUNK_LAYOUT_CACHE) >= 4:
-        _CHUNK_LAYOUT_CACHE.clear()
+    if len(_CHUNK_LAYOUT_CACHE) >= _CHUNK_LAYOUT_CACHE_MAX:
+        _CHUNK_LAYOUT_CACHE.popitem(last=False)
     _CHUNK_LAYOUT_CACHE[key] = layout
     return layout
 
@@ -3425,17 +3441,20 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     #     all selection-overlap chunks; cursor chunk re-renders.
     # `hash(seq)` instead of `id(seq)` — see `_build_seq_inputs`.
     static_key = (hash(seq), id(feats), line_width, show_connectors)
-    static_cache = _CHUNK_STATIC_CACHE.get(static_key)
+    static_cache: "list | None" = _CHUNK_STATIC_CACHE.get(static_key)
     if static_cache is None or len(static_cache) != len(chunks_layout):
         static_cache = [None] * len(chunks_layout)
-        _CHUNK_STATIC_CACHE[static_key] = static_cache
         # Cap is generous because each entry is just a list of `Text`
         # references per chunk, and the static cache only invalidates
         # on (seq, feats, line_width, show_connectors) change — not
         # on selection or cursor moves. 16 entries is enough headroom
         # for resize + plasmid switches without thrashing.
-        if len(_CHUNK_STATIC_CACHE) > 16:
-            _CHUNK_STATIC_CACHE.pop(next(iter(_CHUNK_STATIC_CACHE)))
+        if len(_CHUNK_STATIC_CACHE) >= _CHUNK_STATIC_CACHE_MAX:
+            _CHUNK_STATIC_CACHE.popitem(last=False)
+        _CHUNK_STATIC_CACHE[static_key] = static_cache
+    else:
+        # LRU touch on hit so frequently-used keys don't get evicted.
+        _CHUNK_STATIC_CACHE.move_to_end(static_key)
 
     # Content-derived aa-highlight key: (start, end, strand) uniquely
     # identifies the active CDS regardless of dict identity. Pre-fix
@@ -3451,18 +3470,23 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     )
     overlay_key = (static_key, sel_s, sel_e, usr_s, usr_e,
                    reh_s, reh_e, reh_top_cut, reh_bot_cut, aa_id)
-    overlay_cache = _CHUNK_OVERLAY_CACHE.get(overlay_key)
+    overlay_cache: "list | None" = _CHUNK_OVERLAY_CACHE.get(overlay_key)
     if overlay_cache is None or len(overlay_cache) != len(chunks_layout):
         overlay_cache = [None] * len(chunks_layout)
-        _CHUNK_OVERLAY_CACHE[overlay_key] = overlay_cache
         # Selection state changes per click → overlay key changes →
         # new entry. With only 4 entries, clicking through 5 features
         # in a row evicted the first cache and forced re-render of
         # the selection-overlap chunks. 16 entries gives users a
         # comfortable working set for clicking back-and-forth between
         # several features without redoing per-base style work.
-        if len(_CHUNK_OVERLAY_CACHE) > 16:
-            _CHUNK_OVERLAY_CACHE.pop(next(iter(_CHUNK_OVERLAY_CACHE)))
+        if len(_CHUNK_OVERLAY_CACHE) >= _CHUNK_OVERLAY_CACHE_MAX:
+            _CHUNK_OVERLAY_CACHE.popitem(last=False)
+        _CHUNK_OVERLAY_CACHE[overlay_key] = overlay_cache
+    else:
+        # LRU touch on hit — cursor moves within a long selection
+        # would otherwise let infrequent overlay keys age out the
+        # active one.
+        _CHUNK_OVERLAY_CACHE.move_to_end(overlay_key)
 
     # Lazy-render filter: when `viewport_y_range` is supplied, chunks
     # whose row range falls entirely outside the visible window emit
@@ -4096,14 +4120,28 @@ def _pick_single_record(records: list, source: str):
 
 _NCBI_TIMEOUT_S = 30   # cap long NCBI hangs; the UI worker can't otherwise cancel
 
+# Cap on the GenBank-text response size from `Entrez.efetch`. The record-list
+# API (`_NCBI_MAX_RESPONSE_BYTES = 4 MB`) is too tight for a real chromosome
+# accession (e.g. an E. coli genome serialises to ~10 MB of GB text).
+# 64 MB lets every legitimate plasmid / cosmid / BAC / small chromosome
+# through while refusing a multi-GB pathological response (compromised /
+# misconfigured server, MITM). Mirrors the `resp.read(MAX + 1)` + bail
+# pattern from invariant #20.
+_NCBI_GB_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
 def fetch_genbank(accession: str, email: str = "splicecraft@local"):
     """Fetch a GenBank record by accession from NCBI Entrez. Returns SeqRecord.
 
     Raises ValueError with a user-friendly message if NCBI returns no
-    records (obsolete accession) or multiple records. A 30 s socket timeout
-    is applied so a silent network stall surfaces as an error instead of
-    pinning the worker thread forever.
+    records (obsolete accession), multiple records, or a response larger
+    than `_NCBI_GB_MAX_RESPONSE_BYTES`. A 30 s socket timeout is applied
+    so a silent network stall surfaces as an error instead of pinning
+    the worker thread forever; the size cap defends against a server
+    that is reachable but misbehaving (a fast 30 s of GB-text could
+    OOM the worker without it).
     """
+    import io
     import socket
     from Bio import Entrez, SeqIO
     Entrez.email = email
@@ -4113,9 +4151,27 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
         with Entrez.efetch(
             db="nucleotide", id=accession, rettype="gb", retmode="text"
         ) as handle:
-            records = list(SeqIO.parse(handle, "genbank"))
+            # Bounded read: ask for one byte over the cap so we can
+            # distinguish "exactly at cap" from "exceeded".
+            raw = handle.read(_NCBI_GB_MAX_RESPONSE_BYTES + 1)
     finally:
         socket.setdefaulttimeout(prev_timeout)
+    # Entrez handles return either bytes or str depending on Biopython
+    # version; normalise to text for SeqIO.
+    if isinstance(raw, bytes):
+        raw_len = len(raw)
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        raw_len = len(raw.encode("utf-8", errors="replace"))
+        text = raw
+    if raw_len > _NCBI_GB_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"NCBI accession {accession!r} returned more than "
+            f"{_NCBI_GB_MAX_RESPONSE_BYTES // (1024 * 1024)} MB; refusing "
+            f"to load. If this is a legitimate large record, fetch via "
+            f"NCBI directly and use File > Open."
+        )
+    records = list(SeqIO.parse(io.StringIO(text), "genbank"))
     return _pick_single_record(records, f"NCBI accession {accession!r}")
 
 # Third-party API contract: BioPython's SeqIO format identifier for the
@@ -4759,10 +4815,20 @@ class _CommercialSaaSHistoryNode:
         """Pre-order depth-first traversal: yields self, then each
         child node's traversal. Useful for "find every node with
         operation X" / "count parent fragments" / etc. Returns a
-        generator of `_CommercialSaaSHistoryNode`."""
-        yield self
-        for parent in self.parents:
-            yield from parent.walk()
+        generator of `_CommercialSaaSHistoryNode`.
+
+        Iterative (stack-based) so a hostile `.dna` file with a 1000+
+        deep nested `<Node><Node>...` history can't trip the CPython
+        recursion limit. The total node count is still bounded by the
+        LZMA-decompression cap (`_DNA_HISTORY_XML_MAX_BYTES`).
+        """
+        stack: list = [self]
+        while stack:
+            node = stack.pop()
+            yield node
+            # Push children in reverse so the first child pops next,
+            # preserving the original pre-order traversal sequence.
+            stack.extend(reversed(node.parents))
 
 
 def _coerce_int_or_zero(s) -> int:
@@ -7767,10 +7833,16 @@ class LibraryPanel(Widget):
 
     DEFAULT_CSS = """
     LibraryPanel {
-        /* Width starts at the minimum and grows in `_apply_panel_width`
-           after the library is loaded. The CSS default keeps the
-           panel sane during compose / before the first repopulate. */
-        width: 26;
+        /* Panel width is fixed at the sum of the plasmid-view button
+           row: 4 buttons × min-width 5 + 4 × 1 left-margin = 24, plus
+           the 1-cell `border-right` = 25. Names / status / bp wider
+           than the panel show via the DataTable's built-in horizontal
+           scrollbar (overflow-x: auto on the tables below). Pre-2026-05-06
+           the panel grew to fit the longest plasmid name (capped at 30+
+           cells), which ate map space on libraries with descriptive
+           names; the fixed-width + scroll model gives the map the most
+           real estate while still letting the user pan to any cell. */
+        width: 25;
         border-right: solid $primary;
     }
     /* Subtle "you are here" brighten when focus is anywhere inside
@@ -7781,8 +7853,12 @@ class LibraryPanel(Widget):
     /* Search input lives directly under the header; height 3 is the
        Textual Input default (1 content row + 2 border rows). */
     #lib-search     { height: 3; margin: 0; }
-    #lib-table      { height: 1fr; }
-    #lib-coll-table { height: 1fr; }
+    /* `overflow-x: auto` exposes a horizontal scrollbar when a row's
+       columns exceed the panel's viewport width. The 1-cell extra
+       height (4 instead of 3) reserves space for the scrollbar so
+       it doesn't eat the bottom row when it appears. */
+    #lib-table      { height: 1fr; overflow-x: auto; }
+    #lib-coll-table { height: 1fr; overflow-x: auto; }
     #lib-btns       { height: 3; }
     #lib-btns Button       { min-width: 5; margin: 0 0 0 1; }
     #lib-coll-btns         { height: 3; }
@@ -8001,23 +8077,23 @@ class LibraryPanel(Widget):
         else:
             self._repopulate_plasmids()
 
-    # Panel-width budget. The plasmid name column scales to fit the
-    # longest name in the active library (clipping it would hide
-    # the most important info), but is capped so a single 200-char
-    # name doesn't push the map / sidebar off-screen. Status column
-    # is sized to "SEQUENCING" + a 2-cell circle prefix; bp column
-    # to a 7-digit count + "bp" suffix room.
+    # Column-width budget. The panel itself is fixed-width (CSS), so
+    # these only size the columns inside the DataTable; columns wider
+    # than the panel viewport scroll horizontally via `overflow-x: auto`.
+    # The name column floor protects short-name libraries from a
+    # painfully narrow column; the ceiling caps absurd 200-char names
+    # so a single outlier doesn't make the user pan dozens of cells
+    # to reach the status column.
     _NAME_COL_FLOOR  = 12
     _NAME_COL_CEIL   = 30
     _STATUS_COL_W    = 12
     _BP_COL_W        = 9
-    _PANEL_FIXED_PAD = 8   # border + padding + datatable separators
 
     def _compute_name_col_width(self) -> int:
         """Longest plasmid + collection name in cells, clamped to
-        `[_NAME_COL_FLOOR, _NAME_COL_CEIL]`. The panel and table
-        both use this so the two views stay visually aligned when
-        the user toggles between them.
+        `[_NAME_COL_FLOOR, _NAME_COL_CEIL]`. Both DataTables share
+        this so the two views stay visually aligned when the user
+        toggles between them.
 
         The +2 is the colour-circle prefix: `● ` always reserves
         two cells on plasmid rows even when no status is set, so
@@ -8039,19 +8115,12 @@ class LibraryPanel(Widget):
                     min(max_name + 2, self._NAME_COL_CEIL))
 
     def _apply_panel_width(self) -> None:
-        """Resize the panel and the plasmid DataTable's columns to
-        fit the current library content. Called on mount, on every
-        repopulate, and after add/remove/rename so the layout never
-        clips a longer name than what's been measured."""
+        """Resize the plasmid DataTable's name column to fit the
+        longest current entry. The panel itself is fixed-width via
+        CSS — pre-2026-05-06 this method also grew the panel to fit
+        the longest name, which ate map real estate; now over-wide
+        column content scrolls horizontally inside the table."""
         name_w = self._compute_name_col_width()
-        total_w = (name_w + self._STATUS_COL_W + self._BP_COL_W
-                    + self._PANEL_FIXED_PAD)
-        try:
-            self.styles.width = total_w
-        except Exception:
-            # Style assignment can fail if the widget hasn't been
-            # mounted yet; the next refresh will pick up the value.
-            pass
         # Resize the column itself so the rendered name occupies
         # the new width. Textual's DataTable uses content-driven
         # auto-sizing by default, so explicit column widths keep
@@ -8514,7 +8583,8 @@ class LibraryPanel(Widget):
                 if _get_active_collection_name() == name:
                     _set_active_collection_name(None)
                 self._repopulate_collections()
-                self.app.notify(f"Deleted collection '{name}'.")
+                self.app.notify(f"Deleted collection '{name}'.",
+                                markup=False)
 
             self.app.push_screen(
                 ScaryDeleteConfirmModal(name, n_plas),
@@ -10665,8 +10735,19 @@ def _load_whats_new_body(current_version: str) -> str:
     back to a placeholder if the changelog is missing (e.g. a
     stripped wheel install on some platforms)."""
     global _WHATS_NEW_CACHE
+    # Lookup order, first hit wins:
+    #   1. Alongside the running module — works for the wheel install
+    #      (CHANGELOG.md is bundled into the wheel as of 0.7.x; older
+    #      wheels miss this file and fall through).
+    #   2. One level up from the module — covers `pip install -e .` style
+    #      development installs where splicecraft.py sits inside the repo
+    #      and CHANGELOG.md is at the repo root.
+    #   3. Current working directory — covers `python3 splicecraft.py`
+    #      invocations from inside the source tree.
+    here = Path(__file__).resolve().parent
     candidates = [
-        Path(__file__).resolve().parent / "CHANGELOG.md",
+        here / "CHANGELOG.md",
+        here.parent / "CHANGELOG.md",
         Path.cwd() / "CHANGELOG.md",
     ]
     cl_path: "Path | None" = next(
@@ -11239,12 +11320,66 @@ class OpenFileModal(ModalScreen):
 
     def _actually_load(self, path: str) -> None:
         status = self.query_one("#open-status", Static)
+        # Show an immediate "Parsing…" indicator so the user knows
+        # something is happening while the worker runs. Without this
+        # the modal looks frozen during a multi-second parse on big
+        # files (.dna with deep history XML, BAC/cosmid records).
+        status.update(f"[dim]Parsing {path!r}…[/dim]")
+        # Disable the buttons during the parse so a second click can't
+        # spawn a parallel parse on the same path.
+        try:
+            self.query_one("#btn-open",        Button).disabled = True
+            self.query_one("#btn-cancel-open", Button).disabled = True
+        except NoMatches:
+            pass
+        self._do_load(path)
+
+    @work(thread=True)
+    def _do_load(self, path: str) -> None:
+        """Background `load_genbank` worker. Parsing a large `.gb` /
+        `.dna` (multi-MB chromosome dump, `.dna` with rich history XML)
+        can take 1–3 s on the UI thread; running it here keeps the
+        modal interactive (Esc still cancels). On success the modal
+        dismisses with the record; on failure the status line shows
+        the error and the buttons re-enable.
+        """
         try:
             record = load_genbank(path)
-            record._tui_source = path   # remember where it came from
-            self.dismiss(record)
         except Exception as exc:
-            status.update(f"[red]{exc}[/red]")
+            _log.exception("OpenFileModal load failed for %s", path)
+            def _err():
+                # Modal may have been dismissed mid-parse via Esc; in
+                # that case fall back to a toast so the user still
+                # sees what failed.
+                if not self.is_mounted:
+                    try:
+                        self.app.notify(f"Open failed: {exc}",
+                                          severity="error", timeout=8,
+                                          markup=False)
+                    except Exception:
+                        _log.exception("notify fallback for open error failed")
+                    return
+                try:
+                    self.query_one("#open-status", Static).update(
+                        f"[red]{exc}[/red]"
+                    )
+                    self.query_one("#btn-open",        Button).disabled = False
+                    self.query_one("#btn-cancel-open", Button).disabled = False
+                except NoMatches:
+                    pass
+            self.app.call_from_thread(_err)
+            return
+
+        record._tui_source = path
+
+        def _ok():
+            # Modal dismissed during parse → drop the parsed record on
+            # the floor (the user explicitly bailed). Calling dismiss
+            # on an already-dismissed modal would raise.
+            if not self.is_mounted:
+                return
+            self.dismiss(record)
+        self.app.call_from_thread(_ok)
 
     @on(Input.Submitted)
     def _submitted(self):
@@ -12394,6 +12529,18 @@ def _grammar_dropdown_options() -> list[tuple[str, str]]:
 _SETTINGS_FILE = _DATA_DIR / "settings.json"
 _settings_cache: "dict | None" = None
 
+# Async-flush plumbing for `_set_setting`. Persistent settings are
+# safety-net data (worst case: the user's last toggle doesn't survive a
+# crash before the flush completes), so the disk write happens on a
+# daemon thread instead of blocking the UI thread for the 5–30 ms an
+# `_safe_save_json` cycle takes (read prev for shrink-detect → tempfile
+# write → fsync → atomic rename → backup-pruning). Coalesced: the worker
+# always flushes the most-recent payload, so a burst of 5 toggles in
+# 50 ms collapses to 1–2 disk writes instead of 5.
+_settings_flush_lock = threading.Lock()
+_settings_flush_pending: "dict | None" = None
+_settings_flush_running: bool = False
+
 
 def _load_settings() -> dict:
     """Return the persistent settings dict. Stored on disk as a list of
@@ -12417,6 +12564,10 @@ def _load_settings() -> dict:
 
 
 def _save_settings(settings: dict) -> None:
+    """Synchronous write — kept for the few callsites (tests, migrations)
+    that want the disk state visible immediately on return. UI toggles
+    use `_set_setting`, which mirrors to `_settings_cache` synchronously
+    and defers the disk write to a background thread."""
     global _settings_cache
     entries = [{"key": k, "value": v} for k, v in settings.items()]
     _safe_save_json(_SETTINGS_FILE, entries, "Settings")
@@ -12427,10 +12578,63 @@ def _get_setting(key: str, default=None):
     return _load_settings().get(key, default)
 
 
+def _settings_flush_worker() -> None:
+    """Drain the pending-settings slot, write to disk, repeat until
+    nothing's pending. Runs in a daemon thread spawned by
+    `_set_setting`. Multiple bursts spawn at most one worker at a time
+    (`_settings_flush_running` gate); subsequent `_set_setting` calls
+    just overwrite the pending payload, so the worker writes the latest
+    state once it gets the lock."""
+    global _settings_flush_pending, _settings_flush_running
+    while True:
+        with _settings_flush_lock:
+            payload = _settings_flush_pending
+            _settings_flush_pending = None
+            if payload is None:
+                _settings_flush_running = False
+                return
+        entries = [{"key": k, "value": v} for k, v in payload.items()]
+        try:
+            _safe_save_json(_SETTINGS_FILE, entries, "Settings")
+        except Exception:
+            # The cache was already updated synchronously, so the
+            # in-process state stays consistent; only the on-disk
+            # mirror is stale until the next successful flush.
+            _log.exception("Settings disk flush failed")
+
+
 def _set_setting(key: str, value) -> None:
+    """Update one setting key. Cache is updated synchronously so a
+    subsequent `_load_settings()` (in this process) sees the new value
+    immediately. The disk write is deferred to a daemon thread so a
+    keypress that toggles a setting (e.g. `r`) doesn't block the UI on
+    fsync. Coalesces bursts of toggles into fewer disk writes."""
+    global _settings_cache, _settings_flush_pending, _settings_flush_running
     settings = _load_settings()
     settings[key] = value
-    _save_settings(settings)
+    _settings_cache = dict(settings)
+    with _settings_flush_lock:
+        _settings_flush_pending = dict(settings)
+        if _settings_flush_running:
+            return
+        _settings_flush_running = True
+    threading.Thread(target=_settings_flush_worker,
+                      name="settings-flush",
+                      daemon=True).start()
+
+
+def _settings_flush_sync() -> None:
+    """Block until any pending settings flush has completed. Called from
+    the app's atexit handler so the user's last toggle reaches disk
+    before the process exits, even though the worker is a daemon
+    thread (= killed on interpreter shutdown otherwise)."""
+    deadline = _time.monotonic() + 2.0
+    while _time.monotonic() < deadline:
+        with _settings_flush_lock:
+            if not _settings_flush_running and _settings_flush_pending is None:
+                return
+        _time.sleep(0.02)
+    _log.warning("Settings flush did not complete within 2 s timeout")
 
 
 def _gb_find_forbidden_hits(
@@ -12943,6 +13147,14 @@ def _save_features(entries: list[dict]) -> None:
     _features_generation += 1
 
 
+# Generation-keyed cache of the (name, feature_type) → sequence index.
+# Invalidated automatically by `_save_features` bumping
+# `_features_generation`, so callers don't need to manage staleness —
+# `_build_feature_library_index` rebuilds transparently on the next
+# call after any save / external reload.
+_feature_library_index_cache: "tuple[int, dict[tuple[str, str], str]] | None" = None
+
+
 def _build_feature_library_index() -> dict[tuple[str, str], str]:
     """Return ``{(name, feature_type): sequence_upper}`` for the entire
     feature library — single sweep, used for O(1) part-vs-feature
@@ -12950,7 +13162,18 @@ def _build_feature_library_index() -> dict[tuple[str, str], str]:
     inside ``_populate`` would be O(parts × features); building once
     and looking up is O(parts + features) and reusable across the
     entire populate.
+
+    Memoised by `_features_generation`: a save bumps the generation,
+    so the next call reads the fresh on-disk state via
+    `_load_features`. The cache value is shared (read-only) across
+    callers — every consumer treats the index as a lookup table, never
+    mutating it, so no deepcopy is needed.
     """
+    global _feature_library_index_cache
+    gen = _features_generation
+    cached = _feature_library_index_cache
+    if cached is not None and cached[0] == gen:
+        return cached[1]
     index: dict[tuple[str, str], str] = {}
     for e in _load_features():
         name = e.get("name", "")
@@ -12958,6 +13181,7 @@ def _build_feature_library_index() -> dict[tuple[str, str], str]:
         if not isinstance(name, str) or not isinstance(ftype, str):
             continue
         index[(name, ftype)] = (e.get("sequence", "") or "").upper()
+    _feature_library_index_cache = (gen, index)
     return index
 
 
@@ -19060,7 +19284,8 @@ class FeatureLibraryScreen(Screen):
             self._selected_index = len(self._entries) - 1
             self._mark_dirty(self._selected_index)
         self._repopulate_table()
-        self.app.notify(f"{notice} '{entry.get('name')}' (unsaved).")
+        self.app.notify(f"{notice} '{entry.get('name')}' (unsaved).",
+                        markup=False)
 
     def _replace_entry(self, target_idx: int, new_entry: dict) -> None:
         """Replace entry at ``target_idx``, deduping any other entry that
@@ -19083,7 +19308,8 @@ class FeatureLibraryScreen(Screen):
         self._selected_index = target_idx
         self._mark_dirty(target_idx)
         self._repopulate_table()
-        self.app.notify(f"Edited '{new_entry.get('name')}' (unsaved).")
+        self.app.notify(f"Edited '{new_entry.get('name')}' (unsaved).",
+                        markup=False)
 
     @on(Button.Pressed, "#btn-flib-rename")
     def _rename_btn(self, _) -> None: self.action_rename()
@@ -19104,7 +19330,8 @@ class FeatureLibraryScreen(Screen):
             entry["name"] = str(new_name)
             self._mark_dirty(idx)
             self._repopulate_table()
-            self.app.notify(f"Renamed '{old}' → '{new_name}' (unsaved).")
+            self.app.notify(f"Renamed '{old}' → '{new_name}' (unsaved).",
+                            markup=False)
 
         self.app.push_screen(RenamePlasmidModal(old, ""), callback=_cb)
 
@@ -19131,7 +19358,8 @@ class FeatureLibraryScreen(Screen):
         self._selected_index = len(self._entries) - 1
         self._mark_dirty(self._selected_index)
         self._repopulate_table()
-        self.app.notify(f"Duplicated as '{cand}' (unsaved).")
+        self.app.notify(f"Duplicated as '{cand}' (unsaved).",
+                        markup=False)
 
     @on(Button.Pressed, "#btn-flib-remove")
     def _remove_btn(self, _) -> None: self.action_remove()
@@ -19148,7 +19376,8 @@ class FeatureLibraryScreen(Screen):
         if self._selected_index >= len(self._entries):
             self._selected_index = len(self._entries) - 1
         self._repopulate_table()
-        self.app.notify(f"Removed '{name}' (unsaved).")
+        self.app.notify(f"Removed '{name}' (unsaved).",
+                        markup=False)
 
     @on(Button.Pressed, "#btn-flib-color")
     def _color_btn(self, _) -> None: self.action_color()
@@ -19184,7 +19413,8 @@ class FeatureLibraryScreen(Screen):
             self._mark_dirty(idx)
             self._repopulate_table()
             shown = new_color if new_color else "auto"
-            self.app.notify(f"Color set to {shown} (unsaved).")
+            self.app.notify(f"Color set to {shown} (unsaved).",
+                            markup=False)
 
         self.app.push_screen(ColorPickerModal(ftype, current), callback=_cb)
 
@@ -19475,7 +19705,7 @@ class GrammarEditorModal(ModalScreen):
             self.app.notify(f"Save failed: {exc}", severity="error")
             return
         self.app.notify(f"Saved grammar '{parsed.get('name')}'.",
-                        severity="success")
+                        severity="success", markup=False)
         self.dismiss("saved")
 
     @on(Button.Pressed, "#btn-ged-delete")
@@ -19987,12 +20217,12 @@ class PartsBinModal(Screen):
         ok = _copy_to_clipboard_osc52(text)
         if ok:
             self.app.notify(f"Copied {label} to clipboard ({bp_note}).",
-                            severity="success")
+                            severity="success", markup=False)
         else:
             self.app.notify(
                 f"Could not access clipboard — select the sequence "
                 f"panel and press Ctrl+C instead ({label}, {bp_note}).",
-                severity="warning",
+                severity="warning", markup=False,
             )
 
     @on(Button.Pressed, "#btn-parts-copy-raw")
@@ -21319,14 +21549,14 @@ class DomesticatorModal(ModalScreen):
             match = next((e for e in entries if e.get("id") == pid), None)
             if match is None:
                 self.app.notify(f"Plasmid '{pid}' not in library.",
-                                severity="warning")
+                                severity="warning", markup=False)
                 return
             try:
                 rec = _gb_text_to_record(match.get("gb_text", "") or "")
             except Exception as exc:
                 _log.exception("Failed to parse library entry %s", pid)
                 self.app.notify(f"Failed to load '{pid}': {exc}",
-                                severity="error")
+                                severity="error", markup=False)
                 return
             self._plasmid_pick_id    = pid
             self._plasmid_pick_name  = match.get("name") or pid
@@ -24664,7 +24894,7 @@ class PrimerDesignScreen(Screen):
                         new_rec.name)
                     self._update_feature_dropdown()
                     self.app.notify(f"Loaded {new_rec.name} as primer template.",
-                                    severity="success")
+                                    severity="success", markup=False)
                     return
             self.app.notify("Entry not found.", severity="warning")
 
@@ -24928,7 +25158,7 @@ class PrimerDesignScreen(Screen):
                     _save_primers(entries)
                     self._refresh_library_table()
                     name = primers[row].get("name", "?")
-                    self.app.notify(f"{name}: {nxt}")
+                    self.app.notify(f"{name}: {nxt}", markup=False)
             event.stop()
         elif event.key == "delete":
             self._delete_marked_or_cursor()
@@ -25232,7 +25462,7 @@ class PrimerDesignScreen(Screen):
         _save_primers(entries)
         self._refresh_library_table()
         self.app.notify(f"Saved {fwd_name} + {rev_name} to primer library.",
-                        severity="success")
+                        severity="success", markup=False)
         self._reset_for_new_design()
 
     # ── Add selected library primers as features ──────────────────────────
@@ -25375,7 +25605,7 @@ class PrimerDesignScreen(Screen):
             if any(e.get("name") == new_name for e in entries):
                 self.app.notify(
                     f"A primer named {new_name!r} already exists.",
-                    severity="error")
+                    severity="error", markup=False)
                 return
             for e in entries:
                 if e.get("name") == old_name:
@@ -25383,7 +25613,8 @@ class PrimerDesignScreen(Screen):
                     break
             _save_primers(entries)
             self._refresh_library_table()
-            self.app.notify(f"Renamed {old_name!r} → {new_name!r}")
+            self.app.notify(f"Renamed {old_name!r} → {new_name!r}",
+                            markup=False)
 
         self.app.push_screen(
             RenamePlasmidModal(old_name, old_name),
@@ -26029,10 +26260,18 @@ class LibrarySearchModal(ModalScreen):
         Binding("tab",    "app.focus_next", "Next",   show=False),
     ]
 
+    # Debounce window for live filter. 150 ms feels instant on modern
+    # terminals but coalesces a "type 5 chars in 200 ms" burst into
+    # 1 search instead of 5 — matters when collections.json contains
+    # thousands of plasmids and `_search_collections_library` is the
+    # hot path.
+    _LIVE_FILTER_DEBOUNCE_S = 0.15
+
     def __init__(self, *, initial_query: str = "") -> None:
         super().__init__()
         self._initial_query = initial_query
         self._matches: list[dict] = []
+        self._filter_timer = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="libsearch-box"):
@@ -26106,10 +26345,20 @@ class LibrarySearchModal(ModalScreen):
 
     @on(Input.Changed, "#libsearch-input")
     def _on_query_changed(self, _event: Input.Changed) -> None:
-        # Live filter as the user types. The matcher is fast on the
-        # ~few-thousand-plasmid scale collections live at; if it
-        # becomes a bottleneck we can debounce.
-        self._refresh()
+        # Live filter as the user types — debounced via `set_timer` so
+        # a burst of keystrokes coalesces into a single
+        # `_search_collections_library` call. Per-keystroke firing was
+        # noticeably laggy on 5 k+ plasmid libraries (the matcher walks
+        # every entry across every collection); the debounce keeps
+        # typing snappy without sacrificing live-update behaviour.
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+        self._filter_timer = self.set_timer(
+            self._LIVE_FILTER_DEBOUNCE_S, self._refresh,
+        )
 
     @on(Input.Submitted, "#libsearch-input")
     def _on_query_submitted(self, _event: Input.Submitted) -> None:
@@ -26763,6 +27012,13 @@ class NewCollectionModal(ModalScreen):
 
     def _tick_progress(self, idx: int, total: int,
                         fname: str, ok: bool) -> None:
+        # Early-return when the modal is gone: the import worker can
+        # post a final tick after dismiss, and chasing two query_one
+        # calls + double except blocks per tick wastes work for a
+        # closed UI. The two `except NoMatches` blocks below stay as
+        # belt-and-braces in case the modal is dismissed mid-tick.
+        if not self.is_mounted:
+            return
         try:
             bar = self.query_one("#newcoll-progress", ProgressBar)
             if bar.total != total:
@@ -27261,7 +27517,6 @@ class LibraryDeleteConfirmModal(ModalScreen):
 # acknowledgement.
 
 import http.server
-import threading
 import uuid
 from socketserver import ThreadingMixIn
 
@@ -30675,7 +30930,7 @@ SpeciesPickerModal { align: center middle; }
         new_record = self._rebuild_record_without_feature(pm.selected_idx)
         sp = self.query_one("#seq-panel", SequencePanel)
         self._apply_snapshot(str(new_record.seq), sp._cursor_pos, new_record)
-        self.notify(f"Deleted '{label}'  (Ctrl+Z to undo)")
+        self.notify(f"Deleted '{label}'  (Ctrl+Z to undo)", markup=False)
 
     def action_add_to_library(self):
         if self._current_record is None:
@@ -31106,6 +31361,12 @@ SpeciesPickerModal { align: center middle; }
                 pm = self.query_one("#plasmid-map", PlasmidMap)
                 sp = self.query_one("#seq-panel",   SequencePanel)
             except NoMatches:
+                # Widgets unmounted between scan start and apply (rare,
+                # e.g. the user navigated away). The scan result is
+                # cached above so a future load that needs it can still
+                # use it; we just can't paint right now.
+                _log.debug("Restriction-scan apply skipped — widgets "
+                           "unmounted between worker start and callback")
                 return
             displayed = self._restr_cache if self._show_restr else []
             pm._restr_feats = displayed
@@ -33306,7 +33567,7 @@ SpeciesPickerModal { align: center middle; }
         sp.update_seq(str(new_record.seq), pm._feats + displayed)
         self._mark_dirty()
         self.notify(f"Updated feature: {new_label or '(unnamed)'}  "
-                     f"(Ctrl+Z to undo)")
+                     f"(Ctrl+Z to undo)", markup=False)
 
     def _apply_primer_edit(self, payload: dict) -> None:
         """Mutate a `primer_bind` SeqFeature with the modal's edited
@@ -33897,7 +34158,7 @@ SpeciesPickerModal { align: center middle; }
         Implementation: hide the other panels via `widget.display`
         (Textual removes the widget from layout entirely so the
         remaining one fills the freed space). Three of the four panels
-        carry fixed CSS dimensions — Library 26 cols, Sidebar 32 cols,
+        carry fixed CSS dimensions — Library 25 cols, Sidebar 32 cols,
         SequencePanel 14 rows — so when shown solo we override to
         `1fr` and snapshot the originals so Ctrl+5 can put them back.
         Layout is force-refreshed so live terminals see the swap on
@@ -33916,9 +34177,11 @@ SpeciesPickerModal { align: center middle; }
         # Snapshot canonical dimensions on first focus — the values
         # match the DEFAULT_CSS rules on each widget. Ctrl+5 restores
         # from this snapshot regardless of intermediate transitions.
+        # Library width = sum of plasmid-button-row (4 × 5 + 4 × 1 = 24)
+        # plus the panel's 1-cell border-right.
         if self._panel_dims is None:
             self._panel_dims = {
-                "library_w": 26,
+                "library_w": 25,
                 "sidebar_w": 32,
                 "seq_h":     14,
             }
@@ -34678,6 +34941,14 @@ def main():
                     pass
         except Exception:
             pass
+        # Flush any in-flight settings writes before the daemon thread
+        # gets killed by interpreter shutdown. Without this, the user's
+        # last toggle (if it landed within ~10 ms of quit) might never
+        # reach disk. Bounded by 2 s in `_settings_flush_sync`.
+        try:
+            _settings_flush_sync()
+        except Exception:
+            _log.exception("Settings flush-on-exit failed")
         _log.info("SpliceCraft session %s ending", _SESSION_ID)
         # Flush the rotating-file log handlers so the final session
         # banner + any pending DEBUG records hit disk before the

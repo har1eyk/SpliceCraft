@@ -2,6 +2,102 @@
 
 ---
 
+## [0.7.2.0] — 2026-05-06
+
+### Fixed (review pass — hardening + correctness)
+
+- **Render-cache eviction.** `_BUILD_SEQ_CACHE`, `_CHUNK_LAYOUT_CACHE`,
+  `_CHUNK_STATIC_CACHE`, and `_CHUNK_OVERLAY_CACHE` were converted from
+  blanket-`.clear()` / FIFO-pop eviction to `OrderedDict` LRU with
+  `move_to_end` on hit and `popitem(last=False)` on miss. Matches the
+  proven `_RESTR_SCAN_CACHE` idiom. Cycling through 5+ open plasmids
+  no longer pays the full chunk-layout rebuild cost on every cycle.
+- **`fetch_genbank` size cap.** New `_NCBI_GB_MAX_RESPONSE_BYTES` (64 MB)
+  + `handle.read(MAX + 1)` + bail pattern. Closes the last NCBI ingest
+  path that wasn't size-capped — every legitimate plasmid / cosmid /
+  BAC / small chromosome still fits while a multi-GB pathological
+  response (compromised server, MITM) is refused.
+- **`notify()` markup-injection escapes.** ~12 `notify()` callsites
+  that interpolate user-controlled names (collection / feature /
+  grammar / plasmid / primer / record names + feature labels) now
+  pass `markup=False`. A library entry named `[red]boom[/]` can no
+  longer break the toast layout or render misleading markup.
+- **`_CommercialSaaSHistoryNode.walk()` iterative.** Replaced the
+  yield-from recursion with a stack-based pre-order traversal. A
+  hostile `.dna` history XML with 1000+ deep nested `<Node>` chains
+  can no longer trip the CPython recursion limit.
+- **`_feature_library_match` memoization.** The `(name, type) →
+  sequence` index is now cached by `_features_generation` so the
+  one-off lookup helper doesn't iterate the whole feature library on
+  every call.
+- **`_restr_scan_worker` `NoMatches` debug log.** When widgets are
+  unmounted between scan start and apply, the swallow now logs at
+  `DEBUG` instead of vanishing silently — surfaces in transcripts
+  for future diagnosis.
+- **`_tick_progress` is_mounted guard.** Bulk-import progress callbacks
+  fired after the modal closes now early-return cleanly instead of
+  doing two `query_one` calls + double `except NoMatches` blocks per
+  tick.
+- **`_spill_lost_entries` atomicity.** The lost-entries safety dump
+  now routes through `_atomic_write_text` so a mid-write crash
+  (disk full, RO mount, power loss) leaves either nothing or a
+  complete recovery dump — never a half-written file masquerading as
+  evidence. Safety-net for the safety-net.
+
+### Added (responsiveness)
+
+- **Async settings writes.** `_set_setting` updates the in-memory cache
+  synchronously and dispatches the disk flush to a daemon thread with
+  coalescing — a burst of 5 toggles in 50 ms now collapses to 1–2 disk
+  writes instead of 5. UI no longer blocks on fsync when the user
+  toggles `r` / `c` / aspect / etc. New `_settings_flush_sync()` is
+  called from `main()`'s `finally` so the user's last toggle reaches
+  disk before the daemon thread is killed by interpreter shutdown
+  (bounded 2 s wait).
+- **`LibrarySearchModal` debounce.** `Input.Changed` schedules
+  `_refresh` via `set_timer(0.15 s)` instead of running the cross-
+  collection scan per-keystroke. A 5-character query in a 200 ms burst
+  now triggers 1 search instead of 5 — matters on libraries with
+  thousands of plasmids.
+- **`OpenFileModal` background load.** Large `.gb` / `.dna` parses
+  (BAC/cosmid records, `.dna` files with rich history XML) now run on
+  a `@work(thread=True)` worker that mirrors the `FetchModal._do_fetch`
+  pattern. The modal shows "Parsing…" immediately + disables the
+  buttons + remains interactive (Esc cancels). Stale-modal guard via
+  `is_mounted` so a user who hits Esc mid-parse doesn't crash on
+  dismiss-after-dismiss.
+
+### Changed (UX)
+
+- **`LibraryPanel` width fixed at 25 cells** (sum of the plasmid-view
+  button row: 4 buttons × 5 `min-width` + 4 × 1-cell margin + 1
+  border-right). Pre-2026-05-06 the panel grew to fit the longest
+  plasmid name (capped at ~59 cells), eating map real estate for
+  libraries with descriptive names. Names + status + bp wider than
+  the panel now scroll horizontally inside the table via
+  `overflow-x: auto`. The map gains the freed cells; the column
+  width logic is preserved for the in-table scroll bounds.
+
+### Fixed (packaging)
+
+- **CHANGELOG.md bundled in the wheel.** Added to
+  `[tool.hatch.build.targets.wheel].only-include` so `pipx`/`pip` users
+  get the in-app "What's New" modal text without falling back to the
+  GitHub-link placeholder. Added a third lookup candidate
+  (`Path(__file__).parent.parent / "CHANGELOG.md"`) for editable
+  installs.
+
+### Tests
+
+- `test_round_trip_through_disk` updated to call
+  `_settings_flush_sync()` between `_set_setting` and the cache-clear
+  re-read, since the disk write is now async.
+- F-key panel-restore tests updated for the new 25-cell library
+  width.
+- All 1606 tests pass; the suite picked up no regressions.
+
+---
+
 ## [0.7.1.0] — 2026-05-06
 
 ### Fixed (data safety — defense in depth)
