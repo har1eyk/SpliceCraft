@@ -10041,29 +10041,14 @@ class SequencePanel(Widget):
         if bp < 0:
             return
 
-        # If the click landed on a restriction site bar, highlight the recognition span
+        # If the click landed on a restriction site bar, highlight
+        # the recognition span PLUS the cut region. See
+        # `_resite_highlight_dict` for the span-derivation logic +
+        # rationale for Type IIS coverage.
         resite = self._last_resite_click
         self._last_resite_click = None
         if resite is not None:
-            hi_start = resite["start"]
-            hi_end   = min(resite["end"], len(self._seq))
-            ext_cut  = resite.get("ext_cut_bp")
-            if ext_cut is not None:
-                if ext_cut >= hi_end:
-                    hi_end   = min(ext_cut + 1, len(self._seq))
-                elif ext_cut < hi_start:
-                    hi_start = ext_cut
-            self._re_highlight = {
-                "start":         hi_start,
-                "end":           hi_end,
-                # Absolute top-strand-coord cut positions, baked into
-                # the resite at scan time. -1 means unknown (e.g. an
-                # older custom-built resite without these fields).
-                "top_cut_bp":    resite.get("top_cut_bp", -1),
-                "bottom_cut_bp": resite.get("bottom_cut_bp", -1),
-                "color":         resite["color"],
-                "name":          resite["label"],
-            }
+            self._re_highlight = self._resite_highlight_dict(resite)
             self._sel_range  = None
             self._user_sel   = None
             self._cursor_pos = -1
@@ -10206,6 +10191,53 @@ class SequencePanel(Widget):
             self._chunks_owners.pop(next(iter(self._chunks_owners)))
         self._chunks_owners[cache_key] = result
         return result
+
+    def _resite_highlight_dict(self, resite: dict) -> dict:
+        """Build the `_re_highlight` dict for a clicked restriction
+        site. Highlights the recognition span PLUS the cut region.
+
+        For Type IIS enzymes (BsaI / Esp3I / BbsI / etc.) the
+        recognition site is one place but the cut happens 1–9 bp
+        downstream and the bottom-strand cut is 4 bp further,
+        exposing a sticky overhang. Showing only the recognition
+        glyphs hid the spacer + overhang the user actually plans
+        around. Extending the span to enclose both top + bottom
+        cuts makes the full cut footprint visible: recognition
+        bases stay coloured, the spacer + overhang between top
+        and bottom cuts are now part of the highlight, and the
+        per-strand cut markers (reverse video) still render at
+        their exact positions inside that span.
+
+        For Type IIP / palindromic enzymes (EcoRI / HindIII / etc.)
+        the cuts are inside the recognition, so the recognition
+        span already covers them — the loop is a no-op and the
+        highlight is unchanged from pre-2026-05-08 behaviour.
+
+        Returns a dict with keys ``start``, ``end``, ``top_cut_bp``,
+        ``bottom_cut_bp``, ``color``, ``name``. Caller assigns the
+        result to ``self._re_highlight``.
+        """
+        n        = len(self._seq)
+        hi_start = resite["start"]
+        hi_end   = min(resite["end"], n)
+        top_cut  = resite.get("top_cut_bp", -1)
+        bot_cut  = resite.get("bottom_cut_bp", -1)
+        ext_cut  = resite.get("ext_cut_bp")
+        for cut in (top_cut, bot_cut, ext_cut):
+            if cut is None or cut < 0:
+                continue
+            if cut < hi_start:
+                hi_start = cut
+            if cut >= hi_end:
+                hi_end = min(cut + 1, n)
+        return {
+            "start":         hi_start,
+            "end":           hi_end,
+            "top_cut_bp":    top_cut,
+            "bottom_cut_bp": bot_cut,
+            "color":         resite["color"],
+            "name":          resite["label"],
+        }
 
     def _click_to_bp(self, screen_x: int, screen_y: int) -> int:
         """Map absolute screen coords to a bp index, or -1 if not on a base."""

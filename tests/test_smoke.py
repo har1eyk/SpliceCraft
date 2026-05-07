@@ -1597,6 +1597,87 @@ class TestRestrictionEnzymeClickHighlight:
             assert sp._re_highlight is None
 
 
+class TestTypeIISCutRegionHighlight:
+    """Type IIS enzymes cut OUTSIDE their recognition site. Clicking
+    a Type IIS resite should highlight the recognition span PLUS the
+    spacer + overhang region all the way to the bottom-strand cut so
+    the user can see the full cut footprint at a glance.
+
+    Regression guard for 2026-05-08: pre-fix the highlight only
+    extended to ``ext_cut_bp`` (a single cut position), missing the
+    bases between top and bottom cuts on the overhang side."""
+
+    def test_bsai_resite_highlight_dict_extends_through_overhang(self):
+        # BsaI recognition GGTCTC + cuts 1/5 → top cut at p+7,
+        # bottom cut at p+11 for site starting at p. Verify the
+        # `_resite_highlight_dict` helper extends the span all the
+        # way to the bottom cut so the user sees the full cut
+        # footprint when clicking the resite bar.
+        seq = "A" * 20 + "GGTCTC" + "N" * 10 + "A" * 64
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        bsai_resite = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "BsaI"
+        )
+        assert bsai_resite["start"] == 20
+        assert bsai_resite["end"]   == 26
+        assert bsai_resite["top_cut_bp"]    == 27
+        assert bsai_resite["bottom_cut_bp"] == 31
+
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        hi = sp._resite_highlight_dict(bsai_resite)
+        # Recognition: 20..26 (6 bp). Cut region extends to bottom
+        # cut (31), inclusive — final end = 32 (exclusive).
+        assert hi["start"] == 20
+        assert hi["end"]   == 32, (
+            f"BsaI highlight should span recognition (20..26) "
+            f"+ spacer + overhang to bottom cut (31), inclusive "
+            f"of cut position; got [{hi['start']}, {hi['end']})"
+        )
+        assert hi["top_cut_bp"]    == 27
+        assert hi["bottom_cut_bp"] == 31
+
+    def test_palindromic_resite_highlight_dict_unchanged(self):
+        # EcoRI cuts INSIDE its recognition (top at p+1, bot at p+5
+        # for site length 6). The cut-region extension should NOT
+        # change the highlight span for these — recognition
+        # already covers both cuts.
+        seq = "A" * 10 + "GAATTC" + "A" * 84
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        ecori = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "EcoRI"
+        )
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        hi = sp._resite_highlight_dict(ecori)
+        assert hi["start"] == 10
+        assert hi["end"]   == 16  # unchanged: cuts are inside recognition
+
+    def test_reverse_strand_typeiis_extends_left(self):
+        # Reverse-strand BsaI (recognition GAGACC = rc(GGTCTC))
+        # cuts on the OPPOSITE side: top cut is 5 bp before the
+        # site, bot cut is 1 bp before. The highlight should
+        # extend `start` BACKWARD to enclose both cuts.
+        seq = "A" * 30 + "GAGACC" + "A" * 64
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        bsai_rev = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "BsaI"
+        )
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        hi = sp._resite_highlight_dict(bsai_rev)
+        # Highlight `start` should be at or below the smaller cut
+        # (cuts are upstream of the site for reverse hits).
+        assert hi["start"] <= min(
+            bsai_rev["top_cut_bp"], bsai_rev["bottom_cut_bp"],
+        )
+        # And `end` should still cover the recognition end.
+        assert hi["end"] >= bsai_rev["end"]
+
+
 class TestEnterHighlightsFeatureAtCursor:
     """Regression guard for 2026-04-29: Enter in the seq-panel context
     should highlight the feature whose range contains the current
