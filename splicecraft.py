@@ -25529,34 +25529,28 @@ def _palette_rows_for_grammar(
     """Build the modular Constructor's parts-palette rows for the
     given grammar. Each row is a tuple matching the legacy
     ``_GB_L0_PARTS`` shape so the existing lane-management code can
-    consume both built-in catalog rows and user parts uniformly:
+    consume rows uniformly:
 
         (name, type, position, oh5, oh3, backbone, marker)
 
-    Source priority:
-      1. **User parts** from ``parts_bin.json`` (the user's saved
-         work — what the Constructor's "parts bin" should reflect).
-         Filtered by ``part.get("grammar") == grammar_id`` when
-         ``filter_enabled`` is True.
-      2. **Built-in catalog** for the grammar — kept as a fallback
-         so a brand-new install with an empty parts bin still shows
-         the canonical Golden Braid promoters / CDSs / terminators
-         the user can scan against; deduplicated against any
-         user-saved part with the same name so a custom-domesticated
-         eGFP doesn't appear twice.
+    Source: **user parts only** from ``parts_bin.json`` — what the
+    user has actually saved. The built-in catalog (placeholder
+    promoters / CDSs / terminators with no real sequence) is
+    deliberately NOT mixed in: those rows can't actually assemble,
+    so showing them as palette options is misleading. An empty
+    parts bin → an empty palette is the honest state.
 
-    User parts come first because they reflect the user's actual
-    saved work; the built-in catalog sits below as a reference set.
-    Sorted within each group by position then name so the palette
-    has a stable scan order.
+    Filter: when ``filter_enabled`` is True, only parts whose
+    ``grammar`` field equals ``grammar_id`` are returned. When
+    False, every user part appears regardless of grammar — useful
+    for users with mixed libraries or custom grammars that share
+    overhangs.
+
+    Sorted by position then name for a stable scan order.
     """
-    grammar = _all_grammars().get(grammar_id) or _BUILTIN_GRAMMARS.get(
-        "gb_l0", {},
-    )
     rows: list[tuple] = []
     seen_names: set[str] = set()
 
-    # 1) User parts (filtered by grammar when the toggle is on).
     user_parts = _load_parts_bin()
     if filter_enabled:
         user_parts = [
@@ -25580,19 +25574,6 @@ def _palette_rows_for_grammar(
             str(p.get("backbone") or ""),
             str(p.get("marker") or ""),
         ))
-
-    # 2) Built-in catalog for this grammar — sit below user parts.
-    catalog = grammar.get("catalog") or []
-    for entry in catalog:
-        if not isinstance(entry, (list, tuple)) or len(entry) < 5:
-            continue
-        name = str(entry[0])
-        if name in seen_names:
-            continue
-        seen_names.add(name)
-        # Pad short tuples to the canonical 7-field shape.
-        row = list(entry) + [""] * (7 - len(entry))
-        rows.append(tuple(row[:7]))
 
     return rows
 

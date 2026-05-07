@@ -919,6 +919,36 @@ class TestConstructorMultiGrammarTabs:
     Plant tabs. Each modular tab uses its own grammar context for
     palette filtering, validation, and entry-vector banner."""
 
+    def test_palette_helper_excludes_builtin_catalog(self, isolated_parts_bin):
+        """Regression guard for 2026-05-07: the palette must NOT
+        include the built-in `_GB_L0_PARTS` catalog rows. Those are
+        placeholder entries with no real sequence — they can't
+        actually assemble, so showing them as palette options is
+        misleading. An empty parts bin → an empty palette is the
+        honest state."""
+        # Empty parts bin → empty palette under either filter setting.
+        sc._save_parts_bin([])
+        for filter_enabled in (True, False):
+            rows = sc._palette_rows_for_grammar(
+                "gb_l0", filter_enabled=filter_enabled,
+            )
+            assert rows == [], (
+                f"Empty parts bin must produce empty palette "
+                f"(filter={filter_enabled}); got {len(rows)} rows"
+            )
+        # Even with the gb_l0 grammar's catalog populated, none of
+        # the catalog names should leak into the palette.
+        names_with_no_user_parts = {
+            r[0] for r in sc._palette_rows_for_grammar(
+                "gb_l0", filter_enabled=True,
+            )
+        }
+        catalog_names = {row[0] for row in sc._GB_L0_PARTS}
+        assert not (names_with_no_user_parts & catalog_names), (
+            "Built-in catalog names leaked into the palette: "
+            f"{names_with_no_user_parts & catalog_names}"
+        )
+
     def test_palette_helper_filters_by_grammar(self, isolated_parts_bin):
         # Save two parts with different grammar ids; the helper
         # filtered by grammar should only return the matching one.
