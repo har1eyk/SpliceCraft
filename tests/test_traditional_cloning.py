@@ -1185,6 +1185,42 @@ class TestConstructorMultiGrammarTabs:
             assert "FFE4_test" in banner
             assert "Omega1"    in banner
 
+    async def test_role_buttons_inside_modal_horizontal_extent(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+    ):
+        """Regression guard for 2026-05-08: a leading
+        ``Static("Backbone:")`` inside the row's Horizontal grabbed
+        the full width and pushed the role columns past the modal's
+        right edge (modal x=20..140 but Alpha2 at x=152). The fix
+        drops the inline label in favour of a section header above
+        the row. This test pins every role button's right edge
+        inside the modal's container so it can't regress."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            from textual.widgets import TabbedContent
+            modal.query_one(
+                "#ctor-tabs", TabbedContent,
+            ).active = "ctor-tab-gb_l0"
+            await pilot.pause()
+            await pilot.pause(0.1)
+            box_region = modal.query_one("#ctor-box").region
+            modal_right = box_region.x + box_region.width
+            from textual.widgets import Button
+            for role in ("Alpha1", "Alpha2", "Omega1", "Omega2"):
+                btn = modal.query_one(f"#btn-bb-gb_l0-{role}", Button)
+                btn_right = btn.region.x + btn.region.width
+                assert btn_right <= modal_right, (
+                    f"{role} button extends past modal right edge "
+                    f"({btn.region} vs box {box_region})"
+                )
+
     async def test_role_button_label_shows_bound_vector_name(
             self, tiny_record, isolated_library, isolated_parts_bin,
             tmp_path, monkeypatch,

@@ -25786,12 +25786,20 @@ class ConstructorModal(ModalScreen):
                     yield Button("↓",        id=f"btn-lane-down-{gid}")
                     yield Button("✕ Remove", id=f"btn-lane-remove-{gid}",
                                    variant="error")
-        # Backbone selector — 4 (or 2) per-role columns. Each column
-        # is a Vertical so the bound vector name renders ABOVE the
+        # Backbone selector — per-role columns. Each column is a
+        # Vertical so the bound vector name renders ABOVE the
         # button; queries on `lbl-bb-…` update the name when the
-        # binding changes.
+        # binding changes. The legacy leading "Backbone:" Static
+        # was dropped 2026-05-08 — it grabbed the full row width
+        # in Textual's Horizontal layout (auto-sizing on Static
+        # didn't work as expected) and pushed the role columns
+        # off-screen. The role buttons themselves are self-
+        # explanatory; a section header replaces the inline label.
+        yield Static("L1 Acceptor (press to bind / activate):",
+                       id=f"ctor-backbone-hdr-{gid}",
+                       classes="ctor-backbone-hdr",
+                       markup=False)
         with Horizontal(id=f"ctor-backbone-row-{gid}"):
-            yield Static("Backbone:", id=f"ctor-backbone-label-{gid}")
             backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
             for bb in backbones:
                 classes = ("bb-btn bb-active"
@@ -33422,17 +33430,24 @@ ConstructorModal { align: center middle; }
 #ctor-lane-btns   { height: 3; margin-top: 0; }
 #ctor-lane-btns Button { min-width: 5; margin-right: 1; }
 /* Backbone row: each role is a column (bb-col) holding a name
-   label above the role button. Row height = 4 (1 label + 3 button)
-   so the bound-vector name has space without crowding the button. */
-#ctor-backbone-row { height: 4; margin-top: 1; align: left middle; }
-#ctor-backbone-label { width: auto; padding: 0 1; color: $text-muted; }
-.bb-col           { width: 14; height: 4; margin-right: 1; }
-.bb-name          {
-    height: 1; width: 1fr; content-align: center middle;
+   label above the role button. The Horizontal row sits below a
+   section header (no leading inline label — Textual's Static
+   auto-width inside a Horizontal grabs all remaining space and
+   pushes the role columns off-screen). */
+.ctor-backbone-hdr    {
+    height: 1; margin-top: 1; padding: 0 1;
+    color: $text-muted; background: $primary-darken-3;
+}
+#ctor-backbone-row    { height: 4; align: left top; }
+.bb-col               {
+    width: 14; height: 4; margin-right: 1; padding: 0;
+}
+.bb-name              {
+    height: 1; width: 14; content-align: center middle;
     color: $text-muted;
 }
-.bb-btn           { min-width: 12; width: 1fr; }
-.bb-active        { background: $accent; color: $text; }
+.bb-btn               { min-width: 12; width: 14; height: 3; }
+.bb-active            { background: $accent; color: $text; }
 #ctor-validation  {
     height: 4; border: solid $primary-darken-2;
     padding: 0 1; margin-top: 1; overflow-x: auto;
