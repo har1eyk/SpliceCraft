@@ -1185,6 +1185,47 @@ class TestConstructorMultiGrammarTabs:
             assert "FFE4_test" in banner
             assert "Omega1"    in banner
 
+    async def test_clicking_backbone_button_routes_to_select_backbone(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+    ):
+        """Regression guard for 2026-05-08: the dispatcher's
+        `_gid_from_button` only matched buttons whose id ENDED with
+        `-{gid}`. Backbone buttons have an extra `-{role}` suffix
+        (`btn-bb-{gid}-{role}`), so clicks were silently dropped —
+        the buttons looked clickable but did nothing. Clicking each
+        bb button must now invoke `_select_backbone(gid, role)`."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            calls: list[tuple] = []
+            real_select = modal._select_backbone
+
+            def _spy(gid, role):
+                calls.append((gid, role))
+                # Don't call real_select — it would try to push the
+                # picker modal for unbound roles, which the test
+                # doesn't need.
+
+            modal._select_backbone = _spy
+            from textual.widgets import TabbedContent
+            modal.query_one(
+                "#ctor-tabs", TabbedContent,
+            ).active = "ctor-tab-gb_l0"
+            await pilot.pause()
+            await pilot.pause(0.1)
+            await pilot.click("#btn-bb-gb_l0-Alpha1")
+            await pilot.pause()
+            await pilot.click("#btn-bb-gb_l0-Omega2")
+            await pilot.pause()
+            assert ("gb_l0", "Alpha1") in calls
+            assert ("gb_l0", "Omega2") in calls
+
     async def test_role_buttons_inside_modal_horizontal_extent(
             self, tiny_record, isolated_library, isolated_parts_bin,
     ):

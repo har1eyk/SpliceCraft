@@ -26090,6 +26090,18 @@ class ConstructorModal(ModalScreen):
             event.stop()
             self.dismiss(None)
             return
+        # Backbone buttons have an extra `-{role}` suffix after the
+        # gid (`btn-bb-{gid}-{role}`), so plain end-suffix matching
+        # would miss them. Handle them up front, before the generic
+        # `btn-{stem}-{gid}` dispatch.
+        if bid.startswith("btn-bb-"):
+            rest = bid[len("btn-bb-"):]
+            for _gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
+                if rest.startswith(_gid + "-"):
+                    event.stop()
+                    self._select_backbone(_gid, rest[len(_gid) + 1:])
+                    return
+            return
         # Per-grammar buttons all carry a `-{gid}` suffix.
         gid = self._gid_from_button(bid)
         if not gid:
@@ -26119,14 +26131,6 @@ class ConstructorModal(ModalScreen):
             self._lanes[gid] = []
             self._refresh_lane(gid)
             self._refresh_validation(gid)
-        elif stem.startswith("btn-bb-"):
-            # `btn-bb-{gid}-{name}` — strip stem prefix to recover backbone
-            # name. The bid format is `btn-bb-{gid}-{name}`, so the
-            # backbone name is everything after `btn-bb-{gid}-`.
-            prefix = f"btn-bb-{gid}-"
-            if bid.startswith(prefix):
-                event.stop()
-                self._select_backbone(gid, bid[len(prefix):])
 
     def _lane_move(self, gid: str, delta: int) -> None:
         try:
