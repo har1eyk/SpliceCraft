@@ -9846,7 +9846,18 @@ class SequencePanel(Widget):
             **{k: v for k, v in dbg.items()
                if k in ("packed_row", "seq_col", "is_below", "owner_set")},
         )
-        if (event.shift or event.ctrl) and self._cursor_pos >= 0:
+        if self._last_resite_click is not None:
+            # Resite click — `on_click` will set `_re_highlight` and
+            # clear the cursor. Parking the cursor at the resite
+            # midpoint here would briefly flash + auto-scroll the
+            # viewport to that bp BEFORE on_click runs (visible as
+            # "click on enzyme name → seq panel scrolls and focuses
+            # a feature instead of showing the recog site"). Leave
+            # the cursor + selection state untouched so on_click
+            # owns the post-click view; the drag-start fields below
+            # still get set so a drag-from-resite can extend.
+            pass
+        elif (event.shift or event.ctrl) and self._cursor_pos >= 0:
             # Shift / Ctrl + click: extend bp-level selection from
             # anchor (or cursor) to here. Either modifier triggers
             # the same flow because terminals can swallow shift+click
@@ -9863,14 +9874,16 @@ class SequencePanel(Widget):
             self._cursor_pos = bp
             self._user_sel   = None
             self._sel_anchor = -1
-        # Skip the auto-scroll for lane-art / AA-letter clicks: the
-        # user clicked something already on screen, so jumping the
-        # viewport to the feature midpoint (or the codon centre)
-        # would yank them away from what they were looking at. Plain
-        # DNA-row clicks still scroll if the cursor lands off-screen,
-        # since those clicks set cursor at the literal click bp.
+        # Skip the auto-scroll for lane-art / AA-letter / resite
+        # clicks: the user clicked something already on screen, so
+        # jumping the viewport to the feature midpoint / codon
+        # centre / recognition midpoint would yank them away from
+        # what they were looking at. Plain DNA-row clicks still
+        # scroll if the cursor lands off-screen, since those clicks
+        # set cursor at the literal click bp.
         skip_scroll = (self._last_lane_click
-                       or self._last_aa_codon_click is not None)
+                       or self._last_aa_codon_click is not None
+                       or self._last_resite_click is not None)
         if not skip_scroll:
             self._ensure_cursor_visible()
         self._refresh_view()

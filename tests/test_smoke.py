@@ -1728,6 +1728,81 @@ class TestTypeIISCutRegionHighlight:
             f"expected gray (spacer) bg; styles: {styles_used}"
         )
 
+    async def test_resite_mouse_down_doesnt_park_cursor_at_midpoint(
+            self, isolated_library):
+        """Reproducer for the 2026-05-08 user report: "after origin
+        shift, clicking on any enzyme label scrolls the seq panel
+        and focuses a feature instead of showing the recog site".
+
+        Cause: `on_mouse_down` parked the cursor at the resite
+        midpoint (returned by `_click_to_bp`) and auto-scrolled
+        via `_ensure_cursor_visible` BEFORE `on_click` got a
+        chance to recognise it as a resite click. On a big
+        plasmid with the resite far from the current viewport the
+        scroll yanked the user away from where they were looking.
+
+        Fix: `on_mouse_down` short-circuits all cursor + scroll
+        work when `_last_resite_click` is set. `on_click` owns
+        the post-click view (sets `_re_highlight`, clears
+        cursor, refreshes).
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = "A" * 1000 + "GAATTC" + "A" * 500
+        rec = SeqRecord(
+            Seq(seq), id="t", name="t",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sites = sc._scan_restriction_sites(seq, circular=True)
+            ecori = next(
+                s for s in sites
+                if s.get("type") == "resite" and s.get("label") == "EcoRI"
+            )
+            sp.update_seq(seq, [ecori])
+            await pilot.pause(0.1)
+
+            # Pre-condition: cursor is at -1 (no cursor).
+            sp._cursor_pos = -1
+            sp._user_sel = None
+            sp._sel_anchor = -1
+
+            # Drive mouse_down with `_last_resite_click` set, by
+            # monkey-patching `_click_to_bp` to return EcoRI's
+            # midpoint (1003) and stash the resite. This mirrors
+            # what `_check_packed` does when a click lands on the
+            # parens row of a resite.
+            original_click_to_bp = sp._click_to_bp
+
+            def _stub(_x, _y, _real=original_click_to_bp,
+                      _resite=ecori, _sp=sp):
+                _sp._last_resite_click = _resite
+                return 1003   # EcoRI midpoint, absolute
+
+            sp._click_to_bp = _stub
+            from textual.events import MouseDown
+            sp.on_mouse_down(MouseDown(
+                widget=sp, x=0, y=0, delta_x=0, delta_y=0,
+                button=1, shift=False, meta=False, ctrl=False,
+                screen_x=0, screen_y=0,
+            ))
+            sp._click_to_bp = original_click_to_bp
+            await pilot.pause(0.05)
+
+            # Bug symptom: cursor parked at the resite midpoint
+            # (1003). Fix: cursor stays at its previous position
+            # (-1), so `on_click` can own the cursor state cleanly.
+            assert sp._cursor_pos == -1, (
+                f"on_mouse_down on a resite must not park the "
+                f"cursor at the resite midpoint (would auto-scroll "
+                f"the seq panel); cursor_pos={sp._cursor_pos}"
+            )
+
     async def test_dna_click_after_rotation_doesnt_select_feature(
             self, isolated_library):
         """Regression guard for 2026-05-08: after origin shift, a
