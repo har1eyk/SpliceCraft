@@ -141,6 +141,15 @@ _MODAL_CASES = [
     ("UnsavedNavigateModal",       lambda: sc.UnsavedNavigateModal(
                                                "go back to collections")),
     ("RenamePlasmidModal",         lambda: sc.RenamePlasmidModal("my_plasmid", "abc123")),
+    ("MinPrimerBindingModal",      lambda: sc.MinPrimerBindingModal(15)),
+    ("MultiRecordFastaModal",      lambda: sc.MultiRecordFastaModal(
+                                               5, default_name="demo_set")),
+    ("PartsBinDeleteConfirmModal.single",
+                                    lambda: sc.PartsBinDeleteConfirmModal(
+                                                ["myCDS"])),
+    ("PartsBinDeleteConfirmModal.multi",
+                                    lambda: sc.PartsBinDeleteConfirmModal(
+                                                ["a", "b", "c", "d", "e"])),
     ("LibraryDeleteConfirmModal",  lambda: sc.LibraryDeleteConfirmModal(
                                                "test", 3000, "abc123")),
     ("PlasmidPickerModal",         lambda: sc.PlasmidPickerModal(None)),

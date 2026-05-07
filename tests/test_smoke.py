@@ -1808,6 +1808,248 @@ class TestLibrarySearch:
             assert inp.value == ""
 
 
+class TestDeleteClearsStaleData:
+    """2026-05-07: deletion of the loaded plasmid from the library
+    used to leave the plasmid map / sidebar / sequence panel showing
+    the now-deleted plasmid's data. `_clear_canvas` resets every
+    panel to an empty state when called from the delete-confirm
+    callback. Tested directly here without the confirm modal so the
+    assertions don't depend on async modal dispatch."""
+
+    async def test_clear_canvas_drops_record_and_panels(
+            self, tiny_record, isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert app._current_record is not None
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+            seq_pnl = app.query_one("#seq-panel", sc.SequencePanel)
+            # Pre-condition: panels carry the loaded record.
+            assert pm.record is not None
+            assert pm._feats
+            assert seq_pnl._seq
+
+            app._clear_canvas()
+            await pilot.pause()
+
+            # Record handle dropped + panels emptied.
+            assert app._current_record is None
+            assert pm.record is None
+            assert pm._feats == []
+            assert pm._restr_feats == []
+            assert seq_pnl._seq == ""
+            assert seq_pnl._feats == []
+            # Sidebar table is empty (row→feat mapping is empty too).
+            assert sidebar._row_to_feat_idx == []
+            # Source-path / unsaved flag wiped so Ctrl+S can't
+            # accidentally write to the deleted file's path.
+            assert app._source_path is None
+            assert app._unsaved is False
+
+
+class TestCrashRecoveryNoticeOncePerSet:
+    """`_check_crash_recovery` should warn ONCE per leftover set —
+    same files / same mtimes on the next launch should NOT re-fire
+    the toast. New leftovers (or re-written ones) should still
+    trigger a fresh notice. Cleaning the directory clears the
+    seen-set so a future first crash isn't silenced.
+
+    The helper runs from `on_mount` so the test patches `notify` on
+    the class BEFORE the app instance is created — otherwise the
+    first call lands before the per-instance patch can attach.
+    """
+
+    @staticmethod
+    def _make_leftover(dir_path, name="test_plasmid"):
+        dir_path.mkdir(parents=True, exist_ok=True)
+        f = dir_path / f"{name}-abcd.gb"
+        f.write_text("LOCUS test\n")
+        return f
+
+    @staticmethod
+    def _patch_notify(monkeypatch):
+        """Replace `PlasmidApp.notify` with a capture list. Returns
+        the list so the test can assert on it after run_test exits."""
+        notices: list = []
+        def _capture(self, msg, *a, **kw):
+            notices.append(msg)
+        monkeypatch.setattr(sc.PlasmidApp, "notify", _capture)
+        return notices
+
+    async def test_first_launch_notifies_subsequent_quiet(
+            self, tiny_record, isolated_library, tmp_path,
+            monkeypatch):
+        crash_dir = tmp_path / "crash_recovery"
+        monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", crash_dir)
+        self._make_leftover(crash_dir, "rec_a")
+        self._make_leftover(crash_dir, "rec_b")
+        # Make sure the seen-set starts empty for this test (the
+        # autouse fixture redirects _SETTINGS_FILE to a tmp dir, so
+        # we just need to clear the in-memory cache).
+        notices1 = self._patch_notify(monkeypatch)
+        app1 = _build_app(tiny_record, isolated_library)
+        async with app1.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+        # First launch's on_mount fired the recovery notice.
+        assert any("recovery" in str(m).lower() for m in notices1)
+        sc._settings_flush_sync()
+        assert sc._get_setting("crash_recovery_seen")
+
+        # Second launch with the same leftovers: no notice fires.
+        notices2 = self._patch_notify(monkeypatch)
+        app2 = _build_app(tiny_record, isolated_library)
+        async with app2.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+        assert not any("recovery" in str(m).lower() for m in notices2)
+
+    async def test_new_leftover_re_triggers_notice(
+            self, tiny_record, isolated_library, tmp_path,
+            monkeypatch):
+        crash_dir = tmp_path / "crash_recovery"
+        monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", crash_dir)
+        old = self._make_leftover(crash_dir, "old_rec")
+        # Pre-seed the seen-set so the OLD file alone would be quiet.
+        sc._set_setting(
+            "crash_recovery_seen",
+            [f"{old.name}|{int(old.stat().st_mtime)}"],
+        )
+        sc._settings_flush_sync()
+        # Add a brand-new leftover.
+        self._make_leftover(crash_dir, "fresh_rec")
+        notices = self._patch_notify(monkeypatch)
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+        assert any("fresh_rec" in str(m) for m in notices)
+
+    async def test_clean_directory_resets_seen_set(
+            self, tiny_record, isolated_library, tmp_path,
+            monkeypatch):
+        crash_dir = tmp_path / "crash_recovery"
+        crash_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", crash_dir)
+        # Stale seen-set from a prior session.
+        sc._set_setting(
+            "crash_recovery_seen", ["something_old|123"],
+        )
+        sc._settings_flush_sync()
+        self._patch_notify(monkeypatch)
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+        sc._settings_flush_sync()
+        # Clean dir → seen-set cleared, so a future first-time
+        # crash won't be silenced by the stale acknowledgement.
+        assert not sc._get_setting("crash_recovery_seen")
+
+
+class TestSidebarSortOrder:
+    """Sidebar rows are sorted by (start, end) ASC so features list in
+    appearance order from origin (clockwise on circular plasmids).
+    Tiebreak is shorter-feature-first when starts match. Wrap features
+    sort to the end naturally because their `start` is the high
+    physical position. The sort is display-only; `pm._feats` keeps
+    record order so colour assignment and `_feats_by_start` semantics
+    don't move under the sidebar's feet."""
+
+    def test_sort_key_orders_by_start_then_end(self):
+        # Three features at the same start: sort by end ASC = shortest
+        # span first ("span closest to origin first").
+        a = {"start": 100, "end": 200, "strand": 1}
+        b = {"start": 100, "end": 150, "strand": 1}
+        c = {"start": 100, "end": 175, "strand": 1}
+        feats = [a, b, c]
+        ranked = sorted(range(len(feats)),
+                        key=lambda i: sc.FeatureSidebar._sort_key(feats[i]))
+        assert ranked == [1, 2, 0]   # b (end=150), c (end=175), a (end=200)
+
+    def test_sort_key_origin_first(self):
+        # Features at different starts sort by start ASC; origin-anchored
+        # feature comes first regardless of length.
+        early_long = {"start": 0,    "end": 5000, "strand": 1}
+        mid_short  = {"start": 1000, "end": 1010, "strand": 1}
+        late       = {"start": 4000, "end": 4500, "strand": 1}
+        feats = [late, early_long, mid_short]
+        ranked = sorted(range(len(feats)),
+                        key=lambda i: sc.FeatureSidebar._sort_key(feats[i]))
+        assert [feats[i]["start"] for i in ranked] == [0, 1000, 4000]
+
+    def test_sort_key_wrap_feature_sorts_late(self):
+        # Wrap feature (`end < start`) has a large `start` and sorts to
+        # the end of the list — its leading edge in clockwise traversal
+        # IS that high `start`, even though the tail crosses origin.
+        head        = {"start": 0,    "end": 100,  "strand": 1}
+        middle      = {"start": 2000, "end": 2100, "strand": 1}
+        wrap        = {"start": 5800, "end": 100,  "strand": 1}  # wraps origin
+        feats = [wrap, head, middle]
+        ranked = sorted(range(len(feats)),
+                        key=lambda i: sc.FeatureSidebar._sort_key(feats[i]))
+        # head, middle, wrap (wrap last because start=5800).
+        assert ranked == [1, 2, 0]
+
+    def test_sort_key_handles_missing_or_garbage_coords(self):
+        # Defensive: a feature dict missing start/end (or with None)
+        # should sort to position 0 without raising.
+        ok        = {"start": 100, "end": 200, "strand": 1}
+        no_start  = {"end": 50,    "strand": 1}
+        garbage   = {"start": None, "end": None, "strand": 1}
+        feats = [ok, no_start, garbage]
+        # Both no_start and garbage become (0, *), sort before ok.
+        ranked = sorted(range(len(feats)),
+                        key=lambda i: sc.FeatureSidebar._sort_key(feats[i]))
+        # Order between no_start (0, 50) and garbage (0, 0): garbage first.
+        assert ranked[0] == 2   # garbage (0, 0)
+        assert ranked[1] == 1   # no_start (0, 50)
+        assert ranked[2] == 0   # ok (100, 200)
+
+    async def test_populate_builds_row_to_feat_idx_mapping(self,
+                                                            isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Three features, intentionally added OUT OF ORDER (record
+        # order ≠ start order) so we can verify the sidebar
+        # re-orders for display while the feat indices still resolve.
+        rec = SeqRecord(Seq("A" * 5000), id="sortTest", name="sortTest",
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(3000, 3500, strand=1), type="CDS",
+            qualifiers={"label": ["lateFeat"]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(100, 200, strand=1), type="CDS",
+            qualifiers={"label": ["earlyFeat"]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(1000, 1100, strand=1), type="CDS",
+            qualifiers={"label": ["midFeat"]},
+        ))
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+            # `_row_to_feat_idx` maps display row → pm._feats index.
+            # The display order should be early, mid, late → so row 0
+            # points at earlyFeat, etc.
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            labels_in_row_order = [
+                pm._feats[sidebar._row_to_feat_idx[r]]["label"]
+                for r in range(len(sidebar._row_to_feat_idx))
+            ]
+            assert labels_in_row_order == ["earlyFeat", "midFeat", "lateFeat"]
+            # Inverse mapping resolves the right way too.
+            for row, feat_idx in enumerate(sidebar._row_to_feat_idx):
+                assert sidebar._feat_idx_to_row[feat_idx] == row
+
+
 class TestSidebarClickCentersSeqPanel:
     """Regression guard for the 2026-04-25 sidebar-click centering fix.
 
@@ -4772,44 +5014,73 @@ class TestShiftClickFeatureExtend:
         text_ok = sc._format_feat_tooltip(feat_ok, total=1000)
         assert "Weak binding" not in text_ok
 
-    async def test_action_cycle_min_primer_binding_advances_through_presets(
+    async def test_apply_min_primer_binding_persists_and_stamps(
             self, tiny_record, isolated_library):
-        """The Settings → Min primer binding action cycles through the
-        canonical presets (10/12/15/18/20) and persists each step to
-        settings.json so the choice survives a session restart."""
+        """`_apply_min_primer_binding` (the helper invoked by the
+        modal-driven `set_min_primer_binding` action) persists the new
+        threshold to settings.json AND re-parses the record so the
+        seq-panel `_weak_primer` stamps reflect the new value
+        immediately. Defaults: hydrate is 15 bp."""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            presets = sc.PlasmidApp._MIN_PRIMER_BINDING_PRESETS
-            # Default hydrate is 15 bp.
             assert app._min_primer_binding == 15
-            seen = []
-            for _ in range(len(presets) + 1):
-                app.action_cycle_min_primer_binding()
-                seen.append(app._min_primer_binding)
-            # First call moves 15 → 18, then wraps. Observed sequence
-            # should hit each preset exactly once over `len(presets)`
-            # cycles, ending back at 15.
-            assert seen[:5] == [18, 20, 10, 12, 15]
-            # Persisted value matches the in-memory mirror.
-            assert sc._get_setting("min_primer_binding") == seen[-1]
+            app._apply_min_primer_binding(22)
+            assert app._min_primer_binding == 22
+            sc._settings_flush_sync()
+            assert sc._get_setting("min_primer_binding") == 22
 
-    async def test_action_cycle_min_primer_binding_off_preset_snaps_to_nearest(
+    async def test_min_primer_binding_modal_validates_and_dismisses(
             self, tiny_record, isolated_library):
-        """A hand-edited settings.json value off the preset list snaps
-        to the nearest preset on the next cycle, so the menu always
-        converges on a canonical value."""
+        """The new `MinPrimerBindingModal` accepts integers in [1, 60]
+        and dismisses with the chosen value. Out-of-range, non-integer,
+        and unchanged-value inputs do not produce a write."""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            app._min_primer_binding = 9   # off-preset; nearest is 10
-            app.action_cycle_min_primer_binding()
-            assert app._min_primer_binding == 10
-            app._min_primer_binding = 17  # off-preset; nearest is 18
-            app.action_cycle_min_primer_binding()
-            assert app._min_primer_binding == 18
+            modal = sc.MinPrimerBindingModal(15)
+            await app.push_screen(modal)
+            await pilot.pause()
+            inp    = modal.query_one("#mpb-input", sc.Input)
+            status = modal.query_one("#mpb-status", sc.Static)
+            # Out-of-range — no dismiss, status shows error.
+            inp.value = "999"
+            modal._try_submit()
+            assert app.screen_stack[-1] is modal, (
+                "out-of-range value should not dismiss the modal"
+            )
+            assert "range" in str(status.render()).lower()
+            # Non-integer — same behaviour.
+            inp.value = "abc"
+            modal._try_submit()
+            assert app.screen_stack[-1] is modal
+            assert "integer" in str(status.render()).lower()
+            # Valid — modal dismisses with the int value.
+            inp.value = "25"
+            modal._try_submit()
+            await pilot.pause()
+            assert app.screen_stack[-1] is not modal
+
+    async def test_min_primer_binding_modal_unchanged_dismisses_none(
+            self, tiny_record, isolated_library):
+        """Submitting the existing value is treated as a cancel — no
+        re-stamp / no settings write — so the modal can't be used to
+        force a redundant work cycle."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            results: list = []
+            modal = sc.MinPrimerBindingModal(15)
+            await app.push_screen(modal, callback=results.append)
+            await pilot.pause()
+            inp = modal.query_one("#mpb-input", sc.Input)
+            inp.value = "15"   # same as current_value
+            modal._try_submit()
+            await pilot.pause()
+            assert results == [None]
 
     async def test_record_load_counter_advances_on_apply(
             self, tiny_record, isolated_library):

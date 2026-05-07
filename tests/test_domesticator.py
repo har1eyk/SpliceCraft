@@ -1132,8 +1132,10 @@ class TestFastaPickerModalLayout:
 
 
 class TestFastaAwareDirectoryTree:
-    """The tree paints FASTA files lime green (bold #BFFF00) and other
-    files white (#FFFFFF). We check by listing a directory with both."""
+    """The picker paints FASTA files hot pink (bold #FF69B4) and other
+    files white (#FFFFFF). We check by listing a directory with both.
+    2026-05-06: switched from lime green to pink so the FASTA colour
+    matches what every other picker in the app shows."""
 
     async def test_fasta_and_non_fasta_get_different_styles(self, tmp_path):
         _write_fasta(tmp_path, "hit.fa", "a", "ACGT")
@@ -1160,9 +1162,9 @@ class TestFastaAwareDirectoryTree:
                     # Spans for the file portion should carry the fasta style
                     styles = [s.style for s in label.spans]
                     style_strs = [str(s) for s in styles]
-                    assert any("#bfff00" in s.lower()
+                    assert any("#ff69b4" in s.lower()
                                for s in style_strs), (
-                        f"hit.fa not styled lime: {style_strs}"
+                        f"hit.fa not styled pink: {style_strs}"
                     )
                     found_fasta_style = True
                 elif "miss.txt" in text_str:
@@ -1313,9 +1315,11 @@ class TestPartsBinExportFasta:
             assert top._name == "my-test-part"
             assert top._sequence == "ATGCATGCATGC"
 
-    async def test_export_builtin_part_warns(self, isolated_parts_bin):
-        """Built-in catalog parts have no sequence — the button should
-        notify and NOT push the export modal."""
+    async def test_export_with_no_user_parts_warns(self, isolated_parts_bin):
+        """With an empty parts-bin file (and no built-in catalog rows
+        as of 2026-05-07) the table is empty — pressing Export should
+        notify and NOT push the export modal.
+        """
         app = sc.PlasmidApp()
         async with app.run_test(size=_BASELINE) as pilot:
             await pilot.pause()
@@ -1323,16 +1327,949 @@ class TestPartsBinExportFasta:
             await pilot.pause()
             await pilot.pause(0.1)
             parts_modal = app.screen
-            # No user parts — cursor lands on a built-in (index 0).
-            t = parts_modal.query_one("#parts-table", sc.DataTable)
-            t.move_cursor(row=0)
-            await pilot.pause()
+            # No rows — cursor_row is None / table is empty.
+            assert parts_modal._rows == []
             parts_modal.query_one("#btn-parts-export-fasta",
                                   sc.Button).press()
             await pilot.pause()
             await pilot.pause(0.1)
             # Still on the parts screen — no FastaExportModal pushed.
             assert isinstance(app.screen, sc.PartsBinModal)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Parts Bin: Save to Collection (multi-select via Ctrl+click)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCloneIntoEntryVector:
+    """`_clone_part_into_entry_vector` should simulate real Golden
+    Braid / MoClo cloning: digest the vector + amplicon at the
+    grammar's IIS sites and ligate the insert into the backbone.
+
+    We build a minimal entry vector with two flanking Esp3I sites +
+    a dropout cassette, then run a part designed for the matching
+    overhangs and assert the resulting plasmid:
+      * preserves the vector backbone outside the cuts
+      * excises the dropout
+      * carries the insert sequence
+      * annotates the insert + carries the vector's other features
+        through the ligation.
+    """
+
+    @staticmethod
+    def _build_test_vector(oh5: str = "AATG", oh3: str = "GCTT",
+                            dropout: str = "AAACCCGGG" * 5):
+        """Build a circular SeqRecord pretending to be a pUPD2-style
+        L0 entry vector — backbone + Esp3I + spacer + oh5 + dropout
+        + oh3 + rc(spacer) + rc(Esp3I) + backbone (closing the
+        circle). Annotated with `ori` and `lacZ dropout` features
+        so feature transfer can be tested too."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        backbone_5 = "T" * 40
+        left_site  = "CGTCTCT"
+        right_site = "AGAGACG"
+        backbone_3 = "G" * 60
+        seq = (backbone_5 + left_site + oh5 + dropout + oh3
+               + right_site + backbone_3)
+        rec = SeqRecord(Seq(seq), id="pTestVec", name="pTestVec",
+                         description="test")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, 40, strand=1),
+            type="rep_origin",
+            qualifiers={"label": ["ori"]},
+        ))
+        dropout_start = len(backbone_5) + len(left_site)
+        dropout_end   = dropout_start + len(oh5) + len(dropout) + len(oh3)
+        rec.features.append(SeqFeature(
+            FeatureLocation(dropout_start, dropout_end, strand=1),
+            type="misc_feature",
+            qualifiers={"label": ["lacZ dropout"]},
+        ))
+        return rec
+
+    def _make_part(self, insert: str, oh5: str = "AATG",
+                    oh3: str = "GCTT") -> dict:
+        gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
+        return {
+            "name": "myPromoter", "type": "Promoter", "position": "B3",
+            "oh5": oh5, "oh3": oh3,
+            "backbone": "pTestVec", "marker": "Spec",
+            "sequence": insert, "grammar": "gb_l0",
+            "primed_seq": sc._simulate_primed_amplicon(
+                insert, oh5, oh3, grammar=gb_l0,
+            ),
+        }
+
+    def _build_entry_vector_dict(self, vec_rec) -> dict:
+        return {
+            "name":    vec_rec.name,
+            "size":    len(vec_rec.seq),
+            "source":  "test",
+            "gb_text": sc._record_to_gb_text(vec_rec),
+        }
+
+    def test_clones_into_real_backbone_with_insert_replaced(self):
+        vec_rec = self._build_test_vector()
+        ev      = self._build_entry_vector_dict(vec_rec)
+        insert  = "GAGGAGAAATTAACTATGCATCATCAT"
+        part    = self._make_part(insert)
+        gb_l0   = sc._BUILTIN_GRAMMARS["gb_l0"]
+        cloned  = sc._clone_part_into_entry_vector(part, ev, gb_l0)
+        assert cloned is not None
+        assert cloned.annotations["topology"] == "circular"
+        # Insert appears in the cloned plasmid
+        assert insert in str(cloned.seq)
+        # Dropout cassette is gone
+        assert "AAACCCGGG" * 5 not in str(cloned.seq)
+        # Vector annotations carried through (ori survives the cut)
+        labels = [
+            f.qualifiers.get("label", ["?"])[0] for f in cloned.features
+        ]
+        assert "ori" in labels
+        # Insert annotated with the part's name
+        assert "myPromoter" in labels
+        # Length: vec_size - dropout_size + insert_size, modulo
+        # overhang/site bookkeeping. Just ensure it shrunk vs the
+        # original (since the dropout is bigger than the insert here).
+        assert len(cloned.seq) < len(vec_rec.seq)
+
+    def test_synthesises_insert_when_overhangs_dont_match(self):
+        # When the part's primer-encoded overhangs (oh5/oh3) don't
+        # match any vector cut overhangs, the simulator falls back to
+        # synthesising an insert fragment with the dropout's own
+        # overhangs as sticky ends and oh5+insert+oh3 as the cloned
+        # content. This lets parts designed with the next-level
+        # junction overhangs (e.g. AATG/GCTT BsaI overhangs in gb_l0
+        # CDS, exposed AFTER the part is in pUPD2) still simulate-
+        # clone into pUPD2-style vectors whose dropout exposes
+        # different Esp3I overhangs (CTCG/TGAG).
+        #
+        # Regression guard for 2026-05-07 fix: SpliceCraft's
+        # Domesticator emits primers carrying the BsaI junction
+        # overhangs directly (no Esp3I cloning overhang in front),
+        # so a user cloning into a real pUPD2 derivative like
+        # FFE 1 ENTRY UPD (CTCG/TGAG dropout overhangs) hit a
+        # bail and got a stub-backbone instead of their vector.
+        # Now the synthesis path stamps the correct dropout
+        # overhangs onto the insert so the simulation matches the
+        # bench result.
+        vec_rec = self._build_test_vector(oh5="CTCG", oh3="TGAG")
+        ev      = self._build_entry_vector_dict(vec_rec)
+        # Part overhangs don't match the vector's dropout overhangs.
+        part = self._make_part("ACGTACGTACGTACGT", oh5="AATG", oh3="GCTT")
+        gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
+        cloned = sc._clone_part_into_entry_vector(part, ev, gb_l0)
+        assert cloned is not None
+        # The dropout (AAACCCGGG repeat) is replaced.
+        assert "AAACCCGGG" * 5 not in str(cloned.seq)
+        # The synthesised insert content carries oh5 + insert + oh3.
+        assert "AATGACGTACGTACGTACGTGCTT" in str(cloned.seq)
+        # Vector annotations (ori) survive the ligation.
+        labels = [
+            f.qualifiers.get("label", ["?"])[0] for f in cloned.features
+        ]
+        assert "ori" in labels
+        # The part annotation is centred on the user's insert
+        # (between the BsaI overhangs), not on the Esp3I sticky
+        # ends — so feature transfer to the cloned plasmid
+        # marks the right region for downstream display.
+        part_feats = [
+            f for f in cloned.features
+            if f.qualifiers.get("label", ["?"])[0] == "myPromoter"
+        ]
+        assert len(part_feats) == 1
+        feat = part_feats[0]
+        feat_seq = str(cloned.seq)[
+            int(feat.location.start):int(feat.location.end)
+        ]
+        assert feat_seq == "ACGTACGTACGTACGT"
+
+    def test_synthesis_with_three_cut_vector_picks_smallest_dropout(self):
+        """When the vector has 3+ Esp3I sites (a stray site in the
+        backbone, common after sloppy domestication), the synthesis
+        path picks the SMALLEST fragment as the dropout — that's
+        the conventional pUPD2-style intended dropout cassette
+        (LacZα or similar reporter), not a stray backbone shard.
+        Verifies the heuristic doesn't mis-route the insert."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Two cut sites flanking a tiny "real" dropout, plus one
+        # extra Esp3I site embedded in the long backbone arm. The
+        # backbone-shard between the extra site and the next real
+        # cut should NOT be picked as dropout.
+        BB1 = "T" * 200    # long backbone arm 1
+        DROPOUT = "AAACCCGGG" * 3   # small intended dropout (27 bp)
+        BB2 = "G" * 600    # long backbone arm 2
+        # Format: backbone_arm_1 + Esp3I-A + small_dropout + Esp3I-B
+        # + backbone_with_stray_site + Esp3I-A (extra) + ... close circle
+        vec_seq = (
+            BB1 + "CGTCTCT" + "CTCG" + DROPOUT + "TGAG" + "AGAGACG"
+            + BB2 + "CGTCTCT" + "CCCC" + "AGAGACG" + "C" * 100
+        )
+        rec = SeqRecord(Seq(vec_seq), id="pTriCut", name="pTriCut",
+                         description="vector with stray Esp3I site")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        ev = {
+            "name": "pTriCut", "size": len(vec_seq), "source": "test",
+            "gb_text": sc._record_to_gb_text(rec),
+        }
+        # Part overhangs (AATG/GCTT) deliberately don't match — force
+        # the synthesis path.
+        part = self._make_part("ATATATATAT", oh5="AATG", oh3="GCTT")
+        gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
+        cloned = sc._clone_part_into_entry_vector(part, ev, gb_l0)
+        assert cloned is not None
+        cloned_seq = str(cloned.seq)
+        # The 27-bp dropout is gone (it was the smallest fragment).
+        assert DROPOUT not in cloned_seq
+        # The synthesised AATG-flanked insert is in.
+        assert "AATGATATATATATGCTT" in cloned_seq
+        # Both backbone arms survive.
+        assert BB1 in cloned_seq
+        assert BB2 in cloned_seq
+
+    def test_synthesis_with_zero_overhang_part(self):
+        """A part with empty oh5/oh3 (no junction overhangs assigned
+        — e.g. a custom grammar with blunt-ended positions) still
+        synthesises an insert. Sticky ends come from the dropout
+        edges; the cloned content is just the insert sequence."""
+        vec_rec = self._build_test_vector(oh5="CTCG", oh3="TGAG")
+        ev      = self._build_entry_vector_dict(vec_rec)
+        part    = self._make_part("AAAATTTTGGGGCCCC", oh5="", oh3="")
+        gb_l0   = sc._BUILTIN_GRAMMARS["gb_l0"]
+        cloned  = sc._clone_part_into_entry_vector(part, ev, gb_l0)
+        assert cloned is not None
+        # Insert appears as-is, with no oh5/oh3 padding.
+        assert "AAAATTTTGGGGCCCC" in str(cloned.seq)
+
+    def test_diagnose_flags_vector_with_no_iis_cuts(self):
+        """When the user-configured entry vector has no enzyme cuts
+        at all (a backbone-only sequence with no dropout cassette),
+        the diagnostic returns a clear message naming the vector
+        and the missing enzyme so the user knows to pick a vector
+        with the dropout intact."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Backbone with no Esp3I sites at all.
+        seq = "ACGTACGTACGTACGTACGT" * 20
+        rec = SeqRecord(Seq(seq), id="pNoSites", name="pNoSites")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        ev = {
+            "name": "pNoSites", "size": len(seq), "source": "test",
+            "gb_text": sc._record_to_gb_text(rec),
+            "grammar_id": "gb_l0",
+        }
+        # Configure as the active entry vector for gb_l0.
+        prev = sc._get_entry_vector("gb_l0")
+        try:
+            sc._set_entry_vector("gb_l0", ev)
+            sc._settings_flush_sync()
+            part = self._make_part("ATATATAT")
+            reason = sc._diagnose_part_cloning(part)
+            assert reason is not None
+            assert "Esp3I" in reason
+            assert "pNoSites" in reason
+        finally:
+            sc._set_entry_vector("gb_l0", prev)
+            sc._settings_flush_sync()
+
+    def test_diagnose_returns_none_when_no_entry_vector(self):
+        """Diagnose returns None when no entry vector is configured
+        — that's the legitimate stub-fallback path (parts saved
+        before the user set up an entry vector). The Save-to-
+        Collection notify shouldn't fire spuriously in this case."""
+        prev = sc._get_entry_vector("gb_l0")
+        try:
+            sc._set_entry_vector("gb_l0", None)
+            sc._settings_flush_sync()
+            part = self._make_part("ATATATAT")
+            assert sc._diagnose_part_cloning(part) is None
+        finally:
+            sc._set_entry_vector("gb_l0", prev)
+            sc._settings_flush_sync()
+
+    def test_returns_none_when_no_enzyme_in_grammar(self):
+        vec_rec = self._build_test_vector()
+        ev      = self._build_entry_vector_dict(vec_rec)
+        part    = self._make_part("ACGTACGT")
+        # Grammar without a real enzyme name → simulation can't run.
+        bad_grammar = dict(sc._BUILTIN_GRAMMARS["gb_l0"])
+        bad_grammar["enzyme"] = "NotARealEnzyme"
+        assert sc._clone_part_into_entry_vector(
+            part, ev, bad_grammar,
+        ) is None
+
+    def test_returns_none_on_malformed_vector(self):
+        part = self._make_part("ACGTACGT")
+        gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
+        ev = {"name": "junk", "gb_text": "not valid GenBank text"}
+        assert sc._clone_part_into_entry_vector(
+            part, ev, gb_l0,
+        ) is None
+
+    def test_part_to_cloned_seqrecord_uses_simulation_when_available(
+            self, isolated_library):
+        # When an entry vector is set for the part's grammar,
+        # _part_to_cloned_seqrecord should produce the simulated
+        # cloned plasmid (with vector annotations carried through).
+        vec_rec = self._build_test_vector()
+        sc._set_entry_vector("gb_l0", self._build_entry_vector_dict(vec_rec))
+        sc._settings_flush_sync()
+        part = self._make_part("GAGGAGAAATTAACTATGCATCATCAT")
+        rec = sc._part_to_cloned_seqrecord(part)
+        labels = [
+            f.qualifiers.get("label", ["?"])[0] for f in rec.features
+        ]
+        # Vector's ori comes through — proof we used the real
+        # simulation, not the pUPD2 stub.
+        assert "ori" in labels
+        # Stub fallback would set the description to "Cloned part:
+        # <name>" with no "in <vector>" clause.
+        assert "in " in rec.description
+
+    def test_part_to_cloned_seqrecord_falls_back_when_no_entry_vector(
+            self, isolated_library):
+        # No entry vector → use stub backbone form (preserves
+        # historical behaviour for parts saved before this change).
+        sc._set_entry_vector("gb_l0", None)
+        sc._settings_flush_sync()
+        part = self._make_part("ACGTACGT")
+        rec = sc._part_to_cloned_seqrecord(part)
+        # The stub form ends in `_PUPD2_BACKBONE_STUB` — verify the
+        # stub bytes appear at the end of the cloned sequence.
+        assert sc._PUPD2_BACKBONE_STUB in str(rec.seq)
+
+    def test_iis_digest_byte_exact_no_carryover(self):
+        """The IIS-digest path must produce a cloned plasmid that
+        is byte-exact equal to ``vector.replace(oh5+dropout+oh3,
+        oh5+insert+oh3)`` (modulo origin rotation). Verifies no
+        primed-amplicon carryover (pad / extra spacer / internal
+        site doubling) and no double-counted overhang bytes."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        BB5 = "AAAAAA" * 10
+        OH5 = "AATG"; DROPOUT = "GGGGCCCCCCAAAATTTTGG"; OH3 = "GCTT"
+        BB3 = "TTTTTT" * 10
+        vec_seq = (BB5 + "CGTCTC" + "A" + OH5 + DROPOUT + OH3
+                   + "T" + "GAGACG" + BB3)
+        rec = SeqRecord(Seq(vec_seq), id="pAudit", name="pAudit",
+                         description="audit")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        ev = {
+            "name": "pAudit", "size": len(vec_seq), "source": "test",
+            "gb_text": sc._record_to_gb_text(rec),
+        }
+        insert = "ATATATATATATATAT"
+        part = self._make_part(insert)
+        gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
+        cloned = sc._clone_part_into_entry_vector(part, ev, gb_l0)
+        assert cloned is not None
+        seq = str(cloned.seq)
+        expected = vec_seq.replace(OH5 + DROPOUT + OH3,
+                                    OH5 + insert + OH3)
+        # Byte-exact equality, modulo rotation (cloned plasmid is
+        # circular so the origin can land anywhere).
+        assert len(seq) == len(expected), (
+            f"length differs: {len(seq)} vs {len(expected)} — "
+            f"means primed amplicon bytes (pad/spacer/site) leaked "
+            f"into the cloned plasmid"
+        )
+        assert seq in expected + expected, (
+            "cloned isn't a rotation of expected — extra or missing "
+            "bytes vs vector with dropout swapped"
+        )
+
+    def test_sequence_splice_byte_exact_no_carryover(self):
+        """Same byte-exactness invariant for the sequence-splice
+        fallback path (vector without IIS-site annotations)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        BB5 = "T" * 100
+        OH5 = "AATG"; DROPOUT = "GGGGCCCCCCAAAATTTTGGAAAAAAAA"
+        OH3 = "GCTT"; BB3 = "G" * 100
+        vec_seq = BB5 + OH5 + DROPOUT + OH3 + BB3
+        rec = SeqRecord(Seq(vec_seq), id="pSeqSplice",
+                         name="pSeqSplice", description="audit")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        ev = {
+            "name": "pSeqSplice", "size": len(vec_seq),
+            "source": "test",
+            "gb_text": sc._record_to_gb_text(rec),
+        }
+        insert = "ATATATATATATATAT"
+        part = self._make_part(insert)
+        cloned = sc._splice_part_into_vector_by_overhang(ev, part)
+        assert cloned is not None
+        seq = str(cloned.seq)
+        expected = vec_seq.replace(OH5 + DROPOUT + OH3,
+                                    OH5 + insert + OH3)
+        assert len(seq) == len(expected), (
+            f"length differs: {len(seq)} vs {len(expected)}"
+        )
+        assert seq in expected + expected, (
+            "cloned isn't a rotation of expected"
+        )
+
+    def test_sequence_splice_fallback_when_no_iis_sites(
+            self, isolated_library):
+        """2026-05-07 fix: when the user's entry vector lacks
+        Esp3I/BsaI sites in its annotation (most real plasmids
+        loaded from a generic library don't have them in the
+        gb_text the user picks), the strict IIS digest can't
+        produce a clean dropout. The sequence-splice fallback
+        still finds the part's `oh5...oh3` pair in the vector and
+        replaces the inner segment — so the saved plasmid IS the
+        user's vector with the dropout swapped for the insert,
+        not the pUPD2 stub the legacy fallback used."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Build a vector with the AATG/GCTT overhangs flanking a
+        # dropout cassette but NO Esp3I sites — exactly the case
+        # that broke the strict IIS simulation.
+        backbone_5 = "T" * 500 + "AATG"
+        dropout    = "GCAAACCCGGG" * 30
+        backbone_3 = "GCTT" + "G" * 500
+        seq = backbone_5 + dropout + backbone_3
+        rec = SeqRecord(Seq(seq), id="pUserVec", name="pUserVec",
+                         description="user vector with dropout, no IIS sites")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, 100, strand=1),
+            type="rep_origin", qualifiers={"label": ["ori"]},
+        ))
+        ev = {
+            "name": "pUserVec",
+            "size": len(seq),
+            "source": "test",
+            "gb_text": sc._record_to_gb_text(rec),
+        }
+        sc._set_entry_vector("gb_l0", ev)
+        sc._settings_flush_sync()
+        insert = "GAGGAGAAATTAACTATGCATCATCAT"
+        part = self._make_part(insert)
+        cloned = sc._part_to_cloned_seqrecord(part)
+        # Cloned plasmid is the user's vector minus dropout plus insert
+        s = str(cloned.seq)
+        assert insert in s, "Insert missing from cloned plasmid"
+        assert dropout not in s, "Dropout still present"
+        assert "T" * 100 in s, "Backbone (T-run) missing"
+        assert cloned.annotations["topology"] == "circular"
+        # Vector annotations carried through
+        labels = [
+            f.qualifiers.get("label", ["?"])[0] for f in cloned.features
+        ]
+        assert "ori" in labels
+        # Insert annotated with the part name
+        assert "myPromoter" in labels
+        # NOT the pUPD2 stub
+        assert sc._PUPD2_BACKBONE_STUB not in s
+        # Description references the user's vector name
+        assert "pUserVec" in cloned.description
+
+
+class TestPartToClonedSeqRecord:
+    """`_part_to_cloned_seqrecord` builds a circular SeqRecord whose
+    sequence is the part's cloned form (insert + 5'/3' OH + pUPD2
+    backbone) with one feature spanning the insert region. This is
+    the helper that the parts-bin "Save to Collection" button uses
+    to feed `LibraryPanel.add_entry`.
+    """
+
+    def test_builds_circular_record_with_insert_feature(self):
+        part = {
+            "name": "myCDS", "type": "CDS", "position": "B3",
+            "sequence":  "ATGAAATAATAA",
+            "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spec", "user": True,
+        }
+        rec = sc._part_to_cloned_seqrecord(part)
+        # Cloned form = oh5 + insert + oh3 + backbone stub.
+        assert str(rec.seq).startswith("AATG" + "ATGAAATAATAA")
+        # Topology + molecule_type pull through to GenBank serialisation.
+        assert rec.annotations["topology"] == "circular"
+        assert rec.annotations["molecule_type"] == "DNA"
+        # Single feature spans the insert. Start = len(oh5), len matches.
+        assert len(rec.features) == 1
+        f = rec.features[0]
+        assert int(f.location.start) == 4
+        assert int(f.location.end) == 4 + len("ATGAAATAATAA")
+        assert f.type == "CDS"
+        assert f.qualifiers.get("label") == ["myCDS"]
+
+    def test_sanitises_record_id_for_locus_line(self):
+        # `myCDS w/ slash` has spaces + non-LOCUS-safe characters; the
+        # Biopython GenBank serialiser would reject it. The helper
+        # replaces them with `_` for the id and preserves the original
+        # name on the feature label for human display.
+        part = {
+            "name": "weird name w/ slash", "type": "CDS",
+            "sequence": "ATGAAATAA", "oh5": "AATG", "oh3": "GCTT",
+            "user": True,
+        }
+        rec = sc._part_to_cloned_seqrecord(part)
+        assert rec.id == "weird_name_w__slash"
+        assert "weird name w/ slash" in rec.description
+        assert rec.features[0].qualifiers["label"] == [
+            "weird name w/ slash",
+        ]
+
+    def test_rejects_part_without_sequence(self):
+        part = {"name": "empty", "type": "CDS", "sequence": "",
+                 "oh5": "AATG", "oh3": "GCTT", "user": True}
+        with pytest.raises(ValueError, match="no sequence"):
+            sc._part_to_cloned_seqrecord(part)
+
+
+class TestPartsBinMultiSelect:
+    """Ctrl+click on a parts row toggles its membership in the
+    multi-select set; bare clicks clear the set; built-in catalog
+    rows refuse Ctrl+click. Selection is wiped on `_populate` so a
+    New Part insertion can't leave stale row indices behind.
+    """
+
+    @staticmethod
+    def _seed_user_parts():
+        sc._save_parts_bin([
+            {"name": "partA", "type": "CDS", "position": "B3",
+             "oh5": "AATG", "oh3": "GCTT", "backbone": "pUPD2",
+             "marker": "Spec", "sequence": "ATGAAATAA",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0, "user": True},
+            {"name": "partB", "type": "promoter", "position": "A2",
+             "oh5": "GGAG", "oh3": "AATG", "backbone": "pUPD2",
+             "marker": "Spec", "sequence": "TATAAA" * 5,
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0, "user": True},
+        ])
+
+    async def test_modifier_click_toggles_selection(self, isolated_parts_bin):
+        # 2026-05-07: switched from `_pending_ctrl` + RowSelected to
+        # a direct mouse-event flow because gnome-terminal eats
+        # Ctrl+click for URL handling. The toggle helper is what the
+        # mouse_up branch actually invokes — exercising it directly
+        # is equivalent to a Shift / Ctrl / Alt + click without
+        # depending on whichever modifier the host terminal forwards.
+        self._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._toggle_row_in_selection(0)
+            assert modal._selected_rows == {0}
+            modal._toggle_row_in_selection(1)
+            assert modal._selected_rows == {0, 1}
+            modal._toggle_row_in_selection(0)
+            assert modal._selected_rows == {1}
+
+    async def test_modifier_click_skips_empty_sequence_row(
+            self, isolated_parts_bin):
+        # 2026-05-07: built-in catalog rows are gone, but a hand-
+        # edited parts_bin.json with an empty sequence on a user
+        # part is still possible. The toggle helper's defensive
+        # `not r.get("sequence")` guard keeps that case from
+        # entering the multi-select set (Save-to-Collection /
+        # Delete would otherwise have nothing to operate on for
+        # that row).
+        sc._save_parts_bin([{
+            "name": "broken_part", "type": "CDS", "position": "B3",
+            "oh5": "AATG", "oh3": "GCTT", "backbone": "pUPD2",
+            "marker": "Spec", "sequence": "",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._toggle_row_in_selection(0)
+            # Empty-sequence row refused.
+            assert modal._selected_rows == set()
+
+    async def test_drag_select_replaces_with_range(self, isolated_parts_bin):
+        # Drag-select is the modifier-independent fallback: works in
+        # every terminal because no modifier transmission is
+        # involved. We invoke the on_mouse_move branch directly
+        # after seeding the drag start so the test doesn't depend on
+        # synthetic event delivery — same code path the running app
+        # exercises at the screen level.
+        self._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Pretend the mouse came down on row 0 + the user dragged
+            # to row 1. Patch `_row_under_mouse` so on_mouse_move
+            # reads the fake hover row without needing a real
+            # pointer; this is the only seam the screen-level
+            # handler actually uses.
+            modal._drag_start_row = 0
+            modal._drag_active = True
+            modal._drag_changed = False
+            modal._drag_initial = set()
+            modal._row_under_mouse = lambda: 1   # type: ignore
+            modal.on_mouse_move(None)
+            assert modal._selected_rows == {0, 1}
+            assert modal._drag_changed is True
+
+    async def test_button_click_preserves_multi_select(
+            self, isolated_parts_bin):
+        # 2026-05-07 regression guard: clicking a button (Delete,
+        # Save-to-Collection, etc.) used to land in `on_mouse_down`
+        # because `DataTable.hover_coordinate` is sticky on the
+        # last-hovered row even when the pointer is over a button.
+        # The handler then treated it as a bare click on a table
+        # row and ran the on_mouse_up clear-multi-select branch
+        # BEFORE the button's Pressed handler could read
+        # `_selected_rows`, so Delete / Save acted on just the
+        # cursor row instead of the multi-select set.
+        #
+        # The fix gates on_mouse_down by region.contains(screen_x,
+        # screen_y) — clicks whose coordinates fall outside the
+        # table's screen rectangle no longer touch drag/selection
+        # state. This test simulates the button click via a stub
+        # event with screen coordinates outside the parts-table
+        # region and asserts the selection survives.
+        self._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Build a multi-select via the toggle helper.
+            modal._toggle_row_in_selection(0)
+            modal._toggle_row_in_selection(1)
+            assert modal._selected_rows == {0, 1}
+            # Stub a MouseDown event positioned well below the
+            # parts-table region (screen_y far past the table) to
+            # simulate a click on the button row.
+            t = modal.query_one("#parts-table", sc.DataTable)
+            below_y = t.region.y + t.region.height + 5
+            class _StubEvent:
+                def __init__(self, sy):
+                    self.button = 1
+                    self.ctrl = False
+                    self.shift = False
+                    self.meta = False
+                    self.screen_x = t.region.x + 1
+                    self.screen_y = sy
+            modal.on_mouse_down(_StubEvent(below_y))
+            # Selection unaffected — the click-outside-region guard
+            # kicked in.
+            assert modal._selected_rows == {0, 1}
+            assert modal._drag_active is False
+
+    async def test_drag_unions_with_existing_selection(self, isolated_parts_bin):
+        # 2026-05-07 regression guard: previously on_mouse_move
+        # REPLACED `_selected_rows` with the dragged range, so a
+        # stray pixel-wiggle during a click after earlier
+        # modifier-toggles wiped out everything except the dragged
+        # rows. The fix is to UNION with a snapshot taken at
+        # MouseDown — this test seeds an existing selection of two
+        # toggle picks, then runs a drag that crosses one of them,
+        # and asserts both the prior picks AND the dragged range
+        # survive in `_selected_rows`.
+        self._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Pre-existing modifier+click toggles.
+            modal._toggle_row_in_selection(0)
+            modal._toggle_row_in_selection(1)
+            assert modal._selected_rows == {0, 1}
+            # Begin a drag from row 0; snapshot captures {0, 1}.
+            modal._drag_start_row = 0
+            modal._drag_active = True
+            modal._drag_changed = False
+            modal._drag_initial = set(modal._selected_rows)
+            modal._row_under_mouse = lambda: 1   # type: ignore
+            modal.on_mouse_move(None)
+            # Range [0..1] unioned with snapshot {0, 1} → still {0, 1}.
+            assert modal._selected_rows == {0, 1}
+            # _drag_changed stays False because the union is unchanged.
+            assert modal._drag_changed is False
+
+    async def test_other_buttons_dim_when_selection_non_empty(
+            self, isolated_parts_bin):
+        self._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Pre-selection: every action button is enabled.
+            for sel in modal._OTHER_BTN_IDS:
+                assert modal.query_one(sel, sc.Button).disabled is False
+            # Add row 0 to the multi-select.
+            modal._selected_rows.add(0)
+            modal._refresh_multi_select_visuals()
+            # All other buttons are now dimmed; Save-to-Collection stays.
+            for sel in modal._OTHER_BTN_IDS:
+                assert modal.query_one(sel, sc.Button).disabled is True
+            assert modal.query_one("#btn-parts-save-to-coll",
+                                    sc.Button).disabled is False
+            # Clearing restores everything.
+            modal._clear_multi_select()
+            for sel in modal._OTHER_BTN_IDS:
+                assert modal.query_one(sel, sc.Button).disabled is False
+
+    async def test_populate_clears_stale_selection(self, isolated_parts_bin):
+        self._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._selected_rows.update({0, 1})
+            modal._populate()
+            assert modal._selected_rows == set()
+
+
+class TestPartsBinSaveToCollection:
+    """Save-to-Collection bulk-saves the selected parts to the
+    library/active collection. Each part lands as its own SeqRecord
+    in cloned-plasmid form."""
+
+    async def test_save_to_collection_persists_selected(
+            self, isolated_library, isolated_parts_bin):
+        TestPartsBinMultiSelect._seed_user_parts()
+        # Need an active collection or the action bails. The
+        # `_ensure_default_collection` runs in PlasmidApp.compose().
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Pre-condition: library is empty (or only contains the
+            # default seed; isolate via the fixture).
+            initial = len(sc._load_library())
+            # Multi-select both user parts (rows 0 + 1).
+            modal._selected_rows = {0, 1}
+            modal._refresh_multi_select_visuals()
+            modal.query_one("#btn-parts-save-to-coll", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Library grew by exactly two entries; both have the
+            # cloned topology.
+            entries = sc._load_library()
+            assert len(entries) == initial + 2
+            # Selection cleared after save.
+            assert modal._selected_rows == set()
+
+    async def test_save_to_collection_no_active_warns(
+            self, isolated_library, isolated_parts_bin, monkeypatch):
+        TestPartsBinMultiSelect._seed_user_parts()
+        # Force `_get_active_collection_name` to return None so the
+        # "no active collection" guard fires. (Auto-default collection
+        # is normally created at app startup.)
+        monkeypatch.setattr(sc, "_get_active_collection_name",
+                              lambda: None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._selected_rows = {0, 1}
+            initial = len(sc._load_library())
+            modal.query_one("#btn-parts-save-to-coll", sc.Button).press()
+            await pilot.pause()
+            # No write happened — library unchanged.
+            assert len(sc._load_library()) == initial
+
+
+class TestPartsBinDelete:
+    """Delete button on the parts bin pushes
+    `PartsBinDeleteConfirmModal`. Single-select shows the part name;
+    multi-select shows the count + name preview. Built-in catalog
+    rows refuse delete (they aren't in the parts-bin file).
+    """
+
+    async def test_single_delete_with_confirmation(
+            self, isolated_parts_bin):
+        TestPartsBinMultiSelect._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            initial = len(sc._load_parts_bin())
+            assert initial == 2
+            # Cursor on row 0 (first user part), no multi-select.
+            t = modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            modal.query_one("#btn-parts-delete", sc.Button).press()
+            await pilot.pause()
+            # Confirm modal should be on top.
+            confirm = app.screen
+            assert isinstance(confirm, sc.PartsBinDeleteConfirmModal)
+            # Title for single-delete should NOT mention a count.
+            title = str(
+                confirm.query_one("#partsdel-title", sc.Static).render()
+            )
+            assert "1 parts" not in title
+            # Confirm.
+            confirm.query_one("#btn-partsdel-yes", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert len(sc._load_parts_bin()) == initial - 1
+
+    async def test_multi_delete_shows_count(self, isolated_parts_bin):
+        TestPartsBinMultiSelect._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            initial = len(sc._load_parts_bin())
+            modal._selected_rows = {0, 1}
+            modal._refresh_multi_select_visuals()
+            modal.query_one("#btn-parts-delete", sc.Button).press()
+            await pilot.pause()
+            confirm = app.screen
+            assert isinstance(confirm, sc.PartsBinDeleteConfirmModal)
+            # Title for multi-delete shows the count.
+            title = str(
+                confirm.query_one("#partsdel-title", sc.Static).render()
+            )
+            assert "2 parts" in title
+            confirm.query_one("#btn-partsdel-yes", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Both parts removed.
+            assert len(sc._load_parts_bin()) == initial - 2
+
+    async def test_delete_cancel_keeps_parts(self, isolated_parts_bin):
+        TestPartsBinMultiSelect._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            initial = len(sc._load_parts_bin())
+            t = modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            modal.query_one("#btn-parts-delete", sc.Button).press()
+            await pilot.pause()
+            confirm = app.screen
+            confirm.query_one("#btn-partsdel-no", sc.Button).press()
+            await pilot.pause()
+            assert len(sc._load_parts_bin()) == initial
+
+    async def test_delete_with_empty_parts_bin(
+            self, isolated_parts_bin):
+        # 2026-05-07: built-in catalog rows are gone, so an empty
+        # parts-bin file means an empty table. Pressing Delete
+        # should notify "select a part first" and NOT push the
+        # confirm modal.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal._rows == []
+            modal.query_one("#btn-parts-delete", sc.Button).press()
+            await pilot.pause()
+            # Still on the parts modal — empty table → no confirm.
+            assert isinstance(app.screen, sc.PartsBinModal)
+
+    async def test_delete_clears_lingering_detail_panel(
+            self, isolated_parts_bin):
+        # 2026-05-07 regression guard: deleting the last part used
+        # to leave the detail Static + sequence TextArea showing
+        # the now-deleted part because RowHighlighted doesn't fire
+        # reliably after a clear+rebuild. _populate now drives the
+        # render explicitly and falls back to _clear_part_detail
+        # when the table ends up empty.
+        TestPartsBinMultiSelect._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            t = modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            # Pre-condition: detail panel + seq view show the part.
+            detail = modal.query_one("#parts-detail", sc.Static)
+            seq_view = modal.query_one("#parts-seq-view", sc.TextArea)
+            assert "partA" in str(detail.render())
+            assert "ATG" in seq_view.text
+            # Wipe parts-bin file + repopulate (mirrors what the
+            # delete confirm callback does after `_save_parts_bin`
+            # writes the post-delete entries).
+            sc._save_parts_bin([])
+            modal._populate()
+            await pilot.pause()
+            assert modal._rows == []
+            # Detail + seq view should be clear — no stale data.
+            assert str(detail.render()).strip() == ""
+            assert seq_view.text == ""
+
+    async def test_delete_button_stays_enabled_during_multi_select(
+            self, isolated_parts_bin):
+        # Both Save-to-Collection and Delete should remain clickable
+        # during multi-select; everything else dims.
+        TestPartsBinMultiSelect._seed_user_parts()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._selected_rows = {0}
+            modal._refresh_multi_select_visuals()
+            assert modal.query_one(
+                "#btn-parts-delete", sc.Button
+            ).disabled is False
+            assert modal.query_one(
+                "#btn-parts-save-to-coll", sc.Button
+            ).disabled is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2201,6 +3138,160 @@ class TestSimulateClonedPlasmid:
         assert len(out) == 500 + 4 + 4 + len(sc._PUPD2_BACKBONE_STUB)
 
 
+class TestDomesticatorBackboneFromEntryVector:
+    """2026-05-07 fix: the part dict's `backbone` and `marker`
+    fields used to hardcode pUPD2 / Spectinomycin regardless of
+    grammar or the user's configured entry vector. Now they pull
+    from `_get_entry_vector(grammar_id)`:
+      - `backbone` ← entry_vector["name"]
+      - `marker`   ← `_detect_selection_marker(gb_text)` (or "—")
+    With NO entry vector set, the historical pUPD2 / Spectinomycin
+    defaults stand for backward compat with parts saved before
+    this change.
+    """
+
+    @staticmethod
+    def _build_entry_vector_gb(name: str, marker_label: str) -> str:
+        """Build a minimal GenBank string for use as an entry vector
+        with a single CDS feature carrying `marker_label` in its
+        gene/label qualifiers — drives `_detect_selection_marker`."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id=name, name=name,
+                         description="entry vector for test")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, 800, strand=1), type="CDS",
+            qualifiers={"label": [marker_label],
+                          "gene":  [marker_label]},
+        ))
+        return sc._record_to_gb_text(rec)
+
+    async def test_save_pulls_backbone_from_entry_vector(
+            self, isolated_parts_bin, isolated_library):
+        # Configure a custom entry vector for gb_l0 with a KanR
+        # marker — saved part should carry that name + marker.
+        sc._set_entry_vector("gb_l0", {
+            "name":    "pCustomKan",
+            "size":    1000,
+            "source":  "library:test",
+            "gb_text": self._build_entry_vector_gb(
+                "pCustomKan", "KanR",
+            ),
+        })
+        sc._settings_flush_sync()
+        insert = "ATG" * 8
+        oh5, oh3 = "AATG", "GCTT"
+        app = sc.PlasmidApp()
+        captured: list = []
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            modal = sc.DomesticatorModal("ATG" * 30, [])
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Intercept dismiss synchronously so the part dict is
+            # captured the moment _save calls it — bypasses the
+            # Textual callback queue, which only fires after
+            # run_test has exited and the captured list would
+            # otherwise be empty when we check.
+            modal.dismiss = lambda v=None: captured.append(v)  # type: ignore
+            modal._design = {
+                "part_type":   "CDS",
+                "position":    "Pos 3-4",
+                "oh5":         oh5, "oh3": oh3,
+                "insert_seq":  insert,
+                "fwd_full":    "GCGCCGTCTCAAATG" + insert,
+                "rev_full":    "GCGCCGTCTCAGCTT" + sc._rc(insert),
+                "fwd_tm":      60.2, "rev_tm": 59.8,
+                "amplicon_len": len(insert) + 22,
+            }
+            modal.query_one("#dom-name", sc.Input).value = "kanpart"
+            modal._save(None)
+        assert len(captured) == 1
+        part = captured[0]
+        assert part is not None
+        assert part["backbone"] == "pCustomKan"
+        assert part["marker"] == "Kanamycin"
+
+    async def test_save_falls_back_to_pupd2_when_no_entry_vector(
+            self, isolated_parts_bin, isolated_library):
+        sc._set_entry_vector("gb_l0", None)
+        sc._settings_flush_sync()
+        insert = "ATG" * 8
+        app = sc.PlasmidApp()
+        captured: list = []
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            modal = sc.DomesticatorModal("ATG" * 30, [])
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal.dismiss = lambda v=None: captured.append(v)  # type: ignore
+            modal._design = {
+                "part_type":   "CDS",
+                "position":    "Pos 3-4",
+                "oh5":         "AATG", "oh3": "GCTT",
+                "insert_seq":  insert,
+                "fwd_full":    "GCGCCGTCTCAAATG" + insert,
+                "rev_full":    "GCGCCGTCTCAGCTT" + sc._rc(insert),
+                "fwd_tm":      60.2, "rev_tm": 59.8,
+                "amplicon_len": len(insert) + 22,
+            }
+            modal.query_one("#dom-name", sc.Input).value = "legacypart"
+            modal._save(None)
+        assert len(captured) == 1
+        part = captured[0]
+        assert part["backbone"] == "pUPD2"
+        assert part["marker"] == "Spectinomycin"
+
+
+class TestDetectSelectionMarker:
+    """Marker detector covers the common bacterial selection
+    cassettes by gene-name keyword. Falls back to None on parse
+    failure or when nothing recognisable is annotated."""
+
+    @staticmethod
+    def _gb_with_marker(label: str) -> str:
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="x", name="x")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, 800, strand=1), type="CDS",
+            qualifiers={"label": [label]},
+        ))
+        return sc._record_to_gb_text(rec)
+
+    def test_recognises_canonical_markers(self):
+        for label, expected in [
+            ("AmpR",   "Ampicillin"),
+            ("KanR",   "Kanamycin"),
+            ("SpecR",  "Spectinomycin"),
+            ("CmR",    "Chloramphenicol"),
+            ("TetR",   "Tetracycline"),
+            ("HygR",   "Hygromycin"),
+            ("ZeoR",   "Zeocin"),
+        ]:
+            gb = self._gb_with_marker(label)
+            assert sc._detect_selection_marker(gb) == expected, (
+                f"label {label!r} should map to {expected!r}"
+            )
+
+    def test_returns_none_when_no_marker(self):
+        gb = self._gb_with_marker("just some random gene")
+        assert sc._detect_selection_marker(gb) is None
+
+    def test_returns_none_on_empty_or_malformed(self):
+        assert sc._detect_selection_marker("") is None
+        assert sc._detect_selection_marker(None) is None  # type: ignore
+        assert sc._detect_selection_marker("not a real GenBank") is None
+
+
 class TestDomesticatorSavePersistsSimulations:
     """When the user clicks Save in the domesticator, the part dict
     written to the parts bin must include the `primed_seq` and
@@ -2347,10 +3438,19 @@ class TestPartsBinSequenceView:
             assert insert in ta.text
             assert "shown-part" in ta.text
 
-    async def test_highlighting_builtin_row_shows_placeholder(
+    async def test_empty_sequence_row_shows_placeholder(
             self, isolated_parts_bin):
-        """Built-in catalog rows (no sequence) must show a helpful
-        placeholder in the TextArea rather than looking empty."""
+        """A user part with an empty sequence (rare — only happens
+        if parts_bin.json was hand-edited; built-in catalog rows
+        are gone as of 2026-05-07) must show a placeholder in the
+        TextArea rather than looking empty."""
+        sc._save_parts_bin([{
+            "name": "empty_part", "type": "CDS", "position": "B3",
+            "oh5": "AATG", "oh3": "GCTT", "backbone": "pUPD2",
+            "marker": "Spec", "sequence": "",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
         app = sc.PlasmidApp()
         async with app.run_test(size=_BASELINE) as pilot:
             await pilot.pause()
@@ -2362,14 +3462,7 @@ class TestPartsBinSequenceView:
             t.move_cursor(row=0)
             await pilot.pause()
             ta = modal.query_one("#parts-seq-view", sc.TextArea)
-            # Either empty seq rows are first, or a user row exists.
-            # Handle both cases: if this is a built-in, placeholder;
-            # otherwise the insert is there.
-            r = modal._rows[0]
-            if r["sequence"]:
-                assert r["sequence"] in ta.text
-            else:
-                assert "Built-in" in ta.text
+            assert "No sequence" in ta.text
 
 
 class TestPartsBinCopyButtons:

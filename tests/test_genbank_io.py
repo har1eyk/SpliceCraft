@@ -995,7 +995,11 @@ class TestActionExportFasta:
             assert isinstance(top, sc.FastaExportModal)
             assert top._name == tiny_record.name
             assert top._sequence == str(tiny_record.seq)
-            assert top._default_path.endswith(".fa")
+            # 2026-05-06: the typed-path Input was replaced with a
+            # dir picker + filename Input. The default filename still
+            # carries the .fa extension; the parent dir is split out
+            # into `_start_dir`.
+            assert top._default_filename.endswith(".fa")
 
     @pytest.mark.asyncio
     async def test_action_export_fasta_no_record_notifies(self):
@@ -1007,3 +1011,179 @@ class TestActionExportFasta:
             await pilot.pause()
             # No modal pushed — still on the bare app screen.
             assert not isinstance(app.screen, sc.FastaExportModal)
+
+
+class TestFastaImportViaOpenModal:
+    """OpenFileModal (Ctrl+O) supports FASTA in addition to .gb / .gbk /
+    .dna / .genbank — picking a `.fa` file routes to the FASTA loader
+    instead of `load_genbank` and yields a `topology="linear"` SeqRecord.
+    Locks in the 2026-05-06 unification of plasmid + FASTA ingestion."""
+
+    def test_fasta_path_to_record_builds_linear_record(self, tmp_path):
+        fa = tmp_path / "demo.fa"
+        fa.write_text(">my_seq\nATCGATCGATCG\n")
+        rec = sc._fasta_path_to_record(str(fa))
+        assert str(rec.seq) == "ATCGATCGATCG"
+        assert rec.id == "my_seq"
+        # FASTA carries no topology annotation — the loader defaults to
+        # linear so a chromosome-chunk import doesn't display as a fake
+        # circle. Users flip to circular via the map view-mode toggle.
+        assert rec.annotations["topology"] == "linear"
+        assert rec.annotations["molecule_type"] == "DNA"
+        assert "Imported from FASTA" in rec.description
+
+    def test_fasta_path_to_record_rejects_multi_record(self, tmp_path):
+        fa = tmp_path / "multi.fa"
+        fa.write_text(">a\nACGT\n>b\nGCAT\n")
+        with pytest.raises(ValueError, match="Multi-sequence"):
+            sc._fasta_path_to_record(str(fa))
+
+    def test_open_modal_highlight_map_includes_fasta_and_dna(self):
+        # Map covers plasmid + .dna + every FASTA extension; pink for
+        # FASTA, orange for .dna, green for plasmid text formats.
+        m = sc._PLASMID_PICKER_HIGHLIGHT_MAP
+        assert m[".fa"] == sc._PICKER_FASTA_STYLE
+        assert m[".fasta"] == sc._PICKER_FASTA_STYLE
+        assert m[".dna"] == sc._PICKER_DNA_STYLE
+        assert m[".gb"] == sc._PICKER_PLASMID_STYLE
+        assert m[".gbk"] == sc._PICKER_PLASMID_STYLE
+        # Hot pink + orange must remain distinct so the user can tell
+        # the two binary/sequence formats apart at a glance.
+        assert sc._PICKER_FASTA_STYLE != sc._PICKER_DNA_STYLE
+
+
+class TestMultiRecordFastaImport:
+    """Multi-record FASTA → new collection workflow.
+
+    Picking a multi-record `.fa` in OpenFileModal pushes
+    `MultiRecordFastaModal`. On confirm the helpers build SeqRecords
+    (with topology auto-detected per-record) and create a collection
+    via `_create_fasta_collection`.
+    """
+
+    def test_detect_fasta_topology_circular_hint(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ACGT"), id="x",
+                         description="x circular plasmid backbone")
+        assert sc._detect_fasta_topology(rec) == "circular"
+
+    def test_detect_fasta_topology_default_linear(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        # No "circular" / "plasmid" in description → linear default.
+        rec = SeqRecord(Seq("ACGT"), id="x", description="x chromosome chunk")
+        assert sc._detect_fasta_topology(rec) == "linear"
+        # Empty description: also linear.
+        rec2 = SeqRecord(Seq("ACGT"), id="x", description="")
+        assert sc._detect_fasta_topology(rec2) == "linear"
+
+    def test_fasta_records_to_seqrecords_dedupes_ids(self, tmp_path):
+        fa = tmp_path / "dupes.fa"
+        fa.write_text(
+            ">seq\nACGT\n>seq\nGCAT\n>seq\nTTAA\n"
+        )
+        from Bio import SeqIO
+        parsed = list(SeqIO.parse(str(fa), "fasta"))
+        out = sc._fasta_records_to_seqrecords(parsed, str(fa))
+        assert len(out) == 3
+        ids = [r.id for r in out]
+        # All three input records had id "seq"; the helper appends
+        # `_2`, `_3` to keep them unique so library `add_entry`
+        # doesn't dedupe-by-id and silently drop the duplicates.
+        assert ids == ["seq", "seq_2", "seq_3"]
+
+    def test_fasta_records_to_seqrecords_skips_non_iupac(self, tmp_path):
+        fa = tmp_path / "mixed.fa"
+        # Second record contains '@' which fails the IUPAC check.
+        fa.write_text(">good\nACGT\n>bad\nAC@T\n>good2\nGGCC\n")
+        from Bio import SeqIO
+        parsed = list(SeqIO.parse(str(fa), "fasta"))
+        out = sc._fasta_records_to_seqrecords(parsed, str(fa))
+        # Bad record dropped; the other two come through.
+        assert [r.id for r in out] == ["good", "good2"]
+
+    def test_fasta_records_to_seqrecords_per_record_topology(self, tmp_path):
+        fa = tmp_path / "mixed_topo.fa"
+        fa.write_text(
+            ">linear_one chromosome\nACGT\n"
+            ">circular_two circular plasmid\nGCAT\n"
+        )
+        from Bio import SeqIO
+        parsed = list(SeqIO.parse(str(fa), "fasta"))
+        out = sc._fasta_records_to_seqrecords(parsed, str(fa))
+        assert len(out) == 2
+        assert out[0].annotations["topology"] == "linear"
+        assert out[1].annotations["topology"] == "circular"
+
+    def test_create_fasta_collection_round_trip(self, tmp_path,
+                                                  isolated_library):
+        fa = tmp_path / "set.fa"
+        fa.write_text(
+            ">a\nACGTACGT\n"
+            ">b circular\nGCATGCAT\n"
+            ">c\nTTAATTAA\n"
+        )
+        from Bio import SeqIO
+        parsed = list(SeqIO.parse(str(fa), "fasta"))
+        records = sc._fasta_records_to_seqrecords(parsed, str(fa))
+        sc._create_fasta_collection("FASTA Set", records, str(fa))
+        # Active collection switched to the new one.
+        assert sc._get_active_collection_name() == "FASTA Set"
+        # Every record present in the active collection's plasmid list.
+        coll = sc._find_collection("FASTA Set")
+        assert coll is not None
+        assert len(coll["plasmids"]) == 3
+        names = {p.get("id") for p in coll["plasmids"]}
+        assert names == {"a", "b", "c"}
+        # Library file mirrors the collection's plasmids.
+        assert len(sc._load_library()) == 3
+
+    def test_create_fasta_collection_rejects_duplicate_name(
+            self, tmp_path, isolated_library):
+        # Pre-create a collection so the next call collides.
+        sc._save_collections([{
+            "name": "Existing", "description": "",
+            "plasmids": [], "saved": "2026-05-06",
+        }])
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        records = [SeqRecord(Seq("ACGT"), id="x", name="x",
+                              description="")]
+        with pytest.raises(ValueError, match="already exists"):
+            sc._create_fasta_collection(
+                "Existing", records, str(tmp_path / "x.fa"),
+            )
+
+    @pytest.mark.asyncio
+    async def test_multi_record_modal_validates_name(self,
+                                                       isolated_library):
+        # Pre-create a collision so we can also exercise the dupe path.
+        sc._save_collections([{
+            "name": "Already there", "description": "",
+            "plasmids": [], "saved": "2026-05-06",
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.MultiRecordFastaModal(3, default_name="")
+            await app.push_screen(modal)
+            await pilot.pause()
+            inp = modal.query_one("#multi-fasta-input", sc.Input)
+            status = modal.query_one("#multi-fasta-status", sc.Static)
+            # Empty name → status error, modal stays.
+            inp.value = ""
+            modal._submit()
+            assert app.screen_stack[-1] is modal
+            assert "empty" in str(status.render()).lower()
+            # Collision → status error, modal stays.
+            inp.value = "Already there"
+            modal._submit()
+            assert app.screen_stack[-1] is modal
+            assert "already exists" in str(status.render()).lower()
+            # Valid → dismisses with the name.
+            inp.value = "New collection"
+            modal._submit()
+            await pilot.pause()
+            assert app.screen_stack[-1] is not modal

@@ -31,6 +31,7 @@ import shutil
 import sys
 import threading
 import uuid as _uuid
+import warnings as _warnings
 from collections import OrderedDict as _OD
 from datetime import date as _date, datetime as _datetime
 from io import StringIO
@@ -38,6 +39,27 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 __version__ = "0.7.2.0"
+
+# ── Biopython warning filters ─────────────────────────────────────────
+# Some real-world records (notably NCBI Entrez exports that picked up
+# HTML-escaped `&nbsp;` sequences during scraping) carry annotations
+# whose values exceed Biopython's 79-char-per-line GenBank threshold.
+# Biopython then emits a `BiopythonWarning: Annotation X too long` per
+# line on every serialise, which clutters the terminal at startup
+# (autosave, library mirror, library-add) without giving the user any
+# action to take — the source record is the problem, not SpliceCraft.
+# Filter once at import so we don't re-filter on every call. The
+# import is wrapped in try / except so an environment without Biopython
+# (vanishingly unlikely given it's a hard dep, but defensive in case
+# of a partial install) still loads the module.
+try:
+    from Bio import BiopythonWarning as _BiopythonWarning  # noqa: F401
+    _warnings.filterwarnings(
+        "ignore", message=r"Annotation .* too long",
+        category=_BiopythonWarning,
+    )
+except ImportError:
+    pass
 
 # ── User data directory ────────────────────────────────────────────────────────
 # All user-writable state (library, parts bin, primers, .bak files) lives in
@@ -7541,6 +7563,30 @@ class FeatureSidebar(Widget):
         t = self.query_one("#feat-table", DataTable)
         t.add_columns("Type", "Label", "bp", "±")
 
+    @staticmethod
+    def _sort_key(f: dict) -> tuple:
+        """Sort features by appearance order from origin (clockwise on
+        circular plasmids; left-to-right on linear).
+
+        Primary key: ``start`` ASC — the position where the feature is
+        first encountered traversing from the origin. A wrap feature's
+        ``start`` is its physical position (e.g. 5800 on a 6000 bp
+        plasmid) so it sorts to the end of the list, which matches
+        the "going clockwise from 0, when do we hit it" intuition.
+
+        Secondary key: ``end`` ASC — when two features start at the
+        same bp, the shorter one (smaller end, "span closest to the
+        origin") wins the tie. This puts a tightly-scoped feature
+        like a `primer_bind` ahead of a CDS that nests around it,
+        which feels right when the user is scanning a list.
+
+        Falls back to ``0`` for missing / non-int coords so a malformed
+        feature dict can't trip the sort with a TypeError.
+        """
+        start = int(f.get("start", 0) or 0)
+        end   = int(f.get("end",   0) or 0)
+        return (start, end)
+
     def populate(self, feats: list[dict]) -> None:
         t = self.query_one("#feat-table", DataTable)
         # Suppress the RowHighlighted cascade that fires when DataTable auto-
@@ -7556,9 +7602,25 @@ class FeatureSidebar(Widget):
         # dispatched. Instead we set the flag True here and schedule its
         # reset via call_after_refresh, which runs AFTER all pending messages.
         self._populating = True
+        # Sort by (start, end) for the displayed rows but keep a
+        # row→feat-idx mapping so click handlers + `highlight_row` can
+        # still resolve back to the caller's `pm._feats` list. The
+        # source list is left untouched so colour assignment + the
+        # plasmid map's `_feats_by_start` index keep their existing
+        # semantics. `_feat_idx_to_row` is the inverse, keyed by feat
+        # idx, used by `highlight_row(idx)` from the App side.
+        sorted_feat_idxs = sorted(
+            range(len(feats)),
+            key=lambda i: self._sort_key(feats[i]),
+        )
+        self._row_to_feat_idx = sorted_feat_idxs
+        self._feat_idx_to_row = {
+            feat_i: row_i for row_i, feat_i in enumerate(sorted_feat_idxs)
+        }
         try:
             t.clear()
-            for f in feats:
+            for feat_i in sorted_feat_idxs:
+                f = feats[feat_i]
                 strand_sym = "+" if f["strand"] == 1 else ("−" if f["strand"] == -1 else "·")
                 bp_str     = f"{f['start']+1}‥{f['end']}"
                 t.add_row(
@@ -7599,17 +7661,41 @@ class FeatureSidebar(Widget):
     # and consumed by `_row_selected` to fire `RowOpened`. Reset
     # after every consumption.
     _pending_double_click: bool = False
+    # Sidebar rows are sorted by (start, end) for clockwise-from-origin
+    # display, while `pm._feats` keeps record order so colour assignment
+    # + `_feats_by_start` stay stable. These two maps translate between
+    # the two coordinate systems. Empty defaults at class scope so
+    # `highlight_row` / `_row_highlighted` are safe before the first
+    # `populate()` call.
+    _row_to_feat_idx: list[int] = []
+    _feat_idx_to_row: dict[int, int] = {}
 
-    def highlight_row(self, idx: int) -> None:
-        """Move cursor to row; suppresses the resulting RowActivated echo."""
-        if idx < 0:
+    def highlight_row(self, feat_idx: int) -> None:
+        """Move cursor to the row showing feature ``feat_idx`` (an
+        index into the caller's `pm._feats` list, NOT a DataTable row).
+        Translates through `_feat_idx_to_row` so callers don't have
+        to know about the sidebar's display sort. Suppresses the
+        resulting RowActivated echo via `_prog_row`.
+        """
+        if feat_idx < 0:
+            return
+        row = self._feat_idx_to_row.get(feat_idx)
+        if row is None:
             return
         t = self.query_one("#feat-table", DataTable)
-        self._prog_row = idx
+        self._prog_row = row
         try:
-            t.move_cursor(row=idx)
+            t.move_cursor(row=row)
         except Exception:
             self._prog_row = -1
+
+    def _row_to_feat(self, cursor_row: int) -> int:
+        """Translate a DataTable row index to the corresponding feat
+        index in `pm._feats`. Returns -1 when the row is out of range
+        (e.g. a stale cursor on a sidebar that's just been re-populated)."""
+        if 0 <= cursor_row < len(self._row_to_feat_idx):
+            return self._row_to_feat_idx[cursor_row]
+        return -1
 
     @on(Click)
     def _on_table_click(self, event: Click) -> None:
@@ -7644,7 +7730,10 @@ class FeatureSidebar(Widget):
         if event.cursor_row == self._prog_row:
             self._prog_row = -1
             return
-        self.post_message(self.RowActivated(event.cursor_row,
+        feat_idx = self._row_to_feat(event.cursor_row)
+        if feat_idx < 0:
+            return
+        self.post_message(self.RowActivated(feat_idx,
                                               shift=self._consume_shift()))
 
     @on(DataTable.RowSelected, "#feat-table")
@@ -7686,12 +7775,15 @@ class FeatureSidebar(Widget):
         # genuine "Enter on an already-resting cursor" event.
         is_double = self._pending_double_click
         self._pending_double_click = False
+        feat_idx = self._row_to_feat(event.cursor_row)
+        if feat_idx < 0:
+            return
         if is_double:
-            self.post_message(self.RowOpened(event.cursor_row))
+            self.post_message(self.RowOpened(feat_idx))
             return
         # No `_prog_row` check here — programmatic moves don't trigger
         # RowSelected, only real clicks/Enter do, so we always want to react.
-        self.post_message(self.RowActivated(event.cursor_row,
+        self.post_message(self.RowActivated(feat_idx,
                                               shift=self._consume_shift()))
 
     def action_open_feature_at_cursor(self) -> None:
@@ -7705,10 +7797,13 @@ class FeatureSidebar(Widget):
             t = self.query_one("#feat-table", DataTable)
         except NoMatches:
             return
-        idx = t.cursor_row
-        if idx is None or idx < 0:
+        cursor_row = t.cursor_row
+        if cursor_row is None or cursor_row < 0:
             return
-        self.post_message(self.RowOpened(idx))
+        feat_idx = self._row_to_feat(cursor_row)
+        if feat_idx < 0:
+            return
+        self.post_message(self.RowOpened(feat_idx))
 
 
 # ── Library panel ──────────────────────────────────────────────────────────────
@@ -7984,7 +8079,7 @@ class LibraryPanel(Widget):
                          tooltip="Rename selected collection")
         with Horizontal(id="lib-btns"):
             yield Button("+", id="btn-lib-add", variant="primary",
-                         tooltip="Save loaded plasmid to this collection")
+                         tooltip="Open a plasmid file (.gb / .gbk / .dna / FASTA)")
             yield Button("−", id="btn-lib-del", variant="error",
                          tooltip="Remove selected plasmid")
             yield Button("←", id="btn-lib-back", variant="primary",
@@ -8382,13 +8477,19 @@ class LibraryPanel(Widget):
             entries = [e for e in _load_library() if e.get("id") != entry_id]
             _save_library(entries)
             self._repopulate_plasmids()
-            # If we just deleted the loaded record's library entry, drop
-            # the panel's active-row binding so the dirty asterisk doesn't
-            # point at a row that no longer exists.
+            # If we just deleted the loaded record's library entry,
+            # drop the panel's active-row binding AND clear the
+            # canvas so the plasmid map / sidebar / seq panel don't
+            # linger showing the deleted plasmid's data. Pre-fix
+            # only `set_active(None)` ran, which cleared the panel
+            # pointer but left every other surface stale.
             app = self.app
             cur = getattr(app, "_current_record", None)
             if cur is not None and cur.id == entry_id:
                 self.set_active(None)
+                clear = getattr(app, "_clear_canvas", None)
+                if callable(clear):
+                    clear()
 
         self.app.push_screen(
             LibraryDeleteConfirmModal(name, size, entry_id),
@@ -8577,12 +8678,50 @@ class LibraryPanel(Widget):
             def _on_second(yes2: "bool | None") -> None:
                 if not yes2:
                     return
+                # Snapshot the deleted collection's plasmid IDs so the
+                # canvas-clear check below can tell whether the
+                # currently-loaded record came from this collection
+                # (in which case its source is gone with the
+                # collection and we should drop it from the canvas).
+                deleted_ids: set = set()
+                deleted_coll = _find_collection(name)
+                if deleted_coll is not None:
+                    for p in deleted_coll.get("plasmids", []) or []:
+                        if isinstance(p, dict) and p.get("id"):
+                            deleted_ids.add(p.get("id"))
+
                 remaining = [c for c in _load_collections()
                              if c.get("name") != name]
                 _save_collections(remaining)
-                if _get_active_collection_name() == name:
-                    _set_active_collection_name(None)
+                # If the deleted collection was active, fall back to
+                # the first remaining collection (or default) so the
+                # library file mirrors something sensible. Without
+                # this the plasmid view kept showing the deleted
+                # collection's entries because plasmid_library.json
+                # was stale.
+                was_active = _get_active_collection_name() == name
+                if was_active:
+                    new_active = (remaining[0].get("name")
+                                   if remaining else None)
+                    _set_active_collection_name(new_active)
+                    fallback_plasmids = [
+                        p for p in (
+                            (remaining[0].get("plasmids") if remaining
+                             else None) or []
+                        ) if isinstance(p, dict)
+                    ]
+                    _save_library(fallback_plasmids)
                 self._repopulate_collections()
+                # If the loaded record came from the deleted
+                # collection, clear the canvas — its source is gone.
+                app = self.app
+                cur = getattr(app, "_current_record", None)
+                if (cur is not None and getattr(cur, "id", None)
+                        in deleted_ids):
+                    self.set_active(None)
+                    clear = getattr(app, "_clear_canvas", None)
+                    if callable(clear):
+                        clear()
                 self.app.notify(f"Deleted collection '{name}'.",
                                 markup=False)
 
@@ -11263,27 +11402,94 @@ class FetchModal(ModalScreen):
 # ── Open-file modal ────────────────────────────────────────────────────────────
 
 class OpenFileModal(ModalScreen):
+    """Plasmid-file open dialog. Browse the filesystem via a
+    DirectoryTree and pick a `.gb` / `.gbk` / `.dna` / `.genbank` file
+    (highlighted in lime green); other files render in white but stay
+    selectable for users who saved a plasmid under a non-canonical
+    extension. Pre-2026-05-06 this was a free-typed path Input, which
+    forced users to remember absolute paths and made typo recovery
+    awkward.
+
+    On Open, dismisses with a parsed `SeqRecord`. On Cancel / Esc,
+    dismisses with `None`. The async `load_genbank` worker (with the
+    "Parsing…" indicator + button-disable + stale-modal guard) is
+    unchanged from the previous typed-path version — only the path-
+    selection UI was swapped.
+    """
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        # Default to $HOME because the alternative ($PWD when the user
+        # launched from a deep path) is often a noisy starting point.
+        # Tests pass an explicit `start_path` to scope the tree to the
+        # tmp dir.
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._start = str(start)
+        self._selected: "str | None" = None
+
     def compose(self) -> ComposeResult:
         with Vertical(id="open-box"):
             yield Static(" Open Plasmid File ", id="open-title")
-            yield Label("File path  (.gb / .gbk / .dna):")
-            yield Input(placeholder="/path/to/plasmid.gb", id="open-path")
-            with Horizontal(id="open-btns"):
-                yield Button("Open", id="btn-open", variant="primary")
-                yield Button("Cancel", id="btn-cancel-open")
+            yield Static(
+                f"[dim]{self._start}[/dim]", id="open-header", markup=True,
+            )
+            yield _ExtensionAwareDirectoryTree(
+                self._start,
+                highlight_map=_PLASMID_PICKER_HIGHLIGHT_MAP,
+                id="open-tree",
+            )
+            yield Static(
+                "[dim]"
+                "[#BFFF00].gb / .gbk / .genbank[/]   "
+                "[#FFA500].dna[/]   "
+                "[#FF69B4].fa / .fasta / .fna[/]"
+                "[/dim]",
+                id="open-hint", markup=True,
+            )
             yield Static("", id="open-status", markup=True)
+            with Horizontal(id="open-btns"):
+                yield Button("Open", id="btn-open",
+                              variant="primary", disabled=True)
+                yield Button("Cancel", id="btn-cancel-open")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#open-tree",
+                            _ExtensionAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected, "#open-tree")
+    def _on_file_selected(self, event) -> None:
+        # Highlighting + Open button enable mirror the FastaFilePickerModal
+        # pattern. Status line is cleared so a previous error toast doesn't
+        # bleed across selections.
+        self._selected = str(event.path)
+        try:
+            self.query_one("#open-header", Static).update(
+                f"[dim]{self._selected}[/dim]"
+            )
+            self.query_one("#btn-open", Button).disabled = False
+            self.query_one("#open-status", Static).update("")
+        except NoMatches:
+            pass
 
     @on(Button.Pressed, "#btn-open")
     def _open(self):
-        path = self.query_one("#open-path", Input).value.strip()
+        path = self._selected
         status = self.query_one("#open-status", Static)
         if not path:
-            status.update("[red]Enter a file path.[/red]")
+            status.update("[red]Pick a file first.[/red]")
             return
         # Probe size BEFORE invoking the parser — avoids a 30 s
         # parse on a 50 MB file the user clicked by accident.
@@ -11336,7 +11542,19 @@ class OpenFileModal(ModalScreen):
 
     @work(thread=True)
     def _do_load(self, path: str) -> None:
-        """Background `load_genbank` worker. Parsing a large `.gb` /
+        """Background loader: dispatches by file extension + record count.
+
+        `.gb` / `.gbk` / `.dna` / `.genbank` go through `load_genbank`
+        as before — single-record only.
+
+        FASTA files (`.fa` / `.fasta` / `.fna` / etc.) split by record
+        count: a single-record FASTA is wrapped in a fresh SeqRecord
+        with `topology="linear"` and dismisses the modal directly. A
+        MULTI-record FASTA hands off to `_handle_multi_record_fasta`
+        on the UI thread, which prompts the user to name a new
+        collection and (on confirm) loads every record into it.
+
+        Background-threaded since 2026-05-06: parsing a large `.gb` /
         `.dna` (multi-MB chromosome dump, `.dna` with rich history XML)
         can take 1–3 s on the UI thread; running it here keeps the
         modal interactive (Esc still cancels). On success the modal
@@ -11344,7 +11562,31 @@ class OpenFileModal(ModalScreen):
         the error and the buttons re-enable.
         """
         try:
-            record = load_genbank(path)
+            if _is_fasta_path(path):
+                from Bio import SeqIO
+                try:
+                    parsed = list(SeqIO.parse(path, "fasta"))
+                except (OSError, ValueError) as exc:
+                    raise ValueError(
+                        f"Failed to read FASTA: {exc}"
+                    ) from exc
+                if not parsed:
+                    raise ValueError(
+                        "No FASTA records found in file."
+                    )
+                if len(parsed) > 1:
+                    # Hand off to the UI thread; it pushes the
+                    # collection-name modal and dismisses self with a
+                    # `fasta_collection` payload once the user
+                    # confirms. The worker exits here so the dismiss-
+                    # with-record path below doesn't fire.
+                    self.app.call_from_thread(
+                        self._handle_multi_record_fasta, path, parsed,
+                    )
+                    return
+                record = _fasta_path_to_record(path)
+            else:
+                record = load_genbank(path)
         except Exception as exc:
             _log.exception("OpenFileModal load failed for %s", path)
             def _err():
@@ -11381,15 +11623,192 @@ class OpenFileModal(ModalScreen):
             self.dismiss(record)
         self.app.call_from_thread(_ok)
 
-    @on(Input.Submitted)
-    def _submitted(self):
-        self.query_one("#btn-open", Button).press()
+    def _handle_multi_record_fasta(self, path: str,
+                                     parsed_records: list) -> None:
+        """Push `MultiRecordFastaModal` to ask the user for a collection
+        name; on confirm, build SeqRecords + create the collection +
+        dismiss self with a `fasta_collection` payload that the
+        app-side `_on_open_file_done` handler dispatches on.
+
+        Runs on the UI thread (called via `call_from_thread` from
+        `_do_load`). Re-enables the Open modal's buttons up front so
+        the user can cancel the import and pick a different file
+        without the buttons stuck-disabled from the parsing step.
+        """
+        # Re-enable buttons + clear the "Parsing…" status so the
+        # background OpenFileModal looks normal while the user
+        # answers the prompt.
+        try:
+            self.query_one("#btn-open",        Button).disabled = False
+            self.query_one("#btn-cancel-open", Button).disabled = False
+            self.query_one("#open-status", Static).update("")
+        except NoMatches:
+            pass
+
+        default_name = (Path(path).stem or "Imported")[:80]
+
+        def _on_picked(name: "str | None") -> None:
+            if name is None:
+                # User cancelled the collection prompt — leave the
+                # OpenFileModal open so they can pick a different
+                # file. No-op cleanup here; buttons are already
+                # re-enabled above.
+                return
+            # Build SeqRecords with topology detection + ID dedupe.
+            records = _fasta_records_to_seqrecords(parsed_records, path)
+            if not records:
+                try:
+                    self.query_one("#open-status", Static).update(
+                        "[red]No valid records in FASTA — every "
+                        "record was empty or had non-IUPAC "
+                        "characters.[/red]"
+                    )
+                except NoMatches:
+                    pass
+                return
+            try:
+                _create_fasta_collection(name, records, path)
+            except (OSError, ValueError) as exc:
+                _log.exception(
+                    "Failed to create FASTA collection %r", name,
+                )
+                try:
+                    self.query_one("#open-status", Static).update(
+                        f"[red]Could not create collection: "
+                        f"{exc}[/red]"
+                    )
+                except NoMatches:
+                    pass
+                return
+            # Hand the import payload to the app handler. We dismiss
+            # with a dict (vs. the SeqRecord the single-record path
+            # uses) so the `_on_open_file_done` dispatch can tell
+            # the two cases apart.
+            n_dropped = len(parsed_records) - len(records)
+            if not self.is_mounted:
+                return
+            self.dismiss({
+                "kind":            "fasta_collection",
+                "collection_name": name,
+                "records":         records,
+                "n_dropped":       n_dropped,
+                "source_path":     path,
+            })
+
+        self.app.push_screen(
+            MultiRecordFastaModal(
+                len(parsed_records), default_name=default_name,
+            ),
+            callback=_on_picked,
+        )
 
     @on(Button.Pressed, "#btn-cancel-open")
     def _cancel_btn(self):
         self.dismiss(None)
 
     def action_cancel(self):
+        self.dismiss(None)
+
+
+class MultiRecordFastaModal(ModalScreen):
+    """Prompt to import a multi-record FASTA into a new collection.
+
+    Triggered by `OpenFileModal._do_load` when a picked FASTA contains
+    more than one record. Shows the record count + a name input + a
+    brief description of what will happen (each record becomes a
+    separate library entry; topology is auto-detected from each
+    record's description and otherwise defaults to linear).
+
+    Pure prompt — doesn't touch disk. Dismisses with the validated
+    collection name on submit, or `None` on cancel. The caller
+    (`OpenFileModal`) builds the SeqRecords and calls
+    `_create_fasta_collection` once the modal returns a name.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    DEFAULT_CSS = """
+    MultiRecordFastaModal { align: center middle; }
+    #multi-fasta-dlg {
+        width: 72; max-width: 95%; min-width: 56;
+        height: auto; max-height: 90%;
+        background: $surface; border: solid $primary; padding: 1 2;
+    }
+    #multi-fasta-title  { background: $primary-darken-2; color: $text;
+                          padding: 0 1; margin-bottom: 1; }
+    #multi-fasta-info   { height: auto; color: $text-muted;
+                          margin-bottom: 1; }
+    #multi-fasta-dlg Label { color: $text-muted; margin-top: 1; }
+    #multi-fasta-input  { margin-top: 0; margin-bottom: 1; }
+    #multi-fasta-status { height: 2; color: $text-muted; }
+    #multi-fasta-btns   { height: 3; margin-top: 1; }
+    #multi-fasta-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, count: int, default_name: str = "") -> None:
+        super().__init__()
+        self.count = int(count)
+        self.default_name = default_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="multi-fasta-dlg"):
+            yield Static(" Multi-record FASTA ", id="multi-fasta-title")
+            yield Static(
+                f"This FASTA contains [b]{self.count}[/b] records.\n\n"
+                f"Load all into a new collection? Each record becomes "
+                f"a separate plasmid in the collection. Topology is "
+                f"auto-detected per record from its description "
+                f"(records mentioning [b]circular[/b] or [b]plasmid[/b] "
+                f"load as circular; the rest load as linear).",
+                id="multi-fasta-info", markup=True,
+            )
+            yield Label("Collection name:")
+            yield Input(value=self.default_name,
+                          placeholder="Collection name",
+                          id="multi-fasta-input")
+            yield Static("", id="multi-fasta-status", markup=True)
+            with Horizontal(id="multi-fasta-btns"):
+                yield Button("Create collection",
+                              id="btn-multi-fasta-ok", variant="primary")
+                yield Button("Cancel", id="btn-multi-fasta-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#multi-fasta-input", Input).focus()
+
+    @on(Button.Pressed, "#btn-multi-fasta-ok")
+    def _ok(self, _) -> None:
+        self._submit()
+
+    @on(Input.Submitted, "#multi-fasta-input")
+    def _submitted(self, _) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        # Re-use the agent-API normaliser: strips control chars + caps
+        # length so a hand-typed `name\x00\n` can't break the panel
+        # header / collection-list rendering.
+        raw = self.query_one("#multi-fasta-input", Input).value
+        name = _normalize_collection_name(raw)
+        status = self.query_one("#multi-fasta-status", Static)
+        if name is None:
+            status.update("[red]Name cannot be empty.[/red]")
+            return
+        if _collection_name_taken(name):
+            status.update(
+                f"[red]A collection named '{name}' already exists. "
+                f"Pick a different name.[/red]"
+            )
+            return
+        self.dismiss(name)
+
+    @on(Button.Pressed, "#btn-multi-fasta-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 
@@ -11419,7 +11838,12 @@ class ExportCommercialSaaSModal(ModalScreen):
     def __init__(self, entry: dict, default_path: str = "") -> None:
         super().__init__()
         self._entry = entry
-        self._default_path = default_path
+        rec_name = entry.get("name") or entry.get("id") or "plasmid"
+        fallback = f"{rec_name}.dna"
+        self._start_dir, self._default_filename = _split_default_export_path(
+            default_path, fallback,
+        )
+        self._selected_dir = self._start_dir
 
     def compose(self) -> ComposeResult:
         with Vertical(id="export-box"):
@@ -11430,32 +11854,65 @@ class ExportCommercialSaaSModal(ModalScreen):
             hist_label = (" + history" if has_history
                           else " (no construction history)")
             yield Label(f"[{name}]  {bp} bp{hist_label}")
-            yield Label("Output path (.dna):")
-            yield Input(value=self._default_path,
-                          placeholder="/path/to/plasmid.dna",
-                          id="export-path")
+            yield Static(
+                f"Save in: [b]{self._selected_dir}[/b]",
+                id="export-dir", markup=True,
+            )
+            yield _ExtensionAwareDirectoryTree(
+                self._start_dir,
+                highlight_map=_PLASMID_PICKER_HIGHLIGHT_MAP,
+                id="export-tree",
+            )
+            yield Label("Filename (.dna):")
+            yield Input(value=self._default_filename,
+                          placeholder="plasmid.dna",
+                          id="export-filename")
+            yield Static("", id="export-status", markup=True)
             with Horizontal(id="export-btns"):
                 yield Button("Export",  id="btn-export", variant="primary")
                 yield Button("Cancel",  id="btn-cancel-export")
-            yield Static("", id="export-status", markup=True)
 
     def on_mount(self) -> None:
         try:
-            self.query_one("#export-path", Input).focus()
+            self.query_one("#export-tree",
+                            _ExtensionAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.DirectorySelected, "#export-tree")
+    def _on_dir_selected(self, event) -> None:
+        self._selected_dir = str(event.path)
+        try:
+            self.query_one("#export-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected, "#export-tree")
+    def _on_file_selected(self, event) -> None:
+        p = Path(str(event.path))
+        self._selected_dir = str(p.parent)
+        try:
+            self.query_one("#export-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+            self.query_one("#export-filename", Input).value = p.name
         except NoMatches:
             pass
 
     @on(Button.Pressed, "#btn-export")
     def _do_export(self) -> None:
         try:
-            inp = self.query_one("#export-path", Input)
+            inp = self.query_one("#export-filename", Input)
             status = self.query_one("#export-status", Static)
         except NoMatches:
             return
-        path = inp.value.strip()
-        if not path:
-            status.update("[red]Enter an output path.[/red]")
+        filename = inp.value.strip()
+        if not filename:
+            status.update("[red]Enter a filename.[/red]")
             return
+        path = str(Path(self._selected_dir).expanduser() / filename)
         if not path.lower().endswith(".dna"):
             path += ".dna"
         try:
@@ -11481,7 +11938,7 @@ class ExportCommercialSaaSModal(ModalScreen):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
-    @on(Input.Submitted)
+    @on(Input.Submitted, "#export-filename")
     def _submitted(self) -> None:
         try:
             self.query_one("#btn-export", Button).press()
@@ -11489,8 +11946,40 @@ class ExportCommercialSaaSModal(ModalScreen):
             pass
 
 
+def _split_default_export_path(default_path: str, fallback_filename: str
+                                  ) -> "tuple[str, str]":
+    """Split `default_path` into ``(parent_dir, filename)`` for the
+    "save as" modals. Falls back to `Path.home()` for the dir and
+    `fallback_filename` for the filename when either component is
+    missing or unreadable. Centralised so each export modal handles
+    a missing default the same way."""
+    try:
+        p = Path(default_path).expanduser() if default_path else None
+    except (OSError, ValueError):
+        p = None
+    if p is not None and p.name:
+        parent = p.parent
+        filename = p.name
+    else:
+        parent = Path.home()
+        filename = fallback_filename
+    try:
+        if not parent.is_dir():
+            parent = Path.home()
+    except OSError:
+        parent = Path.home()
+    return (str(parent), filename)
+
+
 class ExportGenBankModal(ModalScreen):
-    """Prompt for a target path, write the current record as GenBank.
+    """Pick an output directory + filename, write the current record
+    as GenBank.
+
+    UI: a `DirectoryTree` for navigating to the parent folder + a
+    filename Input below. Plasmid-flavoured files (.gb / .gbk / .dna /
+    .genbank) are highlighted lime green to make existing exports easy
+    to spot when over-writing. Pre-2026-05-06 this was a single typed
+    path Input; the file browser cuts down on path-typing errors.
 
     On submit, dismisses with a summary dict from `_export_genbank_to_path`
     (keys: path, bp, features) or None if cancelled. The caller is
@@ -11505,7 +11994,12 @@ class ExportGenBankModal(ModalScreen):
     def __init__(self, record, default_path: str = "") -> None:
         super().__init__()
         self._record = record
-        self._default_path = default_path
+        rec_name = getattr(record, "name", "") or "plasmid"
+        fallback = f"{rec_name}.gb"
+        self._start_dir, self._default_filename = _split_default_export_path(
+            default_path, fallback,
+        )
+        self._selected_dir = self._start_dir
 
     def compose(self) -> ComposeResult:
         with Vertical(id="export-box"):
@@ -11514,34 +12008,76 @@ class ExportGenBankModal(ModalScreen):
             bp = len(getattr(self._record, "seq", "") or "")
             feats = len(getattr(self._record, "features", []) or [])
             yield Label(f"[{name}]  {bp} bp, {feats} features")
-            yield Label("Output path (.gb):")
-            yield Input(
-                value=self._default_path,
-                placeholder="/path/to/plasmid.gb",
-                id="export-path",
+            yield Static(
+                f"Save in: [b]{self._selected_dir}[/b]",
+                id="export-dir", markup=True,
             )
+            yield _ExtensionAwareDirectoryTree(
+                self._start_dir,
+                highlight_map=_PLASMID_PICKER_HIGHLIGHT_MAP,
+                id="export-tree",
+            )
+            yield Label("Filename (.gb / .gbk):")
+            yield Input(
+                value=self._default_filename,
+                placeholder="plasmid.gb",
+                id="export-filename",
+            )
+            yield Static("", id="export-status", markup=True)
             with Horizontal(id="export-btns"):
                 yield Button("Export",  id="btn-export", variant="primary")
                 yield Button("Cancel",  id="btn-cancel-export")
-            yield Static("", id="export-status", markup=True)
 
     def on_mount(self) -> None:
+        # Default focus on the tree so arrow keys navigate immediately;
+        # users who just want to confirm the default path can still
+        # Tab to the filename Input or hit Export.
         try:
-            self.query_one("#export-path", Input).focus()
+            self.query_one("#export-tree",
+                            _ExtensionAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.DirectorySelected, "#export-tree")
+    def _on_dir_selected(self, event) -> None:
+        # Clicking a folder updates the "Save in" dir without touching
+        # the filename — the user can keep their typed name across
+        # navigation.
+        self._selected_dir = str(event.path)
+        try:
+            self.query_one("#export-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected, "#export-tree")
+    def _on_file_selected(self, event) -> None:
+        # Clicking an existing file = "save here, overwriting": pull
+        # the filename into the Input so a stray Enter overwrites the
+        # exact file the user clicked.
+        p = Path(str(event.path))
+        self._selected_dir = str(p.parent)
+        try:
+            self.query_one("#export-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+            self.query_one("#export-filename", Input).value = p.name
         except NoMatches:
             pass
 
     @on(Button.Pressed, "#btn-export")
     def _do_export(self) -> None:
         try:
-            inp = self.query_one("#export-path", Input)
+            inp = self.query_one("#export-filename", Input)
             status = self.query_one("#export-status", Static)
         except NoMatches:
             return
-        path = inp.value.strip()
-        if not path:
-            status.update("[red]Enter an output path.[/red]")
+        filename = inp.value.strip()
+        if not filename:
+            status.update("[red]Enter a filename.[/red]")
             return
+        path = str(Path(self._selected_dir).expanduser() / filename)
         try:
             summary = _export_genbank_to_path(self._record, path)
         except OSError as exc:
@@ -11562,7 +12098,7 @@ class ExportGenBankModal(ModalScreen):
             return
         self.dismiss(summary)
 
-    @on(Input.Submitted)
+    @on(Input.Submitted, "#export-filename")
     def _submitted(self) -> None:
         try:
             self.query_one("#btn-export", Button).press()
@@ -11591,10 +12127,19 @@ class GffExportModal(ModalScreen):
         Binding("tab",    "app.focus_next", "Next",   show=False),
     ]
 
+    _GFF_HIGHLIGHT_EXTS = frozenset({".gff", ".gff3"})
+
     def __init__(self, record, default_path: str = "") -> None:
         super().__init__()
         self._record = record
-        self._default_path = default_path
+        rec_name = (getattr(record, "name", "")
+                    or getattr(record, "id", "")
+                    or "plasmid")
+        fallback = f"{rec_name}.gff3"
+        self._start_dir, self._default_filename = _split_default_export_path(
+            default_path, fallback,
+        )
+        self._selected_dir = self._start_dir
 
     def compose(self) -> ComposeResult:
         with Vertical(id="gff-export-box"):
@@ -11606,35 +12151,68 @@ class GffExportModal(ModalScreen):
                 f"[{self._record.name or self._record.id or '?'}]  "
                 f"{n} bp · {f} feature(s)"
             )
-            yield Label("Output path (.gff / .gff3):")
-            yield Input(
-                value=self._default_path,
-                placeholder="/path/to/plasmid.gff3",
-                id="gff-export-path",
+            yield Static(
+                f"Save in: [b]{self._selected_dir}[/b]",
+                id="gff-export-dir", markup=True,
             )
+            yield _ExtensionAwareDirectoryTree(
+                self._start_dir,
+                highlight_map=_GFF_PICKER_HIGHLIGHT_MAP,
+                id="gff-export-tree",
+            )
+            yield Label("Filename (.gff / .gff3):")
+            yield Input(
+                value=self._default_filename,
+                placeholder="plasmid.gff3",
+                id="gff-export-filename",
+            )
+            yield Static("", id="gff-export-status", markup=True)
             with Horizontal(id="gff-export-btns"):
                 yield Button("Export", id="btn-gff-export-ok",
                              variant="primary")
                 yield Button("Cancel", id="btn-gff-export-cancel")
-            yield Static("", id="gff-export-status", markup=True)
 
     def on_mount(self) -> None:
         try:
-            self.query_one("#gff-export-path", Input).focus()
+            self.query_one("#gff-export-tree",
+                            _ExtensionAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.DirectorySelected, "#gff-export-tree")
+    def _on_dir_selected(self, event) -> None:
+        self._selected_dir = str(event.path)
+        try:
+            self.query_one("#gff-export-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected, "#gff-export-tree")
+    def _on_file_selected(self, event) -> None:
+        p = Path(str(event.path))
+        self._selected_dir = str(p.parent)
+        try:
+            self.query_one("#gff-export-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+            self.query_one("#gff-export-filename", Input).value = p.name
         except NoMatches:
             pass
 
     @on(Button.Pressed, "#btn-gff-export-ok")
     def _do_export(self) -> None:
         try:
-            inp    = self.query_one("#gff-export-path", Input)
+            inp    = self.query_one("#gff-export-filename", Input)
             status = self.query_one("#gff-export-status", Static)
         except NoMatches:
             return
-        path = inp.value.strip()
-        if not path:
-            status.update("[red]Enter an output path.[/red]")
+        filename = inp.value.strip()
+        if not filename:
+            status.update("[red]Enter a filename.[/red]")
             return
+        path = str(Path(self._selected_dir).expanduser() / filename)
         try:
             summary = _export_gff_to_path(self._record, path)
         except OSError as exc:
@@ -11647,7 +12225,7 @@ class GffExportModal(ModalScreen):
             return
         self.dismiss(summary)
 
-    @on(Input.Submitted)
+    @on(Input.Submitted, "#gff-export-filename")
     def _submitted(self) -> None:
         try:
             self.query_one("#btn-gff-export-ok", Button).press()
@@ -11680,8 +12258,12 @@ class FastaExportModal(ModalScreen):
         super().__init__()
         self._name = name
         self._sequence = sequence
-        self._default_path = default_path
         self._subtitle = subtitle
+        fallback = f"{name or 'sequence'}.fa"
+        self._start_dir, self._default_filename = _split_default_export_path(
+            default_path, fallback,
+        )
+        self._selected_dir = self._start_dir
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fasta-export-box"):
@@ -11689,34 +12271,68 @@ class FastaExportModal(ModalScreen):
             bp = len(self._sequence or "")
             sub = self._subtitle or f"[{self._name}]  {bp} bp"
             yield Label(sub)
-            yield Label("Output path (.fa / .fasta):")
-            yield Input(
-                value=self._default_path,
-                placeholder="/path/to/sequence.fa",
-                id="fasta-export-path",
+            yield Static(
+                f"Save in: [b]{self._selected_dir}[/b]",
+                id="fasta-export-dir", markup=True,
             )
-            with Horizontal(id="fasta-export-btns"):
-                yield Button("Export", id="btn-fasta-export-ok", variant="primary")
-                yield Button("Cancel", id="btn-fasta-export-cancel")
+            yield _ExtensionAwareDirectoryTree(
+                self._start_dir,
+                highlight_map=_FASTA_PICKER_HIGHLIGHT_MAP,
+                id="fasta-export-tree",
+            )
+            yield Label("Filename (.fa / .fasta):")
+            yield Input(
+                value=self._default_filename,
+                placeholder="sequence.fa",
+                id="fasta-export-filename",
+            )
             yield Static("", id="fasta-export-status", markup=True)
+            with Horizontal(id="fasta-export-btns"):
+                yield Button("Export", id="btn-fasta-export-ok",
+                              variant="primary")
+                yield Button("Cancel", id="btn-fasta-export-cancel")
 
     def on_mount(self) -> None:
         try:
-            self.query_one("#fasta-export-path", Input).focus()
+            self.query_one("#fasta-export-tree",
+                            _ExtensionAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.DirectorySelected, "#fasta-export-tree")
+    def _on_dir_selected(self, event) -> None:
+        self._selected_dir = str(event.path)
+        try:
+            self.query_one("#fasta-export-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected, "#fasta-export-tree")
+    def _on_file_selected(self, event) -> None:
+        p = Path(str(event.path))
+        self._selected_dir = str(p.parent)
+        try:
+            self.query_one("#fasta-export-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+            self.query_one("#fasta-export-filename", Input).value = p.name
         except NoMatches:
             pass
 
     @on(Button.Pressed, "#btn-fasta-export-ok")
     def _do_export(self) -> None:
         try:
-            inp = self.query_one("#fasta-export-path", Input)
+            inp = self.query_one("#fasta-export-filename", Input)
             status = self.query_one("#fasta-export-status", Static)
         except NoMatches:
             return
-        path = inp.value.strip()
-        if not path:
-            status.update("[red]Enter an output path.[/red]")
+        filename = inp.value.strip()
+        if not filename:
+            status.update("[red]Enter a filename.[/red]")
             return
+        path = str(Path(self._selected_dir).expanduser() / filename)
         try:
             summary = _export_fasta_to_path(self._name, self._sequence, path)
         except OSError as exc:
@@ -11737,7 +12353,7 @@ class FastaExportModal(ModalScreen):
             return
         self.dismiss(summary)
 
-    @on(Input.Submitted)
+    @on(Input.Submitted, "#fasta-export-filename")
     def _submitted(self) -> None:
         try:
             self.query_one("#btn-fasta-export-ok", Button).press()
@@ -12214,6 +12830,724 @@ def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str) -> str:
     return oh5 + insert + oh3 + _PUPD2_BACKBONE_STUB
 
 
+def _clone_part_into_entry_vector(
+    part: dict, entry_vector: dict, grammar: dict,
+):
+    """Simulate the actual cloning event: digest the entry vector +
+    the part's primed amplicon with the grammar's Type IIS enzyme,
+    ligate the insert fragment into the vector backbone, return a
+    circular `SeqRecord` of the cloned plasmid.
+
+    Mirrors what happens in real-life Golden Braid / MoClo cloning:
+      1. The entry vector carries a dropout cassette flanked by two
+         enzyme sites (Esp3I for L0, BsaI for L1, etc.).
+      2. Cutting the vector excises the dropout and exposes
+         compatible 4-nt overhangs.
+      3. Cutting the part's PCR amplicon releases the insert with
+         the matching overhangs (designed by the Domesticator).
+      4. Ligation closes the circle: backbone + insert.
+
+    Handles vectors with **more than 2 enzyme sites** (the common
+    real-world case: a pUPD2 derivative that picked up an extra
+    Esp3I site somewhere in the backbone). The helper finds ANY
+    fragment whose overhangs match the part's, treats it as the
+    dropout, and ligates the surviving fragments end-to-end as the
+    backbone chain — same model as a real one-pot reaction with
+    multiple cuts.
+
+    Logs the specific reason on each failure path via `_log.info`
+    so a user wondering "why is my part still using the pUPD2 stub"
+    can grep `splicecraft.log` for `clone_sim`. Returns ``None`` on
+    failure; callers fall back to the stub backbone form.
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+    def _bail(reason: str):
+        _log.info("clone_sim: skipping real-cloning for part %r — %s",
+                   part.get("name"), reason)
+        return None
+
+    enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
+    if not isinstance(enzyme, str) or enzyme not in _NEB_ENZYMES:
+        return _bail(f"grammar enzyme {enzyme!r} not in NEB catalog")
+    gb_text = (entry_vector.get("gb_text") or "").strip() \
+        if isinstance(entry_vector, dict) else ""
+    if not gb_text:
+        return _bail("entry vector has no gb_text")
+    insert = (part.get("sequence") or "").upper()
+    if not insert:
+        return _bail("part has no sequence")
+    oh5 = (part.get("oh5") or "").upper()
+    oh3 = (part.get("oh3") or "").upper()
+
+    # ── Parse the entry vector ──────────────────────────────────
+    try:
+        vec_rec = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        return _bail(f"entry-vector gb_text parse failed: {exc}")
+    vec_seq = str(vec_rec.seq).upper()
+    if not vec_seq:
+        return _bail("entry vector has empty sequence")
+    vec_topology = (vec_rec.annotations.get("topology", "") or "").lower()
+    vec_circular = vec_topology != "linear"
+    vec_features: list[dict] = []
+    for f in (vec_rec.features or []):
+        if f.type == "source":
+            continue
+        try:
+            fs = int(f.location.start)
+            fe = int(f.location.end)
+        except Exception:
+            continue
+        label = ""
+        for k in ("label", "gene", "product", "note"):
+            vals = f.qualifiers.get(k, [])
+            if vals:
+                label = str(vals[0])
+                break
+        vec_features.append({
+            "start": fs, "end": fe,
+            "strand": f.location.strand or 1,
+            "type": f.type, "label": label or f.type,
+            "color": "white",
+        })
+
+    # ── Cut the entry vector at every enzyme site ───────────────
+    # `_excise_fragment_pair` insists on exactly 2 cuts; real
+    # plasmids often have 3+ Esp3I sites (one extra in the backbone
+    # is enough). We use the lower-level `_enzyme_cuts` +
+    # `_fragments_from_cuts` so a multi-cut vector can still
+    # simulate — identify the dropout fragment, ligate the rest
+    # as the backbone chain.
+    cuts = _enzyme_cuts(vec_seq, [enzyme], circular=vec_circular)
+    if len(cuts) < 2:
+        return _bail(
+            f"entry vector has {len(cuts)} {enzyme} cut(s); need ≥2 "
+            f"for the IIS-cloning simulation. Configure a vector "
+            f"with the dropout cassette intact."
+        )
+    all_frags = _fragments_from_cuts(
+        vec_seq, cuts, circular=vec_circular,
+        features=vec_features,
+        source_label=vec_rec.name or "vector",
+    )
+    if not all_frags:
+        return _bail("vector digest produced no fragments")
+
+    # ── Identify the dropout fragment ───────────────────────────
+    # Strategy (in priority order):
+    #   1. The user's part overhangs (oh5/oh3) are the BsaI/L1
+    #      junction overhangs — exposed AFTER L0 cloning. They
+    #      generally do NOT match the L0 entry vector's Esp3I
+    #      cloning overhangs (e.g. pUPD2's CTCG/TGAG dropout).
+    #      So matching by oh5/oh3 fails.
+    #   2. Fall back to "smallest fragment" — the conventional
+    #      dropout cassette in pUPD2-style L0 entry vectors is the
+    #      smaller piece between the two Esp3I cuts (LacZα or
+    #      reporter). Works for FFE 1 ENTRY UPD (854 bp dropout)
+    #      and pUPD2 (small lacZα). Multi-cut vectors with extra
+    #      Esp3I sites in the backbone get the same treatment —
+    #      smallest fragment is still typically the intended
+    #      dropout cassette.
+    raw_name = part.get("name") or "part"
+    ftype = _GB_PART_TYPE_TO_INSDC.get(part.get("type", ""), "misc_feature")
+    note_bits = [f"GB part type: {part.get('type', '?')}"]
+    if part.get("position"):
+        note_bits.append(f"position {part['position']}")
+    if oh5 or oh3:
+        note_bits.append(f"5'OH {oh5} / 3'OH {oh3}")
+    if part.get("marker"):
+        note_bits.append(f"selection {part['marker']}")
+    part_feature = {
+        "start":  0,
+        "end":    0,   # filled in once we know the synthesised top_seq length
+        "strand": 1,
+        "type":   ftype,
+        "label":  raw_name,
+        "note":   "; ".join(note_bits),
+        "color":  "white",
+    }
+
+    # First try: does the part have primer-flanked overhangs that
+    # match a vector fragment exactly? (This is the historical
+    # well-designed-primer path.) If yes, use the original digest
+    # workflow so we honour primer-encoded silent mutations and
+    # respect deliberate overhang choices.
+    primed = part.get("primed_seq") or _simulate_primed_amplicon(
+        insert, oh5, oh3, grammar=grammar,
+    )
+    insert_frags = _digest_with_enzymes(
+        primed, [enzyme], circular=False,
+        source_label=part.get("name") or "insert",
+    )
+    insert_frag = None
+    dropout_idx = -1
+    if len(insert_frags) >= 3:
+        candidate = max(insert_frags[1:-1], key=lambda f: len(f["top_seq"]))
+
+        def _find_dropout(insert):
+            for i, f in enumerate(all_frags):
+                if (_ends_compatible(f["left"], insert["left"])
+                        and _ends_compatible(f["right"], insert["right"])):
+                    return i
+            return -1
+
+        dropout_idx = _find_dropout(candidate)
+        if dropout_idx < 0:
+            rc_candidate = _rc_fragment(candidate)
+            dropout_idx = _find_dropout(rc_candidate)
+            if dropout_idx >= 0:
+                candidate = rc_candidate
+        if dropout_idx >= 0:
+            insert_frag = dict(candidate)
+            insert_frag["features"] = list(insert_frag.get("features", []))
+            f = dict(part_feature)
+            f["end"] = len(insert_frag["top_seq"])
+            insert_frag["features"].append(f)
+
+    # Second try (fallback): synthesise the insert fragment
+    # directly. Dropout = the smallest vector fragment (the
+    # conventional pUPD2-style dropout cassette). Insert top_seq
+    # carries the dropout's left overhang + the part's BsaI
+    # junction overhangs + insert + right BsaI overhang. Sticky
+    # ends are stamped from the dropout's edges so ligation is
+    # always compatible.
+    if insert_frag is None:
+        dropout_idx = min(
+            range(len(all_frags)),
+            key=lambda i: len(all_frags[i]["top_seq"]),
+        )
+        dropout = all_frags[dropout_idx]
+        left_end  = dict(dropout["left"])
+        right_end = dict(dropout["right"])
+        left_oh   = left_end.get("overhang_seq", "")
+        # By the fragment-edge convention (see _fragments_from_cuts):
+        # the left overhang region's bases are the FIRST 4 nt of
+        # top_seq; the right overhang region lives at the START of
+        # the next fragment's top_seq, not at the end of this one.
+        # So the synthesised top_seq starts with `left_oh` and ends
+        # with the part's 3' BsaI overhang — the matching right
+        # overhang region is already inside the backbone chain.
+        synth_top = left_oh + oh5 + insert + oh3
+        f = dict(part_feature)
+        # Place the part feature so that the BsaI overhangs flank
+        # it: the insert annotation covers exactly the user's
+        # designed sequence (between oh5 and oh3). The L1-junction
+        # overhangs themselves stay untagged.
+        f["start"] = len(left_oh) + len(oh5)
+        f["end"]   = f["start"] + len(insert)
+        insert_frag = {
+            "top_seq":      synth_top,
+            "left":         left_end,
+            "right":        right_end,
+            "features":     [f],
+            "source_label": str(raw_name),
+        }
+        _log.info(
+            "clone_sim: synthesised insert fragment for %r — "
+            "dropout idx %d (%d bp), overhangs %s/%s",
+            raw_name, dropout_idx, len(dropout["top_seq"]),
+            left_oh, right_end.get("overhang_seq", ""),
+        )
+
+    # ── Build the backbone chain: surviving fragments end-to-end
+    # in circular order, starting after the dropout.
+    n = len(all_frags)
+    chain_idxs = [(dropout_idx + 1 + i) % n for i in range(n - 1)]
+    backbone_chain = all_frags[chain_idxs[0]]
+    for ci in chain_idxs[1:]:
+        backbone_chain = _ligate_fragments(backbone_chain, all_frags[ci])
+        if backbone_chain is None:
+            return _bail(
+                f"vector backbone fragments can't relegate after "
+                f"removing dropout — extra {enzyme} sites produce "
+                f"incompatible overhangs"
+            )
+
+    # ── Insert into chain + close circle ────────────────────────
+    linear = _ligate_fragments(insert_frag, backbone_chain)
+    if linear is None:
+        return _bail(
+            "insert overhangs don't match backbone chain "
+            "(ligation step)"
+        )
+    closed = _close_circular(linear)
+    if closed is None:
+        return _bail("circle won't close (right edge ≠ left edge)")
+
+    # ── Build the SeqRecord ─────────────────────────────────────
+    safe_id = re.sub(r"[^A-Za-z0-9_]", "_", str(raw_name)) or "part"
+    new_seq = closed["top_seq"]
+    n_seq = len(new_seq)
+    if n_seq == 0:
+        return _bail("cloned plasmid has empty sequence (unreachable)")
+    desc_vec = vec_rec.name or vec_rec.id or "vector"
+    new_rec = SeqRecord(
+        Seq(new_seq), id=safe_id, name=safe_id,
+        description=f"Cloned part: {raw_name} in {desc_vec}",
+    )
+    new_rec.annotations["molecule_type"] = "DNA"
+    new_rec.annotations["topology"]      = "circular"
+    for f in closed.get("features", []):
+        try:
+            s = int(f.get("start", 0))
+            e = int(f.get("end",   0))
+        except (TypeError, ValueError):
+            continue
+        if e <= s or s < 0 or e > n_seq:
+            continue
+        quals = {"label": [f.get("label") or f.get("type") or "feature"]}
+        if f.get("note"):
+            quals["note"] = [str(f["note"])]
+        try:
+            new_rec.features.append(SeqFeature(
+                FeatureLocation(s, e,
+                                  strand=int(f.get("strand", 1) or 1)),
+                type=str(f.get("type", "misc_feature")),
+                qualifiers=quals,
+            ))
+        except Exception:
+            continue
+    _log.info(
+        "clone_sim: real-cloned %r into %r (%d bp → %d bp; %d cuts)",
+        part.get("name"), desc_vec, len(vec_seq), n_seq, len(cuts),
+    )
+    return new_rec
+
+
+def _splice_part_into_vector_by_overhang(
+    entry_vector: dict, part: dict,
+    grammar: "dict | None" = None,
+):
+    """Sequence-based fallback for `_part_to_cloned_seqrecord` when
+    the strict IIS-digest simulation fails (extra enzyme sites,
+    incompatible overhangs, missing recognition annotations, etc.).
+
+    Finds the closest `oh5...oh3` pair in the entry vector's
+    sequence (allowing both circular and reverse-complement search)
+    and splices the part's insert in place of the segment between
+    them — same junction structure the bench reaction would
+    produce, just identified by sequence match instead of by
+    enzyme cut. The user's vector sequence + features are
+    preserved outside the dropout; vector features that fall
+    inside the dropped region are filtered out so the saved record
+    doesn't carry stale annotation.
+
+    **Refuses when the vector has IIS sites that conflict** with
+    the part's overhangs — prevents the case where the helper
+    would otherwise find a coincidental ``oh5...oh3`` pattern
+    elsewhere in the vector and produce a biologically wrong
+    "splice" at the wrong position. Pass `grammar` so this guard
+    can run; without it the splice runs unconstrained (preserving
+    backward compat for callers that haven't migrated yet).
+
+    Returns a circular `SeqRecord` on success, ``None`` when the
+    overhangs aren't found in the vector OR conflict with the
+    vector's IIS cuts — the absolute fallback (stub backbone)
+    handles that case.
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+    insert = (part.get("sequence") or "").upper()
+    oh5 = (part.get("oh5") or "").upper()
+    oh3 = (part.get("oh3") or "").upper()
+    if not insert or len(oh5) < 4 or len(oh3) < 4:
+        return None
+    gb_text = (entry_vector.get("gb_text") or "").strip()
+    if not gb_text:
+        return None
+    try:
+        vec_rec = _gb_text_to_record(gb_text)
+    except Exception:
+        return None
+    vec_seq = str(vec_rec.seq).upper()
+    if not vec_seq:
+        return None
+
+    # IIS-conflict guard: if the vector has IIS sites for the
+    # grammar's enzyme but NONE of the cut overhangs match the
+    # part's, the user's part literally can't drop into this
+    # vector. A sequence-splice would find a coincidental
+    # `oh5...oh3` match somewhere else in the backbone and produce
+    # a biologically meaningless "cloned" plasmid. Refuse here so
+    # the orchestrator can surface a precise error explaining the
+    # required overhangs.
+    if isinstance(grammar, dict):
+        enzyme = grammar.get("enzyme")
+        if isinstance(enzyme, str) and enzyme in _NEB_ENZYMES:
+            vec_circular = (
+                (vec_rec.annotations.get("topology", "") or "").lower()
+                != "linear"
+            )
+            try:
+                cuts = _enzyme_cuts(
+                    vec_seq, [enzyme], circular=vec_circular,
+                )
+            except Exception:
+                cuts = []
+            if cuts:
+                cut_overhangs = {c["overhang_seq"] for c in cuts}
+                # Allow either oh5 or oh3 to match (one end is enough
+                # — the other will be evaluated by the splice's
+                # internal compatibility check).
+                if (oh5 not in cut_overhangs
+                        and oh3 not in cut_overhangs
+                        and _rc(oh5) not in cut_overhangs
+                        and _rc(oh3) not in cut_overhangs):
+                    _log.info(
+                        "clone_sim: refusing sequence-splice for part "
+                        "%r — vector has %d %s cut(s) with overhangs "
+                        "%s, but part needs %s/%s",
+                        part.get("name"), len(cuts), enzyme,
+                        sorted(cut_overhangs), oh5, oh3,
+                    )
+                    return None
+
+    # Search a doubled sequence so we can find an oh5...oh3 pair
+    # that wraps the origin on a circular plasmid. The result is
+    # mapped back into the canonical [0, n) coordinate space below.
+    n = len(vec_seq)
+    is_circular = (
+        (vec_rec.annotations.get("topology", "") or "").lower()
+        != "linear"
+    )
+    search_seq = vec_seq + (vec_seq if is_circular else "")
+
+    # Find all (i, j) with vec[i:i+4] == oh5 and vec[j:j+4] == oh3,
+    # j > i+4 (no overlap). Try both forward and reverse-complement
+    # of the insert so palindromic-ish overhangs still resolve.
+    def _find_pair(s5: str, s3: str) -> "tuple[int, int] | None":
+        best = None
+        i = search_seq.find(s5)
+        while i != -1 and i < n + (n if is_circular else 0):
+            j = search_seq.find(s3, i + len(s5))
+            # Cap dropout span at 10 kb so a coincidental oh5/oh3
+            # match at opposite poles of a big plasmid doesn't
+            # produce a wildly wrong splice.
+            if j != -1 and (j - i) <= 10_000:
+                if best is None or (j - i) < (best[1] - best[0]):
+                    best = (i, j)
+            i = search_seq.find(s5, i + 1)
+        return best
+
+    pair = _find_pair(oh5, oh3)
+    use_rc = False
+    insert_oriented = insert
+    if pair is None:
+        # Try the part's overhangs swapped for an RC-oriented insert
+        rc_oh5 = _rc(oh3)
+        rc_oh3 = _rc(oh5)
+        pair = _find_pair(rc_oh5, rc_oh3)
+        if pair is not None:
+            use_rc = True
+            insert_oriented = _rc(insert)
+    if pair is None:
+        _log.info(
+            "clone_sim: sequence-splice failed for part %r — "
+            "neither oh5/oh3 nor their RC found within 10 kb in vector %r",
+            part.get("name"), vec_rec.name,
+        )
+        return None
+
+    i, j = pair
+    # Build cloned sequence: [vec up to + including oh5] +
+    #   insert + [vec from oh3 onwards]. For a wrap-around match
+    #   (j >= n) the slicing on `search_seq` keeps the
+    #   right-of-dropout segment as a single contiguous run we can
+    #   re-modulus into [0, n).
+    overhang5_end = i + len(oh5)
+    overhang3_start = j
+    if j >= n:
+        # Wrap match: dropout straddles the origin. Build sequence
+        # by walking the doubled `search_seq` from oh5_end up to
+        # oh3_start and continuing past the doubled boundary back
+        # to oh5_start to close the circle on the OTHER side.
+        # Simplest mental model: cloned = vec[oh5_end:n] +
+        #   vec[0:oh3_start - n] => fragments of vec NOT in dropout.
+        # Then prepend oh5 + insert + oh3.
+        # Equivalently: build the new sequence in doubled space and
+        # slice once.
+        cloned = (oh5 + insert_oriented + oh3
+                  + search_seq[overhang3_start + len(oh3):
+                                overhang5_end + n])
+    else:
+        # Normal (non-wrap) case.
+        cloned = (vec_seq[:overhang5_end]
+                  + insert_oriented
+                  + vec_seq[overhang3_start:])
+    cloned = cloned.upper()
+    n_new = len(cloned)
+    if n_new == 0:
+        return None
+
+    # Carry vector features through, dropping any whose footprint
+    # fell entirely within the dropped region. Features outside the
+    # dropped region get shifted by `delta = len(insert) -
+    # len(dropout)` if they sat AFTER the dropout in linear order.
+    dropout_start = i if not (j >= n) else (i % n)
+    dropout_end = (j + len(oh3)) if not (j >= n) else \
+        ((j + len(oh3)) % n)
+    new_feats: list[dict] = []
+    if not (j >= n):
+        # Linear, non-wrap dropout: simple shift bookkeeping.
+        delta = len(insert_oriented) - (j - overhang5_end)
+        for f in (vec_rec.features or []):
+            if f.type == "source":
+                continue
+            try:
+                fs = int(f.location.start)
+                fe = int(f.location.end)
+            except Exception:
+                continue
+            # Drop features fully inside the dropout
+            if fs >= overhang5_end and fe <= overhang3_start:
+                continue
+            # Shift features fully past the dropout
+            if fs >= overhang3_start:
+                new_feats.append({
+                    "obj": f, "start": fs + delta, "end": fe + delta,
+                })
+                continue
+            # Features fully before the dropout: keep as-is
+            if fe <= overhang5_end:
+                new_feats.append({"obj": f, "start": fs, "end": fe})
+                continue
+            # Features straddling the dropout boundary: skip rather
+            # than try to recompute partial coords — they'd be
+            # mis-leading after the splice.
+        # Add the part as its own feature
+        ftype = _GB_PART_TYPE_TO_INSDC.get(
+            part.get("type", ""), "misc_feature",
+        )
+        new_feats.append({
+            "obj": None,
+            "start": overhang5_end,
+            "end":   overhang5_end + len(insert_oriented),
+            "label": part.get("name") or "part",
+            "type":  ftype,
+        })
+    else:
+        # Wrap dropout: simpler to skip the original-feature carry
+        # and just annotate the insert. Origin-wrap feature math is
+        # finicky; the user can re-annotate manually if needed.
+        ftype = _GB_PART_TYPE_TO_INSDC.get(
+            part.get("type", ""), "misc_feature",
+        )
+        new_feats.append({
+            "obj": None,
+            "start": len(oh5),
+            "end":   len(oh5) + len(insert_oriented),
+            "label": part.get("name") or "part",
+            "type":  ftype,
+        })
+
+    raw_name = part.get("name") or "part"
+    safe_id = re.sub(r"[^A-Za-z0-9_]", "_", str(raw_name)) or "part"
+    desc_vec = vec_rec.name or vec_rec.id or "vector"
+    new_rec = SeqRecord(
+        Seq(cloned), id=safe_id, name=safe_id,
+        description=f"Cloned part: {raw_name} in {desc_vec}",
+    )
+    new_rec.annotations["molecule_type"] = "DNA"
+    new_rec.annotations["topology"]      = "circular"
+    for fr in new_feats:
+        try:
+            s = int(fr["start"]); e = int(fr["end"])
+        except (TypeError, ValueError):
+            continue
+        if e <= s or s < 0 or e > n_new:
+            continue
+        if fr.get("obj") is not None:
+            f0 = fr["obj"]
+            label = ""
+            for k in ("label", "gene", "product", "note"):
+                vals = f0.qualifiers.get(k, [])
+                if vals:
+                    label = str(vals[0]); break
+            quals = {"label": [label or f0.type]}
+            try:
+                new_rec.features.append(SeqFeature(
+                    FeatureLocation(
+                        s, e,
+                        strand=int(getattr(
+                            f0.location, "strand", 1) or 1),
+                    ),
+                    type=str(f0.type),
+                    qualifiers=quals,
+                ))
+            except Exception:
+                continue
+        else:
+            try:
+                new_rec.features.append(SeqFeature(
+                    FeatureLocation(s, e, strand=1),
+                    type=fr.get("type", "misc_feature"),
+                    qualifiers={"label": [fr["label"]]},
+                ))
+            except Exception:
+                continue
+    _log.info(
+        "clone_sim: sequence-spliced %r into %r at oh5=%d/oh3=%d "
+        "(%d bp → %d bp, RC=%s)",
+        part.get("name"), desc_vec, i, j,
+        len(vec_seq), n_new, use_rc,
+    )
+    return new_rec
+
+
+def _diagnose_part_cloning(part: dict) -> "str | None":
+    """Return a short user-facing reason describing why a part
+    won't simulate-clone into the configured entry vector for its
+    grammar, or ``None`` when the cloning would succeed.
+
+    Used by the parts-bin Save-to-Collection action to surface a
+    notify when one or more parts fall back to the stub backbone
+    instead of the user's real entry vector. The simulator now
+    synthesises an insert fragment with the dropout's overhangs
+    when the part's primer overhangs don't match (= the user
+    designed primers for AATG/GCTT-style overhangs without knowing
+    the vector exposes CTCG/TGAG via Esp3I), so an overhang
+    mismatch alone is no longer a failure case. The remaining
+    failure cases are:
+
+      * No entry vector configured for the grammar (legitimate
+        stub-fallback — silent, returns None)
+      * Grammar's enzyme isn't recognised
+      * Vector gb_text can't be parsed
+      * Vector has < 2 enzyme cuts (no dropout to excise)
+    """
+    grammar_id = part.get("grammar") or "gb_l0"
+    try:
+        grammar = _all_grammars().get(grammar_id) \
+            or _BUILTIN_GRAMMARS.get("gb_l0") or {}
+        entry_vector = _get_entry_vector(grammar_id)
+    except Exception:
+        return None
+    if not isinstance(entry_vector, dict) or not entry_vector.get("gb_text"):
+        return None   # legitimate stub-fallback case, no error
+    enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
+    if not isinstance(enzyme, str) or enzyme not in _NEB_ENZYMES:
+        return f"grammar's enzyme {enzyme!r} is not recognised"
+    gb_text = entry_vector.get("gb_text") or ""
+    try:
+        vec_rec = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        return f"can't parse entry vector gb_text: {exc}"
+    vec_seq = str(vec_rec.seq).upper()
+    vec_circular = (
+        (vec_rec.annotations.get("topology", "") or "").lower()
+        != "linear"
+    )
+    try:
+        cuts = _enzyme_cuts(vec_seq, [enzyme], circular=vec_circular)
+    except Exception as exc:
+        return f"vector enzyme scan failed: {exc}"
+    if len(cuts) < 2:
+        return (f"entry vector {vec_rec.name!r} has {len(cuts)} {enzyme} "
+                f"site(s) — need ≥2 to excise a dropout cassette for "
+                f"IIS cloning. Pick a vector with the dropout intact.")
+    return None   # cloning will succeed (digest-match or synthesis)
+
+
+def _part_to_cloned_seqrecord(part: dict):
+    """Build a circular SeqRecord representing a parts-bin entry's
+    cloned plasmid form, ready for `LibraryPanel.add_entry`.
+
+    Tiered cloning model:
+      1. **IIS-digest simulation** (preferred). When the part's
+         grammar has a configured entry vector,
+         `_clone_part_into_entry_vector` digests the vector +
+         primed amplicon at the grammar's enzyme sites and ligates
+         — produces a SeqRecord equivalent to a real bench reaction.
+      2. **Sequence-based splice fallback**. When tier 1 fails
+         (vector lacks the IIS sites in the gb_text annotation,
+         extra cuts produce no compatible dropout, etc.) we still
+         search the entry vector's sequence for the part's
+         `oh5...oh3` pair and splice the insert in place of the
+         segment between them. The user's vector sequence is
+         preserved as the backbone — the saved plasmid is the
+         entry vector with the dropout cassette swapped for the
+         insert.
+      3. **Stub backbone** (last resort). When no entry vector is
+         configured at all, or the vector doesn't contain matching
+         overhangs, fall back to `_simulate_cloned_plasmid`
+         (insert + overhangs + pUPD2 placeholder). Save path stays
+         unbreakable.
+
+    The record id is the part's name with non-LOCUS-safe characters
+    replaced by ``_`` so Biopython's GenBank serialiser doesn't
+    reject it on disk write. `clone_sim` log lines record which
+    tier handled the part — grep `splicecraft.log` for diagnosis.
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    insert = part.get("sequence", "") or ""
+    if not insert:
+        raise ValueError("Part has no sequence — cannot build SeqRecord.")
+
+    grammar_id = part.get("grammar") or "gb_l0"
+    try:
+        grammar = _all_grammars().get(grammar_id) \
+            or _BUILTIN_GRAMMARS.get("gb_l0") or {}
+        entry_vector = _get_entry_vector(grammar_id)
+    except Exception:
+        grammar, entry_vector = {}, None
+    if isinstance(entry_vector, dict) and entry_vector.get("gb_text"):
+        # Tier 1: full IIS simulation
+        cloned = _clone_part_into_entry_vector(part, entry_vector, grammar)
+        if cloned is not None:
+            return cloned
+        # Tier 2: sequence-based overhang splice (refuses when
+        # vector's IIS cuts conflict with the part's overhangs).
+        cloned = _splice_part_into_vector_by_overhang(
+            entry_vector, part, grammar=grammar,
+        )
+        if cloned is not None:
+            return cloned
+
+    # Stub backbone fallback — original behaviour pre-2026-05-07.
+    oh5 = part.get("oh5", "") or ""
+    oh3 = part.get("oh3", "") or ""
+    seq = _simulate_cloned_plasmid(insert, oh5, oh3)
+
+    raw_name = part.get("name") or "part"
+    safe_id  = re.sub(r"[^A-Za-z0-9_]", "_", raw_name) or "part"
+
+    rec = SeqRecord(Seq(seq), id=safe_id, name=safe_id,
+                     description=f"Cloned part: {raw_name}")
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"]      = "circular"
+
+    # Insert spans `[len(oh5), len(oh5) + len(insert))` in the linearised
+    # cloned plasmid (oh5 sits at the 5' end of the saved sequence).
+    insert_start = len(oh5)
+    insert_end   = insert_start + len(insert)
+    ftype = _GB_PART_TYPE_TO_INSDC.get(part.get("type", ""), "misc_feature")
+    note_bits = [f"GB part type: {part.get('type', '?')}"]
+    if part.get("position"):
+        note_bits.append(f"position {part['position']}")
+    if oh5 or oh3:
+        note_bits.append(f"5'OH {oh5} / 3'OH {oh3}")
+    if part.get("backbone"):
+        note_bits.append(f"backbone {part['backbone']}")
+    if part.get("marker"):
+        note_bits.append(f"selection {part['marker']}")
+    rec.features.append(SeqFeature(
+        FeatureLocation(insert_start, insert_end, strand=1),
+        type=ftype,
+        qualifiers={
+            "label": [raw_name],
+            "note":  ["; ".join(note_bits)],
+        },
+    ))
+    return rec
+
+
 def _pick_binding_region(seq: str, target_tm: float = 60.0,
                          min_len: int = 18, max_len: int = 25) -> tuple[str, float]:
     """Return the prefix of `seq` (length min_len..max_len) whose Tm is
@@ -12481,6 +13815,80 @@ def _set_entry_vector(grammar_id: str, vector: "dict | None") -> None:
         v["grammar_id"] = grammar_id
         entries.append(v)
     _save_entry_vectors(entries)
+
+
+# Lowercase keyword → display name. Used by `_detect_selection_marker`
+# to pull a sensible marker label out of an entry-vector's GenBank
+# annotations. Order matters: longer / more specific keywords come
+# first so a feature labelled `bla(AmpR)` matches "ampr" rather than
+# "bla". Nothing here is a hard contract — the user can always
+# overwrite the marker on a saved part if our detection picks the
+# wrong one.
+_SELECTION_MARKER_KEYWORDS: "tuple[tuple[str, str], ...]" = (
+    ("ampicillin",     "Ampicillin"),
+    ("ampr",           "Ampicillin"),
+    ("kanamycin",      "Kanamycin"),
+    ("kanr",           "Kanamycin"),
+    ("neomycin",       "Kanamycin"),
+    ("neor",           "Kanamycin"),
+    ("spectinomycin",  "Spectinomycin"),
+    ("specr",          "Spectinomycin"),
+    ("aada",           "Spectinomycin"),
+    ("smr",            "Spectinomycin"),
+    ("chloramphenicol", "Chloramphenicol"),
+    ("cmr",            "Chloramphenicol"),
+    ("cat",            "Chloramphenicol"),
+    ("tetracycline",   "Tetracycline"),
+    ("tetr",           "Tetracycline"),
+    ("hygromycin",     "Hygromycin"),
+    ("hygr",           "Hygromycin"),
+    ("zeocin",         "Zeocin"),
+    ("zeor",           "Zeocin"),
+    ("gentamicin",     "Gentamicin"),
+    ("gmr",            "Gentamicin"),
+    ("erythromycin",   "Erythromycin"),
+    ("ermr",           "Erythromycin"),
+    ("bla",            "Ampicillin"),   # last — matches "bla" alone
+)
+
+
+def _detect_selection_marker(gb_text: str) -> "str | None":
+    """Scan a plasmid's GenBank text for a feature whose
+    label / gene / product / note contains one of
+    ``_SELECTION_MARKER_KEYWORDS`` and return the matching display
+    name (e.g. ``"Kanamycin"``). Returns ``None`` when no recognised
+    marker is found. Used by the Domesticator's part-save path so
+    the saved `marker` field reflects the user's configured entry
+    vector instead of the historical pUPD2 / Spectinomycin defaults.
+
+    Conservative on parse failure: malformed or empty `gb_text`
+    yields ``None`` so the caller can fall back to a placeholder
+    rather than asserting a marker we can't actually verify.
+    """
+    if not isinstance(gb_text, str) or not gb_text.strip():
+        return None
+    try:
+        rec = _gb_text_to_record(gb_text)
+    except Exception:
+        return None
+    qual_keys = ("label", "gene", "product", "note", "standard_name")
+    for feat in getattr(rec, "features", []) or []:
+        bag: list[str] = []
+        for k in qual_keys:
+            vals = feat.qualifiers.get(k) if hasattr(feat, "qualifiers") \
+                else None
+            if isinstance(vals, list):
+                bag.extend(str(v) for v in vals)
+            elif isinstance(vals, str):
+                bag.append(vals)
+        # Also include the feature type so a CDS labelled just `cat`
+        # surfaces — qualifiers sometimes lack the gene/product line.
+        for s in bag:
+            low = s.lower()
+            for kw, display in _SELECTION_MARKER_KEYWORDS:
+                if kw in low:
+                    return display
+    return None
 
 
 def _grammar_position_by_type(grammar: dict, ptype: str) -> "dict | None":
@@ -19910,7 +21318,30 @@ class PartsBinModal(Screen):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
+        # Delete key fires the same multi-select-aware delete flow as
+        # the Delete button; lets the user bulk-delete a Ctrl+click
+        # selection without reaching for the mouse. `priority=True`
+        # keeps DataTable from swallowing the keystroke for its own
+        # cursor-based "delete row" handling (which would otherwise
+        # bypass the confirm modal).
+        Binding("delete", "delete_selected_parts", "Delete part(s)",
+                show=False, priority=True),
     ]
+
+    # IDs of every action button in the parts-row except the
+    # save-to-collection one — populated once on the class so
+    # `_refresh_multi_select_visuals` can dim them in bulk when the
+    # user enters multi-select mode. Listed explicitly (not via a
+    # widget walk) so adding a new button is a single-line change in
+    # both `compose` and here.
+    _OTHER_BTN_IDS: tuple[str, ...] = (
+        "#btn-parts-copy-raw",
+        "#btn-parts-copy-primed",
+        "#btn-parts-copy-cloned",
+        "#btn-new-part",
+        "#btn-parts-save-as-feature",
+        "#btn-parts-export-fasta",
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -19921,6 +21352,47 @@ class PartsBinModal(Screen):
         # whole scan.
         self._feat_lib_index: dict[tuple[str, str], str] = {}
         self._feat_lib_gen_seen: int = -1
+        # Multi-select state for bulk save-to-collection / delete.
+        # Set of row indices into `self._rows`. A non-empty set dims
+        # the non-bulk action buttons so Save-to-Collection + Delete
+        # become the only forward paths.
+        #
+        # Two entry paths populate this set:
+        #
+        #   1. Drag-select. `on_mouse_down` records the start row,
+        #      `on_mouse_move` updates the range as the user drags
+        #      across rows. Works in every terminal (no modifier
+        #      needed) — the most reliable multi-select gesture.
+        #
+        #   2. Modifier+click toggle. The user holds any of
+        #      Ctrl / Shift / Alt and clicks rows one by one to
+        #      build a non-contiguous selection. We accept all three
+        #      modifiers because gnome-terminal eats Ctrl+click for
+        #      URL handling, so Shift / Alt are the practical
+        #      fallbacks; whichever the terminal transmits flips the
+        #      `_click_with_modifier` flag we read in `on_mouse_up`.
+        self._selected_rows: set[int] = set()
+        # Drag-select bookkeeping. `_drag_active` flips True between
+        # MouseDown and MouseUp; `_drag_changed` flips True the first
+        # time MouseMove crosses a row boundary so MouseUp can tell
+        # a real drag from a stray pointer wiggle and decide whether
+        # to commit the range or fall back to the click path.
+        # `_drag_initial` snapshots the multi-select set at drag-start
+        # so on_mouse_move UNIONs the dragged range with the user's
+        # prior selection — pre-2026-05-07 the move handler REPLACED
+        # the set, which wiped earlier modifier+click toggles the
+        # moment a subsequent click had any pointer wiggle.
+        # `_click_with_modifier` is captured on MouseDown rather than
+        # MouseUp / Click because the Click event isn't reliably
+        # delivered from DataTable cells in every terminal — MouseUp
+        # is, and reading the modifier off MouseDown sidesteps the
+        # cases where the terminal reports the modifier on press but
+        # drops it on release.
+        self._drag_start_row: int = -1
+        self._drag_active: bool = False
+        self._drag_changed: bool = False
+        self._drag_initial: "set[int]" = set()
+        self._click_with_modifier: bool = False
 
     def compose(self) -> ComposeResult:
         """Single-pane loadout: parts table dominates, detail + sequence
@@ -19949,7 +21421,11 @@ class PartsBinModal(Screen):
                 yield Button("Copy Cloned",     id="btn-parts-copy-cloned")
                 yield Button("New Part",        id="btn-new-part",    variant="primary")
                 yield Button("Save As Feature", id="btn-parts-save-as-feature")
+                yield Button("Save to Collection",
+                              id="btn-parts-save-to-coll", variant="primary")
                 yield Button("Export FASTA",    id="btn-parts-export-fasta")
+                yield Button("Delete",          id="btn-parts-delete",
+                              variant="error")
                 yield Button("Close",           id="btn-parts-close")
         yield Footer()
 
@@ -19963,11 +21439,26 @@ class PartsBinModal(Screen):
     # ── Row data ─────────────────────────────────────────────────────────────
 
     def _all_rows(self) -> list[dict]:
-        """Every part in the bin, regardless of grammar — the table now
-        shows them all and tags each with a Grammar column. User parts
-        first, then every built-in grammar's catalog appended in
-        registry order. Legacy user parts (no ``grammar`` field, from
-        pre-grammar versions of SpliceCraft) default to ``gb_l0``."""
+        """User parts from the parts-bin file. Legacy user parts (no
+        ``grammar`` field, from pre-grammar versions of SpliceCraft)
+        default to ``gb_l0`` so the Grammar column always renders.
+
+        2026-05-07: built-in catalog rows (the per-grammar
+        Position / Type / Overhang bookkeeping that previously
+        appended after the user parts) were removed. They had no
+        sequence, no primers, and no actionable buttons — every Copy
+        / Save / Export / Delete path bailed with a "built-in
+        catalog parts have no sequence" notify. Net effect was
+        clutter without function. Users still pick a position +
+        overhangs via the New Part modal's grammar-aware form.
+
+        The ``"user": True`` flag is preserved on every row so the
+        downstream filters (`_lib_status_cell`, `_save_to_collection`,
+        `_delete_selected`, `_toggle_row_in_selection`,
+        `on_mouse_move`) keep working without rewrites — the flag
+        is now vacuously True but cheaper than auditing every guard
+        for a one-shot cleanup.
+        """
         rows: list[dict] = []
         for p in _load_parts_bin():
             rows.append({
@@ -19986,23 +21477,6 @@ class PartsBinModal(Screen):
                 "user":     True,
                 "grammar":  p.get("grammar", "gb_l0"),
             })
-        # Built-in catalogs from every grammar — concatenated, with each
-        # row tagged so the Grammar column makes it clear which assembly
-        # standard the row belongs to.
-        for gid, grammar in _all_grammars().items():
-            for row in grammar.get("catalog", []):
-                try:
-                    name, ptype, pos, oh5, oh3, backbone, marker = row
-                except (TypeError, ValueError):
-                    continue
-                rows.append({
-                    "name": name, "type": ptype, "position": pos,
-                    "oh5": oh5, "oh3": oh3, "backbone": backbone,
-                    "marker": marker, "sequence": "", "fwd_primer": "",
-                    "rev_primer": "", "fwd_tm": 0.0, "rev_tm": 0.0,
-                    "user": False,
-                    "grammar": gid,
-                })
         return rows
 
     def _type_color_map(self) -> dict[str, str]:
@@ -20030,6 +21504,11 @@ class PartsBinModal(Screen):
     def _populate(self) -> None:
         t = self.query_one("#parts-table", DataTable)
         t.clear()
+        # Drop the multi-select set: row indices captured before
+        # repopulate may now point at different parts (a New Part
+        # save inserts at index 0). Clearing here keeps the bulk-
+        # save action from operating on stale targets.
+        self._selected_rows.clear()
         self._rows = self._all_rows()
         # Refresh the feature-library index up-front so every row's
         # cell render is an O(1) dict lookup. Without this each row
@@ -20064,6 +21543,20 @@ class PartsBinModal(Screen):
                 self._lib_status_cell(r),
                 grammar_cell,
             )
+        # Refresh the detail / seq panels to match the current
+        # cursor row — or clear them when the table is empty so a
+        # bulk-delete that wipes everything doesn't leave the just-
+        # deleted part's sequence stuck on screen. RowHighlighted
+        # doesn't fire reliably after a clear+rebuild (the cursor
+        # may land on the same numeric row, so the event is
+        # suppressed), so we drive the render explicitly here.
+        if self._rows:
+            cursor = t.cursor_row
+            if cursor is None or cursor < 0 or cursor >= len(self._rows):
+                cursor = 0
+            self._render_part_detail(cursor)
+        else:
+            self._clear_part_detail()
 
     def _refresh_feat_lib_index(self) -> None:
         """Rebuild the feature-library index iff the global
@@ -20109,10 +21602,14 @@ class PartsBinModal(Screen):
             return Text("✓", style="bold yellow")
         return Text("")
 
-    @on(DataTable.RowHighlighted, "#parts-table")
-    def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        idx = event.cursor_row
+    def _render_part_detail(self, idx: int) -> None:
+        """Paint the detail panel + sequence TextArea for the row at
+        `idx` in `self._rows`. Out-of-range indices clear the panels
+        — used by `_populate` after a delete so a now-deleted row's
+        data doesn't linger on screen.
+        """
         if idx < 0 or not hasattr(self, "_rows") or idx >= len(self._rows):
+            self._clear_part_detail()
             return
         r = self._rows[idx]
         color = _GB_TYPE_COLORS.get(r["type"], "white")
@@ -20135,11 +21632,11 @@ class PartsBinModal(Screen):
             detail.append("   Rev: ", style="dim red")
             detail.append(r["rev_primer"], style="red")
             detail.append(f"  Tm {r['rev_tm']:.1f}°C", style="dim")
-        self.query_one("#parts-detail", Static).update(detail)
+        try:
+            self.query_one("#parts-detail", Static).update(detail)
+        except NoMatches:
+            return
 
-        # Full sequence drops into the TextArea below. Built-in catalog
-        # parts have no sequence; show a friendly placeholder so the
-        # scroll area doesn't look broken.
         seq_view = self.query_one("#parts-seq-view", TextArea)
         if r["sequence"]:
             header = (
@@ -20148,11 +21645,29 @@ class PartsBinModal(Screen):
             )
             seq_view.text = header + r["sequence"]
         else:
-            seq_view.text = (
-                "(Built-in catalog entry — no sequence attached. "
-                "Create a new part to see the insert, primed amplicon, "
-                "and cloned plasmid here.)"
-            )
+            # Empty-sequence user part (rare — only via a hand-edited
+            # parts_bin.json since the built-in catalog rows are gone
+            # as of 2026-05-07).
+            seq_view.text = "(No sequence attached to this part.)"
+
+    def _clear_part_detail(self) -> None:
+        """Wipe the detail panel + sequence view. Called after delete
+        when the row the user was viewing no longer exists, so stale
+        data from the just-deleted part doesn't linger on screen."""
+        try:
+            self.query_one("#parts-detail", Static).update("")
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#parts-seq-view", TextArea).text = ""
+        except NoMatches:
+            pass
+
+    @on(DataTable.RowHighlighted, "#parts-table")
+    def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        # Delegates to the shared painter so `_populate` can re-fire
+        # the same render path without synthesising a fake event.
+        self._render_part_detail(event.cursor_row)
 
     # Clicking the sequence area primes it for copy-all: first focus it,
     # then select every character so the user can Ctrl+C immediately.
@@ -20164,15 +21679,19 @@ class PartsBinModal(Screen):
         pass
 
     def on_click(self, event) -> None:
-        """Clicking inside the read-only sequence TextArea selects the
-        entire sequence (ready for Ctrl+C). Any other click bubbles up to
-        Textual's default handlers so buttons and the table still work."""
+        """Click in the sequence view → select all (existing
+        behaviour). All multi-select logic lives in
+        on_mouse_down / on_mouse_move / on_mouse_up because Click
+        events aren't reliably delivered through DataTable cells
+        in every terminal — see those handlers for the full story."""
+        widget = getattr(event, "widget", None)
         try:
             seq_view = self.query_one("#parts-seq-view", TextArea)
         except NoMatches:
             return
-        widget = getattr(event, "widget", None)
-        if widget is seq_view or (widget is not None and seq_view in widget.ancestors):
+        if widget is seq_view or (
+            widget is not None and seq_view in widget.ancestors
+        ):
             self._select_sequence_in_view(seq_view)
 
     def _select_sequence_in_view(self, seq_view: TextArea) -> None:
@@ -20183,6 +21702,232 @@ class PartsBinModal(Screen):
             seq_view.select_all()
         except Exception:
             _log.exception("parts-bin: failed to select sequence text")
+
+    # ── Multi-select (drag + modifier+click) ──────────────────────────────
+
+    def _row_under_mouse(self) -> int:
+        """Return the row index in `self._rows` directly under the
+        mouse pointer, or -1 if the pointer isn't on a data row.
+
+        Reads `DataTable.hover_coordinate` which Textual updates as
+        the mouse moves over the table (independent of click state),
+        so this works during a drag too. The header row + non-table
+        regions return -1 so callers don't have to second-guess the
+        coordinate.
+        """
+        try:
+            t = self.query_one("#parts-table", DataTable)
+        except NoMatches:
+            return -1
+        coord = t.hover_coordinate
+        if coord is None:
+            return -1
+        row = getattr(coord, "row", -1)
+        rows = getattr(self, "_rows", []) or []
+        if 0 <= row < len(rows):
+            return row
+        return -1
+
+    def on_mouse_down(self, event) -> None:
+        """Begin a drag-or-click gesture. Captures the row under the
+        pointer, the modifier state, and a SNAPSHOT of `_selected_rows`.
+
+        Gates on the click's screen coordinates falling INSIDE the
+        parts table's region. Without this gate, clicking a button
+        (Delete, Save to Collection) would trigger my mouse handlers
+        because `DataTable.hover_coordinate` is sticky after the
+        pointer leaves the table — a button click then looked like a
+        bare click on the last-hovered row and ran the clear path
+        BEFORE the button's Pressed handler could read
+        `_selected_rows`. Region.contains is the only reliable
+        widget-vs-elsewhere test; `event.widget` / `.ancestors` are
+        unreliable on screen-level handlers.
+
+        The snapshot lets `on_mouse_move` UNION the dragged range
+        with the user's prior modifier+click selections instead of
+        replacing them. Modifier flag is consumed by `on_mouse_up`
+        to decide between toggle (modifier held) and clear (bare
+        click).
+        """
+        if getattr(event, "button", 1) != 1:
+            return
+        try:
+            table = self.query_one("#parts-table", DataTable)
+        except NoMatches:
+            return
+        region = getattr(table, "region", None)
+        sx = getattr(event, "screen_x", None)
+        sy = getattr(event, "screen_y", None)
+        if (region is None or sx is None or sy is None
+                or not region.contains(sx, sy)):
+            # Click landed outside the parts table — leave drag /
+            # selection state alone so the action handler that runs
+            # next (e.g. Delete button's Pressed) reads the
+            # user's intended `_selected_rows`.
+            return
+        row = self._row_under_mouse()
+        if row < 0:
+            # Click landed in the header or a non-row area — reset
+            # drag state so a later MouseMove over the table can't
+            # mistake us for mid-drag.
+            self._drag_active = False
+            self._drag_start_row = -1
+            return
+        self._drag_start_row = row
+        self._drag_active = True
+        self._drag_changed = False
+        self._drag_initial = set(self._selected_rows)
+        # Accept any of Ctrl / Shift / Alt because terminals vary
+        # in which modifiers they forward on mouse events;
+        # gnome-terminal eats Ctrl+click for URL handling, so
+        # Shift / Alt are the practical fallbacks.
+        self._click_with_modifier = bool(
+            getattr(event, "ctrl",  False)
+            or getattr(event, "shift", False)
+            or getattr(event, "meta",  False)
+        )
+
+    def on_mouse_move(self, event) -> None:
+        """Extend the drag selection to the row currently under the
+        pointer. Only fires while button 1 is held (after MouseDown
+        flipped `_drag_active` True). The new selection is the UNION
+        of the snapshot taken at drag-start and the contiguous range
+        from drag-start to the current row — so a drag adds to the
+        existing modifier-toggle picks rather than replacing them.
+        Built-in catalog rows can no longer appear in `_rows`
+        (2026-05-07 cleanup) but the empty-sequence guard remains as
+        defence against hand-edited parts_bin.json entries."""
+        if not self._drag_active:
+            return
+        row = self._row_under_mouse()
+        if row < 0 or row == self._drag_start_row:
+            return
+        start = min(self._drag_start_row, row)
+        end   = max(self._drag_start_row, row)
+        new_sel: set[int] = set(self._drag_initial)
+        rows = getattr(self, "_rows", []) or []
+        for r_idx in range(start, end + 1):
+            if 0 <= r_idx < len(rows):
+                rd = rows[r_idx]
+                if rd.get("user") and rd.get("sequence"):
+                    new_sel.add(r_idx)
+        if new_sel != self._selected_rows:
+            self._selected_rows = new_sel
+            self._drag_changed = True
+            self._refresh_multi_select_visuals()
+
+    def on_mouse_up(self, event) -> None:
+        """Finalise a click or drag.
+
+        Branches:
+          - Drag actually changed selection (`_drag_changed` set by
+            on_mouse_move): keep what move produced, do nothing.
+          - Modifier held + no drag: toggle the start row in
+            `_selected_rows`. Modifier was captured on MouseDown
+            (`_click_with_modifier`); we OR with the MouseUp event's
+            modifier as belt-and-braces in case the terminal only
+            reported it on release.
+          - Bare click: clear the multi-select so the click feels
+            like "back to single-row mode".
+        """
+        if not self._drag_active:
+            return
+        self._drag_active = False
+        if self._drag_changed:
+            return
+        # OR with MouseUp's modifier — some terminals report it on
+        # release but not press, others vice-versa; either flag
+        # being True triggers the toggle path.
+        modifier = self._click_with_modifier or bool(
+            getattr(event, "ctrl",  False)
+            or getattr(event, "shift", False)
+            or getattr(event, "meta",  False)
+        )
+        if modifier and self._drag_start_row >= 0:
+            self._toggle_row_in_selection(self._drag_start_row)
+            return
+        if self._selected_rows:
+            self._clear_multi_select()
+
+    def _toggle_row_in_selection(self, row: int) -> None:
+        """Add / remove `row` from `_selected_rows`. Built-in catalog
+        rows refuse the toggle with a warning (they have no sequence
+        to save / no parts-bin entry to delete)."""
+        rows = getattr(self, "_rows", []) or []
+        if not (0 <= row < len(rows)):
+            return
+        r = rows[row]
+        if not r.get("user") or not r.get("sequence"):
+            self.app.notify(
+                "Built-in catalog parts have no sequence — "
+                "multi-select skipped.",
+                severity="warning",
+            )
+            return
+        if row in self._selected_rows:
+            self._selected_rows.remove(row)
+        else:
+            self._selected_rows.add(row)
+        self._refresh_multi_select_visuals()
+
+    def _clear_multi_select(self) -> None:
+        """Drop every selected row + restore the standard button
+        layout. Called on bare clicks, after a successful save, and
+        when the parts table is repopulated."""
+        if not self._selected_rows:
+            return
+        self._selected_rows.clear()
+        self._refresh_multi_select_visuals()
+
+    def _refresh_multi_select_visuals(self) -> None:
+        """Sync the table + button row to the current `_selected_rows`.
+
+        Selected rows get a `● ` prefix on the Name cell rendered in
+        bold + the row's type colour so the eye finds them immediately.
+        While the selection is non-empty every action button except
+        "Save to Collection" is disabled, so the only path forward is
+        the bulk-save action (or clicking back into the table to
+        de-select via another Ctrl+click, or anywhere outside to
+        clear).
+
+        Cell updates use `DataTable.update_cell_at` so we touch only
+        the Name column instead of repopulating — repopulating would
+        reset the cursor + move the user's focus, which feels jarring
+        mid-selection.
+        """
+        try:
+            t = self.query_one("#parts-table", DataTable)
+        except NoMatches:
+            return
+        type_colors = self._type_color_map()
+        from textual.coordinate import Coordinate
+        rows = getattr(self, "_rows", []) or []
+        for row_idx, r in enumerate(rows):
+            color = type_colors.get(r["type"], "white")
+            name  = r.get("name", "?")
+            if row_idx in self._selected_rows:
+                cell = Text("● " + name, style=f"bold {color}")
+            else:
+                cell = Text(name, style=color)
+            try:
+                t.update_cell_at(Coordinate(row_idx, 0), cell)
+            except Exception:
+                # update_cell_at can raise if the row index is stale
+                # (e.g., a populate ran after we captured _rows). Log
+                # and continue — the next populate will re-sync.
+                _log.exception("parts-bin: row %d cell update failed",
+                                row_idx)
+        n_sel = len(self._selected_rows)
+        for sel in self._OTHER_BTN_IDS:
+            try:
+                self.query_one(sel, Button).disabled = (n_sel > 0)
+            except NoMatches:
+                pass
+        # Save-to-Collection stays enabled at all times — the handler
+        # validates the cursor row + warns if the user picks an
+        # unsaveable built-in catalog row. Tying the disabled state
+        # to cursor position would require a refresh on every cursor
+        # move; the warning toast is a cheaper UX cue.
 
     # ── Copy helpers ──────────────────────────────────────────────────────
 
@@ -20459,6 +22204,245 @@ class PartsBinModal(Screen):
             callback=_on_done,
         )
 
+    @on(Button.Pressed, "#btn-parts-save-to-coll")
+    def _save_to_collection(self, _) -> None:
+        """Save the multi-selected user parts (or the cursor row when
+        nothing is selected) to the active collection in the library.
+
+        Each part lands as a fresh library entry whose sequence is the
+        part's cloned plasmid form (insert + 5'/3' overhangs + the
+        pUPD2 backbone stub from `_simulate_cloned_plasmid`) so the
+        downstream library / map / sequence panels see a normal
+        circular plasmid. The insert is annotated as a single feature
+        so the user can still see where the part starts in the cloned
+        product.
+
+        Built-in catalog rows (no sequence) are filtered out and
+        reported as 'skipped'. With no active collection at all, the
+        action notifies and bails — the user has to pick or create
+        one in the Library panel first.
+
+        After a successful save the multi-select clears so the next
+        Ctrl+click starts a fresh batch.
+        """
+        coll_name = _get_active_collection_name()
+        if not coll_name:
+            self.app.notify(
+                "No active collection. Pick or create one from the "
+                "Library panel before saving parts.",
+                severity="warning",
+            )
+            return
+
+        # Pick which rows to save: the multi-select set if non-empty,
+        # otherwise the single cursor row (so the button works as
+        # "save the current part" too without forcing a Ctrl+click).
+        if self._selected_rows:
+            target_rows = sorted(self._selected_rows)
+        else:
+            try:
+                t = self.query_one("#parts-table", DataTable)
+                cursor_row = t.cursor_row
+            except NoMatches:
+                cursor_row = None
+            if (cursor_row is None or cursor_row < 0
+                    or cursor_row >= len(self._rows)):
+                self.app.notify(
+                    "Select a part first.", severity="warning",
+                )
+                return
+            target_rows = [cursor_row]
+
+        valid: list[dict] = []
+        skipped: int = 0
+        for row_idx in target_rows:
+            if 0 <= row_idx < len(self._rows):
+                r = self._rows[row_idx]
+                if r.get("user") and r.get("sequence"):
+                    valid.append(r)
+                else:
+                    skipped += 1
+
+        if not valid:
+            self.app.notify(
+                "No saveable parts in selection — built-in catalog "
+                "parts have no sequence to save.",
+                severity="warning",
+            )
+            return
+
+        try:
+            lib = self.app.query_one("#library", LibraryPanel)
+        except NoMatches:
+            self.app.notify(
+                "Library panel not available.", severity="error",
+            )
+            return
+
+        saved_names: list[str] = []
+        failed: list[str] = []
+        # (part_name, reason) pairs surfaced when cloning falls back
+        # to a stub backbone because the user's entry vector + part
+        # overhangs are incompatible. Without this the user sees a
+        # pUPD2-stub plasmid land in their collection and has no idea
+        # the IIS digest didn't actually use their configured vector.
+        diagnostics: list[tuple[str, str]] = []
+        for r in valid:
+            try:
+                reason = _diagnose_part_cloning(r)
+                rec = _part_to_cloned_seqrecord(r)
+                lib.add_entry(rec)
+                saved_names.append(rec.name)
+                if reason:
+                    diagnostics.append((r.get("name", "?"), reason))
+            except Exception as exc:
+                _log.exception(
+                    "parts-bin: save-to-collection failed for %r: %s",
+                    r.get("name"), exc,
+                )
+                failed.append(r.get("name", "?"))
+
+        # Compose a single result toast with the headline number + a
+        # tail listing up to three names so the user can verify
+        # without leaving the modal.
+        tail = ", ".join(saved_names[:3])
+        if len(saved_names) > 3:
+            tail += f" (+{len(saved_names) - 3} more)"
+        extras: list[str] = []
+        if skipped:
+            extras.append(f"{skipped} catalog row(s) skipped")
+        if failed:
+            extras.append(f"{len(failed)} failed")
+        suffix = f" ({'; '.join(extras)})" if extras else ""
+        n = len(saved_names)
+        if n:
+            self.app.notify(
+                f"Saved {n} part(s) to '{coll_name}': {tail}{suffix}",
+                severity="success", markup=False,
+            )
+        else:
+            self.app.notify(
+                f"Save to '{coll_name}' failed — see log{suffix}",
+                severity="error", markup=False,
+            )
+
+        # Surface a separate, persistent warning per part that fell
+        # back to the stub backbone. Long timeout because the
+        # diagnostic message is the user's only clue that their saved
+        # plasmid is not in their configured entry vector — they need
+        # time to read it and decide whether to redesign the part
+        # or pick a different vector.
+        for nm, reason in diagnostics:
+            self.app.notify(
+                f"'{nm}': {reason}",
+                title="Part saved with stub backbone",
+                severity="warning", markup=False, timeout=12,
+            )
+
+        # Clear the multi-select so the next Ctrl+click sequence
+        # starts fresh. Repopulating refreshes the "Feat Lib" column
+        # too in case any part is now also a feature-library entry.
+        self._clear_multi_select()
+
+    def action_delete_selected_parts(self) -> None:
+        """Keyboard binding entry point for Delete — forwards to the
+        same handler the Delete button uses so the keypress and the
+        click share semantics (incl. confirm modal + multi-select
+        awareness)."""
+        self._delete_selected(None)
+
+    @on(Button.Pressed, "#btn-parts-delete")
+    def _delete_selected(self, _) -> None:
+        """Delete the multi-selected user parts from the parts bin (or
+        the cursor row when nothing is selected). Always prompts for
+        confirmation via `PartsBinDeleteConfirmModal`, which adapts
+        its message to the count: "Remove [name]?" for single,
+        "Remove N parts? (preview…)" for multi.
+
+        Built-in catalog rows can't be removed (they live in the
+        grammar module, not the user's parts-bin file). Selected
+        catalog rows are silently skipped from the delete set; if
+        every selected row is built-in, the action notifies and
+        bails before opening the confirm modal.
+        """
+        if self._selected_rows:
+            target_rows = sorted(self._selected_rows)
+        else:
+            try:
+                t = self.query_one("#parts-table", DataTable)
+                cursor_row = t.cursor_row
+            except NoMatches:
+                cursor_row = None
+            if (cursor_row is None or cursor_row < 0
+                    or cursor_row >= len(self._rows)):
+                self.app.notify("Select a part first.", severity="warning")
+                return
+            target_rows = [cursor_row]
+
+        valid: list[dict] = []
+        skipped: int = 0
+        for row_idx in target_rows:
+            if 0 <= row_idx < len(self._rows):
+                r = self._rows[row_idx]
+                if r.get("user"):
+                    valid.append(r)
+                else:
+                    skipped += 1
+
+        if not valid:
+            self.app.notify(
+                "Built-in catalog parts can't be removed from the "
+                "parts bin. Multi-select skipped catalog rows; "
+                "nothing left to delete.",
+                severity="warning",
+            )
+            return
+
+        names = [r.get("name", "?") for r in valid]
+        # Snapshot the (name, sequence) tuples now: a `_populate`
+        # could otherwise re-shuffle row indices between confirmation
+        # and delete and we'd nuke the wrong rows.
+        targets = {
+            (r.get("name", ""), r.get("sequence", "")) for r in valid
+        }
+        # Track skipped count for the post-delete toast (closure capture).
+        skipped_for_toast = skipped
+
+        def _on_confirm(ok: "bool | None") -> None:
+            if not ok:
+                return
+            entries = _load_parts_bin()
+            kept = [
+                e for e in entries
+                if (e.get("name", ""), e.get("sequence", "")) not in targets
+            ]
+            n_removed = len(entries) - len(kept)
+            try:
+                _save_parts_bin(kept)
+            except Exception as exc:
+                _log.exception("parts-bin: delete failed")
+                self.app.notify(
+                    f"Delete failed: {exc}",
+                    severity="error", markup=False,
+                )
+                return
+            extras: list[str] = []
+            if skipped_for_toast:
+                extras.append(
+                    f"{skipped_for_toast} catalog row(s) skipped"
+                )
+            suffix = f" ({'; '.join(extras)})" if extras else ""
+            self.app.notify(
+                f"Removed {n_removed} part(s) from bin{suffix}",
+                severity="success", markup=False,
+            )
+            self._populate()
+
+        self.app.push_screen(
+            PartsBinDeleteConfirmModal(names),
+            callback=_on_confirm,
+        )
+
     @on(Button.Pressed, "#btn-parts-close")
     def _close(self, _) -> None:
         self.dismiss(None)
@@ -20483,9 +22467,12 @@ _FASTA_EXTS: frozenset[str] = frozenset({
     ".fa", ".fasta", ".fna", ".ffn", ".frn", ".fas", ".mpfa", ".faa",
 })
 
-# Lime green and plain white — deliberately high contrast so the eye
-# finds FASTA files immediately in a mixed directory listing.
-_FASTA_PICKER_FASTA_STYLE = "bold #BFFF00"
+# Hot pink and plain white — high contrast so the eye finds FASTA files
+# immediately in a mixed directory listing. 2026-05-06: switched from
+# lime green to pink so FASTA carries the same colour signal across
+# every picker in the app (the Open modal also renders FASTA pink + .dna
+# orange so users can distinguish file types at a glance).
+_FASTA_PICKER_FASTA_STYLE = "bold #FF69B4"
 _FASTA_PICKER_OTHER_STYLE = "#FFFFFF"
 
 
@@ -20538,6 +22525,280 @@ def _parse_fasta_single(path: str) -> tuple[str, str]:
             f"Non-IUPAC characters in sequence: {''.join(bad[:8])}"
         )
     return (rec.id or "fasta", seq)
+
+
+def _fasta_path_to_record(path: str):
+    """Parse a single-record FASTA at `path` into a `SeqRecord` ready
+    to feed `_apply_record`.
+
+    Defaults to `topology="linear"` because FASTA carries no topology
+    annotation and assuming circular would mis-orient the user when
+    they imported a chromosome chunk; the map's view-mode toggle
+    flips to circular if the user knows otherwise. `molecule_type`
+    defaults to ``"DNA"`` — protein FASTA is rejected upstream by
+    `_parse_fasta_single`'s IUPAC check (which accepts ``X``/``*``
+    but matches the codebase's plasmid-centric assumption that DNA
+    is the right molecule).
+
+    Raises whatever `_parse_fasta_single` raises for malformed input;
+    callers are expected to surface the exception text via the modal
+    status line.
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    rec_id, seq = _parse_fasta_single(path)
+    rec = SeqRecord(Seq(seq), id=rec_id, name=rec_id,
+                     description=f"Imported from FASTA: {Path(path).name}")
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"]      = "linear"
+    return rec
+
+
+# ── Multi-record FASTA → collection helpers ───────────────────────────────
+# A multi-record FASTA (e.g. a sequencing-data dump or a plasmid set
+# distributed as a single file) lands in SpliceCraft as a NEW collection
+# instead of forcing the user to split the file by hand. Topology is
+# detected per-record from the FASTA description; explicit "circular"
+# / "plasmid" hints flip it on, otherwise we default to linear (the
+# safer assumption — chromosome chunks are common in FASTA dumps and
+# rendering a 10 Mb linear genome as a circle is far worse than the
+# reverse).
+
+# Tokens whose presence in a FASTA description flips topology to
+# circular. Conservative — protein-coding "plasmid-like" mentions
+# without a positive circular signal stay linear.
+_FASTA_CIRCULAR_HINTS: tuple[str, ...] = ("circular", "plasmid")
+
+
+def _detect_fasta_topology(rec) -> str:
+    """Return ``"circular"`` when the FASTA description contains a
+    `_FASTA_CIRCULAR_HINTS` token (case-insensitive), else
+    ``"linear"``. FASTA carries no topology field, so callers should
+    default to linear and only flip on a positive signal — assuming
+    circular by default would mis-orient chromosome chunks."""
+    desc = (getattr(rec, "description", "") or "").lower()
+    return "circular" if any(h in desc for h in _FASTA_CIRCULAR_HINTS) \
+        else "linear"
+
+
+def _fasta_records_to_seqrecords(parsed_records, file_path: str) -> list:
+    """Turn a list of Bio.SeqIO FASTA records into SeqRecords ready for
+    library import. Per-record:
+
+      - sequence upper-cased + IUPAC-validated (skipped on failure)
+      - topology auto-detected via `_detect_fasta_topology`
+      - id deduplicated by suffixing ``_2`` / ``_3`` / etc. so the
+        library-add dedup-by-id doesn't silently swallow duplicates
+        (FASTA files in the wild often have all records named ``seq``)
+
+    Returns only the records that parsed cleanly; empty / non-IUPAC
+    records are logged at WARNING and skipped so a single bad entry
+    doesn't kill the whole import. Callers should check the returned
+    list length against the input length and surface a notice when
+    records were dropped.
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    seen_ids: set = set()
+    out: list = []
+    valid_chars = set("ACGTURYMKSWBDHVN-X*")
+    file_name = Path(file_path).name
+    for i, rec in enumerate(parsed_records):
+        seq = str(rec.seq).upper()
+        if not seq:
+            _log.warning(
+                "FASTA record %d (%r): empty sequence, skipping",
+                i, rec.id,
+            )
+            continue
+        if set(seq) - valid_chars:
+            _log.warning(
+                "FASTA record %d (%r): non-IUPAC characters, skipping",
+                i, rec.id,
+            )
+            continue
+        # Dedupe id — append `_2`, `_3`, etc. on collision.
+        base = (str(rec.id or "").strip()) or f"fasta_{i + 1}"
+        cand = base
+        n = 2
+        while cand in seen_ids:
+            cand = f"{base}_{n}"
+            n += 1
+        seen_ids.add(cand)
+        topology = _detect_fasta_topology(rec)
+        new_rec = SeqRecord(
+            Seq(seq), id=cand, name=cand,
+            description=(rec.description
+                         or f"Imported from FASTA: {file_name}"),
+        )
+        new_rec.annotations["molecule_type"] = "DNA"
+        new_rec.annotations["topology"]      = topology
+        out.append(new_rec)
+    return out
+
+
+def _create_fasta_collection(name: str, records: list, file_path: str) -> None:
+    """Persist a new collection containing `records` as library entries
+    and switch the active collection to it. Raises `ValueError` on
+    name collision (caller should pre-check via `_collection_name_taken`
+    so the modal can show the error inline before the disk write).
+
+    Routes through `_save_collections` + `_save_library` so the
+    4-layer data-safety net (atomic write, rotating backups, daily
+    snapshot, lost-entry spillover — see CLAUDE.md invariant #31)
+    rides along with the import.
+    """
+    if not records:
+        raise ValueError("No valid records to import.")
+    if _collection_name_taken(name):
+        raise ValueError(f"A collection named {name!r} already exists.")
+    src_path = Path(file_path)
+    plasmids = [_record_to_library_entry(rec, src_path) for rec in records]
+    # Append the empty-shell collection first; the active-collection
+    # mirror in `_save_library` then fills its `plasmids` array.
+    existing = _load_collections()
+    existing.append({
+        "name":        name,
+        "description": (
+            f"Imported from {src_path.name} ({len(records)} FASTA records)"
+        ),
+        "plasmids":    [],
+        "saved":       _date.today().isoformat(),
+    })
+    _save_collections(existing)
+    _set_active_collection_name(name)
+    # Triggers `_sync_active_collection_plasmids` which mirrors the
+    # plasmids into the collection we just created.
+    _save_library(plasmids)
+
+
+# Plasmid file extensions excluding `.dna` — `_PLASMID_FILE_EXTS` keeps
+# the full set for backward compat with callers that don't distinguish
+# the .dna binary format from text-based GenBank. The `_PLASMID_TEXT_EXTS`
+# subset is what the Open modal highlights in lime green; .dna gets its
+# own orange so the visual separates "binary plasmid" from "text plasmid".
+_PLASMID_FILE_EXTS: frozenset[str] = frozenset(
+    {".gb", ".gbk", ".dna", ".genbank"}
+)
+_PLASMID_TEXT_EXTS: frozenset[str] = frozenset(
+    {".gb", ".gbk", ".genbank"}
+)
+
+# Per-format colours. Pink for FASTA + orange for .dna are the global
+# "always render this colour wherever this file type appears" rules so
+# users learn one signal across every picker in the app. Lime green is
+# the per-modal "primary format" highlight (e.g. .gb in plasmid
+# pickers, .gff in the GFF export picker). Plain white for everything
+# else keeps mixed directories scannable.
+_PICKER_PLASMID_STYLE = "bold #BFFF00"   # lime green — .gb / .gbk / .genbank
+_PICKER_GFF_STYLE     = "bold #BFFF00"   # lime green — .gff / .gff3
+_PICKER_DNA_STYLE     = "bold #FFA500"   # orange    — .dna (binary plasmid)
+_PICKER_FASTA_STYLE   = "bold #FF69B4"   # hot pink  — .fa / .fasta / .fna / …
+_PICKER_OTHER_STYLE   = "#FFFFFF"        # plain white for everything else
+
+# Legacy alias kept until callers migrate; `_PICKER_HIGHLIGHT_STYLE`
+# was the single-style API for `_ExtensionAwareDirectoryTree` before
+# the per-extension `highlight_map` landed.
+_PICKER_HIGHLIGHT_STYLE = _PICKER_PLASMID_STYLE
+
+
+# ── Pre-baked highlight maps for the file-picker modals ───────────────────
+# Centralised so every picker shows the same cross-cutting colours: FASTA
+# is always pink and .dna is always orange. Each picker's "primary"
+# format (the file type it reads / writes) is layered on top in lime
+# green: a plasmid picker emphasises .gb / .gbk / .genbank, the GFF
+# export picker emphasises .gff / .gff3, the FASTA picker emphasises
+# FASTA itself (which falls under the global pink rule).
+
+# Open / GenBank-flavoured export pickers — primary in lime green
+# (text plasmid formats), .dna in orange, FASTA in pink for
+# cross-format navigation.
+_PLASMID_PICKER_HIGHLIGHT_MAP: dict[str, str] = {
+    **{e: _PICKER_PLASMID_STYLE for e in _PLASMID_TEXT_EXTS},
+    ".dna": _PICKER_DNA_STYLE,
+    **{e: _PICKER_FASTA_STYLE for e in _FASTA_EXTS},
+}
+
+# GFF export — primary green for .gff / .gff3, secondary pink/orange
+# for cross-format navigation.
+_GFF_PICKER_HIGHLIGHT_MAP: dict[str, str] = {
+    ".gff":  _PICKER_GFF_STYLE,
+    ".gff3": _PICKER_GFF_STYLE,
+    ".dna":  _PICKER_DNA_STYLE,
+    **{e: _PICKER_FASTA_STYLE for e in _FASTA_EXTS},
+}
+
+# FASTA picker / FASTA export — FASTA itself is the primary so it
+# carries the global pink; .dna and the plasmid formats are listed as
+# navigation hints (orange + green).
+_FASTA_PICKER_HIGHLIGHT_MAP: dict[str, str] = {
+    **{e: _PICKER_FASTA_STYLE for e in _FASTA_EXTS},
+    ".dna": _PICKER_DNA_STYLE,
+    **{e: _PICKER_PLASMID_STYLE for e in _PLASMID_TEXT_EXTS},
+}
+
+
+class _ExtensionAwareDirectoryTree(DirectoryTree):
+    """DirectoryTree that highlights files per-extension via a colour map.
+
+    Construction options (mutually compatible — `highlight_map` wins
+    when both are supplied):
+
+      `highlight_map: dict[str, str]` — explicit ``{".ext": "style"}``.
+        Lets a single tree colour different formats with different
+        styles (e.g. pink for FASTA, orange for .dna, green for .gb).
+      `highlight_exts: frozenset[str]` + `highlight_style: str` — legacy
+        single-colour API. Every extension in the set renders in
+        `highlight_style`; everything else in `other_style`.
+
+    Files that don't match any rule render in `other_style` (white by
+    default). Directories keep Textual's default styling so folder
+    navigation cues stay obvious.
+
+    Replaces the per-modal `_FastaAwareDirectoryTree` /
+    `_ZipAwareDirectoryTree` triplet — each modal just constructs this
+    with the highlight rules it cares about.
+    """
+
+    def __init__(self, path, *,
+                  highlight_map: "dict[str, str] | None" = None,
+                  highlight_exts: "frozenset[str] | None" = None,
+                  highlight_style: str = _PICKER_PLASMID_STYLE,
+                  other_style:     str = _PICKER_OTHER_STYLE,
+                  **kwargs) -> None:
+        super().__init__(path, **kwargs)
+        # Lower-case once on construction so the per-render check is a
+        # single dict lookup; lets callers write the literal {".gb": ...}
+        # without worrying about case variants on the input side.
+        if highlight_map is not None:
+            self._highlight_map: dict[str, str] = {
+                k.lower(): v for k, v in highlight_map.items()
+            }
+        elif highlight_exts is not None:
+            self._highlight_map = {
+                e.lower(): highlight_style for e in highlight_exts
+            }
+        else:
+            self._highlight_map = {}
+        self._other_style = other_style
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = node.data
+        if data is None:
+            return label
+        p = getattr(data, "path", None)
+        if p is None:
+            return label
+        try:
+            if not p.is_file():
+                return label
+        except OSError:
+            return label
+        styled = label.copy()
+        suffix = (getattr(p, "suffix", "") or "").lower()
+        styled.stylize(self._highlight_map.get(suffix, self._other_style))
+        return styled
 
 
 class _FastaAwareDirectoryTree(DirectoryTree):
@@ -21336,51 +23597,17 @@ class DomesticatorModal(ModalScreen):
             # Scrollable body — everything between title and buttons. Primer
             # design results expand vertically, so the body needs to scroll
             # on narrow terminals rather than overflow off-screen.
+            #
+            # 2026-05-07 reorder: the Source picker leads. The user's
+            # very first decision is "where does this part's DNA come
+            # from", so the picker + the four matching panels (direct,
+            # feature library, plasmid feature, FASTA file) live at
+            # the top of the scroll body. Grammar / vector / name /
+            # type / codon-table follow because those are
+            # configuration of HOW the part is domesticated rather
+            # than WHAT goes in.
             with ScrollableContainer(id="dom-body"):
-                # ── Row 0: Cloning grammar picker ──
-                with Horizontal(id="dom-grammar-row"):
-                    yield Label("Cloning grammar")
-                    yield Select(
-                        _grammar_dropdown_options(),
-                        value=active_gid,
-                        id="dom-grammar-select",
-                        allow_blank=False,
-                    )
-                # ── Row 0.5: Entry-vector banner ──
-                # Mirrors the same banner the Constructor shows, but
-                # surfaced HERE because L0 part design depends on
-                # which destination plasmid the part will land in
-                # (overhangs, forbidden sites, etc. are grammar-
-                # scoped but the user wants visual confirmation that
-                # the right vector is set BEFORE designing primers).
-                # Change… jumps into the Grammar editor for the
-                # active grammar; on dismiss the banner refreshes.
-                with Horizontal(id="dom-vector-row"):
-                    yield Static(self._entry_vector_summary(active_gid),
-                                 id="dom-vector-info", markup=True)
-                    yield Button("Change…",
-                                 id="btn-dom-vector-change",
-                                 variant="default")
-                # ── Row 1: Part name + type ──
-                with Horizontal(id="dom-row1"):
-                    with Vertical(id="dom-name-col"):
-                        yield Label("Part name")
-                        yield Input(placeholder="e.g. my-promoter", id="dom-name")
-                    with Vertical(id="dom-type-col"):
-                        yield Label("Part type")
-                        yield Select(type_options, id="dom-type",
-                                     value=default_type)
-                # ── Row 2: overhang info (auto-updated from type) ──
-                yield Static("", id="dom-oh-info", markup=True)
-                # ── Codon table picker (for silent-mutation repair) ──
-                with Horizontal(id="dom-codon-row"):
-                    yield Static(
-                        "Codon table: [bold]E. coli K12[/bold] (taxid 83333)",
-                        id="dom-codon-label", markup=True,
-                    )
-                    yield Button("Change", id="btn-dom-codon",
-                                 variant="default")
-                # ── Row 3: Source picker ──
+                # ── Source picker (first decision) ──
                 yield Label("Source")
                 with RadioSet(id="dom-src"):
                     yield RadioButton("Direct input",         id="dom-src-direct",  value=True)
@@ -21423,6 +23650,52 @@ class DomesticatorModal(ModalScreen):
                         yield Static("(no file selected)", id="dom-fasta-name")
                         yield Button("Browse", id="btn-dom-pick-fasta")
                     yield Static("", id="dom-fasta-preview", markup=True)
+                # ── Cloning grammar picker ──
+                # Picking a different grammar from the dropdown
+                # re-persists the active-grammar setting and rebuilds
+                # the Type Select with that grammar's positions.
+                with Horizontal(id="dom-grammar-row"):
+                    yield Label("Cloning grammar")
+                    yield Select(
+                        _grammar_dropdown_options(),
+                        value=active_gid,
+                        id="dom-grammar-select",
+                        allow_blank=False,
+                    )
+                # ── Entry-vector banner ──
+                # Mirrors the same banner the Constructor shows, but
+                # surfaced HERE because L0 part design depends on
+                # which destination plasmid the part will land in
+                # (overhangs, forbidden sites, etc. are grammar-
+                # scoped but the user wants visual confirmation that
+                # the right vector is set BEFORE designing primers).
+                # Change… jumps into the Grammar editor for the
+                # active grammar; on dismiss the banner refreshes.
+                with Horizontal(id="dom-vector-row"):
+                    yield Static(self._entry_vector_summary(active_gid),
+                                 id="dom-vector-info", markup=True)
+                    yield Button("Change…",
+                                 id="btn-dom-vector-change",
+                                 variant="default")
+                # ── Part name + type ──
+                with Horizontal(id="dom-row1"):
+                    with Vertical(id="dom-name-col"):
+                        yield Label("Part name")
+                        yield Input(placeholder="e.g. my-promoter", id="dom-name")
+                    with Vertical(id="dom-type-col"):
+                        yield Label("Part type")
+                        yield Select(type_options, id="dom-type",
+                                     value=default_type)
+                # ── Overhang info (auto-updated from type) ──
+                yield Static("", id="dom-oh-info", markup=True)
+                # ── Codon table picker (for silent-mutation repair) ──
+                with Horizontal(id="dom-codon-row"):
+                    yield Static(
+                        "Codon table: [bold]E. coli K12[/bold] (taxid 83333)",
+                        id="dom-codon-label", markup=True,
+                    )
+                    yield Button("Change", id="btn-dom-codon",
+                                 variant="default")
                 # ── Primer results ──
                 yield Static("", id="dom-primer-results", markup=True)
             # ── Buttons (pinned below scroll body so they're always reachable) ──
@@ -21932,14 +24205,34 @@ class DomesticatorModal(ModalScreen):
         oh5    = d["oh5"]
         oh3    = d["oh3"]
         grammar = _get_active_grammar()
+        grammar_id = grammar.get("id", "gb_l0")
+        # 2026-05-07: pull `backbone` + `marker` from the user's
+        # configured entry vector for the active grammar instead of
+        # the historical pUPD2 / Spectinomycin hardcodes. The vector
+        # name becomes the displayed backbone; the selection marker
+        # is detected by scanning the vector's annotated features
+        # (`_detect_selection_marker`). Falls back to "—" when the
+        # marker can't be inferred from the gb_text. When NO entry
+        # vector is set, the gb_l0 historical defaults stand so old
+        # parts saved before this change keep their displayed
+        # metadata.
+        ev = _get_entry_vector(grammar_id)
+        if isinstance(ev, dict) and ev.get("name"):
+            backbone = str(ev["name"])
+            marker = _detect_selection_marker(
+                str(ev.get("gb_text", "") or "")
+            ) or "—"
+        else:
+            backbone = "pUPD2"
+            marker = "Spectinomycin"
         part = {
             "name":        name,
             "type":        d["part_type"],
             "position":    d["position"],
             "oh5":         oh5,
             "oh3":         oh3,
-            "backbone":    "pUPD2",
-            "marker":      "Spectinomycin",
+            "backbone":    backbone,
+            "marker":      marker,
             "sequence":    insert,
             "fwd_primer":  d["fwd_full"],
             "rev_primer":  d["rev_full"],
@@ -21949,7 +24242,7 @@ class DomesticatorModal(ModalScreen):
                 insert, oh5, oh3, grammar=grammar,
             ),
             "cloned_seq":  _simulate_cloned_plasmid(insert, oh5, oh3),
-            "grammar":     grammar.get("id", "gb_l0"),
+            "grammar":     grammar_id,
         }
         self.dismiss(part)
 
@@ -27331,6 +29624,111 @@ class RenamePlasmidModal(ModalScreen):
         self.dismiss(None)
 
 
+class MinPrimerBindingModal(ModalScreen):
+    """Prompt for the `min_primer_binding` threshold (integer bp).
+
+    Replaces the old preset-cycle action with a free-typed integer
+    input. Validates against `_settings_validator_int_range(1, 60)` —
+    the same range the agent endpoint enforces — so the modal can't
+    persist a value the loader would reject on next launch. Dismisses
+    with the chosen integer (1–60) on submit, or `None` on cancel /
+    no-change.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    DEFAULT_CSS = """
+    MinPrimerBindingModal { align: center middle; }
+    #mpb-dlg {
+        width: 56; height: auto;
+        background: $surface; border: solid $primary; padding: 1 2;
+    }
+    #mpb-title  { background: $primary-darken-2; color: $text;
+                  padding: 0 1; margin-bottom: 1; }
+    #mpb-help   { height: auto; color: $text-muted; margin-bottom: 1; }
+    #mpb-input  { margin-top: 0; margin-bottom: 1; }
+    #mpb-status { height: 1; color: $text-muted; }
+    #mpb-btns   { height: 3; margin-top: 1; }
+    #mpb-btns Button { margin-right: 1; }
+    """
+
+    _MIN_BP = 1
+    _MAX_BP = 60
+
+    def __init__(self, current_value: int) -> None:
+        super().__init__()
+        self.current_value = int(current_value)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="mpb-dlg"):
+            yield Static(" Minimum primer binding length ", id="mpb-title")
+            yield Static(
+                "Primers whose bound region is shorter than this "
+                "threshold are flagged with a yellow ⚠ on the "
+                "sequence panel. Allowed range: "
+                f"{self._MIN_BP}–{self._MAX_BP} bp.",
+                id="mpb-help",
+            )
+            yield Label("Threshold (bp):")
+            yield Input(
+                value=str(self.current_value),
+                placeholder=f"{self._MIN_BP}–{self._MAX_BP}",
+                id="mpb-input",
+            )
+            yield Static("", id="mpb-status", markup=True)
+            with Horizontal(id="mpb-btns"):
+                yield Button("Apply",  id="btn-mpb-apply",  variant="primary")
+                yield Button("Cancel", id="btn-mpb-cancel")
+
+    def on_mount(self) -> None:
+        # Default focus on the input so the user can immediately type a
+        # new value; the existing text is preselected (Textual default)
+        # so a single keystroke replaces the displayed number.
+        self.query_one("#mpb-input", Input).focus()
+
+    @on(Button.Pressed, "#btn-mpb-apply")
+    def _apply_btn(self, _) -> None:
+        self._try_submit()
+
+    @on(Input.Submitted, "#mpb-input")
+    def _submitted(self, _) -> None:
+        self._try_submit()
+
+    def _try_submit(self) -> None:
+        raw    = self.query_one("#mpb-input", Input).value.strip()
+        status = self.query_one("#mpb-status", Static)
+        if not raw:
+            status.update("[red]Enter a value.[/red]")
+            return
+        try:
+            value = int(raw)
+        except ValueError:
+            status.update("[red]Must be an integer.[/red]")
+            return
+        if not (self._MIN_BP <= value <= self._MAX_BP):
+            status.update(
+                f"[red]Out of range — pick "
+                f"{self._MIN_BP}–{self._MAX_BP}.[/red]"
+            )
+            return
+        if value == self.current_value:
+            # No-op — treat as cancel so we don't bother re-stamping
+            # primers + writing settings for an unchanged value.
+            self.dismiss(None)
+            return
+        self.dismiss(value)
+
+    @on(Button.Pressed, "#btn-mpb-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class PlasmidStatusPickerModal(ModalScreen):
     """Tiny modal to set the workflow status on a library entry.
 
@@ -27440,6 +29838,94 @@ class PlasmidStatusPickerModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class PartsBinDeleteConfirmModal(ModalScreen):
+    """Confirm-on-delete modal for the parts bin. Adapts its message,
+    title, and primary-button label to the count of selected parts so
+    the user always knows whether they're about to commit a single
+    delete or a bulk delete.
+
+    For single delete: shows the part name in bold.
+    For multi delete: shows the count + a name preview (first 3, with
+    "(+N more)" tail when over 3).
+
+    Default focus on [No] so a stray Enter bails out — same handslip
+    protection as `LibraryDeleteConfirmModal`. Dismisses True on
+    confirm, False on cancel / Escape.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next button", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    PartsBinDeleteConfirmModal { align: center middle; }
+    #partsdel-dlg {
+        width: 76; max-width: 95%; min-width: 56;
+        height: auto; max-height: 90%;
+        background: $surface; border: solid $error; padding: 1 2;
+    }
+    #partsdel-title { background: $error-darken-2; color: $text;
+                      padding: 0 1; margin-bottom: 1; }
+    #partsdel-msg   { height: auto; margin-bottom: 1; }
+    #partsdel-btns  { height: 3; margin-top: 1; }
+    #partsdel-btns Button { margin-right: 1; min-width: 16; }
+    """
+
+    def __init__(self, names: list[str]) -> None:
+        super().__init__()
+        self._names = list(names)
+
+    def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
+        n = len(self._names)
+        # Preview: first three names with markup escaped — a part
+        # called `[red]boom[/]` shouldn't reformat the dialog.
+        preview = ", ".join(_esc(name) for name in self._names[:3])
+        if n > 3:
+            preview += f" (+{n - 3} more)"
+        if n == 1:
+            title = " Remove part from bin "
+            body = (
+                f"  Remove [bold]{_esc(self._names[0])}[/bold] "
+                f"from the parts bin?\n\n"
+                f"  [dim]This cannot be undone from within the app. "
+                f"A backup (.bak) of the parts-bin file is kept.[/dim]"
+            )
+            yes_label = "Yes, remove"
+        else:
+            title = f" Remove {n} parts from bin "
+            body = (
+                f"  Remove [bold]{n}[/bold] parts from the parts bin?\n"
+                f"  [dim]({preview})[/dim]\n\n"
+                f"  [dim]This cannot be undone from within the app. "
+                f"A backup (.bak) of the parts-bin file is kept.[/dim]"
+            )
+            yes_label = f"Yes, remove all {n}"
+        with Vertical(id="partsdel-dlg"):
+            yield Static(title, id="partsdel-title")
+            yield Static(body, id="partsdel-msg", markup=True)
+            with Horizontal(id="partsdel-btns"):
+                yield Button("No",   id="btn-partsdel-no",
+                              variant="default")
+                yield Button(yes_label, id="btn-partsdel-yes",
+                              variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#btn-partsdel-no", Button).focus()
+
+    @on(Button.Pressed, "#btn-partsdel-no")
+    def _no(self, _) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-partsdel-yes")
+    def _yes(self, _) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class LibraryDeleteConfirmModal(ModalScreen):
@@ -29637,15 +32123,19 @@ FetchModal { align: center middle; }
 
 /* ── Open-file modal ─────────────────────────────────────── */
 OpenFileModal { align: center middle; }
+OpenFileModal { align: center middle; }
 #open-box {
-    width: 70; height: auto;
+    width: 90; max-width: 95%; min-width: 60;
+    height: 32; max-height: 90%;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #open-title { background: $primary; padding: 0 1; margin-bottom: 1; }
-#open-box Label { color: $text-muted; margin-top: 1; }
-#open-btns { height: 3; margin-top: 1; }
-#open-btns Button { margin-right: 1; }
+#open-header { height: 1; margin-bottom: 1; color: $text-muted; }
+#open-tree   { height: 1fr; border: solid $primary-darken-2; }
+#open-hint   { height: 1; margin-top: 1; color: $text-muted; }
 #open-status { height: 1; margin-top: 1; }
+#open-btns   { height: 3; margin-top: 1; }
+#open-btns Button { margin-right: 1; }
 
 /* ── FASTA file picker modal ─────────────────────────────── */
 FastaFilePickerModal { align: center middle; }
@@ -29666,11 +32156,15 @@ FastaFilePickerModal { align: center middle; }
 ExportGenBankModal { align: center middle; }
 ExportCommercialSaaSModal { align: center middle; }
 #export-box {
-    width: 72; height: auto;
+    width: 90; max-width: 95%; min-width: 60;
+    height: 36; max-height: 92%;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #export-title { background: $primary; padding: 0 1; margin-bottom: 1; }
+#export-dir   { height: 1; margin-top: 1; color: $text-muted; }
+#export-tree  { height: 1fr; border: solid $primary-darken-2; margin-top: 1; }
 #export-box Label { color: $text-muted; margin-top: 1; }
+#export-filename { margin-top: 0; margin-bottom: 1; }
 #export-btns { height: 3; margin-top: 1; }
 #export-btns Button { margin-right: 1; }
 #export-status { height: 2; margin-top: 1; }
@@ -29678,11 +32172,15 @@ ExportCommercialSaaSModal { align: center middle; }
 /* ── Export-GFF3 modal ───────────────────────────────────── */
 GffExportModal { align: center middle; }
 #gff-export-box {
-    width: 72; height: auto;
+    width: 90; max-width: 95%; min-width: 60;
+    height: 36; max-height: 92%;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #gff-export-title { background: $primary; padding: 0 1; margin-bottom: 1; }
+#gff-export-dir   { height: 1; margin-top: 1; color: $text-muted; }
+#gff-export-tree  { height: 1fr; border: solid $primary-darken-2; margin-top: 1; }
 #gff-export-box Label { color: $text-muted; margin-top: 1; }
+#gff-export-filename { margin-top: 0; margin-bottom: 1; }
 #gff-export-btns { height: 3; margin-top: 1; }
 #gff-export-btns Button { margin-right: 1; }
 #gff-export-status { height: 2; margin-top: 1; }
@@ -29690,11 +32188,15 @@ GffExportModal { align: center middle; }
 /* ── Export-FASTA modal ──────────────────────────────────── */
 FastaExportModal { align: center middle; }
 #fasta-export-box {
-    width: 72; height: auto;
+    width: 90; max-width: 95%; min-width: 60;
+    height: 36; max-height: 92%;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #fasta-export-title { background: $primary; padding: 0 1; margin-bottom: 1; }
+#fasta-export-dir   { height: 1; margin-top: 1; color: $text-muted; }
+#fasta-export-tree  { height: 1fr; border: solid $primary-darken-2; margin-top: 1; }
 #fasta-export-box Label { color: $text-muted; margin-top: 1; }
+#fasta-export-filename { margin-top: 0; margin-bottom: 1; }
 #fasta-export-btns { height: 3; margin-top: 1; }
 #fasta-export-btns Button { margin-right: 1; }
 #fasta-export-status { height: 2; margin-top: 1; }
@@ -31201,11 +33703,26 @@ SpeciesPickerModal { align: center middle; }
             _log.exception("Failed to clear autosave %s", path)
 
     def _check_crash_recovery(self) -> None:
-        """On startup, warn the user if leftover autosaves exist.
+        """On startup, warn the user if leftover autosaves exist —
+        ONCE per leftover set, not on every launch.
 
         A .gb file in `_CRASH_RECOVERY_DIR` means the previous session
-        made unsaved edits and didn't cleanly save or abandon. The user
-        can recover via File > Open or by inspecting the directory.
+        made unsaved edits and didn't cleanly save or abandon. The
+        user can recover via File > Open or by inspecting the
+        directory. To keep the notice from re-firing every launch
+        until the directory is empty, we persist the (name, mtime)
+        signature of the leftovers we've notified about in
+        ``settings.json: crash_recovery_seen``. The user only sees
+        the warning when:
+
+          * a brand-new leftover appears (new file + new mtime), or
+          * a previously-seen file was re-written (same name, newer
+            mtime — meaning a fresh round of unsaved edits)
+
+        Pre-2026-05-07: the notice fired on every launch as long as
+        the directory was non-empty, which spammed users who
+        couldn't recover and didn't want to manually delete the
+        files.
         """
         try:
             if not _CRASH_RECOVERY_DIR.exists():
@@ -31215,15 +33732,53 @@ SpeciesPickerModal { align: center middle; }
             _log.exception("Could not scan crash-recovery dir")
             return
         if not leftovers:
+            # Clean directory: clear the seen-set so a future first-
+            # time crash isn't silenced by a stale acknowledgement.
+            if _get_setting("crash_recovery_seen"):
+                _set_setting("crash_recovery_seen", [])
             return
-        names = ", ".join(p.stem for p in leftovers[:3])
-        if len(leftovers) > 3:
-            names += f" (+{len(leftovers) - 3} more)"
+
+        # Per-file signature: `<name>|<mtime>` so a re-write of an
+        # existing leftover (= the user resumed editing then crashed
+        # again) re-triggers the notice.
+        current_keys: list[str] = []
+        for p in leftovers:
+            try:
+                mt = int(p.stat().st_mtime)
+            except OSError:
+                mt = 0
+            current_keys.append(f"{p.name}|{mt}")
+
+        raw_seen = _get_setting("crash_recovery_seen")
+        seen = set(raw_seen) if isinstance(raw_seen, list) else set()
+        new_keys = [k for k in current_keys if k not in seen]
+        if not new_keys:
+            return
+
+        # Lead the toast with the genuinely-new files; aggregate
+        # count covers any older leftovers still on disk so the user
+        # sees the full picture without being spammed about them
+        # every launch.
+        new_set = set(new_keys)
+        new_stems = [
+            p.stem for p, k in zip(leftovers, current_keys)
+            if k in new_set
+        ]
+        names = ", ".join(new_stems[:3])
+        if len(new_stems) > 3:
+            names += f" (+{len(new_stems) - 3} more)"
+        total = len(leftovers)
+        prefix = (f"{len(new_stems)} new of {total} unsaved recovery "
+                  f"file(s)" if total > len(new_stems)
+                  else f"Unsaved recovery file(s) from a prior session")
         self.notify(
-            f"Unsaved recovery files from a prior session: {names}. "
+            f"{prefix}: {names}. "
             f"Open via File > Open from {_CRASH_RECOVERY_DIR}",
             severity="warning", timeout=15,
         )
+        # Persist the full current set so future launches are quiet
+        # unless something new lands on disk.
+        _set_setting("crash_recovery_seen", current_keys)
 
     @work(thread=True)
     def _check_for_updates_worker(self) -> None:
@@ -32187,7 +34742,58 @@ SpeciesPickerModal { align: center middle; }
     def action_open_file(self):
         # Same auto-persist policy as fetch; _import_and_persist preserves
         # the record's _tui_source path for later "Save" operations.
-        self.push_screen(OpenFileModal(), callback=self._import_and_persist)
+        # The dispatch handler also covers the multi-record FASTA case
+        # where the modal returns a `{"kind": "fasta_collection", ...}`
+        # dict instead of a single SeqRecord.
+        self.push_screen(OpenFileModal(),
+                          callback=self._on_open_file_done)
+
+    def _on_open_file_done(self, result) -> None:
+        """Dispatch the OpenFileModal's dismiss payload.
+
+        Two payload shapes:
+          - ``SeqRecord`` (single-record .gb / .gbk / .dna / .genbank /
+            single-record FASTA): same flow as `_import_and_persist`.
+          - ``dict`` with ``kind="fasta_collection"`` (multi-record
+            FASTA): the modal already created the collection (via
+            `_create_fasta_collection`) and switched the active
+            collection. We load the first record into the canvas and
+            refresh the library panel so the user sees the new
+            collection's plasmid list right away.
+        """
+        if result is None:
+            return
+        if isinstance(result, dict) and result.get("kind") == "fasta_collection":
+            records = result.get("records") or []
+            if not records:
+                return
+            # Load the first record into the canvas; the rest live in
+            # the new collection and are pickable from the library
+            # panel. Using `_apply_record` rather than
+            # `_import_and_persist` because the records were already
+            # persisted by `_create_fasta_collection`.
+            self._apply_record(records[0])
+            try:
+                lib = self.query_one("#library", LibraryPanel)
+                lib._view_mode = "plasmids"
+                lib._apply_view_mode()
+                lib._repopulate()
+                lib.set_active(records[0].id)
+            except NoMatches:
+                pass
+            n = len(records)
+            n_dropped = int(result.get("n_dropped", 0) or 0)
+            extra = (f"; skipped {n_dropped} malformed record(s)"
+                     if n_dropped else "")
+            self._notify_success(
+                f"Loaded {n} record(s) into collection "
+                f"'{result['collection_name']}' — active: "
+                f"{records[0].name}{extra}",
+                timeout=6,
+            )
+            return
+        # Single-record path: same as before.
+        self._import_and_persist(result)
 
     def action_show_help(self) -> None:
         """`?` — open the keyboard-shortcut reference modal. Bound at
@@ -32892,6 +35498,58 @@ SpeciesPickerModal { align: center middle; }
                 "(press 'v' to toggle).",
                 severity="information", timeout=8,
             )
+
+    def _clear_canvas(self) -> None:
+        """Drop the loaded record from every panel — used after the
+        user deletes the loaded plasmid from the library so the
+        plasmid map / feature sidebar / sequence panel don't keep
+        showing the now-deleted plasmid's data.
+
+        Mirrors `_apply_record`'s panel-touch surface in reverse:
+        the record handle is cleared, the load counter is bumped
+        (so any in-flight workers refuse to apply their results),
+        the restriction-scan cache is wiped, and each panel is
+        explicitly set to an empty state. Undo / redo stacks are
+        dropped — there's nothing to undo back to once the source
+        plasmid is gone. `_source_path` is cleared so a stray
+        Ctrl+S can't accidentally write over the deleted file's
+        original.
+        """
+        self._current_record = None
+        self._record_load_counter += 1
+        self._restr_cache = []
+        self._source_path = None
+        self._unsaved = False
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._current_undo_key = None
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            pm = None
+        if pm is not None:
+            pm.record = None
+            pm._total = 0
+            pm.origin_bp = 0
+            pm.selected_idx = -1
+            pm._feats = []
+            pm._feats_by_start = []
+            pm._feats_starts_sorted = []
+            pm._restr_feats = []
+            pm._draw_cache = None
+            pm.refresh()
+        try:
+            sidebar = self.query_one("#sidebar", FeatureSidebar)
+        except NoMatches:
+            sidebar = None
+        if sidebar is not None:
+            sidebar.populate([])
+        try:
+            seq_pnl = self.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            seq_pnl = None
+        if seq_pnl is not None:
+            seq_pnl.update_seq("", [])
 
     # ── Feature selection: map ↔ sidebar ↔ sequence panel ─────────────────────
 
@@ -33691,7 +36349,14 @@ SpeciesPickerModal { align: center middle; }
 
     @on(LibraryPanel.AddCurrentRequested)
     def _library_add_current(self, _):
-        self.action_add_to_library()
+        # 2026-05-07: re-routed from `action_add_to_library` (which
+        # required a record already on the canvas) to the same flow
+        # Ctrl+O drives — pushing the OpenFileModal lets the user
+        # browse for a file directly from the library panel without
+        # having to load it first. Single-record loads land in the
+        # active collection via `_import_and_persist`; multi-record
+        # FASTA pops the collection-import modal.
+        self.action_open_file()
 
     @on(LibraryPanel.GainedFocus)
     def _library_gained_focus(self, _event) -> None:
@@ -34018,8 +36683,8 @@ SpeciesPickerModal { align: center middle; }
                 (f"[{cu}] Check for updates on launch",  "toggle_check_updates"),
                 (f"Linear layout: {pm_layout} → switch to {ll_next}",
                                                           "toggle_linear_layout"),
-                (f"Min primer binding: {self._min_primer_binding} bp → cycle",
-                                                          "cycle_min_primer_binding"),
+                (f"Min primer binding: {self._min_primer_binding} bp → set…",
+                                                          "set_min_primer_binding"),
                 ("---",                                   None),
                 ("Restore library / collections from backup…",
                                                           "restore_from_backup"),
@@ -34083,35 +36748,38 @@ SpeciesPickerModal { align: center middle; }
         state = "enabled" if self._check_updates else "disabled"
         self.notify(f"Update check on launch: {state}")
 
-    # Cycle order for `action_cycle_min_primer_binding` — covers the
-    # span where most users actually want to draw the line. Off-preset
-    # values (hand-edited settings.json) snap to the nearest preset on
-    # the next cycle. Module-scope so tests can import + assert.
-    _MIN_PRIMER_BINDING_PRESETS = (10, 12, 15, 18, 20)
-
-    def action_cycle_min_primer_binding(self) -> None:
-        """Settings → Min primer binding: cycle through 10/12/15/18/20 bp.
+    def action_set_min_primer_binding(self) -> None:
+        """Settings → Min primer binding: open `MinPrimerBindingModal`
+        to type a new threshold (1–60 bp). Replaces the old
+        preset-cycle action — users wanted to type the exact value
+        rather than tab through 10/12/15/18/20.
 
         Primers whose bound region is shorter than the threshold are
         flagged with a yellow ⚠ in place of the strand arrow on the
         seq panel + an extra tooltip line. Persisted to settings.json
-        so the choice survives sessions. Re-parses the current record
-        so the stamps reflect the new threshold immediately (the
-        seq-panel cache invalidates because `_feats` is re-assigned —
-        CLAUDE.md pitfall #5)."""
-        presets = self._MIN_PRIMER_BINDING_PRESETS
-        cur = self._min_primer_binding
-        if cur in presets:
-            nxt = presets[(presets.index(cur) + 1) % len(presets)]
-        else:
-            # Off-preset value — snap to nearest. Stable when distances
-            # tie (Python's `min` keeps the first match in iteration order).
-            nxt = min(presets, key=lambda p: abs(p - cur))
+        so the choice survives sessions; the modal validates against
+        the same `_settings_validator_int_range(1, 60)` the agent
+        endpoint uses.
+        """
+        def _on_picked(value: "int | None") -> None:
+            if value is None:
+                return
+            self._apply_min_primer_binding(int(value))
+        self.push_screen(
+            MinPrimerBindingModal(self._min_primer_binding),
+            callback=_on_picked,
+        )
+
+    def _apply_min_primer_binding(self, nxt: int) -> None:
+        """Persist `nxt` as the new min-primer-binding threshold and
+        re-stamp `_weak_primer` on the current record's primer feats
+        so the seq panel + sidebar reflect the change immediately.
+        `_parse` reads the threshold from `self.app._min_primer_binding`,
+        so re-parsing the record picks up the new value automatically.
+        Cache is invalidated by re-assigning `_feats` (CLAUDE.md
+        pitfall #5)."""
         self._min_primer_binding = nxt
         _set_setting("min_primer_binding", nxt)
-        # Re-stamp `_weak_primer` on the current record's primer feats.
-        # `_parse` reads the threshold from `self.app._min_primer_binding`
-        # so the new value is picked up automatically.
         try:
             pm = self.query_one("#plasmid-map", PlasmidMap)
         except NoMatches:

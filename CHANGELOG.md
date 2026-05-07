@@ -2,6 +2,91 @@
 
 ---
 
+## [0.7.3.0] — 2026-05-07
+
+### Fixed (correctness — Golden Braid L0 cloning simulation)
+
+- **IIS-cloning simulation now respects the entry vector's dropout
+  overhangs, not the part's BsaI junction overhangs.** The user's
+  `oh5`/`oh3` on a parts-bin entry are the L1-junction overhangs
+  exposed AFTER L0 cloning (e.g. `AATG`/`GCTT` for a Golden Braid
+  CDS, exposed by BsaI in the next assembly step). The L0 cloning
+  step itself uses Esp3I and the entry vector's dropout overhangs
+  (e.g. `CTCG`/`TGAG` for pUPD2 / FFE 1 ENTRY UPD). Previously
+  `_clone_part_into_entry_vector` matched the part's `oh5`/`oh3`
+  against the vector's Esp3I cut overhangs and bailed when they
+  didn't match — so a CDS designed in SpliceCraft's Domesticator
+  (BsaI overhangs only) saved into a real pUPD2-style entry vector
+  silently fell back to the pUPD2 stub backbone instead of the
+  user's actual vector. Now the simulator identifies the dropout
+  fragment first (smallest fragment after IIS digest), then
+  synthesises an insert with the dropout's overhangs as sticky
+  ends and `oh5 + insert + oh3` as the cloned content. Result:
+  byte-exact correct cloned plasmids that match a real bench
+  reaction. Verified end-to-end with aeBlue (`/blueWT.fasta`)
+  cloned into `FFE 1 ENTRY UPD.dna` via Esp3I → 2433 bp plasmid
+  with FuGFP cassette excised + aeBlue in its place.
+- **Save-to-Collection diagnostic notify.** When a part lands in
+  the collection with a stub backbone instead of the user's
+  configured entry vector (no vector configured, vector lacks
+  ≥2 enzyme cuts), a per-part warning toast surfaces the reason
+  via the new `_diagnose_part_cloning(part)` helper. Without this
+  the user just saw "Saved N parts" and had no idea their
+  cloning fell back. Notification timeout extended to 12 s so
+  the explanation has time to land.
+
+### Added (UI + UX)
+
+- **Multi-record FASTA → bulk import.** Loading a FASTA with
+  multiple records now prompts to import all sequences into a new
+  collection. Per-record linear/circular detection.
+- **Parts-bin Save-to-Collection.** New button + multi-select
+  (Ctrl/Shift/Alt+click + drag). Selected parts are simulate-cloned
+  into the active grammar's entry vector (or stub fallback) and
+  added as fresh library entries. Acts on toggled parts uniformly
+  whether the toggle came from modifier-click or drag.
+- **Parts-bin Delete + multi-delete.** New Delete button + Delete
+  keyboard binding. Multi-select deletes show a count in the
+  warning modal. Removes the built-in catalog rows (no sequence
+  → not actionable from this UI).
+- **File browsers everywhere paths were typed.** Ctrl+O modal,
+  Library `+` button, Domesticator source pickers, etc. Highlights
+  FASTA in pink, `.dna` in orange.
+- **Settings: typeable minimum primer length.** Replaced the
+  cycling presets with a free-form integer input.
+- **Feature sidebar sort by genome order from origin.** Sorts
+  ascending by `start`, ties broken by `end`. Wrap features
+  appear at their origin-relative position.
+
+### Fixed (UI consistency)
+
+- **Stale data clearing on deletion.** Deleting the currently-
+  loaded plasmid from the library now clears the canvas + sequence
+  panel + sidebar. Same fix applied to parts-bin deletes (the
+  loaded part's data no longer lingers after the part is removed).
+- **Crash-recovery notice fires once per leftover set.** Previously
+  it re-displayed on every load while leftovers existed.
+- **Domesticator: source group moved to the top.** First thing a
+  user picks is where the part comes from.
+- **Backbone + selection marker reflect the user's configured
+  entry vector** for L0 parts (not the hardcoded pUPD2 /
+  Spectinomycin defaults).
+
+### Internal
+
+- New helpers `_clone_part_into_entry_vector` (rewritten with
+  synthesis fallback), `_splice_part_into_vector_by_overhang`
+  (refuses sequence-splice when vector has IIS cuts whose
+  overhangs conflict with part's overhangs — prevents silent
+  wrong-position splice), `_diagnose_part_cloning` (Save-to-
+  Collection notify backend).
+- Test coverage: 4 new edge-case tests for the synthesis path
+  (3-cut vector, zero-overhang part, no-cuts vector diagnostic,
+  no-vector diagnostic) plus a regression test capturing the
+  exact aeBlue + FFE-1-style scenario that motivated the fix.
+
+---
+
 ## [0.7.2.0] — 2026-05-06
 
 ### Fixed (review pass — hardening + correctness)
