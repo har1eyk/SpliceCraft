@@ -280,7 +280,12 @@ class TestRealisticPerf:
         db = sc._blast_get_db("blastn", ["PerfTest"])
         elapsed = time.perf_counter() - t0
         assert db.get("subjects"), "DB build returned empty"
-        # 500 ms is generous on a single 2.7 kb plasmid — typical is
-        # 30-50 ms. If we ever cross half a second something architectural
-        # changed.
-        assert elapsed < 0.5, f"BLAST DB build too slow: {elapsed:.3f}s"
+        # Typical wall time on a single 2.7 kb plasmid is 30-50 ms.
+        # The 1.5 s ceiling is generous: it tolerates the ~10-20×
+        # slowdown pytest-xdist's `-n auto` parallelism can cause on a
+        # loaded build host without false-positiving, while still
+        # catching a real architectural regression (anything pushing
+        # this past 1.5 s in serial would be 30-50× the baseline,
+        # which is what we actually want to detect). Bumped from 0.5 s
+        # in 0.7.6 after a release suite flake at 0.564 s.
+        assert elapsed < 1.5, f"BLAST DB build too slow: {elapsed:.3f}s"
