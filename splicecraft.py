@@ -443,7 +443,7 @@ _tstyle_mod.Style.from_rich_style = classmethod(_from_rich_style_cached)
 from textual.widgets import (
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
     ListItem, ListView, ProgressBar, RadioButton, RadioSet, Select,
-    Static, TabbedContent, TabPane, TextArea, Tree,
+    Static, Tab, TabbedContent, TabPane, Tabs, TextArea, Tree,
 )
 # `Markdown` is deliberately NOT in this list — it pulls markdown_it
 # (~50 ms) + pygments (~50 ms) + rich.markdown (~30 ms) at import
@@ -16465,6 +16465,186 @@ def _clone_part_into_entry_vector(
     return new_rec
 
 
+def _site_for_enzyme(enzyme: str) -> str:
+    """Look up the recognition site for ``enzyme`` from the NEB
+    catalog. Returns "" for unknown enzymes (callers fall back to the
+    grammar's primary site)."""
+    info = _NEB_ENZYMES.get(enzyme)
+    if isinstance(info, tuple) and info:
+        return str(info[0]).upper()
+    return ""
+
+
+def _assembly_fragment_from_source(
+    source: dict, grammar: dict, source_level: int,
+) -> "dict | None":
+    """Extract a uniform ``{name, sequence, oh5, oh3}`` fragment dict
+    from an L0 part OR an L1+ assembled plasmid, suitable for chaining
+    in a multi-part Golden Braid assembly.
+
+    L0 sources read fields directly. L1+ sources are digested with the
+    level-up enzyme (which alternates by level — see
+    ``_enzyme_for_level_up``); the smaller of the two released
+    fragments becomes the carried "insert". Returns ``None`` on any
+    extraction failure so the caller can surface a clean error."""
+    if source_level <= 0:
+        seq = (source.get("sequence") or "").upper()
+        oh5 = (source.get("oh5") or "").upper()
+        oh3 = (source.get("oh3") or "").upper()
+        if not seq or not oh5 or not oh3:
+            return None
+        return {
+            "name":     source.get("name") or "part",
+            "sequence": seq,
+            "oh5":      oh5,
+            "oh3":      oh3,
+            "level":    int(source_level),
+        }
+    enzyme = _enzyme_for_level_up(grammar, source_level)
+    if not enzyme:
+        return None
+    gb_text = source.get("gb_text") or ""
+    if not gb_text:
+        return None
+    try:
+        rec = _gb_text_to_record(gb_text)
+    except Exception:
+        _log.exception("assembly_fragment: gb_text parse failed for %r",
+                        source.get("name"))
+        return None
+    plasmid_seq = str(rec.seq).upper()
+    if not plasmid_seq:
+        return None
+    topology = (rec.annotations.get("topology", "") or "").lower()
+    circular = topology != "linear"
+    try:
+        frags, err = _excise_fragment_pair(
+            plasmid_seq, [enzyme], circular=circular,
+            source_label=source.get("name") or "src",
+        )
+    except Exception:
+        _log.exception("assembly_fragment: digest failed for %r",
+                        source.get("name"))
+        return None
+    if err is not None or len(frags) != 2:
+        return None
+    insert_frag = min(frags, key=lambda f: len(f.get("top_seq") or ""))
+    top_seq = (insert_frag.get("top_seq") or "").upper()
+    oh5 = (insert_frag.get("left")  or {}).get("overhang_seq", "").upper()
+    oh3 = (insert_frag.get("right") or {}).get("overhang_seq", "").upper()
+    if not top_seq or not oh5 or not oh3:
+        return None
+    # Strip the leading 4-bp 5' overhang to match the L0 storage
+    # convention (sequence WITHOUT the overhang; oh5/oh3 held
+    # separately). The right overhang lives between this fragment's
+    # cut and the next fragment, so it doesn't appear inside top_seq.
+    seq_no_oh = top_seq[len(oh5):] if top_seq.startswith(oh5) else top_seq
+    return {
+        "name":     source.get("name") or "src",
+        "sequence": seq_no_oh,
+        "oh5":      oh5,
+        "oh3":      oh3,
+        "level":    int(source_level),
+    }
+
+
+def _clone_assembly_into_entry_vector(
+    sources: list[dict],
+    entry_vector: dict,
+    grammar: dict,
+    *,
+    source_level: int = 0,
+    name: str = "",
+):
+    """Multi-source Golden Braid assembly cloner.
+
+    Concatenates ``sources`` (L0 parts when ``source_level == 0``, or
+    L1+ assembled plasmids when ≥ 1) into a single chained insert,
+    then ligates that insert into the cut ``entry_vector`` via the
+    existing single-part cloning machinery (`_clone_part_into_entry_vector`)
+    by synthesising a virtual "part" whose ``sequence`` is the chained
+    inserts and whose ``oh5`` / ``oh3`` are the boundary sticky ends
+    of the chain.
+
+    The level-up enzyme is picked by `_enzyme_for_level_up(grammar,
+    source_level)`, which alternates between ``grammar.enzyme`` and
+    ``grammar.level_up_enzyme`` each level so the assembled product
+    survives the next cycle's cut. The chosen enzyme + matching
+    recognition site override `grammar.enzyme` / `grammar.site` for
+    the duration of this single call so the downstream
+    primed-amplicon synthesis + IIS-cut digest happen with the right
+    enzyme.
+
+    Returns ``None`` on any failure (empty source list, source
+    extraction failure, junction-overhang mismatch, vector cut
+    failure). Callers should surface a notify so the user knows the
+    digest didn't simulate cleanly."""
+    if not sources:
+        return None
+    fragments: list[dict] = []
+    for s in sources:
+        # Defensive: every source must claim the requested level.
+        # Without this check, a misrouted L0 part in an L1+ lane
+        # would silently fall through to the L0 extraction branch
+        # (since `_assembly_fragment_from_source` only looks at the
+        # `source_level` parameter, not the part's own `level`
+        # field), producing a wrong-grammar assembly.
+        s_lvl = _part_level(s)
+        if not _level_matches_tab(s_lvl, source_level):
+            _log.info(
+                "clone_assembly: source %r has level %d, expected %d",
+                s.get("name"), s_lvl, source_level,
+            )
+            return None
+        frag = _assembly_fragment_from_source(s, grammar, source_level)
+        if frag is None:
+            _log.info(
+                "clone_assembly: source %r rejected (level %d)",
+                s.get("name"), source_level,
+            )
+            return None
+        fragments.append(frag)
+    # Validate chain: every junction must have matching overhangs.
+    for i in range(len(fragments) - 1):
+        if fragments[i]["oh3"] != fragments[i + 1]["oh5"]:
+            _log.info(
+                "clone_assembly: junction %d mismatch (%s vs %s)",
+                i, fragments[i]["oh3"], fragments[i + 1]["oh5"],
+            )
+            return None
+    # Concatenate top strands. Adjacent overhangs collapse: each
+    # fragment contributes its 5'OH (except the first, whose oh5 is
+    # the chain's terminal sticky end) + its body sequence.
+    seq_parts: list[str] = []
+    for i, f in enumerate(fragments):
+        if i > 0:
+            seq_parts.append(f["oh5"])
+        seq_parts.append(f["sequence"])
+    combined_seq = "".join(seq_parts)
+    # Pick the enzyme + site for the level-up step.
+    target_enzyme = _enzyme_for_level_up(grammar, source_level)
+    if not target_enzyme:
+        return None
+    target_site = _site_for_enzyme(target_enzyme)
+    grammar_for_step = dict(grammar)
+    grammar_for_step["enzyme"] = target_enzyme
+    if target_site:
+        grammar_for_step["site"] = target_site
+    synthetic_name = name or "+".join(f["name"] for f in fragments)
+    synthetic = {
+        "name":     synthetic_name,
+        "sequence": combined_seq,
+        "oh5":      fragments[0]["oh5"],
+        "oh3":      fragments[-1]["oh3"],
+        "type":     ("TU" if source_level == 0 else "MOD"),
+        "position": ("TU" if source_level == 0 else "MOD"),
+        "grammar":  grammar.get("id"),
+    }
+    return _clone_part_into_entry_vector(
+        synthetic, entry_vector, grammar_for_step,
+    )
+
+
 def _splice_part_into_vector_by_overhang(
     entry_vector: dict, part: dict,
     grammar: "dict | None" = None,
@@ -16980,6 +17160,12 @@ _BUILTIN_GRAMMARS: dict[str, dict] = {
         "id":              "gb_l0",
         "name":            "Golden Braid L0",
         "enzyme":          _GB_L0_ENZYME_NAME,
+        # Iterative GB cycle: L0 → L1 cuts with Esp3I (`enzyme`); L1 →
+        # L2 cuts with BsaI (`level_up_enzyme`); L2 → L3 wraps around
+        # to Esp3I again (parity on source level — see
+        # `_enzyme_for_level_up`). The two enzymes alternate each
+        # level so the assembled product survives the next cut.
+        "level_up_enzyme": "BsaI",
         "site":            _GB_L0_ENZYME_SITE,
         "spacer":          _GB_SPACER,
         "pad":             _GB_PAD,
@@ -17003,6 +17189,7 @@ _BUILTIN_GRAMMARS: dict[str, dict] = {
         "id":              "moclo_plant",
         "name":            "MoClo Plant (Weber 2011)",
         "enzyme":          "BsaI",
+        "level_up_enzyme": "BpiI",
         "site":            "GGTCTC",
         "spacer":          "A",
         "pad":             "GCGC",
@@ -17336,6 +17523,80 @@ def _grammar_position_by_type(grammar: dict, ptype: str) -> "dict | None":
         if pos.get("type") == ptype:
             return pos
     return None
+
+
+# ── Level helpers (Golden Braid iterative cycle) ───────────────────────
+# Every part / assembled plasmid carries an integer ``level``:
+#   * 0   — domesticated L0 part (single Promoter / CDS / Terminator)
+#   * 1   — TU (single transcription unit, L0 parts ligated into α/Ω L1)
+#   * 2+  — MOD (module of TUs, two L1 plasmids ligated into L2 — and so
+#           on iteratively; level keeps incrementing each cycle)
+#
+# The user-facing labels collapse to L0 / TU / MOD (any level ≥2 is a
+# MOD) per the parts-bin tab UX spec. Internally we keep the raw int so
+# enzyme-parity arithmetic (`_enzyme_for_level_up`) keeps working as
+# the user iterates further up the GB cycle.
+
+def _part_level(part: dict) -> int:
+    """Return the integer level stored on a part dict, defaulting to 0
+    for legacy parts that predate the field. Coerces strings ("L0",
+    "TU", "MOD") and numerics (0, 1, 2) so a hand-edited parts_bin.json
+    keeps loading. Negative / non-numeric values fall back to 0."""
+    raw = part.get("level", 0) if isinstance(part, dict) else 0
+    if isinstance(raw, bool):
+        return 0  # bool is a subclass of int — explicit guard
+    if isinstance(raw, int):
+        return max(0, raw)
+    if isinstance(raw, str):
+        s = raw.strip().upper()
+        if s in ("L0", "0"):
+            return 0
+        if s in ("TU", "L1", "1"):
+            return 1
+        if s in ("MOD", "MODULE", "L2"):
+            return 2
+        if s.isdigit():
+            return max(0, int(s))
+    return 0
+
+
+def _part_level_label(level: int) -> str:
+    """Map an integer level to the user-facing label used in the Parts
+    Bin tabs and notify strings: L0 → 'L0', 1 → 'TU', ≥2 → 'MOD'."""
+    if level <= 0:
+        return "L0"
+    if level == 1:
+        return "TU"
+    return "MOD"
+
+
+def _level_matches_tab(part_level: int, tab_level: int) -> bool:
+    """True iff a part with ``part_level`` belongs in the ``tab_level``
+    Parts Bin tab / Constructor palette filter.
+
+    Tabs L0 (0) and TU (1) exact-match their level; the MOD tab
+    (2) absorbs every level ≥ 2 (L2 / L3 / L4 / …). Used by the
+    parts-bin row filter, the constructor's palette refresh, and
+    the lane-resolver's identity match — extracted so the rule
+    change in one place propagates everywhere."""
+    if tab_level < 2:
+        return part_level == tab_level
+    return part_level >= 2
+
+
+def _enzyme_for_level_up(grammar: dict, source_level: int) -> str:
+    """Pick the Type IIS enzyme that releases parts from a level-N
+    source plasmid for assembly into a level-(N+1) destination.
+
+    Golden Braid alternates enzymes each level: L0→L1 uses
+    ``grammar.enzyme``, L1→L2 uses ``grammar.level_up_enzyme``, L2→L3
+    wraps back to ``grammar.enzyme``. Parity on ``source_level`` picks
+    the right one. Falls back to ``grammar.enzyme`` when a custom
+    grammar omits ``level_up_enzyme`` (older custom grammars predate
+    iterative cycle support)."""
+    primary = str(grammar.get("enzyme") or "")
+    secondary = str(grammar.get("level_up_enzyme") or "") or primary
+    return primary if (source_level % 2) == 0 else secondary
 
 
 def _grammar_dropdown_options() -> list[tuple[str, str]]:
@@ -24787,6 +25048,518 @@ class GrammarEditorModal(ModalScreen):
 
 # ── Parts bin modal ────────────────────────────────────────────────────────────
 
+
+class PartEditModal(ModalScreen):
+    """View / edit a parts-bin row.
+
+    Read-only by default — `Edit` flips the form editable, `Save`
+    commits and dismisses with ``{"idx": <row idx>, "entry": <new
+    dict>}``, `Cancel` dismisses with ``None``.
+
+    Grammar is locked: changing it invalidates the type / position /
+    overhang semantics. Users who need to migrate a part to a
+    different grammar should delete + re-create through the
+    Domesticator. Type changes auto-fill position + overhangs from
+    the matching grammar position so the common "re-tag" edit
+    doesn't require manual oh re-entry.
+
+    Sequence + overhang edits trigger re-derivation of ``primed_seq``
+    / ``cloned_seq`` so the Copy Primed / Copy Cloned actions on the
+    Parts Bin keep serving the right amplicon. Primer edits re-run
+    the primer3 Tm calc (or fall back to 0.0 when primer3 is
+    unavailable).
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    # IUPAC alphabet for DNA. Pre-built once at class scope so every
+    # save doesn't rebuild the lookup set. `frozenset` makes accidental
+    # mutation a TypeError.
+    _VALID_IUPAC = frozenset("ACGTRYWSMKBDHVN")
+
+    DEFAULT_CSS = """
+    PartEditModal { align: center middle; }
+    #partedit-dlg {
+        width: 96; max-width: 95%; height: auto; max-height: 36;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #partedit-title {
+        height: 1;
+        text-style: bold;
+        background: $accent;
+        color: $text;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    /* Body sizes to content (auto), with overflow scroll as a safety
+       net for sub-baseline terminals. */
+    #partedit-body { height: auto; padding: 0 1; overflow-y: auto; }
+    #partedit-body Label { color: $text-muted; margin: 0; height: 1; }
+    /* Each label+input pair is 4 rows: 1 label + 3 input/select.
+       No margin-top between rows — borders give enough separation. */
+    #partedit-row1, #partedit-row2,
+    #partedit-row3, #partedit-row4 { height: 4; }
+    /* Row 1: Name (2fr) | Grammar (2fr) | Type (3fr) — grammar is a
+       real Select now (was a locked banner), so users can re-tag a
+       part to a different cloning grammar from this modal. */
+    #partedit-row1 #partedit-name-col    { width: 2fr; padding-right: 1; }
+    #partedit-row1 #partedit-grammar-col { width: 2fr; padding-right: 1; }
+    #partedit-row1 #partedit-type-col    { width: 3fr; }
+    /* Row 2: 5'OH | 3'OH | Position. Position widens to 2fr because
+       its values ("Pos 3-4 (CDS)") are wider than 4-bp overhangs. */
+    #partedit-row2 #partedit-oh5-col      { width: 1fr; padding-right: 1; }
+    #partedit-row2 #partedit-oh3-col      { width: 1fr; padding-right: 1; }
+    #partedit-row2 #partedit-position-col { width: 2fr; }
+    /* Rows 3 / 4: pairs of equal-width columns. */
+    #partedit-row3 Vertical,
+    #partedit-row4 Vertical { width: 1fr; padding-right: 1; }
+    #partedit-seq { height: 6; border: solid $primary-darken-1; margin-top: 1; }
+    #partedit-status { height: 1; padding: 0 1; }
+    #partedit-btns { height: 3; margin-top: 1; }
+    #partedit-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, idx: int, part: dict) -> None:
+        super().__init__()
+        self._idx = idx
+        # Defensive copy so partial edits don't leak back if the user
+        # cancels — the committed dict is rebuilt from the form widgets
+        # at Save time, so this snapshot only matters for the read-only
+        # initial render.
+        self._part = dict(part)
+        self._editing = False
+        # Grammar id is the source of truth — `_grammar` and
+        # `_position_index` are derived caches refreshed by
+        # `_apply_grammar` whenever the user picks a different
+        # grammar from the dropdown. Storing the id (not the dict)
+        # keeps a stale grammar from leaking after a re-pick.
+        self._grammar_id: str = self._part.get("grammar", "gb_l0") or "gb_l0"
+        self._grammar: dict = {}
+        self._position_index: dict[str, dict] = {}
+        self._apply_grammar(self._grammar_id, refresh_widgets=False)
+
+    def _apply_grammar(self, gid: str, *, refresh_widgets: bool) -> None:
+        """Snap `_grammar` + `_position_index` to the grammar with id
+        ``gid``. Falls back to ``gb_l0`` for an unknown id (e.g., a
+        custom grammar that was deleted while the modal was open).
+
+        ``refresh_widgets=True`` rebuilds the Type select and refreshes
+        the position / overhang inputs from the new grammar's matching
+        position. Pass False from `__init__` (widgets don't exist
+        yet) and True from the grammar-change handler.
+        """
+        all_g = _all_grammars()
+        new_grammar = all_g.get(gid) or _BUILTIN_GRAMMARS["gb_l0"]
+        self._grammar_id = gid if gid in all_g else "gb_l0"
+        self._grammar = new_grammar
+        self._position_index = {}
+        for pos in new_grammar.get("positions", []):
+            ptype = pos.get("type")
+            if (isinstance(ptype, str) and ptype
+                    and ptype not in self._position_index):
+                self._position_index[ptype] = pos
+        if not refresh_widgets:
+            return
+
+        # Preserve the user's current type if it survives the grammar
+        # change; otherwise default to the first option.
+        try:
+            type_sel = self.query_one("#partedit-type", Select)
+            cur_val = type_sel.value
+        except NoMatches:
+            return
+        cur_type = (cur_val if isinstance(cur_val, str)
+                    and cur_val != Select.BLANK else "")
+        opts, _ = self._type_options(cur_type)
+        new_type = (cur_type if cur_type and cur_type in self._position_index
+                    else (opts[0][1] if opts else ""))
+        type_sel.set_options(opts)
+        if new_type:
+            type_sel.value = new_type
+        # Refresh position / overhang inputs from the new grammar's
+        # matching position so the form is internally consistent
+        # immediately after the grammar pick.
+        pos = self._position_index.get(new_type)
+        if pos is not None:
+            for sel, key, upper in (
+                ("#partedit-position", "name", False),
+                ("#partedit-oh5",       "oh5",  True),
+                ("#partedit-oh3",       "oh3",  True),
+            ):
+                try:
+                    val = str(pos.get(key, "") or "")
+                    self.query_one(sel, Input).value = (
+                        val.upper() if upper else val
+                    )
+                except NoMatches:
+                    pass
+
+    def _type_options(self, current_type: "str | None" = None) -> tuple[list[tuple[str, str]], str]:
+        """Build ``(label, ptype)`` options for the Type select keyed
+        off the active grammar's positions. ``current_type`` (if
+        non-empty + not in the grammar) is added with a ``(legacy)``
+        suffix so a Save round-trips it without silently rewriting
+        the field. A grammar with no positions yields a placeholder
+        so the Select widget composes (Select with ``allow_blank=False``
+        and an empty list raises at mount)."""
+        opts: list[tuple[str, str]] = []
+        for ptype, pos in self._position_index.items():
+            label = (
+                f"{ptype}  ({pos.get('name','?')}: "
+                f"{pos.get('oh5','')}→{pos.get('oh3','')})"
+            )
+            opts.append((label, ptype))
+        current = current_type if current_type is not None else (
+            self._part.get("type", "") or ""
+        )
+        if current and current not in self._position_index:
+            opts.insert(0, (f"{current} (legacy)", current))
+        if not opts:
+            # Pathological grammar (no positions, no part type). Surface
+            # an inert placeholder rather than crashing the Select.
+            opts = [("(no types defined)", "")]
+        default = (current
+                   if current and any(v == current for _, v in opts)
+                   else opts[0][1])
+        return opts, default
+
+    def _validate_iupac_chars(self, label: str, value: str,
+                               status_widget) -> bool:
+        """Render a red status + return False if ``value`` contains
+        any non-IUPAC bases. Empty string passes. Used by every DNA
+        field on save (sequence, overhangs, primers) so the error
+        format stays consistent and the validation block doesn't
+        repeat 4 times in `_on_save`."""
+        if not value:
+            return True
+        bad = [c for c in value if c not in self._VALID_IUPAC]
+        if not bad:
+            return True
+        if status_widget is not None:
+            status_widget.update(
+                f"[red]{label} has invalid bases: "
+                f"{''.join(sorted(set(bad)))[:10]}[/red]"
+            )
+        return False
+
+    def _primer_label(self, base: str, tm: object) -> str:
+        """Format a primer field label including its current Tm so
+        the user knows what Tm they're editing against. ``tm`` is
+        coerced to float when possible; non-numeric / zero values
+        render as a plain label without a Tm suffix."""
+        try:
+            tm_f = float(tm)  # handles int, str-of-float, np.float64
+        except (TypeError, ValueError):
+            tm_f = 0.0
+        if tm_f > 0:
+            return f"{base} (Tm {tm_f:.1f}°C):"
+        return f"{base}:"
+
+    def compose(self) -> ComposeResult:
+        type_options, default_type = self._type_options()
+        # Grammar dropdown — the canonical option list shared with the
+        # Domesticator + future grammar pickers. The part's stored
+        # grammar is selected by default; if it's not in the registry
+        # (e.g., a custom grammar deleted since the part was saved)
+        # we splice it in with a "(missing)" suffix so a Save still
+        # round-trips the value rather than silently rewriting it.
+        grammar_options = list(_grammar_dropdown_options())
+        if not any(gid == self._grammar_id for _, gid in grammar_options):
+            grammar_options.insert(
+                0, (f"{self._grammar_id} (missing)", self._grammar_id),
+            )
+        p = self._part
+        # Title interpolates the part name verbatim. Static defaults to
+        # markup=True, which would interpret a name like "[red]X" as
+        # Rich markup. markup=False renders the name literally.
+        with Vertical(id="partedit-dlg"):
+            yield Static(f" Part: {p.get('name', '?')} ",
+                         id="partedit-title", markup=False)
+            with ScrollableContainer(id="partedit-body"):
+                # Row 1 — identity: Name | Grammar | Type
+                with Horizontal(id="partedit-row1"):
+                    with Vertical(id="partedit-name-col"):
+                        yield Label("Name:")
+                        yield Input(value=p.get("name", ""),
+                                     id="partedit-name", disabled=True)
+                    with Vertical(id="partedit-grammar-col"):
+                        yield Label("Cloning grammar:")
+                        yield Select(grammar_options,
+                                      value=self._grammar_id,
+                                      id="partedit-grammar",
+                                      allow_blank=False, disabled=True)
+                    with Vertical(id="partedit-type-col"):
+                        yield Label("Type:")
+                        yield Select(type_options, value=default_type,
+                                     id="partedit-type",
+                                     allow_blank=False, disabled=True)
+                # Row 2 — cloning context: 5'OH | 3'OH | Position
+                with Horizontal(id="partedit-row2"):
+                    with Vertical(id="partedit-oh5-col"):
+                        yield Label("5' overhang:")
+                        yield Input(value=p.get("oh5", ""),
+                                     id="partedit-oh5", disabled=True)
+                    with Vertical(id="partedit-oh3-col"):
+                        yield Label("3' overhang:")
+                        yield Input(value=p.get("oh3", ""),
+                                     id="partedit-oh3", disabled=True)
+                    with Vertical(id="partedit-position-col"):
+                        yield Label("Position:")
+                        yield Input(value=p.get("position", ""),
+                                     id="partedit-position", disabled=True)
+                # Row 3 — vector: Backbone | Selection marker
+                with Horizontal(id="partedit-row3"):
+                    with Vertical():
+                        yield Label("Backbone:")
+                        yield Input(value=p.get("backbone", ""),
+                                     id="partedit-backbone", disabled=True)
+                    with Vertical():
+                        yield Label("Selection marker:")
+                        yield Input(value=p.get("marker", ""),
+                                     id="partedit-marker", disabled=True)
+                # Row 4 — primers (Tms shown in labels)
+                with Horizontal(id="partedit-row4"):
+                    with Vertical():
+                        yield Label(self._primer_label("Forward primer",
+                                                         p.get("fwd_tm")))
+                        yield Input(value=p.get("fwd_primer", ""),
+                                     id="partedit-fwd", disabled=True)
+                    with Vertical():
+                        yield Label(self._primer_label("Reverse primer",
+                                                         p.get("rev_tm")))
+                        yield Input(value=p.get("rev_primer", ""),
+                                     id="partedit-rev", disabled=True)
+                seq = p.get("sequence", "")
+                seq_ta = TextArea(seq, id="partedit-seq",
+                                   read_only=True, soft_wrap=True)
+                seq_ta.border_title = (
+                    f"Insert sequence  (5'→3', {len(seq):,} bp)"
+                )
+                yield seq_ta
+            yield Static("", id="partedit-status", markup=True)
+            with Horizontal(id="partedit-btns"):
+                yield Button("Edit",   id="btn-partedit-edit",
+                             variant="primary")
+                yield Button("Save",   id="btn-partedit-save",
+                             variant="success", disabled=True)
+                yield Button("Cancel", id="btn-partedit-cancel")
+
+    def _set_editing(self, on: bool) -> None:
+        """Toggle every form field between read-only and editable.
+        TextArea uses `read_only`; everything else uses `disabled` —
+        Inputs in the disabled state still show their value clearly,
+        which is the right read-mode look."""
+        self._editing = on
+        for sel in (
+            "#partedit-name", "#partedit-grammar", "#partedit-type",
+            "#partedit-oh5", "#partedit-oh3",
+            "#partedit-position",
+            "#partedit-backbone", "#partedit-marker",
+            "#partedit-fwd", "#partedit-rev",
+        ):
+            try:
+                self.query_one(sel).disabled = not on
+            except NoMatches:
+                pass
+        try:
+            self.query_one("#partedit-seq", TextArea).read_only = not on
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-partedit-edit", Button).display = not on
+            self.query_one("#btn-partedit-save", Button).disabled = not on
+        except NoMatches:
+            pass
+        if on:
+            try:
+                self.query_one("#partedit-name", Input).focus()
+            except NoMatches:
+                pass
+
+    @on(Button.Pressed, "#btn-partedit-edit")
+    def _on_edit(self) -> None:
+        self._set_editing(True)
+        try:
+            self.query_one("#partedit-status", Static).update(
+                "[dim]Edit mode — make changes and press Save.[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Select.Changed, "#partedit-grammar")
+    def _on_grammar_changed(self, event: Select.Changed) -> None:
+        """Grammar change → swap the active grammar, rebuild the Type
+        select, and refresh position / overhangs from the new
+        grammar's matching position. No-op in read-only mode and on
+        the initial Select.Changed that fires during compose."""
+        if not self._editing:
+            return
+        new_gid = (event.value
+                    if isinstance(event.value, str) else "")
+        if not new_gid or new_gid == self._grammar_id:
+            return
+        self._apply_grammar(new_gid, refresh_widgets=True)
+        try:
+            self.query_one("#partedit-status", Static).update(
+                "[dim]Grammar updated — overhangs refreshed for the "
+                "new grammar.[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Select.Changed, "#partedit-type")
+    def _on_type_changed(self, event: Select.Changed) -> None:
+        """Type change → prefill position + overhangs from the
+        grammar's matching position so re-tagging a part doesn't
+        require manual oh re-entry. No-op while in read-only mode
+        (Select.Changed fires on initial render too)."""
+        if not self._editing:
+            return
+        ptype = event.value if isinstance(event.value, str) else ""
+        pos = self._position_index.get(ptype) if ptype else None
+        if not pos:
+            return
+        try:
+            pos_inp = self.query_one("#partedit-position", Input)
+            oh5_inp = self.query_one("#partedit-oh5",      Input)
+            oh3_inp = self.query_one("#partedit-oh3",      Input)
+        except NoMatches:
+            return
+        pos_inp.value = pos.get("name", pos_inp.value)
+        oh5_inp.value = (pos.get("oh5", "") or "").upper()
+        oh3_inp.value = (pos.get("oh3", "") or "").upper()
+
+    @on(Button.Pressed, "#btn-partedit-cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        # Required so the `escape` binding actually closes the modal —
+        # `Binding("escape", "cancel", …)` dispatches to `action_cancel`,
+        # which `ModalScreen` doesn't supply by default. Without this,
+        # Escape would be silently swallowed.
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-partedit-save")
+    def _on_save(self) -> None:
+        if not self._editing:
+            return
+        try:
+            name     = self.query_one("#partedit-name",     Input).value
+            ptype    = self.query_one("#partedit-type",     Select).value
+            oh5      = self.query_one("#partedit-oh5",      Input).value
+            oh3      = self.query_one("#partedit-oh3",      Input).value
+            position = self.query_one("#partedit-position", Input).value
+            backbone = self.query_one("#partedit-backbone", Input).value
+            marker   = self.query_one("#partedit-marker",   Input).value
+            fwd      = self.query_one("#partedit-fwd",      Input).value
+            rev      = self.query_one("#partedit-rev",      Input).value
+            seq_text = self.query_one("#partedit-seq",      TextArea).text
+        except NoMatches:
+            return
+        try:
+            status = self.query_one("#partedit-status", Static)
+        except NoMatches:
+            status = None
+
+        # ── Sanitise form values ────────────────────────────────────
+        clean_name = _sanitize_label(name, max_len=200)
+        if not clean_name:
+            if status:
+                status.update("[red]Name cannot be empty.[/red]")
+            return
+        clean_ptype = _sanitize_label(str(ptype) if ptype else "", max_len=64)
+        if not clean_ptype:
+            if status:
+                status.update("[red]Type cannot be empty.[/red]")
+            return
+        clean_seq = "".join(str(seq_text or "").split()).upper()
+        clean_oh5 = "".join(str(oh5 or "").split()).upper()
+        clean_oh3 = "".join(str(oh3 or "").split()).upper()
+        clean_fwd = "".join(str(fwd or "").split()).upper()
+        clean_rev = "".join(str(rev or "").split()).upper()
+
+        # ── DNA validation (one helper, four call sites) ───────────
+        for label_, val in (
+            ("Sequence",       clean_seq),
+            ("5' OH",          clean_oh5),
+            ("3' OH",          clean_oh3),
+            ("Forward primer", clean_fwd),
+            ("Reverse primer", clean_rev),
+        ):
+            if not self._validate_iupac_chars(label_, val, status):
+                return
+
+        # ── Build updated entry ─────────────────────────────────────
+        # Preserve any unrelated fields the user didn't see (schema-
+        # version stamps, legacy qualifiers) so partial schemas survive.
+        out = dict(self._part)
+        out["name"]       = clean_name
+        out["type"]       = clean_ptype
+        out["position"]   = _sanitize_label(position, max_len=64)
+        out["oh5"]        = clean_oh5
+        out["oh3"]        = clean_oh3
+        out["backbone"]   = _sanitize_label(backbone, max_len=120)
+        out["marker"]     = _sanitize_label(marker,   max_len=120)
+        out["sequence"]   = clean_seq
+        out["fwd_primer"] = clean_fwd
+        out["rev_primer"] = clean_rev
+        out["grammar"]    = self._grammar_id
+        # Re-derive Tms whenever the primer text changed (including
+        # the empty → empty no-op via the equality short-circuit, so
+        # we don't burn a primer3 call on a value the user didn't
+        # touch). Round to 0.1 °C for stable JSON round-trips.
+        if clean_fwd != self._part.get("fwd_primer", ""):
+            tm = _primer_tm_safe(clean_fwd)
+            out["fwd_tm"] = round(float(tm), 1) if tm is not None else 0.0
+        if clean_rev != self._part.get("rev_primer", ""):
+            tm = _primer_tm_safe(clean_rev)
+            out["rev_tm"] = round(float(tm), 1) if tm is not None else 0.0
+        # Re-derive simulator outputs when sequence, overhangs, OR
+        # grammar changed (different grammar → different enzyme tail
+        # in `primed_seq`). Empty sequence drops the derived fields so
+        # a user who hand-clears the seq doesn't ship a stale primed
+        # amplicon to Copy Primed.
+        seq_or_oh_changed = (
+            clean_seq != self._part.get("sequence", "")
+            or clean_oh5 != self._part.get("oh5", "")
+            or clean_oh3 != self._part.get("oh3", "")
+            or self._grammar_id != (self._part.get("grammar") or "gb_l0")
+        )
+        if seq_or_oh_changed:
+            if clean_seq:
+                out["primed_seq"] = _simulate_primed_amplicon(
+                    clean_seq, clean_oh5, clean_oh3, grammar=self._grammar,
+                )
+                out["cloned_seq"] = _simulate_cloned_plasmid(
+                    clean_seq, clean_oh5, clean_oh3,
+                )
+            else:
+                out.pop("primed_seq", None)
+                out.pop("cloned_seq", None)
+
+        # No-op detection: if every comparable field round-trips
+        # unchanged, dismiss without writing the file. Avoids burning
+        # a JSON write + UI repopulate when the user clicked Edit
+        # → Save with no actual modifications. Derived fields (Tm /
+        # primed_seq / cloned_seq) follow from the exposed set, so
+        # only comparing exposed fields is sufficient.
+        exposed = ("name", "type", "position", "oh5", "oh3",
+                   "backbone", "marker", "sequence",
+                   "fwd_primer", "rev_primer", "grammar")
+        original_grammar = self._part.get("grammar") or "gb_l0"
+        baseline = {**self._part, "grammar": original_grammar}
+        if all(out.get(k, "") == baseline.get(k, "") for k in exposed):
+            self.dismiss(None)
+            return
+        self.dismiss({"idx": self._idx, "entry": out})
+
+
 class PartsBinModal(Screen):
     """Modular cloning parts library — full-screen view.
 
@@ -24826,6 +25599,14 @@ class PartsBinModal(Screen):
         # bypass the confirm modal).
         Binding("delete", "delete_selected_parts", "Delete part(s)",
                 show=False, priority=True),
+        # Ctrl+A selects every row in the active tab so a Delete /
+        # Del keypress can wipe the whole filtered slice (e.g. clean
+        # out every TU before re-running an assembly batch). Best-
+        # effort: many terminals intercept Ctrl+A for tmux / line-
+        # editing, so we register at priority and silently no-op
+        # when the keystroke never reaches Textual.
+        Binding("ctrl+a", "select_all_parts", "Select all",
+                show=False, priority=True),
     ]
 
     # IDs of every action button in the parts-row except the
@@ -24835,9 +25616,9 @@ class PartsBinModal(Screen):
     # widget walk) so adding a new button is a single-line change in
     # both `compose` and here.
     _OTHER_BTN_IDS: tuple[str, ...] = (
-        "#btn-parts-copy-raw",
         "#btn-parts-copy-primed",
         "#btn-parts-copy-cloned",
+        "#btn-parts-edit",
         "#btn-new-part",
         "#btn-load-part",
         "#btn-parts-save-as-feature",
@@ -24894,17 +25675,28 @@ class PartsBinModal(Screen):
         self._drag_changed: bool = False
         self._drag_initial: "set[int]" = set()
         self._click_with_modifier: bool = False
+        # Active level tab — drives `_all_rows` filtering. Default L0
+        # so the bin opens to the same view it always has. The Tabs
+        # widget mirrors this in its UI state. ``2`` is "MOD" (any
+        # plasmid with `level >= 2`).
+        self._active_level: int = 0
 
     def compose(self) -> ComposeResult:
         """Single-pane loadout: parts table dominates, detail + sequence
         peek out at the bottom, all buttons live on a single bottom row.
-        Grammar selection happens inside the New Part modal — every part
-        in the table carries its own ``grammar`` id, surfaced as a
-        column rather than a top-of-modal filter.
+        A `Tabs` strip at the top filters by part level (L0 / TU / MOD)
+        so domesticated parts, single transcription units, and modules
+        live in their own slices of the bin without mixing.
         """
         yield Header()
         with Vertical(id="parts-box"):
             yield Static(" Parts Bin ", id="parts-title")
+            yield Tabs(
+                Tab("L0 parts",   id="tab-parts-l0"),
+                Tab("TUs",        id="tab-parts-tu"),
+                Tab("Modules",    id="tab-parts-mod"),
+                id="parts-level-tabs",
+            )
             yield DataTable(id="parts-table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="parts-detail")
             # Read-only TextArea so the full sequence is visible with a
@@ -24917,9 +25709,9 @@ class PartsBinModal(Screen):
                 read_only=True, soft_wrap=True, show_line_numbers=False,
             )
             with Horizontal(id="parts-btns"):
-                yield Button("Copy Raw",        id="btn-parts-copy-raw")
                 yield Button("Copy Primed",     id="btn-parts-copy-primed")
                 yield Button("Copy Cloned",     id="btn-parts-copy-cloned")
+                yield Button("Edit",            id="btn-parts-edit")
                 yield Button("New Part",        id="btn-new-part",    variant="primary")
                 yield Button("Load Part",       id="btn-load-part",   variant="primary")
                 yield Button("Save As Feature", id="btn-parts-save-as-feature")
@@ -24941,28 +25733,23 @@ class PartsBinModal(Screen):
     # ── Row data ─────────────────────────────────────────────────────────────
 
     def _all_rows(self) -> list[dict]:
-        """User parts from the parts-bin file. Legacy user parts (no
-        ``grammar`` field, from pre-grammar versions of SpliceCraft)
-        default to ``gb_l0`` so the Grammar column always renders.
+        """User parts from the parts-bin file, filtered to the active
+        level tab. Legacy user parts (no ``grammar`` field) default to
+        ``gb_l0``; legacy parts without a ``level`` field default to
+        L0 (the only level that existed pre-2026-05-10) so they show
+        up under the L0 tab without a migration step.
 
-        2026-05-07: built-in catalog rows (the per-grammar
-        Position / Type / Overhang bookkeeping that previously
-        appended after the user parts) were removed. They had no
-        sequence, no primers, and no actionable buttons — every Copy
-        / Save / Export / Delete path bailed with a "built-in
-        catalog parts have no sequence" notify. Net effect was
-        clutter without function. Users still pick a position +
-        overhangs via the New Part modal's grammar-aware form.
-
-        The ``"user": True`` flag is preserved on every row so the
-        downstream filters (`_lib_status_cell`, `_save_to_collection`,
-        `_delete_selected`, `_toggle_row_in_selection`,
-        `on_mouse_move`) keep working without rewrites — the flag
-        is now vacuously True but cheaper than auditing every guard
-        for a one-shot cleanup.
+        Level filter:
+          * tab L0  → ``_part_level(p) == 0``
+          * tab TU  → ``_part_level(p) == 1``
+          * tab MOD → ``_part_level(p) >= 2``
         """
         rows: list[dict] = []
+        active = self._active_level
         for p in _load_parts_bin():
+            lvl = _part_level(p)
+            if not _level_matches_tab(lvl, active):
+                continue
             rows.append({
                 "name":     p.get("name", "?"),
                 "type":     p.get("type", "?"),
@@ -24978,6 +25765,14 @@ class PartsBinModal(Screen):
                 "rev_tm":   p.get("rev_tm", 0.0),
                 "user":     True,
                 "grammar":  p.get("grammar", "gb_l0"),
+                "level":    lvl,
+                # Carry gb_text + source-parts on the row so the L1+
+                # constructor mode (and future actions like "open in
+                # main viewer") can pull them off without re-loading
+                # parts_bin.json.
+                "gb_text":      p.get("gb_text", ""),
+                "source_parts": list(p.get("source_parts") or []),
+                "source_role":  p.get("source_role", ""),
             })
         return rows
 
@@ -25001,6 +25796,22 @@ class PartsBinModal(Screen):
             "Name", "Type", "Pos", "5'OH", "3'OH", "Sequence",
             "Feat Lib", "Grammar",
         )
+        self._populate()
+
+    @on(Tabs.TabActivated, "#parts-level-tabs")
+    def _on_level_tab_changed(self, event: Tabs.TabActivated) -> None:
+        """Switch the active part-level filter when the user clicks
+        a tab. ``_populate`` re-renders the table for the new level."""
+        tab_id = event.tab.id or ""
+        new_level = (
+            0 if tab_id == "tab-parts-l0" else
+            1 if tab_id == "tab-parts-tu" else
+            2 if tab_id == "tab-parts-mod" else
+            self._active_level
+        )
+        if new_level == self._active_level:
+            return
+        self._active_level = new_level
         self._populate()
 
     def _populate(self) -> None:
@@ -25316,9 +26127,12 @@ class PartsBinModal(Screen):
         of the snapshot taken at drag-start and the contiguous range
         from drag-start to the current row — so a drag adds to the
         existing modifier-toggle picks rather than replacing them.
-        Built-in catalog rows can no longer appear in `_rows`
-        (2026-05-07 cleanup) but the empty-sequence guard remains as
-        defence against hand-edited parts_bin.json entries."""
+
+        Selection rule: any user part is eligible. Pre-2026-05-10
+        we also required `sequence` to be non-empty, but TU/MOD
+        plasmids legitimately store their bases in `gb_text` rather
+        than `sequence`, so the empty-seq filter would have hidden
+        them from drag-select once the L1+ tabs landed."""
         if not self._drag_active:
             return
         row = self._row_under_mouse()
@@ -25331,7 +26145,7 @@ class PartsBinModal(Screen):
         for r_idx in range(start, end + 1):
             if 0 <= r_idx < len(rows):
                 rd = rows[r_idx]
-                if rd.get("user") and rd.get("sequence"):
+                if rd.get("user"):
                     new_sel.add(r_idx)
         if new_sel != self._selected_rows:
             self._selected_rows = new_sel
@@ -25372,19 +26186,15 @@ class PartsBinModal(Screen):
             self._clear_multi_select()
 
     def _toggle_row_in_selection(self, row: int) -> None:
-        """Add / remove `row` from `_selected_rows`. Built-in catalog
-        rows refuse the toggle with a warning (they have no sequence
-        to save / no parts-bin entry to delete)."""
+        """Add / remove `row` from `_selected_rows`. Any user part is
+        eligible; pre-2026-05-10 we also required `sequence`, but
+        TU/MOD plasmids store their bases in `gb_text` instead, so
+        the empty-seq filter hid every L1+ row from multi-select."""
         rows = getattr(self, "_rows", []) or []
         if not (0 <= row < len(rows)):
             return
         r = rows[row]
-        if not r.get("user") or not r.get("sequence"):
-            self.app.notify(
-                "Built-in catalog parts have no sequence — "
-                "multi-select skipped.",
-                severity="warning",
-            )
+        if not r.get("user"):
             return
         if row in self._selected_rows:
             self._selected_rows.remove(row)
@@ -25492,15 +26302,6 @@ class PartsBinModal(Screen):
                 severity="warning", markup=False,
             )
 
-    @on(Button.Pressed, "#btn-parts-copy-raw")
-    def _copy_raw(self, _) -> None:
-        """Copy just the insert (raw part sequence, no primer tails)."""
-        r = self._selected_user_row()
-        if r is None:
-            return
-        seq = r["sequence"]
-        self._copy_and_notify(seq, "raw sequence", f"{len(seq)} bp")
-
     @on(Button.Pressed, "#btn-parts-copy-primed")
     def _copy_primed(self, _) -> None:
         """Copy the full PCR amplicon (insert + primer tails = pad + Esp3I
@@ -25541,6 +26342,88 @@ class PartsBinModal(Screen):
             seq, "cloned plasmid", f"{len(seq)} bp circular (linearised at 5′ OH)",
         )
 
+    @on(Button.Pressed, "#btn-parts-edit")
+    def _edit_part(self, _) -> None:
+        """Open `PartEditModal` on the cursor row. The modal returns
+        ``{"idx": <display row>, "entry": <new dict>}`` on save (or
+        ``None`` on cancel / no-op save). We rewrite the matching
+        parts-bin entry by ``(name, sequence)`` identity (same match
+        as `_delete_selected`) so a `_populate` between push and
+        dismiss can't overwrite the wrong row.
+
+        Built-in catalog rows (no sequence) are filtered out by
+        `_selected_user_row` — same guard as the Copy buttons.
+        """
+        original = self._selected_user_row()
+        if original is None:
+            return
+        # `_selected_user_row` already validated the cursor row + that
+        # the row carries a sequence; re-read the cursor here purely
+        # for the modal's idx payload (purely informational).
+        try:
+            idx = self.query_one("#parts-table", DataTable).cursor_row
+        except NoMatches:
+            idx = -1
+        idx = idx if isinstance(idx, int) else -1
+        # Snapshot the identity at click time so the callback finds
+        # the entry even if `_populate` runs in between.
+        identity = (original.get("name", ""), original.get("sequence", ""))
+
+        def _on_result(payload):
+            if not isinstance(payload, dict):
+                # None → cancel or no-op save; nothing to commit.
+                return
+            new_entry = payload.get("entry")
+            if not isinstance(new_entry, dict):
+                return
+            entries = _load_parts_bin()
+            replaced = False
+            updated: list[dict] = []
+            for e in entries:
+                if (not replaced
+                        and (e.get("name", ""), e.get("sequence", ""))
+                            == identity):
+                    updated.append(new_entry)
+                    replaced = True
+                else:
+                    updated.append(e)
+            if not replaced:
+                # File changed between push + dismiss (concurrent edit,
+                # hand-edited parts_bin.json). Refuse to commit rather
+                # than silently appending a duplicate — the user can
+                # reopen the edit on the now-current row.
+                _log.warning(
+                    "parts-bin: edit identity %r not found in file; "
+                    "refusing to overwrite", identity,
+                )
+                self.app.notify(
+                    "Couldn't save edit: the part was modified or "
+                    "removed by another writer. Re-open Edit on the "
+                    "refreshed row.",
+                    severity="warning", markup=False,
+                )
+                self._populate()
+                return
+            try:
+                _save_parts_bin(updated)
+            except Exception as exc:
+                _log.exception("parts-bin: edit save failed")
+                self.app.notify(
+                    f"Edit save failed: {exc}",
+                    severity="error", markup=False,
+                )
+                return
+            self._populate()
+            self.app.notify(
+                f"Updated '{new_entry.get('name', '?')}'",
+                severity="success", markup=False,
+            )
+
+        self.app.push_screen(
+            PartEditModal(idx, original),
+            callback=_on_result,
+        )
+
     @on(Button.Pressed, "#btn-new-part")
     def _new_part(self, _) -> None:
         # Opens the domesticator modal. The current record's sequence + name
@@ -25562,8 +26445,10 @@ class PartsBinModal(Screen):
             # Tag the part with the active grammar so the parts bin
             # filter can route it to the right tab next time. Legacy
             # parts (saved before grammars existed) default to gb_l0
-            # in `_all_rows`.
+            # in `_all_rows`. Level defaults to 0 (L0 part) since the
+            # Domesticator only ever produces single-part L0 entries.
             part_dict.setdefault("grammar", self._active_grammar_id())
+            part_dict.setdefault("level", 0)
             entries = _load_parts_bin()
             entries.insert(0, part_dict)
             _save_parts_bin(entries)
@@ -25703,6 +26588,7 @@ class PartsBinModal(Screen):
             "fwd_tm":     0.0,
             "rev_tm":     0.0,
             "grammar":    grammar_id,
+            "level":      0,
         }
         try:
             entries = _load_parts_bin()
@@ -26025,6 +26911,35 @@ class PartsBinModal(Screen):
         click share semantics (incl. confirm modal + multi-select
         awareness)."""
         self._delete_selected(None)
+
+    def action_select_all_parts(self) -> None:
+        """Ctrl+A handler: add every user row in the active tab to
+        the multi-select. Subsequent Delete / Del fires the same
+        confirm-modal flow as a manual multi-select would.
+
+        No-op when the table is empty (no rows to select) — quiet
+        rather than a notify because Ctrl+A is a fast power-user
+        gesture and a toast on every empty press would be noise."""
+        rows = getattr(self, "_rows", []) or []
+        new_sel: set[int] = set()
+        for idx, r in enumerate(rows):
+            if r.get("user"):
+                new_sel.add(idx)
+        if not new_sel:
+            return
+        if new_sel == self._selected_rows:
+            # Already at full-select; second Ctrl+A toggles back to
+            # an empty selection, mirroring the typical text-editor
+            # gesture (Ctrl+A then Ctrl+A again deselects).
+            self._clear_multi_select()
+            return
+        self._selected_rows = new_sel
+        self._refresh_multi_select_visuals()
+        self.app.notify(
+            f"Selected {len(new_sel)} part{'s' if len(new_sel) != 1 else ''} "
+            f"— Delete to remove, Esc to cancel.",
+            severity="information", markup=False, timeout=4,
+        )
 
     @on(Button.Pressed, "#btn-parts-delete")
     def _delete_selected(self, _) -> None:
@@ -28130,7 +29045,11 @@ class TraditionalCloningPane(Vertical):
                           id="trad-vector-hdr")
             yield DataTable(id="trad-vector-table",
                               cursor_type="row", zebra_stripes=True)
-        # Enzyme picker
+        # Enzyme picker + action buttons share a row so the results
+        # panel below has room to actually show its multi-line output.
+        # Pre-2026-05-10 the enzyme row + action row each occupied 4
+        # rows (h=3 + 1 margin), eating 8 rows that the results panel
+        # needed.
         with Horizontal(id="trad-enzyme-row"):
             yield Static("Enzymes:", id="trad-enzyme-label")
             opts = [(name, name) for name in sorted(_NEB_ENZYMES.keys())]
@@ -28139,22 +29058,25 @@ class TraditionalCloningPane(Vertical):
             yield Select([("(single digest)", "")] + opts,
                           id="trad-enzyme-2", prompt="E2 (optional)",
                           allow_blank=True)
-        # Action row
-        with Horizontal(id="trad-action-row"):
             yield Button("Simulate", id="btn-trad-simulate",
                           variant="primary")
             yield Button("Clear",    id="btn-trad-clear")
-        # Results pane + Save buttons (disabled until a simulate runs).
+        # Results panel — the multi-line simulation output.
         with Vertical(id="trad-results"):
             yield Static(
                 "[dim]Results appear here after Simulate.[/]",
                 id="trad-results-text", markup=True,
             )
-            with Horizontal(id="trad-save-row"):
-                yield Button("Save Forward", id="btn-trad-save-fwd",
-                              variant="primary", disabled=True)
-                yield Button("Save Reverse", id="btn-trad-save-rev",
-                              variant="primary", disabled=True)
+        # Save buttons sit BELOW the results panel as a sibling, not
+        # nested inside it. Pre-2026-05-10 they were children of
+        # `#trad-results`, which capped the results' usable rows to
+        # ``1fr - save-row(3) - margin-top(1)`` — frequently 0 rows
+        # of visible output text.
+        with Horizontal(id="trad-save-row"):
+            yield Button("Save Forward", id="btn-trad-save-fwd",
+                          variant="primary", disabled=True)
+            yield Button("Save Reverse", id="btn-trad-save-rev",
+                          variant="primary", disabled=True)
 
     # ── Mount ─────────────────────────────────────────────────────────────────
 
@@ -28867,7 +29789,7 @@ class TraditionalCloningPane(Vertical):
 
 
 def _palette_rows_for_grammar(
-    grammar_id: str, *, filter_enabled: bool,
+    grammar_id: str, *, filter_enabled: bool, source_level: int = 0,
 ) -> list[tuple]:
     """Build the modular Constructor's parts-palette rows for the
     given grammar. Each row is a tuple matching the legacy
@@ -28876,18 +29798,16 @@ def _palette_rows_for_grammar(
 
         (name, type, position, oh5, oh3, backbone, marker)
 
-    Source: **user parts only** from ``parts_bin.json`` — what the
+    Source: **user parts only** from ``parts_bin.json`` filtered by
+    ``source_level`` (0 = L0 parts, 1 = TUs, ≥2 = modules) — what the
     user has actually saved. The built-in catalog (placeholder
     promoters / CDSs / terminators with no real sequence) is
-    deliberately NOT mixed in: those rows can't actually assemble,
-    so showing them as palette options is misleading. An empty
-    parts bin → an empty palette is the honest state.
+    deliberately NOT mixed in: those rows can't actually assemble.
 
     Filter: when ``filter_enabled`` is True, only parts whose
     ``grammar`` field equals ``grammar_id`` are returned. When
-    False, every user part appears regardless of grammar — useful
-    for users with mixed libraries or custom grammars that share
-    overhangs.
+    False, every user part of the requested level appears regardless
+    of grammar — useful for users with mixed libraries.
 
     Sorted by position then name for a stable scan order.
     """
@@ -28900,6 +29820,10 @@ def _palette_rows_for_grammar(
             p for p in user_parts
             if (p.get("grammar") or "gb_l0") == grammar_id
         ]
+    user_parts = [
+        p for p in user_parts
+        if _level_matches_tab(_part_level(p), source_level)
+    ]
     user_parts.sort(key=lambda p: (
         _natural_sort_key(str(p.get("position") or "")),
         _natural_sort_key(str(p.get("name") or "")),
@@ -29036,6 +29960,15 @@ class ConstructorModal(ModalScreen):
         # lookup in `_add_selected_part` doesn't re-load parts_bin
         # on every keystroke. Re-built on filter toggle + on mount.
         self._palette_rows: dict[str, list[tuple]] = {}
+        # Per-grammar source level — drives the palette filter and
+        # cycle direction. 0 = "L0 parts → TU" (the default L0→L1
+        # workflow); 1 = "TU plasmids → MOD"; 2 = "MOD plasmids →
+        # next module" (further iteration). The constructor uses
+        # this to pick which enzyme to digest with: even levels use
+        # `grammar.enzyme`, odd levels use `grammar.level_up_enzyme`.
+        self._source_levels: dict[str, int] = {
+            gid: 0 for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS
+        }
 
     @staticmethod
     def _filter_enabled() -> bool:
@@ -29074,32 +30007,56 @@ class ConstructorModal(ModalScreen):
         unbound button opens the plasmid picker; clicking a bound
         button activates that backbone for the assembly.
         """
-        # Filter checkbox — toggles the per-grammar palette filter.
-        # Default value pulls from the persisted setting so a fresh
-        # mount starts with the user's last choice.
-        with Horizontal(id=f"ctor-filter-row-{gid}"):
+        # Source-level picker + filter checkbox. The radios drive the
+        # GB cycle direction: L0 → TU is the standard L0 cloning
+        # workflow; TU → MOD and MOD → next iterate the cycle by
+        # ligating two pre-assembled L1+ plasmids into a higher-level
+        # destination, alternating enzymes each step.
+        with Horizontal(id=f"ctor-level-row-{gid}",
+                          classes="ctor-level-row"):
+            yield Static("Source:", id=f"ctor-level-label-{gid}",
+                          classes="ctor-level-label")
+            with RadioSet(id=f"ctor-level-set-{gid}",
+                            classes="ctor-level-set"):
+                yield RadioButton("L0 parts → TU",
+                                    value=True,
+                                    id=f"ctor-level-l0-{gid}")
+                yield RadioButton("TUs → MOD",
+                                    id=f"ctor-level-tu-{gid}")
+                yield RadioButton("MODs → next",
+                                    id=f"ctor-level-mod-{gid}")
+        with Horizontal(id=f"ctor-filter-row-{gid}",
+                         classes="ctor-filter-row"):
             yield Checkbox(
                 f"Filter parts by {gid}",
                 value=self._filter_enabled(),
                 id=f"chk-ctor-filter-{gid}",
             )
-        with Horizontal(id=f"ctor-main-{gid}"):
-            with Vertical(id=f"ctor-palette-col-{gid}"):
+        with Horizontal(id=f"ctor-main-{gid}",
+                         classes="ctor-main"):
+            with Vertical(id=f"ctor-palette-col-{gid}",
+                            classes="ctor-palette-col"):
                 yield Static(" Parts Palette ",
-                              id=f"ctor-palette-hdr-{gid}")
+                              id=f"ctor-palette-hdr-{gid}",
+                              classes="ctor-palette-hdr")
                 yield DataTable(id=f"ctor-palette-{gid}",
+                                  classes="ctor-palette",
                                   cursor_type="row",
                                   zebra_stripes=True)
                 yield Button("→  Add to Lane",
                                id=f"btn-ctor-add-{gid}",
                                variant="primary")
-            with Vertical(id=f"ctor-lane-col-{gid}"):
+            with Vertical(id=f"ctor-lane-col-{gid}",
+                            classes="ctor-lane-col"):
                 yield Static(" Assembly Lane ",
-                              id=f"ctor-lane-hdr-{gid}")
+                              id=f"ctor-lane-hdr-{gid}",
+                              classes="ctor-lane-hdr")
                 yield DataTable(id=f"ctor-lane-{gid}",
+                                  classes="ctor-lane",
                                   cursor_type="row",
                                   zebra_stripes=True)
-                with Horizontal(id=f"ctor-lane-btns-{gid}"):
+                with Horizontal(id=f"ctor-lane-btns-{gid}",
+                                  classes="ctor-lane-btns"):
                     yield Button("↑",        id=f"btn-lane-up-{gid}")
                     yield Button("↓",        id=f"btn-lane-down-{gid}")
                     yield Button("✕ Remove", id=f"btn-lane-remove-{gid}",
@@ -29117,7 +30074,8 @@ class ConstructorModal(ModalScreen):
                        id=f"ctor-backbone-hdr-{gid}",
                        classes="ctor-backbone-hdr",
                        markup=False)
-        with Horizontal(id=f"ctor-backbone-row-{gid}"):
+        with Horizontal(id=f"ctor-backbone-row-{gid}",
+                         classes="ctor-backbone-row"):
             backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
             for bb in backbones:
                 classes = ("bb-btn bb-active"
@@ -29135,9 +30093,10 @@ class ConstructorModal(ModalScreen):
                     # the button id alone.
                     yield Button(bb, id=f"btn-bb-{gid}-{bb}",
                                    classes=classes)
-        yield Static("", id=f"ctor-validation-{gid}")
-        with Horizontal(id=f"ctor-btns-{gid}"):
-            yield Button("Simulate Assembly",
+        yield Static("", id=f"ctor-validation-{gid}",
+                       classes="ctor-validation")
+        with Horizontal(id=f"ctor-btns-{gid}", classes="ctor-btns"):
+            yield Button("Save To Library",
                            id=f"btn-ctor-simulate-{gid}",
                            variant="primary", disabled=True)
             yield Button("Clear Lane", id=f"btn-ctor-clear-{gid}",
@@ -29168,13 +30127,15 @@ class ConstructorModal(ModalScreen):
     # ── Palette ──────────────────────────────────────────────────────────
 
     def _refresh_palette(self, gid: str) -> None:
-        """Rebuild the parts palette table for grammar ``gid``."""
+        """Rebuild the parts palette table for grammar ``gid``,
+        filtered to the active source level (L0 / TU / MOD)."""
         try:
             pt = self.query_one(f"#ctor-palette-{gid}", DataTable)
         except NoMatches:
             return
         rows = _palette_rows_for_grammar(
             gid, filter_enabled=self._filter_enabled(),
+            source_level=self._source_levels.get(gid, 0),
         )
         self._palette_rows[gid] = rows
         pt.clear()
@@ -29236,15 +30197,48 @@ class ConstructorModal(ModalScreen):
         types come from the grammar dict itself rather than hardcoded
         constants, so adding a custom grammar with a different
         position layout works without touching this function.
+
+        For L1+ source levels (TU → MOD, MOD → next), only chain
+        continuity is checked. Boundary / slot / CDS-pairing rules
+        are L0 conventions: at L1+ the lane is a sequence of
+        pre-built TUs whose junction overhangs depend on the L1+
+        destination vector's dropout, not on any positional table.
         """
         lane = self._lanes.get(gid, [])
+        source_level = self._source_levels.get(gid, 0)
         if not lane:
-            return False, ["Lane is empty — add L0 parts to build a TU."]
+            if source_level == 0:
+                return False, ["Lane is empty — add L0 parts to build a TU."]
+            level_label = _part_level_label(source_level)
+            next_label  = _part_level_label(source_level + 1)
+            return False, [
+                f"Lane is empty — add {level_label} plasmids to "
+                f"build a {next_label}."
+            ]
 
         grammar = _all_grammars().get(gid) or _BUILTIN_GRAMMARS.get("gb_l0", {})
+        errors: list[str] = []
+
+        # Overhang continuity at every junction — applies to ALL levels.
+        for i in range(len(lane) - 1):
+            oh3 = lane[i][4]
+            oh5 = lane[i + 1][3]
+            if oh3 != oh5:
+                errors.append(
+                    f"Overhang mismatch at junction {i+1}→{i+2}: "
+                    f"{lane[i][0]!r} ends {oh3!r} but "
+                    f"{lane[i+1][0]!r} starts {oh5!r}."
+                )
+
+        # The remaining checks (boundary overhangs, positional slots,
+        # CDS-NS / C-tag pairing, mandatory part types) are L0
+        # conventions — they don't apply when the lane is composed of
+        # pre-built TUs / MODs. Skip them at level ≥ 1.
+        if source_level >= 1:
+            return len(errors) == 0, errors
+
         tu_start, tu_end = _grammar_tu_overhangs(grammar)
         pos_slots = _grammar_pos_slots(grammar)
-        errors: list[str] = []
 
         # 1. Boundary overhangs.
         if tu_start and lane[0][3] != tu_start:
@@ -29257,17 +30251,6 @@ class ConstructorModal(ModalScreen):
                 f"Last part must carry the {tu_end} overhang. "
                 f"Got {lane[-1][4]!r}."
             )
-
-        # 2. Overhang continuity at every junction.
-        for i in range(len(lane) - 1):
-            oh3 = lane[i][4]
-            oh5 = lane[i + 1][3]
-            if oh3 != oh5:
-                errors.append(
-                    f"Overhang mismatch at junction {i+1}→{i+2}: "
-                    f"{lane[i][0]!r} ends {oh3!r} but "
-                    f"{lane[i+1][0]!r} starts {oh5!r}."
-                )
 
         # 3. Duplicate positional slots.
         seen: dict[int, str] = {}
@@ -29319,7 +30302,16 @@ class ConstructorModal(ModalScreen):
 
     def _build_chain(self, gid: str) -> Text:
         """Render the overhang chain for grammar ``gid``'s lane with
-        colour-coded junctions (green = matches expected, red = mismatch).
+        colour-coded junctions (green = matches expected, red =
+        mismatch).
+
+        At source level 0 (L0 → TU) the lane's terminal overhangs
+        must match the grammar's fixed TU boundaries (Promoter side
+        / Terminator side). At source level ≥ 1 (TU/MOD → next) the
+        boundaries depend on whichever destination vector the user
+        picks at save time, so we render the actual lane edges
+        without flagging them as right/wrong — only the inter-junction
+        continuity matters here.
         """
         t = Text()
         lane = self._lanes.get(gid, [])
@@ -29328,11 +30320,18 @@ class ConstructorModal(ModalScreen):
             return t
 
         grammar = _all_grammars().get(gid) or _BUILTIN_GRAMMARS.get("gb_l0", {})
-        tu_start, tu_end = _grammar_tu_overhangs(grammar)
+        source_level = self._source_levels.get(gid, 0)
+        if source_level == 0:
+            tu_start, tu_end = _grammar_tu_overhangs(grammar)
+            check_boundaries = True
+        else:
+            tu_start, tu_end = lane[0][3], lane[-1][4]
+            check_boundaries = False
 
-        start_ok = (lane[0][3] == tu_start)
+        start_ok = (lane[0][3] == tu_start) if check_boundaries else True
         t.append("5'-", style="dim")
-        t.append(tu_start, style="bold green" if start_ok else "bold red")
+        t.append(tu_start,
+                 style="bold green" if start_ok else "bold red")
 
         for i, row in enumerate(lane):
             name, ptype, _pos, oh5, oh3, *_rest = row
@@ -29344,7 +30343,7 @@ class ConstructorModal(ModalScreen):
             t.append(f"[{name}]", style=color)
             t.append("—", style="white")
             exp_out  = lane[i + 1][3] if i + 1 < len(lane) else tu_end
-            oh3_ok   = (oh3 == exp_out)
+            oh3_ok   = (oh3 == exp_out) if check_boundaries or (i + 1 < len(lane)) else True
             t.append(oh3, style="bold cyan" if oh3_ok else "bold red")
 
         t.append("-3'", style="dim")
@@ -29357,37 +30356,56 @@ class ConstructorModal(ModalScreen):
         except NoMatches:
             return
         is_valid, errors = self._validate(gid)
-        sim.disabled = not is_valid
         bb_key   = self._backbones.get(gid, "")
         bb       = _CONSTRUCTOR_BACKBONES.get(gid, {}).get(bb_key, {})
+        bound = _get_entry_vector(gid, bb_key) if bb_key else None
+        has_vector = (isinstance(bound, dict) and bool(bound.get("gb_text")))
+        # Save is only useful when chain is valid AND a backbone is bound
+        # (so the cloning simulator has a target to ligate into). Chain-
+        # validity drives the green status text; backbone-not-set surfaces
+        # as a separate yellow hint per the 2026-05-10 UX spec ("words
+        # green as soon as parts fit").
+        sim.disabled = not (is_valid and has_vector)
 
+        source_level = self._source_levels.get(gid, 0)
+        target_level = source_level + 1
+        target_label = _part_level_label(target_level)
         t = Text()
         t.append_text(self._build_chain(gid))
         t.append("\n")
         if is_valid:
+            # Chain is good — flip green immediately so the user knows
+            # the lane is biologically valid as soon as the parts fit,
+            # before they've made the (separable) backbone decision.
+            t.append(
+                f"✓  Valid {target_label} — overhang chain is consistent.",
+                style="bold green",
+            )
             if not bb_key:
-                # Lane chains correctly but no backbone is active.
-                # Yellow (not green) so the user sees there's still
-                # one decision left before assembly is meaningful.
+                t.append("\n")
                 t.append(
-                    "✓  Lane is valid — press a backbone button "
-                    "below to set the L1 destination.",
-                    style="bold yellow",
+                    f"↓  Pick a backbone below to set the L{target_level} "
+                    f"destination, then press Save To Library.",
+                    style="yellow",
+                )
+            elif not has_vector:
+                t.append("\n")
+                t.append(
+                    f"↓  {bb_key} role isn't bound to a library plasmid "
+                    "yet — click the role button below to pick one.",
+                    style="yellow",
                 )
             else:
-                bound = _get_entry_vector(gid, bb_key)
                 bb_sel  = bb.get("selection", "")
                 bb_note = bb.get("note", "")
-                if isinstance(bound, dict) and bound.get("name"):
-                    target = str(bound.get("name") or "?")
-                else:
-                    target = "(none — pick from library →)"
+                target  = str(bound.get("name") or "?")
                 sel_part  = f", {bb_sel} selection" if bb_sel else ""
                 note_part = f", {bb_note}" if bb_note else ""
+                t.append("\n")
                 t.append(
-                    f"✓  Valid TU — assembles into {bb_key} "
+                    f"→  Will assemble into {bb_key} "
                     f"({target}{sel_part}{note_part})",
-                    style="bold green",
+                    style="green",
                 )
         else:
             for err in errors:
@@ -29440,10 +30458,7 @@ class ConstructorModal(ModalScreen):
             self._lane_remove(gid)
         elif stem == f"btn-ctor-simulate":
             event.stop()
-            self.app.notify(
-                "Simulate Assembly: coming soon.",
-                severity="information",
-            )
+            self._save_to_library(gid)
         elif stem == f"btn-ctor-clear":
             event.stop()
             self._lanes[gid] = []
@@ -29476,6 +30491,243 @@ class ConstructorModal(ModalScreen):
             self._refresh_lane(gid,
                                restore_cursor=min(idx, len(lane) - 1))
             self._refresh_validation(gid)
+
+    # ── Save To Library ────────────────────────────────────────────────────
+
+    def _resolve_lane_to_parts(self, gid: str) -> "list[dict] | None":
+        """Look up each lane row's full part dict from the parts bin
+        by name, filtered to the active source level. Returns None +
+        notifies if any row references a part that's no longer in
+        the bin OR no longer matches the active level (e.g. user
+        deleted a part, or saved a TU into a name that previously
+        held an L0 part).
+
+        The level filter matters because parts at different levels
+        can legitimately share a name (e.g. an L0 part "myCDS" and
+        a TU named "myCDS+myProm"). Without filtering, the first
+        match in file order would win and we could ligate the wrong
+        plasmid into the destination."""
+        lane = self._lanes.get(gid, [])
+        if not lane:
+            return None
+        expected_level = self._source_levels.get(gid, 0)
+        bin_index: dict[str, dict] = {}
+        for p in _load_parts_bin():
+            nm = p.get("name") or ""
+            if not _level_matches_tab(_part_level(p), expected_level):
+                continue
+            if nm and nm not in bin_index:
+                bin_index[nm] = p
+        out: list[dict] = []
+        missing: list[str] = []
+        for row in lane:
+            nm = str(row[0])
+            p = bin_index.get(nm)
+            if p is None:
+                missing.append(nm)
+                continue
+            out.append(p)
+        if missing:
+            level_label = _part_level_label(expected_level)
+            self.app.notify(
+                f"Lane references {level_label} parts that aren't in "
+                f"the bin (or have changed level): "
+                f"{', '.join(missing[:3])}"
+                + (" …" if len(missing) > 3 else ""),
+                severity="error", markup=False,
+            )
+            return None
+        return out
+
+    def _save_to_library(self, gid: str) -> None:
+        """Run the multi-part Golden Braid assembly for `gid`'s lane,
+        save the result to the plasmid library AND mirror it to the
+        parts bin tagged ``level=1`` (TU) so it's available as a
+        source for the next L1→L2 cycle. Notifies on success / every
+        failure path so the user never gets a silent no-op."""
+        is_valid, errors = self._validate(gid)
+        if not is_valid:
+            self.app.notify(
+                "Lane is not a valid TU yet — fix overhangs first.",
+                severity="warning",
+            )
+            return
+        bb_key = self._backbones.get(gid, "")
+        if not bb_key:
+            self.app.notify(
+                "Pick a backbone (the row of role buttons below) "
+                "before saving.",
+                severity="warning",
+            )
+            return
+        entry_vector = _get_entry_vector(gid, bb_key)
+        if not (isinstance(entry_vector, dict) and entry_vector.get("gb_text")):
+            self.app.notify(
+                f"The {bb_key} role isn't bound to a library plasmid. "
+                "Click the role button to pick one.",
+                severity="warning",
+            )
+            return
+        parts = self._resolve_lane_to_parts(gid)
+        if parts is None:
+            return
+        # Source level comes from the active radio (per-grammar) — the
+        # lane carries TU rows when `_source_levels[gid] == 1` and L0
+        # parts when 0. We don't infer from `_part_level(parts[0])`
+        # because legacy parts on disk lack the field, so the radio is
+        # the authoritative state.
+        source_level = self._source_levels.get(gid, 0)
+        grammar = _all_grammars().get(gid) or _BUILTIN_GRAMMARS.get("gb_l0", {})
+        # Default name: backbone name + " · " + concatenated part
+        # names, capped to keep the library / bin row width sane.
+        default_name = self._compose_assembly_name(
+            entry_vector.get("name") or bb_key, parts,
+        )
+        new_rec = _clone_assembly_into_entry_vector(
+            parts, entry_vector, grammar,
+            source_level=source_level, name=default_name,
+        )
+        if new_rec is None:
+            self.app.notify(
+                "Assembly simulation failed — log has details. "
+                "Common causes: extra IIS sites in the entry vector, "
+                "or the lane's terminal overhangs don't match the "
+                "vector's dropout overhangs.",
+                severity="error", markup=False,
+            )
+            return
+        try:
+            self._persist_assembly(
+                new_rec, gid, source_level=source_level,
+                entry_vector=entry_vector, parts=parts,
+                backbone_role=bb_key,
+            )
+        except Exception as exc:
+            _log.exception("Save To Library: persist failed")
+            self.app.notify(
+                f"Save failed: {exc}",
+                severity="error", markup=False,
+            )
+            return
+        target_level = source_level + 1
+        level_label = _part_level_label(target_level)
+        # Mention the active collection in the notify so the user
+        # knows the assembly automatically mirrored there (via
+        # `_save_library` → `_sync_active_collection_plasmids`).
+        # Falls back to the "main" library wording when no
+        # collection is active.
+        active_coll = _get_active_collection_name()
+        coll_part = (
+            f"collection '{active_coll}'"
+            if active_coll else "library"
+        )
+        self.app.notify(
+            f"Saved '{default_name}' to {coll_part} "
+            f"({len(new_rec.seq):,} bp, level {level_label}). "
+            f"Also added to Parts Bin under {level_label}.",
+            severity="success", markup=False,
+        )
+
+    def _compose_assembly_name(self, vector_name: str,
+                                  parts: list[dict]) -> str:
+        """Build a default name for the assembled plasmid: vector +
+        '·' + part-names (CDS / promoter labels), capped at 60 chars
+        so the library row stays single-line."""
+        labels: list[str] = []
+        for p in parts:
+            nm = str(p.get("name") or "?")
+            if nm and nm not in labels:
+                labels.append(nm)
+        joined = "+".join(labels)
+        full = f"{vector_name} · {joined}" if vector_name else joined
+        return full[:60].rstrip()
+
+    def _persist_assembly(self, new_rec, gid: str, *,
+                            source_level: int,
+                            entry_vector: dict,
+                            parts: list[dict],
+                            backbone_role: str) -> None:
+        """Add the newly-cloned plasmid to plasmid_library.json AND
+        mirror a parts-bin entry so the result can be picked from the
+        L1+ assembly palette in subsequent cycles. Both go through
+        their respective `_save_*` helpers (sacred invariant #7 — no
+        bypassing `_safe_save_json`)."""
+        from copy import deepcopy
+        gb_text = _record_to_gb_text(new_rec)
+        # Library entry — same shape as the main library schema.
+        plasmid_id = re.sub(
+            r"[^A-Za-z0-9_]+", "_",
+            new_rec.id or new_rec.name or "assembly",
+        ) or "assembly"
+        # Disambiguate vs existing library entries.
+        existing = {e.get("id") or "" for e in _load_library()}
+        unique_id = plasmid_id
+        suffix = 2
+        while unique_id in existing:
+            unique_id = f"{plasmid_id}_{suffix}"
+            suffix += 1
+        from datetime import date
+        lib_entry = {
+            "id":      unique_id,
+            "name":    new_rec.id or new_rec.name or unique_id,
+            "size":    len(new_rec.seq),
+            "n_feats": len(new_rec.features or []),
+            "source":  f"constructor:{gid}:{backbone_role}",
+            "added":   date.today().isoformat(),
+            "gb_text": gb_text,
+        }
+        lib_entries = _load_library()
+        lib_entries.insert(0, lib_entry)
+        _save_library(lib_entries)
+        # Parts-bin entry — tagged with level so the new TU/MOD shows
+        # up in the right Parts Bin tab AND can be selected as a
+        # source for the next assembly cycle.
+        target_level = source_level + 1
+        target_label = _part_level_label(target_level)
+        # Selection marker propagates from the picked backbone role's
+        # spec (the L1/L2/Lx role determines which antibiotic the
+        # assembled vector confers). The user's role declaration in
+        # `_CONSTRUCTOR_BACKBONES` is the canonical source.
+        selection = (
+            _CONSTRUCTOR_BACKBONES.get(gid, {})
+            .get(backbone_role, {})
+            .get("selection", "")
+        )
+        # Boundary overhangs of the assembled plasmid become the
+        # next-level oh5/oh3. Read them off the first/last source
+        # fragment we just chained.
+        bin_entry = {
+            "name":     new_rec.id or new_rec.name or unique_id,
+            "type":     target_label,
+            "position": target_label,
+            "oh5":      str(parts[0].get("oh5") or ""),
+            "oh3":      str(parts[-1].get("oh3") or ""),
+            "backbone": str(entry_vector.get("name") or backbone_role),
+            "marker":   selection,
+            "sequence": "",  # the gb_text below is the source of truth for L1+
+            "fwd_primer": "",
+            "rev_primer": "",
+            "fwd_tm":   0.0,
+            "rev_tm":   0.0,
+            "grammar":  gid,
+            "level":    target_level,
+            # Carry the assembled plasmid's gb_text on the bin entry
+            # so `_assembly_fragment_from_source` can digest it for
+            # the next cycle without a library round-trip.
+            "gb_text":  gb_text,
+            "source_parts": [str(p.get("name") or "") for p in parts],
+            "source_role":  backbone_role,
+        }
+        bin_entries = _load_parts_bin()
+        bin_entries.insert(0, deepcopy(bin_entry))
+        _save_parts_bin(bin_entries)
+        _log.info(
+            "constructor: saved assembly %r (level %d, gid %s) — "
+            "%d bp, %d parts, vector %r",
+            unique_id, target_level, gid,
+            len(new_rec.seq), len(parts),
+            entry_vector.get("name"),
+        )
 
     def _backbone_name_label(self, gid: str, role: str) -> str:
         """Static text rendered ABOVE the role's button. Shows the
@@ -29540,6 +30792,40 @@ class ConstructorModal(ModalScreen):
             except NoMatches:
                 continue
             btn.set_class(bb == name, "bb-active")
+        self._refresh_validation(gid)
+
+    # ── Source-level radios ─────────────────────────────────────────────
+
+    @on(RadioSet.Changed)
+    def _on_level_radio(self, event: RadioSet.Changed) -> None:
+        """Source-level switch: clear the lane (overhang scheme
+        differs across levels), update `self._source_levels[gid]`,
+        and refresh palette + validation. Triggered by clicks on
+        any of the L0 / TU / MOD radios."""
+        rs_id = (event.radio_set.id or "")
+        if not rs_id.startswith("ctor-level-set-"):
+            return
+        gid = rs_id[len("ctor-level-set-"):]
+        if gid not in self._source_levels:
+            return
+        rb_id = (event.pressed.id or "") if event.pressed else ""
+        if rb_id.startswith("ctor-level-l0-"):
+            new_level = 0
+        elif rb_id.startswith("ctor-level-tu-"):
+            new_level = 1
+        elif rb_id.startswith("ctor-level-mod-"):
+            new_level = 2
+        else:
+            return
+        if new_level == self._source_levels[gid]:
+            return
+        self._source_levels[gid] = new_level
+        # Lane carries level-N overhangs; switching levels would
+        # produce a chain that doesn't match the new destination's
+        # dropout. Wipe it so the user starts fresh.
+        self._lanes[gid] = []
+        self._refresh_lane(gid)
+        self._refresh_palette(gid)
         self._refresh_validation(gid)
 
     # ── Filter checkbox ─────────────────────────────────────────────────
@@ -34363,9 +35649,13 @@ class PartsBinDeleteConfirmModal(ModalScreen):
             )
             yes_label = "Yes, remove"
         else:
+            # Bulk-delete: render the count in red bold so it's
+            # impossible to miss before clicking Yes. The title +
+            # button label echo the count too as belt + braces.
             title = f" Remove {n} parts from bin "
             body = (
-                f"  Remove [bold]{n}[/bold] parts from the parts bin?\n"
+                f"  Remove [bold red]{n}[/bold red] parts from "
+                f"the parts bin?\n"
                 f"  [dim]({preview})[/dim]\n\n"
                 f"  [dim]This cannot be undone from within the app. "
                 f"A backup (.bak) of the parts-bin file is kept.[/dim]"
@@ -37058,15 +38348,29 @@ ConstructorModal { align: center middle; }
 #ctor-vector-row  { height: 3; margin-bottom: 1; align: left middle; }
 #ctor-vector-info { width: 1fr; padding: 0 1; }
 #ctor-vector-row Button { min-width: 12; margin-left: 1; }
-#ctor-main        { height: 18; }
-#ctor-palette-col { width: 1fr; border-right: solid $primary-darken-2; padding-right: 1; }
-#ctor-palette-hdr { background: $primary-darken-2; padding: 0 1; }
-#ctor-palette     { height: 1fr; }
-#ctor-lane-col    { width: 1fr; padding-left: 1; }
-#ctor-lane-hdr    { background: $primary-darken-2; padding: 0 1; }
-#ctor-lane        { height: 1fr; }
-#ctor-lane-btns   { height: 3; margin-top: 0; }
-#ctor-lane-btns Button { min-width: 5; margin-right: 1; }
+/* All ctor-* layout rules below select by class — pre-2026-05-10
+   they keyed off `#ctor-foo` IDs, but the per-grammar tab split in
+   2026-04 appended a `-{gid}` suffix to every widget's id, silently
+   invalidating the entire stylesheet. The constructor was running
+   on Textual auto-layout (no fixed heights, no fr distribution)
+   for almost a month; symptoms ranged from "Add to Lane button
+   gets clipped when validation grows long" to palette / lane
+   tables collapsing to a single row. */
+/* ctor-main was h:18 originally; the level-row added in 2026-05-10
+   eats 3 rows of vertical budget. Drop main to 14 so the modular
+   pane fits inside `ctor-tabs` (h:36 minus tab header ≈ h:34). */
+.ctor-main        { height: 14; }
+.ctor-palette-col { width: 1fr; border-right: solid $primary-darken-2; padding-right: 1; }
+.ctor-palette-hdr { background: $primary-darken-2; padding: 0 1; height: 1; }
+.ctor-palette     { height: 1fr; }
+.ctor-lane-col    { width: 1fr; padding-left: 1; }
+.ctor-lane-hdr    { background: $primary-darken-2; padding: 0 1; height: 1; }
+.ctor-lane        { height: 1fr; }
+.ctor-lane-btns   { height: 3; margin-top: 0; }
+.ctor-lane-btns Button { min-width: 5; margin-right: 1; }
+.ctor-filter-row  { height: 3; }
+.ctor-btns        { height: 3; margin-top: 1; }
+.ctor-btns Button { margin-right: 1; }
 /* Backbone row: each role is a column (bb-col) holding a name
    label above the role button. The Horizontal row sits below a
    section header (no leading inline label — Textual's Static
@@ -37076,7 +38380,11 @@ ConstructorModal { align: center middle; }
     height: 1; margin-top: 1; padding: 0 1;
     color: $text-muted; background: $primary-darken-3;
 }
-#ctor-backbone-row    { height: 4; align: left top; }
+.ctor-level-row           { height: 3; align: left middle; margin-bottom: 0; }
+.ctor-level-label         { width: 8; color: $text-muted; padding: 1 1 0 0; }
+.ctor-level-set           { layout: horizontal; height: 3; }
+.ctor-level-set RadioButton { margin-right: 1; }
+.ctor-backbone-row    { height: 4; align: left top; }
 .bb-col               {
     width: 14; height: 4; margin-right: 1; padding: 0;
 }
@@ -37086,37 +38394,55 @@ ConstructorModal { align: center middle; }
 }
 .bb-btn               { min-width: 12; width: 14; height: 3; }
 .bb-active            { background: $accent; color: $text; }
-#ctor-validation  {
-    height: 4; border: solid $primary-darken-2;
-    padding: 0 1; margin-top: 1; overflow-x: auto;
+/* Validation panel was previously selected by `#ctor-validation` —
+   the per-grammar split appended a `-{gid}` suffix to the widget id
+   in 2026-04, which silently invalidated this rule. Without an
+   active height cap the Static grew with every error line and
+   pushed `#ctor-main` (palette + lane + Add to Lane button) off the
+   visible region. Capping at 4 rows + internal y-scroll restores
+   the bounded layout. */
+.ctor-validation  {
+    height: 3; border: solid $primary-darken-2;
+    padding: 0 1; margin-top: 0;
+    overflow-x: auto; overflow-y: auto;
 }
-#ctor-btns        { height: 3; margin-top: 1; }
-#ctor-btns Button { margin-right: 1; }
-
 /* ── Traditional cloning tab ────────────────────────────── */
 TraditionalCloningPane    { height: auto; }
 #trad-mode-row            { height: 3; align: left middle; margin-bottom: 1; }
 #trad-mode-label          { width: 18; color: $text-muted; }
 #trad-mode-row RadioSet   { layout: horizontal; height: 3; }
 #trad-mode-row RadioButton { margin-right: 2; }
-#trad-source-host         { height: 9; border: solid $primary-darken-2;
+/* Source host sizes to its visible content. With the feature row +
+   pcr rows hidden in plasmid mode, the host shrinks from 9 → 6
+   rows so the results panel below has more room. */
+#trad-source-host         { height: auto; border: solid $primary-darken-2;
                             padding: 0 1; margin-bottom: 1; }
 #trad-source-host > Static { color: $text-muted; padding: 0 1;
                               background: $primary-darken-2; }
 #trad-pcr-name            { width: 1fr; }
-#trad-pcr-seq             { height: 5; border: solid $primary-darken-3; }
-#trad-source-table, #trad-vector-table { height: 5; }
+#trad-pcr-seq             { height: 4; border: solid $primary-darken-3; }
+#trad-source-table, #trad-vector-table { height: 4; }
+/* Feature-row + pcr-rows had no explicit height so they defaulted to
+   1fr — in feature / pcr modes they ballooned to fill `#trad-source-
+   host`, pushing the vector + enzyme + results panels off-screen. */
+#trad-feature-row         { height: 3; align: left middle; }
+#trad-pcr-rows            { height: auto; }
 #trad-feature-select      { width: 1fr; }
-#trad-vector-row          { height: 7; border: solid $primary-darken-2;
+/* Vector row sizes to its visible content (header + table) so it
+   doesn't claim a fixed row count regardless of table height. */
+#trad-vector-row          { height: auto; border: solid $primary-darken-2;
                             padding: 0 1; margin-bottom: 1; }
 #trad-vector-row > Static { color: $text-muted; padding: 0 1;
                             background: $primary-darken-2; }
+/* Enzyme selects + Simulate / Clear buttons share one row. */
 #trad-enzyme-row          { height: 3; align: left middle; margin-bottom: 1; }
 #trad-enzyme-label        { width: 18; color: $text-muted; }
 #trad-enzyme-row Select   { width: 22; margin-right: 2; }
-#trad-action-row          { height: 3; align: left middle; margin-bottom: 1; }
-#trad-action-row Button   { margin-right: 1; }
-#trad-results             { height: 1fr; border: solid $primary-darken-2;
+#trad-enzyme-row Button   { margin-right: 1; }
+/* Results panel + save row are siblings (not nested) — keeps the
+   results region tall enough to actually show simulation output. */
+#trad-results             { height: 1fr; min-height: 6;
+                            border: solid $primary-darken-2;
                             padding: 0 1; overflow-y: auto; }
 #trad-results > Static    { padding: 0 1; }
 #trad-save-row            { height: 3; margin-top: 1; align: left middle; }

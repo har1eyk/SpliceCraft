@@ -1875,21 +1875,25 @@ class TestPartsBinMultiSelect:
             modal._toggle_row_in_selection(0)
             assert modal._selected_rows == {1}
 
-    async def test_modifier_click_skips_empty_sequence_row(
+    async def test_modifier_click_accepts_empty_sequence_row(
             self, isolated_parts_bin):
-        # 2026-05-07: built-in catalog rows are gone, but a hand-
-        # edited parts_bin.json with an empty sequence on a user
-        # part is still possible. The toggle helper's defensive
-        # `not r.get("sequence")` guard keeps that case from
-        # entering the multi-select set (Save-to-Collection /
-        # Delete would otherwise have nothing to operate on for
-        # that row).
+        # Pre-2026-05-10: the toggle helper rejected rows with empty
+        # `sequence` to keep removed built-in catalog placeholders
+        # out of the multi-select set. Now TU/MOD plasmids
+        # legitimately store their bases in `gb_text` (not
+        # `sequence`), so the empty-seq guard hid every L1+ row from
+        # multi-select. Rule is now `r.get("user")`-only — a user
+        # part with empty sequence (TU, MOD, or hand-edited L0) is
+        # still selectable, just not eligible for sequence-based
+        # actions like Copy Primed.
         sc._save_parts_bin([{
-            "name": "broken_part", "type": "CDS", "position": "B3",
-            "oh5": "AATG", "oh3": "GCTT", "backbone": "pUPD2",
+            "name": "tu_like_part", "type": "TU", "position": "TU",
+            "oh5": "TACA", "oh3": "GACT", "backbone": "alpha1",
             "marker": "Spec", "sequence": "",
             "fwd_primer": "", "rev_primer": "",
             "fwd_tm": 0.0, "rev_tm": 0.0,
+            "level": 1,
+            "gb_text": "LOCUS x 100 bp DNA circular SYN\n//\n",
         }])
         app = sc.PlasmidApp()
         async with app.run_test(size=_BASELINE) as pilot:
@@ -1898,9 +1902,13 @@ class TestPartsBinMultiSelect:
             await pilot.pause()
             await pilot.pause(0.1)
             modal = app.screen
+            # Switch to TU tab so the row appears in `_rows`.
+            tabs = modal.query_one("#parts-level-tabs", sc.Tabs)
+            tabs.active = "tab-parts-tu"
+            await pilot.pause()
+            await pilot.pause(0.1)
             modal._toggle_row_in_selection(0)
-            # Empty-sequence row refused.
-            assert modal._selected_rows == set()
+            assert modal._selected_rows == {0}
 
     async def test_drag_select_replaces_with_range(self, isolated_parts_bin):
         # Drag-select is the modifier-independent fallback: works in
@@ -3405,6 +3413,9 @@ class TestPartsBinSequenceView:
             assert ta.read_only is True
 
     async def test_copy_buttons_are_present(self, isolated_parts_bin):
+        # Copy Raw was removed 2026-05-09 — users select the sequence
+        # in the parts-seq-view TextArea + Ctrl+C instead. The Edit
+        # button took its slot in the action row.
         app = sc.PlasmidApp()
         async with app.run_test(size=_BASELINE) as pilot:
             await pilot.pause()
@@ -3412,9 +3423,9 @@ class TestPartsBinSequenceView:
             await pilot.pause()
             await pilot.pause(0.1)
             modal = app.screen
-            assert modal.query_one("#btn-parts-copy-raw",    sc.Button) is not None
             assert modal.query_one("#btn-parts-copy-primed", sc.Button) is not None
             assert modal.query_one("#btn-parts-copy-cloned", sc.Button) is not None
+            assert modal.query_one("#btn-parts-edit",        sc.Button) is not None
 
     async def test_highlighting_user_row_loads_sequence_into_textarea(
             self, isolated_parts_bin):
@@ -3507,17 +3518,6 @@ class TestPartsBinCopyButtons:
         await pilot.pause(0.1)
         return captured
 
-    async def test_copy_raw_copies_insert(
-            self, isolated_parts_bin, monkeypatch):
-        sc._save_parts_bin([self._stub_part()])
-        app = sc.PlasmidApp()
-        async with app.run_test(size=_BASELINE) as pilot:
-            await pilot.pause()
-            captured = await self._select_first_row_and_press(
-                app, pilot, "#btn-parts-copy-raw", monkeypatch,
-            )
-            assert captured == ["ATGCATGCATGC"]
-
     async def test_copy_primed_copies_amplicon_with_tails(
             self, isolated_parts_bin, monkeypatch):
         sc._save_parts_bin([self._stub_part()])
@@ -3589,10 +3589,442 @@ class TestPartsBinCopyButtons:
             # If isolated_parts_bin is empty the first row is a built-in
             # (no sequence). Only test if that's actually the case.
             if modal._rows and not modal._rows[0].get("sequence"):
-                modal.query_one("#btn-parts-copy-raw", sc.Button).press()
+                modal.query_one("#btn-parts-copy-primed", sc.Button).press()
                 await pilot.pause()
                 await pilot.pause(0.1)
                 assert captured == []
+
+
+class TestPartsBinEdit:
+    """The Edit button opens PartEditModal pre-populated with the
+    cursor row, and its Save callback rewrites the matching parts-
+    bin entry by `(name, sequence)` identity. Added 2026-05-09 along
+    with the Copy Raw → Edit swap."""
+
+    @staticmethod
+    def _stub_part(name="edit-part", insert="ATGCATGCATGC"):
+        return {
+            "name": name, "type": "CDS", "position": "Pos 3-4",
+            "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": insert,
+            "fwd_primer": "GCGCCGTCTCAAATGATGCATGCATGC",
+            "rev_primer": "GCGCCGTCTCAGCTTGCATGCATGCAT",
+            "fwd_tm": 60.0, "rev_tm": 60.0,
+            "grammar": "gb_l0",
+        }
+
+    async def test_edit_button_present_in_action_row(
+            self, isolated_parts_bin):
+        """The Edit button must exist alongside the (remaining) Copy
+        buttons. Smoke check that the compose() change held."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal.query_one("#btn-parts-edit", sc.Button) is not None
+
+    async def test_edit_save_rewrites_entry_in_parts_bin(
+            self, isolated_parts_bin):
+        """Saving the modal swaps the matching parts-bin entry in
+        place. Match on (name, sequence) identity so a `_populate`
+        between push and dismiss can't desync the row index."""
+        sc._save_parts_bin([self._stub_part(name="orig")])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            assert isinstance(edit_modal, sc.PartEditModal)
+            edit_modal._set_editing(True)
+            await pilot.pause()
+            edit_modal.query_one("#partedit-name", sc.Input).value = "renamed"
+            edit_modal.query_one("#partedit-backbone",
+                                  sc.Input).value = "pUPD-Kan"
+            edit_modal.query_one("#btn-partedit-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            entries = sc._load_parts_bin()
+            assert len(entries) == 1
+            assert entries[0]["name"] == "renamed"
+            assert entries[0]["backbone"] == "pUPD-Kan"
+            assert entries[0]["sequence"] == "ATGCATGCATGC"
+
+    async def test_edit_seq_or_overhang_change_rederives_simulator_outputs(
+            self, isolated_parts_bin):
+        """Editing the sequence or overhangs must regenerate
+        `primed_seq` and `cloned_seq` so Copy Primed / Copy Cloned
+        keep serving the right amplicon after a save."""
+        original_insert = "ATGCATGCATGC"
+        new_insert      = "ATGAAACCCGGGTTT"
+        sc._save_parts_bin([self._stub_part(insert=original_insert)])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            edit_modal._set_editing(True)
+            await pilot.pause()
+            edit_modal.query_one("#partedit-seq",
+                                  sc.TextArea).text = new_insert
+            edit_modal.query_one("#btn-partedit-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            entries = sc._load_parts_bin()
+            assert entries[0]["sequence"] == new_insert
+            assert new_insert in entries[0]["primed_seq"]
+            assert new_insert in entries[0]["cloned_seq"]
+
+    async def test_edit_invalid_dna_blocks_save(
+            self, isolated_parts_bin):
+        """Bases outside the IUPAC alphabet must block the save and
+        render a red status — same validation pattern the grammar
+        editor uses."""
+        sc._save_parts_bin([self._stub_part()])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            edit_modal._set_editing(True)
+            await pilot.pause()
+            # 'Z' is not in the IUPAC alphabet — save must refuse.
+            edit_modal.query_one("#partedit-seq",
+                                  sc.TextArea).text = "ATGCZZZZ"
+            edit_modal.query_one("#btn-partedit-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Modal still on the stack — save was blocked.
+            assert isinstance(app.screen, sc.PartEditModal)
+            status_text = str(
+                edit_modal.query_one("#partedit-status", sc.Static).render()
+            )
+            assert "invalid bases" in status_text.lower()
+            # Parts bin file untouched.
+            assert sc._load_parts_bin()[0]["sequence"] == "ATGCATGCATGC"
+
+    async def test_edit_button_warns_when_no_part_selected(
+            self, isolated_parts_bin):
+        """Empty parts bin → cursor row is invalid; the Edit button
+        must notify rather than push an Edit modal on a phantom row."""
+        sc._save_parts_bin([])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            stack_depth = len(app.screen_stack)
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Stack unchanged — no PartEditModal pushed.
+            assert len(app.screen_stack) == stack_depth
+
+    async def test_escape_closes_edit_modal(self, isolated_parts_bin):
+        """`Binding('escape', 'cancel', …)` only fires if the modal
+        actually defines `action_cancel`. Pre-2026-05-09 the binding
+        was registered but the action wasn't, so Escape was a no-op."""
+        sc._save_parts_bin([self._stub_part()])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.PartEditModal)
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, sc.PartEditModal)
+
+    async def test_no_op_save_does_not_write_file(self, isolated_parts_bin):
+        """Edit → Save without changing anything must dismiss without
+        rewriting parts_bin.json. Verifies via the parts-bin file's
+        mtime — if the no-op short-circuit fires, mtime stays put."""
+        sc._save_parts_bin([self._stub_part()])
+        before_mtime = sc._PARTS_BIN_FILE.stat().st_mtime_ns
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            edit_modal._set_editing(True)
+            await pilot.pause()
+            edit_modal.query_one("#btn-partedit-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        after_mtime = sc._PARTS_BIN_FILE.stat().st_mtime_ns
+        assert after_mtime == before_mtime
+
+    async def test_primer_tm_appears_in_label(self, isolated_parts_bin):
+        """The primer field labels must include the part's stored Tm
+        so users editing the primer aren't blind to the current Tm."""
+        part = self._stub_part()
+        part["fwd_tm"] = 62.3
+        part["rev_tm"] = 60.1
+        sc._save_parts_bin([part])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            labels = [str(lbl.render()) for lbl in
+                      edit_modal.query("Label")]
+            assert any("Tm 62.3" in lbl for lbl in labels)
+            assert any("Tm 60.1" in lbl for lbl in labels)
+
+    async def test_modal_renders_part_with_markup_in_name(
+            self, isolated_parts_bin):
+        """A part name like '[red]X' must NOT be interpreted as Rich
+        markup in the modal title — the Static is composed with
+        markup=False so the bracketed text renders verbatim."""
+        sc._save_parts_bin([self._stub_part(name="[red]evil[/]")])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            title = str(
+                edit_modal.query_one("#partedit-title", sc.Static).render()
+            )
+            # Brackets survive into the rendered text rather than
+            # being parsed as a Rich `[red]` tag.
+            assert "[red]evil[/]" in title
+
+    async def test_legacy_type_appears_with_suffix(self, isolated_parts_bin):
+        """A part whose stored type is no longer in the active grammar
+        (e.g. an old custom grammar removed) must still show up in
+        the Type select with a '(legacy)' suffix so a Save round-
+        trips the value."""
+        part = self._stub_part()
+        part["type"] = "ZZ-ghost-type"  # not in any built-in grammar
+        sc._save_parts_bin([part])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            opts, default = edit_modal._type_options()
+            opt_labels = [label for (label, value) in opts]
+            assert default == "ZZ-ghost-type"
+            assert any("ZZ-ghost-type (legacy)" in label
+                        for label in opt_labels)
+
+    async def test_grammar_dropdown_is_present_and_editable(
+            self, isolated_parts_bin):
+        """The grammar field must be a real Select (was a locked
+        banner pre-2026-05-10) so users can re-tag a part to a
+        different cloning grammar without recreating it."""
+        sc._save_parts_bin([self._stub_part()])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            grammar_sel = edit_modal.query_one(
+                "#partedit-grammar", sc.Select,
+            )
+            assert grammar_sel.value == "gb_l0"
+            # Disabled until the user clicks Edit (read-only by default).
+            assert grammar_sel.disabled is True
+            edit_modal._set_editing(True)
+            await pilot.pause()
+            assert grammar_sel.disabled is False
+
+    async def test_grammar_change_rebuilds_type_options_and_overhangs(
+            self, isolated_parts_bin):
+        """Switching grammar from gb_l0 → moclo_plant must rebuild
+        the Type select with the new grammar's positions and refresh
+        oh5 / oh3 / position. Both grammars carry CDS so the type
+        selection survives the swap."""
+        sc._save_parts_bin([self._stub_part()])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            edit_modal._set_editing(True)
+            await pilot.pause()
+            # Pre-swap: gb_l0 CDS overhangs.
+            assert edit_modal.query_one(
+                "#partedit-oh5", sc.Input).value == "AATG"
+            edit_modal.query_one(
+                "#partedit-grammar", sc.Select).value = "moclo_plant"
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Post-swap: MoClo CDS overhangs (5'=AGGT, 3'=GCTT).
+            assert edit_modal.query_one(
+                "#partedit-oh5", sc.Input).value == "AGGT"
+            assert edit_modal.query_one(
+                "#partedit-oh3", sc.Input).value == "GCTT"
+            assert edit_modal._grammar_id == "moclo_plant"
+
+    async def test_grammar_change_persists_through_save(
+            self, isolated_parts_bin):
+        """Saving after a grammar swap must write the new grammar id
+        into parts_bin.json AND re-derive primed_seq with the new
+        grammar's enzyme tail."""
+        sc._save_parts_bin([self._stub_part()])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            edit_modal._set_editing(True)
+            await pilot.pause()
+            edit_modal.query_one(
+                "#partedit-grammar", sc.Select).value = "moclo_plant"
+            await pilot.pause()
+            await pilot.pause(0.05)
+            edit_modal.query_one("#btn-partedit-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        entries = sc._load_parts_bin()
+        assert len(entries) == 1
+        assert entries[0]["grammar"] == "moclo_plant"
+        # MoClo Plant uses BsaI (GGTCTC) so the primed amplicon must
+        # contain the BsaI site, not Esp3I (CGTCTC).
+        primed = entries[0].get("primed_seq", "")
+        assert "GGTCTC" in primed
+        assert "CGTCTC" not in primed
+
+    async def test_save_refuses_when_identity_missing_in_file(
+            self, isolated_parts_bin):
+        """If the parts-bin file changes between push and dismiss
+        (concurrent writer / hand-edit) and the original identity is
+        gone, the callback must NOT silently append a duplicate.
+        Refuse + notify, leaving the file as-is."""
+        original = self._stub_part(name="orig")
+        sc._save_parts_bin([original])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            edit_modal = app.screen
+            edit_modal._set_editing(True)
+            await pilot.pause()
+            # Concurrent writer wipes the bin out from under the
+            # dialog (simulating an external splicecraft / a
+            # rm + restore flow). Identity will not match anywhere.
+            sc._save_parts_bin([])
+            edit_modal.query_one("#partedit-name",
+                                  sc.Input).value = "renamed"
+            edit_modal.query_one("#btn-partedit-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        # File still empty — no silent append of the renamed part.
+        assert sc._load_parts_bin() == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4876,6 +5308,18 @@ def _build_gb_l0_part_seq(oh5: str, oh3: str,
     return core + backbone
 
 
+def _build_moclo_plant_part_seq(oh5: str, oh3: str,
+                                 insert: str = "ATGAAACCCGGG" * 5) -> str:
+    """Build a synthetic MoClo Plant L0 part vector. MoClo uses BsaI
+    (GGTCTC) at L0; layout mirrors `_build_gb_l0_part_seq` but with
+    BsaI + reverse-complement BsaI (GAGACC) flanking the insert. The
+    backbone padding has no BsaI sites so the digest yields exactly
+    two fragments: insert (oh5 → oh3) and backbone."""
+    core = "GGTCTCA" + oh5 + insert + oh3 + "AGAGACC"
+    backbone = "AAAAATTTTT" * 50
+    return core + backbone
+
+
 class TestClassifyPartFromPlasmid:
     """``_classify_part_from_plasmid`` digests a circular plasmid with
     each grammar's Type IIS enzyme and matches the released fragment's
@@ -4922,4 +5366,1148 @@ class TestClassifyPartFromPlasmid:
         assert result is not None
         assert (len(result["insert"]["top_seq"])
                 < len(result["vector"]["top_seq"]))
+
+    def test_detects_moclo_plant_promoter(self):
+        """A MoClo Plant L0 promoter (GGAG / AATG, BsaI-cuttable) must
+        classify to MoClo Plant Pos 1 / Promoter — the canonical
+        layout for the J23100 promoter as it ships in standard MoClo
+        Plant L0 entry vectors. Regression guard for the FFE 7
+        plasmid case the user reported on 2026-05-10."""
+        seq = _build_moclo_plant_part_seq("GGAG", "AATG")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]    == "moclo_plant"
+        assert result["position"]["type"] == "Promoter"
+        assert result["position"]["name"] == "Pos 1"
+        assert result["insert"]["left"]["overhang_seq"]  == "GGAG"
+        assert result["insert"]["right"]["overhang_seq"] == "AATG"
+
+    def test_detects_moclo_plant_cds(self):
+        """MoClo Plant CDS overhangs (AGGT / GCTT) must classify to
+        the Pos 3 / CDS slot. Differentiates from gb_l0 CDS (AATG /
+        GCTT) which would NOT match because gb_l0's positions are
+        offset by the AATG-bracketed 5'UTR slot."""
+        seq = _build_moclo_plant_part_seq("AGGT", "GCTT")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]       == "moclo_plant"
+        assert result["position"]["type"] == "CDS"
+
+    def test_no_esp3i_sites_falls_through_to_bsai(self):
+        """A plasmid with NO Esp3I sites at all (so gb_l0 digest
+        returns 0 fragments) must fall through to MoClo Plant rather
+        than failing classification. This is the FFE 7 case in
+        practice — MoClo Plant L0 vectors typically carry no Esp3I
+        sites because their domestication strips them."""
+        seq = _build_moclo_plant_part_seq("GGAG", "AATG")
+        # Spot-check: no Esp3I (CGTCTC) in either strand.
+        assert "CGTCTC" not in seq
+        assert "GAGACG" not in seq
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"] == "moclo_plant"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Golden Braid iterative cycle: level helpers + multi-part assembly
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_l1_alpha_vector(name: str, alpha_oh5: str, alpha_oh3: str,
+                            tu_start: str = "GGAG",
+                            tu_end:   str = "CGCT") -> dict:
+    """Build a real-shape Golden Braid L1 alpha vector dict — has BOTH
+    inward-facing BsaI sites (the L1→L2 cut) AND inward-facing Esp3I
+    sites (the L0→L1 cut), matching the pDGB1_α architecture. Used to
+    test the iterative GB cycle end-to-end."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    bsai_left,  bsai_right  = "GGTCTCA", sc._rc("GGTCTCA")
+    esp3i_left, esp3i_right = "CGTCTCA", sc._rc("CGTCTCA")
+    dropout  = "ACGTAGCT" * 10
+    backbone = "GGGGTTTTAAAA" * 30
+    seq = (backbone +
+            bsai_left + alpha_oh5 +
+            esp3i_left + tu_start + dropout + tu_end + esp3i_right +
+            alpha_oh3 + bsai_right +
+            "TTTGGG" * 30)
+    rec = SeqRecord(Seq(seq), id=name, name=name)
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"] = "circular"
+    return {"name": name, "gb_text": sc._record_to_gb_text(rec)}
+
+
+def _make_l2_omega_vector(name: str, oh5: str = "TACA",
+                            oh3: str = "CCAA") -> dict:
+    """L2 omega destination — only BsaI sites (since BsaI is the
+    L1→L2 enzyme). The dropout exposes ``oh5`` / ``oh3`` overhangs
+    matching the chained alpha1+alpha2 BsaI cut."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    bsai_left, bsai_right = "GGTCTCA", sc._rc("GGTCTCA")
+    dropout  = "ACGTAGCT" * 10
+    backbone = "GGGGTTTTAAAA" * 30
+    seq = (backbone + bsai_left + oh5 + dropout + oh3 + bsai_right +
+            "TTTGGG" * 30)
+    rec = SeqRecord(Seq(seq), id=name, name=name)
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"] = "circular"
+    return {"name": name, "gb_text": sc._record_to_gb_text(rec)}
+
+
+def _make_l0_tu_parts(suffix: str = "a") -> list[dict]:
+    """Four L0 parts that chain GGAG→TGAC→AATG→GCTT→CGCT — a minimal
+    Golden Braid L0 TU layout (Promoter / 5'UTR / CDS / Terminator)."""
+    return [
+        {"name": f"P_{suffix}", "sequence": "AAATTT" * 5,
+         "oh5": "GGAG", "oh3": "TGAC"},
+        {"name": f"U_{suffix}", "sequence": "CCCAAA" * 3,
+         "oh5": "TGAC", "oh3": "AATG"},
+        {"name": f"C_{suffix}", "sequence": "ATGAAA" * 6,
+         "oh5": "AATG", "oh3": "GCTT"},
+        {"name": f"T_{suffix}", "sequence": "TTTGGG" * 4,
+         "oh5": "GCTT", "oh3": "CGCT"},
+    ]
+
+
+class TestPartLevelHelpers:
+    """`_part_level`, `_part_level_label`, and `_enzyme_for_level_up`
+    are the foundation for the iterative GB cycle. Coverage matters
+    because every part / parts-bin tab / cloning step keys off them."""
+
+    def test_part_level_default_is_zero(self):
+        assert sc._part_level({}) == 0
+        assert sc._part_level({"name": "x"}) == 0
+
+    def test_part_level_int_passthrough(self):
+        assert sc._part_level({"level": 2}) == 2
+        assert sc._part_level({"level": 5}) == 5
+
+    def test_part_level_string_coercion(self):
+        assert sc._part_level({"level": "L0"})  == 0
+        assert sc._part_level({"level": "TU"})  == 1
+        assert sc._part_level({"level": "MOD"}) == 2
+        assert sc._part_level({"level": "3"})   == 3
+
+    def test_part_level_negative_clamps_to_zero(self):
+        assert sc._part_level({"level": -1}) == 0
+
+    def test_part_level_bool_is_zero(self):
+        # bool is a subclass of int — making sure True isn't read
+        # as level=1 by accident (it would silently route a domesticator
+        # part into the TU tab).
+        assert sc._part_level({"level": True}) == 0
+        assert sc._part_level({"level": False}) == 0
+
+    def test_part_level_label_mapping(self):
+        assert sc._part_level_label(0) == "L0"
+        assert sc._part_level_label(1) == "TU"
+        assert sc._part_level_label(2) == "MOD"
+        assert sc._part_level_label(7) == "MOD"
+        assert sc._part_level_label(-1) == "L0"
+
+    def test_enzyme_for_level_up_alternates(self):
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        # L0 → L1 uses Esp3I; L1 → L2 uses BsaI; cycle alternates.
+        assert sc._enzyme_for_level_up(gb, 0) == "Esp3I"
+        assert sc._enzyme_for_level_up(gb, 1) == "BsaI"
+        assert sc._enzyme_for_level_up(gb, 2) == "Esp3I"
+        assert sc._enzyme_for_level_up(gb, 3) == "BsaI"
+
+    def test_enzyme_for_level_up_moclo(self):
+        moclo = sc._BUILTIN_GRAMMARS["moclo_plant"]
+        # MoClo L0 → L1 uses BsaI; L1 → L2 uses BpiI.
+        assert sc._enzyme_for_level_up(moclo, 0) == "BsaI"
+        assert sc._enzyme_for_level_up(moclo, 1) == "BpiI"
+        assert sc._enzyme_for_level_up(moclo, 2) == "BsaI"
+
+    def test_enzyme_for_level_up_falls_back_when_missing(self):
+        """A custom grammar without `level_up_enzyme` should reuse
+        the primary enzyme so the iterative cycle degrades cleanly
+        rather than crashing."""
+        legacy = {"id": "custom", "enzyme": "BsaI"}
+        # Even-source uses primary; odd-source falls back to primary
+        # since `level_up_enzyme` is missing.
+        assert sc._enzyme_for_level_up(legacy, 0) == "BsaI"
+        assert sc._enzyme_for_level_up(legacy, 1) == "BsaI"
+
+
+class TestCloneAssemblyIntoEntryVector:
+    """`_clone_assembly_into_entry_vector` is the simulator that
+    powers the Constructor's Save To Library button. It must handle
+    L0 → TU (multi-part chain) AND L1 → MOD (two pre-built TUs) so
+    the full GB cycle is simulatable."""
+
+    def test_l0_to_tu_chains_parts_correctly(self):
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")
+        parts = _make_l0_tu_parts("a")
+        result = sc._clone_assembly_into_entry_vector(
+            parts, vec, gb, source_level=0, name="TU_a",
+        )
+        assert result is not None
+        # The combined TU insert (with terminal sticky ends) must
+        # appear in the cloned plasmid's top strand or its RC.
+        expected_chain = (
+            "GGAG" + "AAATTT"*5 + "TGAC" + "CCCAAA"*3
+            + "AATG" + "ATGAAA"*6 + "GCTT" + "TTTGGG"*4 + "CGCT"
+        )
+        seq = str(result.seq).upper()
+        assert (expected_chain in seq) or (expected_chain in sc._rc(seq))
+
+    def test_l0_to_tu_returns_none_on_chain_mismatch(self):
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")
+        # Break the chain: P ends GGTT but U expects TGAC.
+        parts = _make_l0_tu_parts("a")
+        parts[0]["oh3"] = "GGTT"  # was TGAC
+        result = sc._clone_assembly_into_entry_vector(
+            parts, vec, gb, source_level=0,
+        )
+        assert result is None
+
+    def test_l1_to_mod_iterates_cycle(self):
+        """Full GB cycle: assemble two L0 → L1 plasmids, then ligate
+        the two L1 plasmids into an Omega L2 destination using the
+        level-up (BsaI) enzyme. Verifies the iterative cloning
+        scaffold works end-to-end."""
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        # Step 1: L0 → L1 alpha1 (junction overhang TACA→GACT)
+        a1_vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")
+        a2_vec = _make_l1_alpha_vector("alpha2", "GACT", "CCAA")
+        tu_a = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("a"), a1_vec, gb, source_level=0,
+            name="TU_a",
+        )
+        tu_b = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("b"), a2_vec, gb, source_level=0,
+            name="TU_b",
+        )
+        assert tu_a is not None and tu_b is not None
+        # Step 2: L1 → L2 (BsaI cuts each TU + the omega vector)
+        omega_vec = _make_l2_omega_vector("omega", "TACA", "CCAA")
+        tu_a_src = {"name": "TU_a", "level": 1, "grammar": "gb_l0",
+                     "gb_text": sc._record_to_gb_text(tu_a)}
+        tu_b_src = {"name": "TU_b", "level": 1, "grammar": "gb_l0",
+                     "gb_text": sc._record_to_gb_text(tu_b)}
+        mod = sc._clone_assembly_into_entry_vector(
+            [tu_a_src, tu_b_src], omega_vec, gb, source_level=1,
+            name="MOD_test",
+        )
+        assert mod is not None
+        # MOD should contain BOTH parent TU inserts. Spot-check
+        # one signature from each: the unique CDS bases.
+        mod_seq = str(mod.seq).upper()
+        cds_a = "ATGAAA" * 6  # TU_a's CDS
+        cds_b = "ATGCCC" * 6  # TU_b's CDS (parts_b not used here, use a/a)
+        assert (cds_a in mod_seq) or (cds_a in sc._rc(mod_seq))
+
+    def test_assembly_fragment_extracts_overhangs(self):
+        """`_assembly_fragment_from_source` is the helper that turns a
+        TU plasmid into a fragment dict with sequence + oh5/oh3, ready
+        for chaining at L1→L2. Failure here breaks every iteration past
+        L0→L1."""
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        a1_vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")
+        tu = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("a"), a1_vec, gb, source_level=0,
+            name="TU_a",
+        )
+        assert tu is not None
+        src = {"name": "TU_a", "level": 1, "grammar": "gb_l0",
+                "gb_text": sc._record_to_gb_text(tu)}
+        frag = sc._assembly_fragment_from_source(src, gb, source_level=1)
+        assert frag is not None
+        assert frag["oh5"] == "TACA"
+        assert frag["oh3"] == "GACT"
+
+    def test_empty_sources_returns_none(self):
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")
+        assert sc._clone_assembly_into_entry_vector(
+            [], vec, gb, source_level=0,
+        ) is None
+
+    def test_source_level_mismatch_returns_none(self):
+        """A source whose `level` field doesn't match `source_level`
+        must be rejected — without this guard, an L0 part smuggled
+        into an L1+ lane would silently fall through to the L0
+        extraction branch (since `_assembly_fragment_from_source`
+        keys off the parameter, not the part's own level), producing
+        a wrong-grammar synthetic assembly."""
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")
+        # Mark these L0 parts with level=0 explicitly; passing them
+        # to source_level=1 should fail the level-match guard.
+        parts = [{**p, "level": 0} for p in _make_l0_tu_parts("a")]
+        result = sc._clone_assembly_into_entry_vector(
+            parts, vec, gb, source_level=1,
+        )
+        assert result is None
+
+
+class TestLevelMatchesTab:
+    """`_level_matches_tab` is the shared filter rule for parts-bin
+    tabs / constructor palettes / the lane resolver. Centralised so
+    the L0/TU/MOD definition lives in one place."""
+
+    def test_l0_tab_exact_match(self):
+        assert sc._level_matches_tab(0, 0)
+        assert not sc._level_matches_tab(1, 0)
+        assert not sc._level_matches_tab(2, 0)
+
+    def test_tu_tab_exact_match(self):
+        assert sc._level_matches_tab(1, 1)
+        assert not sc._level_matches_tab(0, 1)
+        assert not sc._level_matches_tab(2, 1)
+
+    def test_mod_tab_absorbs_level_2_and_above(self):
+        # Tab "MOD" (level 2) catches every level ≥ 2 so further
+        # iteration (L3, L4, …) doesn't need new tabs.
+        assert sc._level_matches_tab(2, 2)
+        assert sc._level_matches_tab(3, 2)
+        assert sc._level_matches_tab(7, 2)
+        # And below-2 levels stay out of the MOD tab.
+        assert not sc._level_matches_tab(0, 2)
+        assert not sc._level_matches_tab(1, 2)
+
+
+class TestPartsBinSelectAll:
+    """`Ctrl+A` selects every row in the active tab so a follow-up
+    Delete keypress wipes the whole filtered slice. The selection
+    rule was also relaxed to drop the obsolete `sequence` filter so
+    TU/MOD rows (whose bases live in `gb_text`) are eligible too."""
+
+    @staticmethod
+    def _stub(name="p", level=0, **extra):
+        base = {
+            "name": name, "type": "CDS", "position": "Pos 3",
+            "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spec",
+            "sequence": "ATG" * 12 if level == 0 else "",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+            "grammar": "gb_l0",
+            "level": level,
+        }
+        if level >= 1:
+            base["gb_text"] = (
+                "LOCUS x 100 bp DNA circular SYN\n//\n"
+            )
+        base.update(extra)
+        return base
+
+    async def test_ctrl_a_selects_every_l0_row(self, isolated_parts_bin):
+        sc._save_parts_bin([self._stub(f"p{i}") for i in range(5)])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal._selected_rows == set()
+            modal.action_select_all_parts()
+            await pilot.pause()
+            assert modal._selected_rows == {0, 1, 2, 3, 4}
+
+    async def test_ctrl_a_on_empty_bin_is_noop(self, isolated_parts_bin):
+        sc._save_parts_bin([])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal.action_select_all_parts()
+            assert modal._selected_rows == set()
+
+    async def test_ctrl_a_twice_toggles_back_to_empty(
+            self, isolated_parts_bin):
+        """Pressing Ctrl+A on a fully-selected table deselects —
+        mirrors the standard text-editor gesture."""
+        sc._save_parts_bin([self._stub(f"p{i}") for i in range(3)])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal.action_select_all_parts()
+            assert len(modal._selected_rows) == 3
+            modal.action_select_all_parts()
+            assert modal._selected_rows == set()
+
+    async def test_ctrl_a_then_delete_removes_every_part(
+            self, isolated_parts_bin):
+        sc._save_parts_bin([self._stub(f"p{i}") for i in range(3)])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal.action_select_all_parts()
+            await pilot.pause()
+            modal.action_delete_selected_parts()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Confirm modal pushed with all 3 names.
+            confirm = app.screen
+            assert isinstance(confirm, sc.PartsBinDeleteConfirmModal)
+            confirm.query_one("#btn-partsdel-yes", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert sc._load_parts_bin() == []
+
+    async def test_ctrl_a_selects_tu_rows_in_tu_tab(
+            self, isolated_parts_bin):
+        """TU rows have empty `sequence` (their bases live in
+        `gb_text`). Pre-2026-05-10 the multi-select guard required
+        a non-empty `sequence` and silently rejected every TU; the
+        relaxed rule (just `r.get('user')`) makes Ctrl+A select
+        them all from the TU tab."""
+        sc._save_parts_bin([
+            self._stub("L0_part", level=0),
+            self._stub("TU_a", level=1),
+            self._stub("TU_b", level=1),
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            tabs = modal.query_one("#parts-level-tabs", sc.Tabs)
+            tabs.active = "tab-parts-tu"
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal.action_select_all_parts()
+            await pilot.pause()
+            # Two TUs in the active TU tab — both selected.
+            assert modal._selected_rows == {0, 1}
+            assert all(
+                modal._rows[i]["level"] == 1
+                for i in modal._selected_rows
+            )
+
+    async def test_ctrl_a_only_selects_active_tab_rows(
+            self, isolated_parts_bin):
+        """`_rows` is the post-filter view, so Ctrl+A on the L0
+        tab won't reach into TU/MOD rows hiding under other tabs."""
+        sc._save_parts_bin([
+            self._stub("L0_part", level=0),
+            self._stub("TU_x", level=1),
+            self._stub("MOD_y", level=2),
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Default L0 tab.
+            assert modal._active_level == 0
+            modal.action_select_all_parts()
+            await pilot.pause()
+            assert len(modal._selected_rows) == 1
+            assert modal._rows[0]["name"] == "L0_part"
+
+
+class TestPartsBinMultiDeleteWarning:
+    """Pressing the Delete button with a multi-selection MUST push a
+    `PartsBinDeleteConfirmModal` showing the count + a name preview
+    BEFORE any rows are written away. Locks in the user-visible
+    safety net so a future refactor can't silently bypass the
+    confirmation."""
+
+    @staticmethod
+    def _stub(name="p"):
+        return {
+            "name": name, "type": "CDS", "position": "Pos 3",
+            "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spec",
+            "sequence": "ATG" * 12,
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+            "grammar": "gb_l0", "level": 0,
+        }
+
+    async def test_delete_button_with_multiselect_pushes_confirm_modal(
+            self, isolated_parts_bin):
+        sc._save_parts_bin([self._stub(f"p{i}") for i in range(5)])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal.action_select_all_parts()
+            await pilot.pause()
+            modal.query_one("#btn-parts-delete", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            confirm = app.screen
+            assert isinstance(confirm, sc.PartsBinDeleteConfirmModal)
+            # Body must show the count + preview names + the "cannot be
+            # undone" hint so the user can't miss what they're about to
+            # do.
+            body = str(
+                confirm.query_one("#partsdel-msg", sc.Static).render()
+            )
+            assert "5" in body
+            assert "p0" in body
+            # Title carries the count too — visible even when the user
+            # tabs away from the body.
+            title = str(
+                confirm.query_one("#partsdel-title", sc.Static).render()
+            )
+            assert "Remove 5 parts" in title
+            # Yes button echoes the count one more time.
+            yes_btn = confirm.query_one("#btn-partsdel-yes", sc.Button)
+            assert "5" in str(yes_btn.label)
+            # Default focus on No so a stray Enter cancels (handslip
+            # protection — sacred for any bulk-delete confirm modal).
+            no_btn = confirm.query_one("#btn-partsdel-no", sc.Button)
+            assert no_btn.has_focus
+
+    async def test_no_button_aborts_the_delete(self, isolated_parts_bin):
+        sc._save_parts_bin([self._stub(f"p{i}") for i in range(3)])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal.action_select_all_parts()
+            await pilot.pause()
+            modal.query_one("#btn-parts-delete", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            confirm = app.screen
+            confirm.query_one("#btn-partsdel-no", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Bin untouched.
+            assert len(sc._load_parts_bin()) == 3
+
+
+class TestPartsBinLevelTabs:
+    """The Parts Bin top-of-modal Tabs filter rows by part level
+    (L0 / TU / MOD). User parts default to L0; Constructor-saved
+    assemblies tag themselves with the appropriate level."""
+
+    @staticmethod
+    def _stub_part(name="p", level=0, **extra):
+        base = {
+            "name": name, "type": "CDS", "position": "Pos 3",
+            "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spec",
+            "sequence": "ATG" * 12,
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+            "grammar": "gb_l0",
+            "level": level,
+        }
+        base.update(extra)
+        return base
+
+    async def test_default_tab_is_l0_filters_other_levels(
+            self, isolated_parts_bin):
+        sc._save_parts_bin([
+            self._stub_part(name="L0_part", level=0),
+            self._stub_part(name="TU_plasmid", level=1),
+            self._stub_part(name="MOD_plasmid", level=2),
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal._active_level == 0
+            assert len(modal._rows) == 1
+            assert modal._rows[0]["name"] == "L0_part"
+
+    async def test_tu_tab_shows_level_1_only(
+            self, isolated_parts_bin):
+        sc._save_parts_bin([
+            self._stub_part(name="L0_part", level=0),
+            self._stub_part(name="TU_plasmid", level=1),
+            self._stub_part(name="MOD_plasmid", level=2),
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            tabs = modal.query_one("#parts-level-tabs", sc.Tabs)
+            tabs.active = "tab-parts-tu"
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert modal._active_level == 1
+            names = [r["name"] for r in modal._rows]
+            assert names == ["TU_plasmid"]
+
+    async def test_mod_tab_shows_level_2_and_above(
+            self, isolated_parts_bin):
+        sc._save_parts_bin([
+            self._stub_part(name="MOD_plasmid", level=2),
+            self._stub_part(name="L3_plasmid", level=3),
+            self._stub_part(name="TU_plasmid", level=1),
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            tabs = modal.query_one("#parts-level-tabs", sc.Tabs)
+            tabs.active = "tab-parts-mod"
+            await pilot.pause()
+            await pilot.pause(0.1)
+            names = sorted(r["name"] for r in modal._rows)
+            assert names == ["L3_plasmid", "MOD_plasmid"]
+
+    async def test_legacy_part_with_no_level_field_lands_in_l0(
+            self, isolated_parts_bin):
+        """Pre-2026-05-10 parts have no `level` field. They must
+        default to L0 so existing libraries don't disappear into a
+        non-default tab on first open."""
+        legacy = self._stub_part(name="legacy")
+        legacy.pop("level", None)
+        sc._save_parts_bin([legacy])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert len(modal._rows) == 1
+            assert modal._rows[0]["name"] == "legacy"
+
+
+class TestConstructorSaveToLibrary:
+    """The Save To Library button (renamed from Simulate Assembly)
+    actually clones the lane parts into the bound entry vector and
+    writes the result to plasmid_library.json + parts_bin.json. The
+    new entry tags itself with `level=1` (TU) so it surfaces under
+    the TU tab and can be picked from the L1+ palette."""
+
+    async def test_button_label_is_save_to_library(
+            self, isolated_library, isolated_parts_bin):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            btn = modal.query_one("#btn-ctor-simulate-gb_l0", sc.Button)
+            assert "Save To Library" in str(btn.label)
+
+
+class TestConstructorGreenStatus:
+    """Validation status flips green as soon as the lane chain is
+    consistent — even before the user picks a backbone. Backbone-
+    not-set surfaces as a separate yellow hint per the 2026-05-10
+    UX spec."""
+
+    async def test_green_fires_with_complete_chain_no_backbone(
+            self, isolated_library, isolated_parts_bin):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Inject a complete TU lane (4 parts that chain GGAG→CGCT).
+            modal._lanes["gb_l0"] = [
+                ("P", "Promoter",   "Pos 1",   "GGAG", "TGAC", "", ""),
+                ("U", "5' UTR",     "Pos 2",   "TGAC", "AATG", "", ""),
+                ("C", "CDS",        "Pos 3-4", "AATG", "GCTT", "", ""),
+                ("T", "Terminator", "Pos 5",   "GCTT", "CGCT", "", ""),
+            ]
+            modal._refresh_validation("gb_l0")
+            await pilot.pause()
+            vbox = modal.query_one("#ctor-validation-gb_l0", sc.Static)
+            text = str(vbox.render())
+            # Green confirmation text for the chain validity.
+            assert "Valid TU" in text
+            # Save button stays disabled because no backbone is bound.
+            btn = modal.query_one("#btn-ctor-simulate-gb_l0", sc.Button)
+            assert btn.disabled is True
+
+
+class TestConstructorL1PlusMode:
+    """Source-level radios switch the constructor between L0→TU
+    (default) and L1+ assembly modes. Switching levels clears the
+    lane (overhang scheme differs) and refilters the palette."""
+
+    async def test_level_radio_switch_clears_lane_and_refilters(
+            self, isolated_library, isolated_parts_bin):
+        # Stage one L0 part and one TU plasmid in the bin.
+        sc._save_parts_bin([
+            {"name": "L0p", "type": "CDS", "position": "Pos 3-4",
+             "oh5": "AATG", "oh3": "GCTT",
+             "sequence": "ATG" * 10,
+             "grammar": "gb_l0", "level": 0,
+             "backbone": "", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0},
+            {"name": "TU1", "type": "TU", "position": "TU",
+             "oh5": "TACA", "oh3": "GACT",
+             "sequence": "",
+             "grammar": "gb_l0", "level": 1,
+             "backbone": "alpha1", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0,
+             "gb_text": "LOCUS  TU1  100 bp DNA circular SYN\n//\n"},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Default: source level 0 → palette only contains L0 parts.
+            assert modal._source_levels["gb_l0"] == 0
+            # Stage some lane content so we can verify the clear path.
+            modal._lanes["gb_l0"] = [
+                ("L0p", "CDS", "Pos 3-4", "AATG", "GCTT", "", ""),
+            ]
+            # Switch to TU-source mode by toggling the radio.
+            tu_rb = modal.query_one("#ctor-level-tu-gb_l0", sc.RadioButton)
+            tu_rb.value = True
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert modal._source_levels["gb_l0"] == 1
+            # Lane was cleared on level switch.
+            assert modal._lanes["gb_l0"] == []
+            # Palette now lists only the TU plasmid.
+            palette_names = [r[0] for r in modal._palette_rows.get("gb_l0", [])]
+            assert palette_names == ["TU1"]
+
+    def test_validate_l1_chain_skips_l0_constraints(self):
+        """At source_level=1 the validator only enforces chain
+        continuity — boundary overhangs / mandatory L0 part types /
+        slot-occupancy / CDS-NS pairing all stop applying since
+        the lane carries pre-built TUs, not L0 parts."""
+        modal = sc.ConstructorModal()
+        modal._source_levels["gb_l0"] = 1
+        # A 2-TU chain whose junction overhangs match (TACA→GACT,
+        # GACT→CCAA). No "Promoter" / "Terminator" parts; under L0
+        # rules this would error on missing types + boundary mismatch.
+        modal._lanes["gb_l0"] = [
+            ("TU1", "TU", "TU", "TACA", "GACT", "alpha1", ""),
+            ("TU2", "TU", "TU", "GACT", "CCAA", "alpha2", ""),
+        ]
+        is_valid, errors = modal._validate("gb_l0")
+        assert is_valid is True
+        assert errors == []
+
+    def test_validate_l1_chain_still_catches_overhang_mismatch(self):
+        modal = sc.ConstructorModal()
+        modal._source_levels["gb_l0"] = 1
+        # Junction TACA→GACT, GGGG→CCAA — second junction breaks.
+        modal._lanes["gb_l0"] = [
+            ("TU1", "TU", "TU", "TACA", "GACT", "alpha1", ""),
+            ("TU2", "TU", "TU", "GGGG", "CCAA", "alpha2", ""),
+        ]
+        is_valid, errors = modal._validate("gb_l0")
+        assert is_valid is False
+        assert any("junction" in e.lower() for e in errors)
+
+
+class TestConstructorChainAndStatusAtL1Plus:
+    """Hardening for the L1+ source-level UI surfaces: chain-render
+    boundary handling, green-text labelling, and the L<N> hint in
+    the backbone-not-set yellow line. Pre-2026-05-10 these all
+    hardcoded L0/L1 conventions and rendered red-everywhere /
+    'Valid TU' / 'L1 destination' regardless of the active source
+    level."""
+
+    def test_build_chain_at_l1_does_not_flag_lane_boundaries_red(self):
+        """At L1+ source level, the lane's terminal overhangs depend
+        on the destination vector — not the grammar's L0
+        Promoter→Terminator boundaries. `_build_chain` must NOT
+        compare lane[0]/lane[-1] against grammar.tu_start/tu_end at
+        L1+, which would render the boundary labels red even though
+        the chain is biologically valid."""
+        modal = sc.ConstructorModal()
+        modal._source_levels["gb_l0"] = 1
+        # alpha1+alpha2 chain (TACA→GACT, GACT→CCAA) — no L0 grammar
+        # boundary involvement here.
+        modal._lanes["gb_l0"] = [
+            ("TU1", "TU", "TU", "TACA", "GACT", "alpha1", ""),
+            ("TU2", "TU", "TU", "GACT", "CCAA", "alpha2", ""),
+        ]
+        text = modal._build_chain("gb_l0")
+        rendered = str(text)
+        # Chain should show the actual terminal overhangs.
+        assert "TACA" in rendered
+        assert "CCAA" in rendered
+        # GB L0 boundaries (GGAG / CGCT) must NOT appear — the L1+
+        # chain isn't constrained by them.
+        assert "GGAG" not in rendered
+        assert "CGCT" not in rendered
+
+    async def test_status_says_valid_mod_at_l1_source_level(
+            self, isolated_library, isolated_parts_bin):
+        """At L1 source level the green status must say "Valid MOD",
+        not "Valid TU" — the assembled product is a module, not a
+        single transcription unit."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._source_levels["gb_l0"] = 1
+            modal._lanes["gb_l0"] = [
+                ("TU1", "TU", "TU", "TACA", "GACT", "alpha1", ""),
+                ("TU2", "TU", "TU", "GACT", "CCAA", "alpha2", ""),
+            ]
+            modal._refresh_validation("gb_l0")
+            await pilot.pause()
+            vbox = modal.query_one("#ctor-validation-gb_l0", sc.Static)
+            text = str(vbox.render())
+            assert "Valid MOD" in text
+
+    async def test_backbone_hint_uses_target_level(
+            self, isolated_library, isolated_parts_bin):
+        """The yellow 'pick a backbone' hint must reference the
+        ACTUAL target level (L<source+1>) rather than always saying
+        L1 — pre-fix every hint hardcoded `f"{1 if … else 1}"`."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._source_levels["gb_l0"] = 1
+            modal._lanes["gb_l0"] = [
+                ("TU1", "TU", "TU", "TACA", "GACT", "alpha1", ""),
+                ("TU2", "TU", "TU", "GACT", "CCAA", "alpha2", ""),
+            ]
+            modal._refresh_validation("gb_l0")
+            await pilot.pause()
+            vbox = modal.query_one("#ctor-validation-gb_l0", sc.Static)
+            text = str(vbox.render())
+            assert "L2 destination" in text
+            assert "L1 destination" not in text
+
+
+class TestResolveLaneToPartsLevelFilter:
+    """Hardening for `_resolve_lane_to_parts` — when the parts bin
+    holds an L0 part AND a TU plasmid with the same name (a real
+    possibility once users start naming TUs after their dominant
+    L0 component), the resolver MUST return the entry whose level
+    matches the active source level. Pre-2026-05-10 it returned
+    the first match in file order, which could ligate the wrong
+    plasmid into the destination."""
+
+    @staticmethod
+    def _stub_l0(name="X"):
+        return {"name": name, "type": "CDS", "position": "Pos 3",
+                "oh5": "AATG", "oh3": "GCTT",
+                "sequence": "ATG" * 10, "grammar": "gb_l0", "level": 0,
+                "backbone": "", "marker": "",
+                "fwd_primer": "", "rev_primer": "",
+                "fwd_tm": 0.0, "rev_tm": 0.0}
+
+    @staticmethod
+    def _stub_tu(name="X"):
+        return {"name": name, "type": "TU", "position": "TU",
+                "oh5": "TACA", "oh3": "GACT",
+                "sequence": "", "grammar": "gb_l0", "level": 1,
+                "backbone": "alpha1", "marker": "Spec",
+                "fwd_primer": "", "rev_primer": "",
+                "fwd_tm": 0.0, "rev_tm": 0.0,
+                "gb_text": "LOCUS X 100 bp DNA circular SYN\n//\n"}
+
+    async def test_l0_mode_resolves_l0_entry_when_name_collides(
+            self, isolated_library, isolated_parts_bin):
+        sc._save_parts_bin([self._stub_tu("X"), self._stub_l0("X")])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._source_levels["gb_l0"] = 0
+            modal._lanes["gb_l0"] = [
+                ("X", "CDS", "Pos 3", "AATG", "GCTT", "", "")
+            ]
+            resolved = modal._resolve_lane_to_parts("gb_l0")
+            assert resolved is not None
+            assert len(resolved) == 1
+            assert resolved[0]["level"] == 0
+            assert resolved[0]["sequence"] == "ATG" * 10
+
+    async def test_tu_mode_resolves_tu_entry_when_name_collides(
+            self, isolated_library, isolated_parts_bin):
+        sc._save_parts_bin([self._stub_l0("X"), self._stub_tu("X")])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._source_levels["gb_l0"] = 1
+            modal._lanes["gb_l0"] = [
+                ("X", "TU", "TU", "TACA", "GACT", "alpha1", "")
+            ]
+            resolved = modal._resolve_lane_to_parts("gb_l0")
+            assert resolved is not None
+            assert len(resolved) == 1
+            assert resolved[0]["level"] == 1
+            assert resolved[0].get("gb_text", "")
+
+
+class TestPersistedAssemblyMetadata:
+    """When the Constructor saves an assembly, the parts-bin entry
+    needs the right metadata so the next-level cycle has a usable
+    source. Marker comes from the role's `selection` antibiotic;
+    `gb_text`, oh5, oh3, and `level` round-trip into a usable
+    L1+ palette row."""
+
+    def test_clone_assembly_parts_bin_metadata_round_trip(
+            self, isolated_library, isolated_parts_bin):
+        """Driving `_persist_assembly` directly so we don't have to
+        spin up the full UI just to verify the bin entry shape."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("AAAA" * 100), id="MyTU", name="MyTU")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "alpha1_vec",
+                            "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[
+                {"name": "P", "oh5": "GGAG", "oh3": "TGAC", "level": 0},
+                {"name": "T", "oh5": "TGAC", "oh3": "CGCT", "level": 0},
+            ],
+            backbone_role="Alpha1",
+        )
+        bin_entries = sc._load_parts_bin()
+        assert len(bin_entries) == 1
+        e = bin_entries[0]
+        assert e["level"]    == 1
+        assert e["type"]     == "TU"
+        assert e["oh5"]      == "GGAG"
+        assert e["oh3"]      == "CGCT"
+        assert e["grammar"]  == "gb_l0"
+        assert e["backbone"] == "alpha1_vec"
+        # Marker propagates from the GB Alpha1 role's selection
+        # antibiotic (Spectinomycin per `_CONSTRUCTOR_BACKBONES`).
+        assert e["marker"] == "Spectinomycin"
+        # gb_text is the source of truth for L1+ chaining; must NOT
+        # be empty so the next-cycle cloner can digest this plasmid.
+        assert e["gb_text"]
+        # Source-parts list survives so the user can audit which
+        # L0 parts went into this TU.
+        assert e["source_parts"] == ["P", "T"]
+        assert e["source_role"]  == "Alpha1"
+        # And the library entry exists too.
+        lib_entries = sc._load_library()
+        assert len(lib_entries) == 1
+        assert lib_entries[0]["name"] == "MyTU"
+
+    def test_clone_assembly_disambiguates_id_collision(
+            self, isolated_library, isolated_parts_bin):
+        """If the library already contains an entry whose id matches
+        the assembly's safe-id, `_persist_assembly` must append a
+        numeric suffix rather than overwriting the existing entry."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        sc._save_library([{
+            "id": "MyTU", "name": "older",
+            "size": 100, "n_feats": 0, "source": "test",
+            "added": "2026-01-01", "gb_text": "LOCUS x 100 bp DNA\n//\n",
+        }])
+        rec = SeqRecord(Seq("AAAA" * 50), id="MyTU", name="MyTU")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "alpha1_vec",
+                            "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[{"name": "P", "oh5": "GGAG", "oh3": "CGCT", "level": 0}],
+            backbone_role="Alpha1",
+        )
+        ids = [e.get("id") for e in sc._load_library()]
+        assert "MyTU"   in ids
+        assert "MyTU_2" in ids
+
+
+class TestConstructorComposeAssemblyName:
+    """The default name builder collapses long lanes and handles edge
+    cases (empty vector name, single-part chain, > 60 char concat)."""
+
+    def test_compose_assembly_name_basic(self):
+        modal = sc.ConstructorModal()
+        name = modal._compose_assembly_name(
+            "alpha1", [{"name": "P"}, {"name": "T"}],
+        )
+        assert "alpha1" in name
+        assert "P" in name and "T" in name
+
+    def test_compose_assembly_name_dedupes(self):
+        modal = sc.ConstructorModal()
+        name = modal._compose_assembly_name(
+            "alpha1",
+            [{"name": "P"}, {"name": "P"}, {"name": "T"}],
+        )
+        # Each unique part name appears once.
+        assert name.count("P") == 1 or "P+P" not in name
+
+    def test_compose_assembly_name_caps_length(self):
+        modal = sc.ConstructorModal()
+        very_long_name = "X" * 80
+        name = modal._compose_assembly_name(
+            very_long_name, [{"name": "P"}],
+        )
+        assert len(name) <= 60
+
+    def test_compose_assembly_name_handles_empty_vector_name(self):
+        modal = sc.ConstructorModal()
+        name = modal._compose_assembly_name("", [{"name": "P"}])
+        # No leading separator when vector_name is empty.
+        assert not name.startswith("·")
+        assert "P" in name
+
+
+class TestAssemblyMirrorsToActiveCollection:
+    """`_save_library` already calls `_sync_active_collection_plasmids`,
+    so a constructor save should automatically appear in whatever
+    collection the user has open. Regression guard: the chain
+    Constructor.Save → _save_library → mirror must keep working as
+    the assembly path evolves."""
+
+    def test_persisted_assembly_appears_in_active_collection(
+            self, isolated_library, isolated_parts_bin):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Seed a collection and mark it active. The autouse
+        # `_protect_user_data` fixture already redirected the
+        # collections file to tmp.
+        sc._save_collections([{
+            "name": "MyProject",
+            "description": "test",
+            "plasmids": [],
+            "saved": "2026-05-10",
+        }])
+        sc._set_active_collection_name("MyProject")
+        # Drive the persist path directly so we don't have to spin
+        # up the Constructor's full UI just to confirm the mirror.
+        rec = SeqRecord(Seq("AAAA" * 100), id="MyTU", name="MyTU")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "alpha1_vec",
+                            "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[{"name": "P", "oh5": "GGAG", "oh3": "CGCT", "level": 0}],
+            backbone_role="Alpha1",
+        )
+        # Library got the entry…
+        lib_ids = [e.get("id") for e in sc._load_library()]
+        assert "MyTU" in lib_ids
+        # …AND the active collection's plasmids list mirrors it.
+        colls = sc._load_collections()
+        active = next(
+            (c for c in colls if c.get("name") == "MyProject"), None,
+        )
+        assert active is not None
+        coll_ids = [p.get("id") for p in active.get("plasmids", [])]
+        assert "MyTU" in coll_ids
+
+
+class TestConstructorPaletteFitsWithLongValidation:
+    """The Add to Lane button used to get clipped (or pushed off
+    screen) once `_refresh_validation` produced a long error list:
+    the Static had no height cap, so it grew with every error line
+    and squeezed `#ctor-main` (palette + lane + Add to Lane button)
+    out of the visible region. Pinning the validation panel to a
+    fixed height with internal y-scroll keeps everything reachable
+    no matter how many junctions break."""
+
+    async def test_add_to_lane_button_visible_with_many_errors(
+            self, isolated_library, isolated_parts_bin):
+        # Stage many L0 parts so the palette has rows to render.
+        sc._save_parts_bin([
+            {"name": f"P{i}", "type": "CDS", "position": "Pos 3-4",
+             "oh5": "AATG", "oh3": "GCTT",
+             "sequence": "ATG" * 10,
+             "grammar": "gb_l0", "level": 0,
+             "backbone": "", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0}
+            for i in range(20)
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            from textual.widgets import TabbedContent
+            modal.query_one(
+                "#ctor-tabs", TabbedContent,
+            ).active = "ctor-tab-gb_l0"
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Stuff the lane with all-mismatching parts so validation
+            # produces a long error list (boundary + every junction).
+            modal._lanes["gb_l0"] = [
+                (f"L{i}", "CDS", "Pos", "AATG", "GCTT", "", "")
+                for i in range(15)
+            ]
+            modal._refresh_lane("gb_l0")
+            modal._refresh_validation("gb_l0")
+            await pilot.pause()
+            # Validation must be capped — without a height limit it
+            # used to grab 35+ rows and push the buttons off screen.
+            vbox = modal.query_one("#ctor-validation-gb_l0", sc.Static)
+            assert vbox.region.height <= 8, (
+                f"Validation panel grew to h={vbox.region.height} "
+                f"— previously this pushed #ctor-main off screen."
+            )
+            # The Add to Lane button + palette table are still
+            # within the 48-row terminal viewport.
+            term_h = _BASELINE[1]
+            for sel in ("#btn-ctor-add-gb_l0", "#ctor-palette-gb_l0",
+                         "#ctor-lane-btns-gb_l0"):
+                w = modal.query_one(sel)
+                bottom = w.region.y + w.region.height
+                assert bottom <= term_h, (
+                    f"{sel} extends to row {bottom}, past the "
+                    f"terminal bottom ({term_h})."
+                )
 

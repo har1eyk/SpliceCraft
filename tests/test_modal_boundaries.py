@@ -228,6 +228,21 @@ _MODAL_CASES = [
                                                 total=2686,
                                                 sequence="ATG" * 100,
                                                 notes="See [Bolivar 1977](https://doi.org/10.1016/0378-1119(77)90000-2)")),
+    ("PartEditModal",                lambda: sc.PartEditModal(
+                                                idx=0,
+                                                part={"name": "myCDS",
+                                                      "type": "CDS",
+                                                      "position": "Pos 3",
+                                                      "oh5": "AATG",
+                                                      "oh3": "GCTT",
+                                                      "backbone": "pUPD2",
+                                                      "marker": "Spectinomycin",
+                                                      "sequence": "ATG" * 50,
+                                                      "fwd_primer": "GCGCCGTCTCAAATG",
+                                                      "rev_primer": "GCGCCGTCTCAAAGC",
+                                                      "fwd_tm": 60.5,
+                                                      "rev_tm": 61.2,
+                                                      "grammar": "gb_l0"})),
     ("HistoryViewerModal",           lambda: sc.HistoryViewerModal(
                                                 "pUC19",
                                                 sc._CommercialSaaSHistoryNode.new(
