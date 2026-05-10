@@ -4571,6 +4571,38 @@ def _paint_feature_bar(arr: list[tuple[str, str]], f: dict,
             arr[col] = (ch, color)
 
 
+def _spliced_idx_to_genomic_bp(idx: int,
+                                  exons: "list[tuple[int, int]]",
+                                  strand: int) -> int:
+    """Map a 0-based offset into the spliced (intron-removed) CDS
+    sequence back to its genomic bp. Exons are stored in ascending
+    genomic order; strand=-1 reverses the walk so the first spliced
+    base lives at the 3'-most exon's far end.
+
+    Used by `_paint_cds_aa` to paint each codon's middle-base AA
+    letter above the right column even when the codon straddles an
+    intron junction (issue #9 from Cory Tobin)."""
+    if strand == -1:
+        # Walk exons from 3' end of the last exon back to 5' end of the
+        # first one. Spliced index 0 = exons[-1].end - 1 (the last
+        # genomic base of the last exon).
+        cum = 0
+        for xs, xe in reversed(exons):
+            length = xe - xs
+            if idx < cum + length:
+                return xe - 1 - (idx - cum)
+            cum += length
+        return -1
+    # Forward strand: spliced index 0 = exons[0].start.
+    cum = 0
+    for xs, xe in exons:
+        length = xe - xs
+        if idx < cum + length:
+            return xs + (idx - cum)
+        cum += length
+    return -1
+
+
 def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
                    chunk_start: int, chunk_end: int,
                    seq_upper: str,
@@ -4582,6 +4614,11 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
     The original CDS coords live in `_orig_start` / `_orig_end`; we
     use those for both the cache lookup (so each half shares the full
     translation) and the codon-midpoint formula.
+
+    Intron-aware (issue #9 from Cory Tobin): when `f["_exons"]` is
+    set, each codon's middle-base bp is looked up via
+    `_spliced_idx_to_genomic_bp` so the AA letter lands above the
+    right column even on a codon that straddles an intron junction.
     """
     if not seq_upper:
         return
@@ -4592,12 +4629,29 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
     # Original CDS bounds — fall back to the half's bounds for non-wrap.
     orig_s = f.get("_orig_start", f["start"])
     orig_e = f.get("_orig_end",   f["end"])
+    exons = f.get("_exons")
     n = len(seq_upper)
     strand = f.get("strand", 1)
     color  = f.get("color", "white")
     is_aa_active = (aa_highlight is not None and f is aa_highlight)
     sty = (f"reverse bold {color}" if is_aa_active
            else f"bold {color}")
+    content_w = chunk_end - chunk_start
+    if exons:
+        # Intron-aware: every codon's middle base is at spliced index
+        # 3*ci + 1. Walk via the helper. The painter doesn't try to
+        # narrow `i_range` because the codon→bp map isn't monotonic
+        # across intron junctions; full-scan with per-bp filter is the
+        # correct (and bounded) approach.
+        for ci in range(n_codons):
+            aa_bp = _spliced_idx_to_genomic_bp(3*ci + 1, exons, strand)
+            if aa_bp < 0:
+                continue
+            if chunk_start <= aa_bp < chunk_end:
+                col = aa_bp - chunk_start
+                if 0 <= col < content_w:
+                    arr[col] = (aa_letters[ci], sty)
+        return
     if orig_e >= orig_s:
         # Non-wrap: narrow the codon range whose midpoint can land in
         # this chunk so a 10 kb CDS doesn't iterate every codon per
@@ -4617,7 +4671,6 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
         # drop the ones outside this chunk. Each call only sees the
         # chunk-local arr so the cost is bounded by codons-in-CDS.
         i_range = range(n_codons)
-    content_w = chunk_end - chunk_start
     for ci in i_range:
         if strand == -1:
             aa_bp = (virt_e - 3*ci - 2) % n if n else 0
@@ -5550,16 +5603,35 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
     `_orig_end` (stamped by the splitter) hold the CDS's true
     coords; we key the cache and translate against those so all
     halves of the same wrap-CDS share one translation.
+
+    Intron-aware (issue #9 from Cory Tobin): when `f["_exons"]` is
+    set, the spliced CDS sequence is built by concatenating ONLY the
+    exonic bases (in ascending-genomic order, then strand-corrected),
+    so introns whose length isn't a multiple of 3 no longer shift the
+    reading frame for AAs past the splice. Cache key includes the
+    exon list so two CDSes with the same outer bounds but different
+    splice patterns don't share a translation.
     """
     s = f.get("_orig_start", f["start"])
     e = f.get("_orig_end",   f["end"])
     strand = f.get("strand", 1)
+    exons = f.get("_exons")
+    exon_key = tuple(exons) if exons else None
     # hash(seq) instead of id(seq) — see `_build_seq_inputs`.
-    key = (hash(seq), s, e, strand)
+    key = (hash(seq), s, e, strand, exon_key)
     cached = _CDS_AA_CACHE.get(key)
     if cached is not None:
         return cached
-    if e < s:
+    if exons:
+        # Spliced CDS: concatenate exon bases in genomic order, then
+        # strand-correct as one block. `virt_e` for downstream codon-
+        # midpoint math becomes the LINEAR end of the last exon —
+        # painter walks the exon list for the per-codon bp lookup so
+        # it doesn't depend on a contiguous virtual range.
+        cds_seq = "".join(seq[xs:xe].upper() for xs, xe in exons)
+        cds_len = len(cds_seq)
+        virt_e  = max(xe for _xs, xe in exons)
+    elif e < s:
         cds_seq = (seq[s:] + seq[:e]).upper()
         cds_len = len(cds_seq)
         virt_e  = s + cds_len
@@ -5581,7 +5653,8 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
     return result
 
 
-def _translate_cds(full_seq: str, start: int, end: int, strand: int) -> str:
+def _translate_cds(full_seq: str, start: int, end: int, strand: int,
+                    exons: "list[tuple[int, int]] | None" = None) -> str:
     """Translate a CDS region to single-letter AA string (stop codon → *).
 
     Uses _IUPAC_COMP for the reverse-complement step so IUPAC ambiguity codes
@@ -5593,8 +5666,17 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int) -> str:
     for `join(tail..end, 0..head)` origin-spanning features on circular
     plasmids. We concatenate the tail + head before translating so the
     protein comes out correctly. Regression guard added 2026-04-13.
+
+    Intron-aware (issue #9 from Cory Tobin): pass `exons=[(s, e), ...]`
+    in ascending genomic order to splice introns OUT before translating.
+    Without this, an intron whose length isn't a multiple of 3 frame-
+    shifts every AA past the splice. Wrap-CDS isn't intron-aware (the
+    wrap encoding overloads `end < start`); callers that combine wrap +
+    introns should handle it themselves.
     """
-    if end < start:
+    if exons:
+        sub = "".join(full_seq[xs:xe].upper() for xs, xe in exons)
+    elif end < start:
         sub = (full_seq[start:] + full_seq[:end]).upper()
     else:
         sub = full_seq[start:end].upper()
@@ -8180,6 +8262,7 @@ class PlasmidMap(Widget):
                 )
                 continue
             strand = getattr(feat.location, "strand", 1) or 1
+            feat_exons: "list[tuple[int, int]] | None" = None
 
             # Compound / joined locations need special handling:
             #   * parts that are CONTIGUOUS (each part.end == next.start):
@@ -8229,6 +8312,24 @@ class PlasmidMap(Widget):
                         "Flattened compound feature %s (%d..%d) to outer bounds",
                         _feat_label(feat), start, end,
                     )
+                # Intron-aware splice info (issue #9 from Cory Tobin).
+                # For a multi-exon CDS like `join(100..200, 400..500)`,
+                # stash the exon list so `_translate_cds` and
+                # `_paint_cds_aa` can splice out introns before reading
+                # the codon table. Without this, the AA letters past the
+                # intron come out in the wrong reading frame whenever
+                # the intron length isn't a multiple of 3.
+                #
+                # Skipped for origin wraps (the existing wrap-encoding
+                # already encodes the two pieces in `start`/`end`) and
+                # for contiguous compound (no information is lost in
+                # flattening). Captured as half-open `(s, e)` tuples in
+                # ascending genomic order; strand handling happens at
+                # read time inside `_cds_aa_list`.
+                if not is_wrap and not is_contiguous and len(parts) >= 2:
+                    feat_exons = [
+                        (int(p.start), int(p.end)) for p in parts
+                    ]
 
             # Clamp coords that exceed the sequence length — rendering
             # math assumes start, end ∈ [0, total].
@@ -8254,6 +8355,8 @@ class PlasmidMap(Widget):
                 "color":  _FEATURE_PALETTE[idx % len(_FEATURE_PALETTE)],
                 "label":  _feat_label(feat),
             }
+            if feat_exons is not None:
+                new_feat["_exons"] = feat_exons
             # ── Partial-binding primer detection ────────────────────
             # When a `primer_bind` feature carries a `/primer_seq`
             # qualifier (set by `_add_selected_to_map` since 0.5.9),
@@ -8520,10 +8623,39 @@ class PlasmidMap(Widget):
 
     # ── Mouse ──────────────────────────────────────────────────────────────────
 
-    def on_mouse_scroll_up(self, _: MouseScrollUp):
+    def on_mouse_scroll_up(self, event: MouseScrollUp):
+        """Mouse-wheel up. Default = rotate clockwise (circular view).
+        In linear mode, Ctrl+scroll zooms in and Shift+scroll pans
+        left — both flagged by Koeng101 in issue #5 as SnapGene
+        muscle memory. Plain scroll in linear mode falls through to
+        the rotate action (which is a no-op for linear records, so
+        the default is harmless)."""
+        if self._map_mode == "linear":
+            if getattr(event, "ctrl", False):
+                self.action_linear_zoom_in()
+                event.stop()
+                return
+            if getattr(event, "shift", False):
+                self._linear_pan(-1)
+                self.refresh()
+                event.stop()
+                return
         self.action_rotate_cw()
 
-    def on_mouse_scroll_down(self, _: MouseScrollDown):
+    def on_mouse_scroll_down(self, event: MouseScrollDown):
+        """Mouse-wheel down. Default = rotate counter-clockwise. In
+        linear mode, Ctrl+scroll zooms out and Shift+scroll pans
+        right (issue #5)."""
+        if self._map_mode == "linear":
+            if getattr(event, "ctrl", False):
+                self.action_linear_zoom_out()
+                event.stop()
+                return
+            if getattr(event, "shift", False):
+                self._linear_pan(1)
+                self.refresh()
+                event.stop()
+                return
         self.action_rotate_ccw()
 
     def _label_at(self, x: int, y: int) -> int:
@@ -8937,6 +9069,14 @@ class PlasmidMap(Widget):
             (orig_txt, "dim cyan"),
         ]):
             canvas.put_text(cx - len(txt) // 2, cy - 1 + i, txt, sty)
+
+        # Top-right v-toggle hint, parallel to the linear-mode hint at
+        # the equivalent corner. Discoverability for the circular ⇄
+        # linear toggle — flagged by Koeng101 in issue #4. Mirrors the
+        # `[ flag · v = circular ]` text the linear renderer puts in
+        # the same spot.
+        hint = "[ v = linear ]"
+        canvas.put_text(max(0, w - len(hint) - 1), 0, hint, "dim")
 
         return bc.combine(canvas)
 
@@ -38143,6 +38283,201 @@ class PlasmidPickerModal(ModalScreen):
         self.dismiss(None)
 
 
+class FeatureSearchModal(ModalScreen):
+    """Find an annotation on the current plasmid and jump the seq-
+    panel cursor + map selection to it.
+
+    Anirudh asked for this in issue #6 — "search annotations feature
+    that helps to zoom into one specific annotation without scrolling
+    a lot" — and the maintainer (Seb) replied on 2026-05-03 that he'd
+    work on it. This is the implementation.
+
+    Layout: search Input on top, results DataTable below, status line
+    at the bottom showing the match count.
+
+    Dismiss payload:
+      None — cancelled (Escape / Cancel button)
+      int  — index into the feature list the caller passed in
+    """
+
+    BINDINGS = [
+        Binding("escape",       "cancel",         "Cancel"),
+        Binding("tab",          "app.focus_next", "Next", show=False),
+        Binding("shift+tab",    "app.focus_previous", "Prev", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    FeatureSearchModal { align: center middle; }
+    #fsm-dlg {
+        width: 90;
+        height: 28;
+        background: $surface;
+        border: heavy $primary;
+        padding: 1;
+    }
+    #fsm-title {
+        text-align: center;
+        background: $primary-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
+    #fsm-search { margin: 1 0 0 0; }
+    #fsm-table { height: 1fr; margin-top: 1; }
+    #fsm-status { color: $text-muted; padding: 0 1; }
+    #fsm-btns {
+        height: 3;
+        align: right middle;
+        padding-top: 1;
+    }
+    """
+
+    def __init__(self, feats: "list[dict]", total: int = 0):
+        super().__init__()
+        self._feats = feats or []
+        self._total = total
+        # Stash (original_idx, label, type, span_str) tuples so the
+        # filter re-render is fast and we can map a clicked row back
+        # to the original feature index in the caller's list.
+        self._row_data: list[tuple] = []
+        for i, f in enumerate(self._feats):
+            ftype = f.get("type", "?")
+            if ftype in ("source", "resite", "recut"):
+                # Annotations the user thinks of as "features" don't
+                # include restriction overlays or whole-record source.
+                continue
+            label = (
+                f.get("label")
+                or f.get("name")
+                or ftype
+                or "(unnamed)"
+            )
+            s = int(f.get("start", 0))
+            e = int(f.get("end", 0))
+            span = _feat_span_label(s, e, total) if total else f"{s}..{e}"
+            self._row_data.append((i, str(label), str(ftype), span))
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fsm-dlg"):
+            yield Static(" Find annotation ", id="fsm-title")
+            yield Input(
+                placeholder="type to filter (name or type)...",
+                id="fsm-search",
+            )
+            yield DataTable(id="fsm-table", cursor_type="row",
+                              zebra_stripes=True)
+            yield Static("", id="fsm-status")
+            with Horizontal(id="fsm-btns"):
+                yield Button("Go to feature",
+                              id="btn-fsm-ok", variant="primary")
+                yield Button("Cancel", id="btn-fsm-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#fsm-table", DataTable)
+        t.add_columns("Label", "Type", "Span")
+        self._refilter("")
+        # Land focus on the search bar so the user types straight in.
+        try:
+            self.query_one("#fsm-search", Input).focus()
+        except NoMatches:
+            pass
+
+    def _refilter(self, query: str) -> None:
+        """Repopulate the table with rows whose label / type contain
+        `query` (case-insensitive). Empty query shows everything.
+        Row keys are the ORIGINAL feature index (stringified) so a
+        dismiss can route back to `self._feats[idx]` unambiguously."""
+        try:
+            t = self.query_one("#fsm-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        q = query.strip().lower()
+        n_shown = 0
+        for orig_idx, label, ftype, span in self._row_data:
+            if q and q not in label.lower() and q not in ftype.lower():
+                continue
+            t.add_row(
+                Text(label[:48], style="bold"),
+                ftype,
+                span,
+                key=str(orig_idx),
+            )
+            n_shown += 1
+        try:
+            status = self.query_one("#fsm-status", Static)
+            if not self._row_data:
+                status.update("[dim]No annotations on this plasmid.[/dim]")
+            elif n_shown == 0:
+                status.update(
+                    f"[dim]No matches — {len(self._row_data)} "
+                    f"annotation(s) total.[/dim]"
+                )
+            else:
+                status.update(
+                    f"[dim]{n_shown} of {len(self._row_data)} "
+                    f"annotation(s).[/dim]"
+                )
+        except NoMatches:
+            pass
+        if n_shown:
+            try:
+                t.move_cursor(row=0)
+            except Exception:
+                pass
+
+    @on(Input.Changed, "#fsm-search")
+    def _on_search_change(self, event: Input.Changed) -> None:
+        self._refilter(event.value or "")
+
+    @on(Input.Submitted, "#fsm-search")
+    def _on_search_submit(self, _event: Input.Submitted) -> None:
+        # Enter from the search bar jumps to the first matching row.
+        try:
+            t = self.query_one("#fsm-table", DataTable)
+        except NoMatches:
+            return
+        if t.row_count > 0:
+            t.focus()
+            # Trigger the same path as clicking "Go to feature".
+            self._dismiss_with_cursor(t)
+
+    def _dismiss_with_cursor(self, t: DataTable) -> None:
+        try:
+            row_key = t.coordinate_to_cell_key((t.cursor_row, 0)).row_key
+        except Exception:
+            return
+        if row_key and row_key.value:
+            try:
+                idx = int(row_key.value)
+            except (TypeError, ValueError):
+                return
+            self.dismiss(idx)
+
+    @on(DataTable.RowSelected, "#fsm-table")
+    def _row_selected(self, event):
+        if event.row_key and event.row_key.value:
+            try:
+                idx = int(event.row_key.value)
+            except (TypeError, ValueError):
+                return
+            self.dismiss(idx)
+
+    @on(Button.Pressed, "#btn-fsm-ok")
+    def _ok(self, _):
+        try:
+            t = self.query_one("#fsm-table", DataTable)
+        except NoMatches:
+            return
+        self._dismiss_with_cursor(t)
+
+    @on(Button.Pressed, "#btn-fsm-cancel")
+    def _cancel_btn(self, _):
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class RestoreFromBackupModal(ModalScreen):
     """Settings → Restore from backup… recovery UI.
 
@@ -42665,6 +43000,18 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+f",      "add_feature",      "+Feat",         show=True),
         Binding("ctrl+p",      "open_primer_design", "Primers",     show=True, priority=True),
         Binding("ctrl+b",      "open_blast",       "BLAST",         show=True, priority=True),
+        # Direct shortcut to the cloning-grammar editor (issue #10
+        # from Cory Tobin). The editor itself has been there since
+        # 0.4.x but it was only reachable via Settings → Cloning
+        # grammars… — Cory found it once, then lost it. Ctrl+G
+        # makes it a one-keystroke jump from anywhere.
+        Binding("ctrl+g",      "open_grammars",    "Grammars",      show=True, priority=True),
+        # Find annotation modal (issue #6 from Anirudh) — fuzzy
+        # search the current plasmid's features by label or type and
+        # jump the cursor + selection to a hit. Ctrl+/ matches the
+        # universal "find" reflex without colliding with Ctrl+F
+        # (already bound to add-feature here).
+        Binding("ctrl+slash",  "find_annotation",  "Find feature",  show=True, priority=True),
         # Off-footer (still bound):
         Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
@@ -42692,6 +43039,15 @@ SpeciesPickerModal { align: center middle; }
         Binding("f3",          "focus_panel_sidebar",  "Features only",show=False, priority=True),
         Binding("f4",          "focus_panel_seq",      "Sequence only",show=False, priority=True),
         Binding("f5",          "focus_panel_all",      "All panels",   show=False, priority=True),
+        # Ctrl+# aliases for the F-key fullscreen views — SnapGene
+        # muscle memory (Koeng101 + Cory Tobin in issue #1). Ctrl+1
+        # is Library (=F1), Ctrl+2 is Sequence (=F4 because that's the
+        # one Cory specifically called out), Ctrl+3 is Features (=F3).
+        # Ctrl+0 returns to all-panels view.
+        Binding("ctrl+1",      "focus_panel_library",  "Library only", show=False, priority=True),
+        Binding("ctrl+2",      "focus_panel_seq",      "Sequence only",show=False, priority=True),
+        Binding("ctrl+3",      "focus_panel_sidebar",  "Features only",show=False, priority=True),
+        Binding("ctrl+0",      "focus_panel_all",      "All panels",   show=False, priority=True),
         # Rotation keys (arrows + [/]) live on PlasmidMap.BINDINGS so they
         # only rotate when the map has focus. Pre-2026-04-29 the `[`/`]`
         # keys were App-level with priority=True, which fired even on
@@ -43785,7 +44141,14 @@ SpeciesPickerModal { align: center middle; }
         if aa_feat is not None and not bottom:
             f_s, f_e = aa_feat["start"], aa_feat["end"]
             strand = aa_feat.get("strand", 1)
-            aa_str = _translate_cds(seq, f_s, f_e, strand).rstrip("*")
+            # Intron-aware (issue #9 from Cory Tobin): if the CDS
+            # feature carries `_exons`, splice introns out before
+            # translating so the copied AA string matches the AA
+            # letters rendered above the DNA.
+            exons = aa_feat.get("_exons")
+            aa_str = _translate_cds(
+                seq, f_s, f_e, strand, exons=exons,
+            ).rstrip("*")
             # Route through the 4-tier helper so a clipboard-broken
             # SSH session still gets the AA string via the disk-fallback
             # tier (hardening item 37). Pre-fix this fell through to
@@ -47353,6 +47716,75 @@ SpeciesPickerModal { align: center middle; }
         appear automatically in every grammar dropdown
         (`_grammar_dropdown_options`) once saved."""
         self.push_screen(GrammarManagerModal())
+
+    def action_find_annotation(self) -> None:
+        """Open the feature-search modal (issue #6 from Anirudh). On
+        dismiss, jump the seq-panel cursor and select the chosen
+        feature in the map — the SnapGene / Geneious "find
+        annotation" reflex. No-op when no record is loaded."""
+        if self._current_record is None:
+            self.notify(
+                "Load a plasmid before searching annotations.",
+                severity="information",
+            )
+            return
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            return
+        feats = list(pm._feats or [])
+        if not feats:
+            self.notify(
+                "No annotations on this plasmid to search.",
+                severity="information",
+            )
+            return
+        total = pm._total
+
+        def _on_pick(idx):
+            if not isinstance(idx, int) or idx < 0 or idx >= len(feats):
+                return
+            f = feats[idx]
+            try:
+                start = int(f.get("start", 0))
+            except (TypeError, ValueError):
+                start = 0
+            # Map: select the feature so the highlight + label render.
+            try:
+                pm.select_feature(idx)
+            except (NoMatches, AttributeError):
+                pass
+            # Seq panel: park the cursor at the feature's 5' end and
+            # scroll the view so the bp is visible. `_set_view_origin`
+            # and `_cursor_pos` already exist on SequencePanel — we
+            # piggyback on the same path Ctrl+G used to use for the
+            # short-lived go-to-bp prompt.
+            try:
+                sp = self.query_one("#seq-panel", SequencePanel)
+                sp._cursor_pos = max(0, min(start, len(sp._seq) - 1))
+                sp._user_sel = None
+                sp._refresh_view()
+                sp.refresh()
+            except (NoMatches, AttributeError):
+                pass
+            # Map-mode origin nudge so a wrap feature lands on screen
+            # in circular view. No-op on linear; defensive on a
+            # missing _set_origin_bp.
+            try:
+                if pm._map_mode == "circular":
+                    pm.origin_bp = start
+                    pm.refresh()
+            except AttributeError:
+                pass
+            label = f.get("label") or f.get("type", "feature")
+            self._notify_success(
+                f"Jumped to {label} at bp {start + 1}"
+            )
+
+        self.push_screen(
+            FeatureSearchModal(feats, total=total),
+            callback=_on_pick,
+        )
 
     def action_open_primer_design(self) -> None:
         """Open the full-screen Primer Design workbench. Passes the current

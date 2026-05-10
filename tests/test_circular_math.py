@@ -628,3 +628,133 @@ class TestWrapFeaturePrimerDesignScreen:
             "against the inverted backbone region rather than the user's "
             "feature."
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Intron-bearing CDS — issue #9 from Cory Tobin (har1eyk reported similar)
+# Pre-fix `_translate_cds` and `_paint_cds_aa` treated every CDS as
+# contiguous, so an intron whose length isn't a multiple of 3 frame-
+# shifted every AA past the splice. The loader now stamps `_exons`
+# on CompoundLocation CDSes; the translators splice introns out.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestIntronAwareTranslation:
+    def test_translate_cds_with_exons_skips_intron(self):
+        # 60 bp record: exon-1 [0:9] (ATG GGG AAA) + intron [9:13]
+        # (CCCC — 4 bp, not a multiple of 3) + exon-2 [13:22] (TTT TGT
+        # AAA). Spliced CDS = ATGGGGAAATTTTGTAAA = M G K F C K (no stop)
+        # → six AAs.
+        seq = (
+            "ATGGGGAAA"   # exon 1 (9 bp)
+            "CCCC"         # intron (4 bp) — would frameshift everything after
+            "TTTTGTAAA"   # exon 2 (9 bp) → F C K
+            + "G" * 38     # padding to round out the test sequence
+        )
+        assert len(seq) == 60
+        exons = [(0, 9), (13, 22)]
+        # Reference: build the spliced sequence by hand and translate.
+        spliced = seq[0:9] + seq[13:22]
+        assert spliced == "ATGGGGAAATTTTGTAAA"
+        # Translate via the exon-aware path.
+        result = sc._translate_cds(seq, 0, 22, 1, exons=exons)
+        assert result == "MGKFCK*", (
+            f"Expected MGKFCK* (correctly spliced); got {result!r}. "
+            f"Pre-fix the intron's 4 bp shifted every downstream codon's "
+            f"reading frame."
+        )
+
+    def test_translate_cds_without_exons_keeps_legacy_contiguous(self):
+        # The legacy path (no exons) must still produce the contiguous
+        # translation — so passing a non-intron CDS through the new
+        # signature doesn't regress.
+        seq = "ATGGGGAAATAA"   # M G K *
+        result = sc._translate_cds(seq, 0, 12, 1)
+        assert result == "MGK*"
+
+    def test_translate_cds_with_exons_reverse_strand(self):
+        # Reverse strand: spliced CDS on the bottom strand should
+        # translate from the 3' end of the genomic span. Build a record
+        # whose top strand reverse-complements to ATGGGGAAATTTTGTAAA
+        # (the same spliced CDS as the forward test) on the bottom
+        # strand. RC of ATGGGGAAATTTTGTAAA = TTTACAAAATTTCCCCAT.
+        # Place that at genomic positions: exon-2 (5' of spliced) at
+        # [4:13] = TTTACAAAA (rc of "TTTTGTAAA"), intron at [13:17] =
+        # GGGG (rc of "CCCC"), exon-1 (3' of spliced) at [17:26] =
+        # TTTCCCCAT (rc of "ATGGGGAAA").
+        # NB exons stored in ascending genomic order:
+        #   genomic[4:13]  → 3' end of spliced CDS (last exon)
+        #   genomic[17:26] → 5' end of spliced CDS (first exon)
+        rc_spliced = (
+            "GAAA"          # padding 0..4
+            + "TTTACAAAA"   # exon 2 of spliced, on bottom: AAAATTTGT
+                              # wait — let me just compute and use
+        )
+        # Cleanest: build by hand using sc._IUPAC_COMP.
+        spliced_top = "ATGGGGAAATTTTGTAAA"
+        # Place spliced_top.reverse_complement() on the bottom strand,
+        # then construct exons in ascending genomic order.
+        rc = spliced_top.translate(sc._IUPAC_COMP)[::-1]
+        # exon-1 (5' of CDS = end of genomic span) = first 9 chars of
+        # spliced_top → bottom strand bases at the END of the genomic
+        # span. Layout: [pad 4][rc of exon-2 = "TTTACAAAA"][intron
+        # "GGGG"][rc of exon-1 = "TTTCCCCAT"][pad].
+        rc_exon1 = "ATGGGGAAA".translate(sc._IUPAC_COMP)[::-1]   # TTTCCCCAT
+        rc_exon2 = "TTTTGTAAA".translate(sc._IUPAC_COMP)[::-1]   # TTTACAAAA
+        intron_rc = "CCCC".translate(sc._IUPAC_COMP)[::-1]       # GGGG
+        seq = (
+            "G" * 4              # padding 0..4
+            + rc_exon2           # 4..13 (genomic 5' = CDS 3' end)
+            + intron_rc          # 13..17
+            + rc_exon1           # 17..26 (genomic 3' = CDS 5' end)
+            + "G" * 4            # padding
+        )
+        assert len(seq) == 30
+        exons = [(4, 13), (17, 26)]
+        result = sc._translate_cds(seq, 4, 26, -1, exons=exons)
+        assert result == "MGKFCK*", (
+            f"Reverse-strand spliced CDS should still translate to "
+            f"MGKFCK*; got {result!r}"
+        )
+
+    def test_cds_aa_list_uses_exons_from_feature_dict(self):
+        # Build a feature dict carrying _exons and verify _cds_aa_list
+        # produces the spliced translation.
+        seq = "ATGGGGAAA" + "CCCC" + "TTTTGTAAA" + "G" * 38
+        f = {
+            "type": "CDS", "start": 0, "end": 22, "strand": 1,
+            "_exons": [(0, 9), (13, 22)],
+        }
+        aa_letters, cds_len, _virt_e = sc._cds_aa_list(seq, f)
+        assert cds_len == 18, f"spliced CDS is 18 bp, got {cds_len}"
+        assert "".join(aa_letters) == "MGKFCK", (
+            f"Expected MGKFCK (spliced); got {''.join(aa_letters)!r}"
+        )
+
+    def test_cds_aa_list_no_exons_is_contiguous(self):
+        # No _exons key → legacy contiguous translation path.
+        seq = "ATGGGGAAATAA"
+        f = {"type": "CDS", "start": 0, "end": 12, "strand": 1}
+        aa_letters, _, _ = sc._cds_aa_list(seq, f)
+        assert "".join(aa_letters) == "MGK*"
+
+    def test_spliced_idx_to_genomic_bp_forward(self):
+        # exons = [(0, 9), (13, 22)] → spliced length 18.
+        # spliced[0] = genomic[0]; spliced[8] = genomic[8];
+        # spliced[9] = genomic[13]; spliced[17] = genomic[21].
+        exons = [(0, 9), (13, 22)]
+        assert sc._spliced_idx_to_genomic_bp(0,  exons, 1) == 0
+        assert sc._spliced_idx_to_genomic_bp(8,  exons, 1) == 8
+        assert sc._spliced_idx_to_genomic_bp(9,  exons, 1) == 13
+        assert sc._spliced_idx_to_genomic_bp(17, exons, 1) == 21
+
+    def test_spliced_idx_to_genomic_bp_reverse(self):
+        # Reverse strand: spliced[0] = 3'-most base of last exon =
+        # genomic[exons[-1].end - 1].
+        exons = [(0, 9), (13, 22)]
+        assert sc._spliced_idx_to_genomic_bp(0, exons, -1) == 21
+        assert sc._spliced_idx_to_genomic_bp(8, exons, -1) == 13
+        # Crossing the splice: spliced[9] is the first base of the
+        # 5'-most exon's far end on the genomic forward strand.
+        assert sc._spliced_idx_to_genomic_bp(9, exons, -1) == 8
+        assert sc._spliced_idx_to_genomic_bp(17, exons, -1) == 0
