@@ -2608,7 +2608,15 @@ class TestSearchInputWidget:
         """A burst of three keystrokes within the debounce window
         fires the on_filter callback exactly once after the window
         expires. Without the cancel-and-reschedule it would fire
-        three times."""
+        three times.
+
+        Window bumped to 0.3 s (was 0.05 s) so xdist parallel load
+        on a busy CPU can't space the three rapid assignments out
+        wider than the debounce. Pre-bump the test was flaky under
+        `pytest -n auto` heat — the inter-assignment scheduling
+        gap could stretch past 50 ms when 8 workers were CPU-bound,
+        firing the callback per-keystroke instead of once.
+        """
         import asyncio
         from textual.app import App
         calls = []
@@ -2617,7 +2625,7 @@ class TestSearchInputWidget:
             def compose(self):
                 yield sc._SearchInput(
                     id="harness-search",
-                    debounce_s=0.05,
+                    debounce_s=0.3,
                     on_filter=lambda q: calls.append(q),
                 )
 
@@ -2630,7 +2638,7 @@ class TestSearchInputWidget:
             inp.value = "pU"
             inp.value = "pUC"
             # Wait past the debounce window.
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.6)
             await pilot.pause()
         assert len(calls) == 1, (
             f"expected 1 debounced call, got {len(calls)}: {calls}"
@@ -4642,16 +4650,33 @@ class TestShiftClickFeatureExtend:
         """Lazy chunk rendering — when `viewport_y_range` excludes
         most chunks, the function emits blank-line placeholders and
         returns much faster than the full-render path on a long
-        sequence."""
+        sequence.
+
+        Best-of-3 timing on each variant: pytest-xdist's worker
+        contention can spike a single run by 10×, but the median /
+        min across 3 trials is reliable. Pre-best-of this assertion
+        was flaky under `pytest -n auto` heat.
+        """
         import time
         seq = "ATGC" * 25_000   # 100 kb
-        t0 = time.perf_counter()
-        full = sc._build_seq_text(seq, [], line_width=120)
-        t_full = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        lazy = sc._build_seq_text(seq, [], line_width=120,
-                                    viewport_y_range=(0, 30))
-        t_lazy = time.perf_counter() - t0
+
+        def _timed(fn):
+            best = float("inf")
+            for _ in range(3):
+                t0 = time.perf_counter()
+                result = fn()
+                dt = time.perf_counter() - t0
+                if dt < best:
+                    best = dt
+            return best, result
+
+        t_full, full = _timed(
+            lambda: sc._build_seq_text(seq, [], line_width=120)
+        )
+        t_lazy, lazy = _timed(
+            lambda: sc._build_seq_text(seq, [], line_width=120,
+                                          viewport_y_range=(0, 30))
+        )
         # The lazy variant must produce a Text whose total newline
         # count matches the full variant — placeholder lines preserve
         # height for accurate scrollbar positioning.
