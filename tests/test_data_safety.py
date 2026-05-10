@@ -923,3 +923,44 @@ class TestDoSaveUsesAtomicWrite:
             # No lingering tempfile in the target directory
             leftover = list(tmp_path.glob(f".{target.name}.*.tmp"))
             assert leftover == []
+
+
+class TestSafeSaveJsonOversizeGuard:
+    """An oversized file (over `_SAFE_LOAD_JSON_MAX_BYTES`) cannot be
+    silently overwritten — `_safe_load_json` returns `[]` for an
+    oversized file, so the in-memory state is empty even though the
+    on-disk content is real. Pre-2026-05-10 the next save would
+    happily overwrite the oversized file with the empty list, silently
+    nuking 147 MB of FlowersForEveryone collection data on a real
+    user's machine. The save-side guard now refuses to overwrite such
+    a file so the user always gets a chance to recover."""
+
+    def test_save_refuses_to_overwrite_oversized_existing_file(
+            self, tmp_path, monkeypatch):
+        # Patch the cap to a tiny value so we don't have to actually
+        # write a 1 GB file in the test.
+        monkeypatch.setattr(sc, "_SAFE_LOAD_JSON_MAX_BYTES", 1024)
+        target = tmp_path / "oversized.json"
+        # Write a 2 KB blob — over the patched cap.
+        target.write_bytes(b"x" * 2048)
+        with pytest.raises(OSError, match="Refusing to overwrite oversized"):
+            sc._safe_save_json(target, [], "test")
+        # Existing file untouched.
+        assert target.stat().st_size == 2048
+
+    def test_save_proceeds_when_existing_file_under_cap(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "_SAFE_LOAD_JSON_MAX_BYTES", 1024 * 1024)
+        target = tmp_path / "small.json"
+        target.write_text('{"_schema_version": 1, "entries": []}')
+        # Normal save — must succeed.
+        sc._safe_save_json(target, [{"id": "X"}], "test")
+        assert "X" in target.read_text()
+
+    def test_save_proceeds_when_no_existing_file(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "_SAFE_LOAD_JSON_MAX_BYTES", 1024)
+        target = tmp_path / "fresh.json"
+        # First save — file doesn't exist yet, no oversize check triggers.
+        sc._safe_save_json(target, [{"id": "X"}], "test")
+        assert target.exists()

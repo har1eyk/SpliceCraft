@@ -796,6 +796,38 @@ def _safe_save_json(path: Path, entries: list, label: str,
     import os
     import tempfile
 
+    # OVERSIZE GUARD (sacred invariant — DO NOT BYPASS).
+    #
+    # If the file already on disk is larger than `_safe_load_json` can
+    # read, the in-memory cache may be EMPTY (the load returned [] +
+    # a warning). Overwriting the file here would silently destroy
+    # whatever real data was in it — that's exactly how the user's
+    # FFE collection got nuked on 2026-05-10 when their `gb_text`
+    # bloat pushed `collections.json` past the old 50 MB cap.
+    #
+    # Refuse: raise OSError so the caller's `try/except` surfaces a
+    # real error to the user instead of silently writing the empty
+    # in-memory state. The cap was bumped to 1 GB; tripping this
+    # guard now indicates a genuinely runaway file (or a future cap
+    # bump is needed) — either way, "abort + scream" is the right
+    # answer over "silently nuke".
+    if path.exists():
+        try:
+            existing_size = path.stat().st_size
+        except OSError:
+            existing_size = 0
+        if existing_size > _SAFE_LOAD_JSON_MAX_BYTES:
+            msg = (
+                f"Refusing to overwrite oversized {label} "
+                f"({existing_size:,} bytes > "
+                f"{_SAFE_LOAD_JSON_MAX_BYTES:,} cap). The previous "
+                f"load was refused (see `_safe_load_json`); writing "
+                f"the empty in-memory state would silently destroy "
+                f"the file. Move {path} aside before retrying."
+            )
+            _log.error(msg)
+            raise OSError(msg)
+
     # Step 1: read prior content for backup + shrink-guard analysis.
     existing_count = 0
     prev_entries: "list | None" = None
@@ -1136,7 +1168,14 @@ def _restore_from_backup(target_path: Path, source_path: Path,
     return len(entries)
 
 
-_SAFE_LOAD_JSON_MAX_BYTES = 50 * 1024 * 1024   # 50 MB — same as bulk import
+# Pre-2026-05-10 the cap was 50 MB. A real user collection (the
+# FlowersForEveryone test set: 385 plasmids with rich `gb_text`) grew
+# past that on a normal user's machine, which silently triggered the
+# load-fail → save-empty → wipe pathology described in
+# `_safe_save_json`'s OVERSIZE GUARD comment. Bumped to 1 GB so
+# accidental cap-trips are extremely rare; the guard below handles
+# the remaining edge case so a future cap-trip can't nuke data.
+_SAFE_LOAD_JSON_MAX_BYTES = 1024 * 1024 * 1024   # 1 GB
 
 
 def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
@@ -1147,14 +1186,15 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     SpliceCraft < 0.3.1. The legacy file gets silently rewritten as an
     envelope on the next save.
 
-    Capped at ``_SAFE_LOAD_JSON_MAX_BYTES`` (50 MB) — same cap as bulk
+    Capped at ``_SAFE_LOAD_JSON_MAX_BYTES`` (1 GB) — same cap as bulk
     import. A corrupted / mis-restored / hostile shared library would
-    otherwise OOM on read. A 50 MB JSON envelope is wildly above any
-    legitimate plasmid library.
+    otherwise OOM on read.
 
     - Missing file → ([], None) — normal first run, no warning.
     - Valid file   → (entries, None).
-    - Oversized file → ([], warning).
+    - Oversized file → ([], warning). The matching guard in
+      `_safe_save_json` REFUSES to overwrite an oversized file so
+      the in-memory empty state can't silently nuke the user's data.
     - Corrupt file → attempt .bak restore; if .bak is valid →
       (bak_entries, warning). If .bak also corrupt → ([], warning).
     """
