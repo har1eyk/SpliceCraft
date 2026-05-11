@@ -2,6 +2,149 @@
 
 ---
 
+## [0.7.10.0] — 2026-05-10 — full GB 2.0 grammar + performance sweep + CDS start-codon fix
+
+### New: full Golden Braid 2.0 grammar (`_GB_POSITIONS` expanded 7 → 17 slots)
+
+The Golden Braid L0 grammar now exposes every position from the
+canonical GB 2.0 fusion-site table (Sarrion-Perdigones et al. 2013),
+not just the BASIC subset. Users can now domesticate and assemble
+parts for the **SECRETED**, **CT-FUSION**, **NT-FUSION**, **OP-PROM-A**,
+and **OP-PROM-B** workflows from the official figure.
+
+- **5' Non-Transcribed** — `Promoter` (combined PromUTR+ATG; Pos 01-12,
+  unchanged for BASIC workflow), `Promoter-only` (PromUTR without LINK),
+  `Operator-A` (Pos 01-02, OP-PROM-A operator), `Operator-B` (Pos 02,
+  OP-PROM-B operator), `Min Promoter` (Pos 03-12, pairs with either
+  Operator).
+- **5' UTR** — `5' UTR` (kept under this name for backward compat; it's
+  technically the LINK position Pos 12 in canonical GB 2.0), plus
+  `Distal 5' UTR` (Pos 03-11, the actual GB 2.0 5'UTR upstream of LINK).
+- **Translated region** — `Signal peptide` (Pos 13, SECRETED workflow
+  N-terminal coding extension), `CDS` (Pos 13-16, full CDS with stop;
+  unchanged for BASIC), `CDS-NS` and `C-tag` (legacy 2-part split,
+  preserved for back-compat), plus canonical variants `CDS-NS (CT)`
+  (Pos 13-15, CDS no-stop for CT-FUSION), `CT-tag` (Pos 16, canonical
+  C-terminal tag), `CDS-after-SP` (Pos 14-16, CDS body after a signal
+  peptide).
+- **3' Non-Translated** — `Terminator` (Pos 17-21, combined 3'UTR+TER;
+  unchanged for BASIC), `3' UTR` (Pos 17 alone), `Terminator-only`
+  (Pos 21 alone).
+- Each new slot has its own colour in `_GB_TYPE_COLORS` (5'NT shades of
+  green, 5'UTR shades of cyan, translated shades of yellow/orange, 3'NT
+  shades of blue) and INSDC mapping in `_GB_PART_TYPE_TO_INSDC`
+  (`Signal peptide → sig_peptide`, `Distal 5' UTR → 5'UTR`, `3' UTR →
+  3'UTR`, etc.).
+- **No breaking changes**: existing user parts classified under the
+  pre-existing slot names keep their `position` / `oh5` / `oh3` fields
+  unchanged. Legacy `Pos 1` / `Pos 1a` / `Pos 1b` / `Pos 3-4` / `Pos 3`
+  / `Pos 4` / `Pos 5` labels are preserved on the back-compat slots so
+  parts-bin entries that hardcoded these stay readable.
+- **Cross-grammar collision trade-off** — three new GB positions
+  (`3' UTR` GCTT/GGTA, `Terminator-only` GGTA/CGCT, plus the existing
+  `Promoter` GGAG/AATG) share overhangs with MoClo Plant Pos 4 / Pos 5
+  / Pos 1. Post-cloned MoClo C-tag / Terminator / Promoter parts (no
+  BsaI sites left to disambiguate from GB's level_up enzyme) will
+  classify as gb_l0; the user can re-tag via the Parts Bin Edit modal.
+  Same precedent as the 0.7.7.2 Promoter expansion.
+
+### Fixed: CDS annotation in cloned L1 plasmids now includes the ATG start codon
+
+**User report**: "CDS's cloned seem to lose the annotation of their
+ATG because it also occupies the AATG overhang."
+
+Real bug. The GB 2.0 fusion overhang at the Pos 12→13 boundary is AATG
+(= A + ATG, where the A is a spacer and ATG is the start codon). The
+domesticator's forward primer absorbs the ATG into this overhang and
+PCR-binds at codon 2 of the source CDS — so the L0 part's `sequence`
+field (the body between overhangs) starts at codon 2 and the ATG lives
+only inside the AATG fusion. When the L0 part was assembled into an L1
+plasmid, the CDS feature on the assembled product spanned only the
+body, visibly dropping the start codon from the plasmid map.
+
+- New helper `_atg_offset_for_part(part_oh5, part_type)` returns the
+  3-nt upstream extension that pushes a coding-part feature's 5'
+  boundary back into the AATG overhang so the ATG is included. Returns
+  3 for any coding part type (`CDS`, `CDS-NS`, `Signal peptide`,
+  `CDS-NS (CT)`) whose 5' overhang is AATG; 0 otherwise. Defensive
+  against `None` / non-string inputs.
+- Applied at two fix points: `_reconstruct_l0_features_in_seq`
+  (re-deriving L0 part features on legacy L1 plasmids) and the
+  chained-features loop in the assembly path (where new L1 cassettes
+  get their features synthesised). Strand-aware: forward parts get
+  the extension at the lower coordinate, reverse-strand parts at the
+  upper coordinate. Clamps to `[0, insert_len]` so the linear-insert
+  case can't produce a negative start.
+- Regression guarded by `TestAtgOffsetForPart` (5 tests on the helper)
+  + `TestReDerivedCdsIncludesStartCodon` (4 integration tests covering
+  the forward CDS path, the Promoter-doesn't-extend path, the Signal
+  peptide path, and the origin-clamp edge case).
+
+### Performance sweep
+
+A profile-driven pass shaved hot-path costs on multi-plasmid workflows
+and library I/O. Each change was bench-validated via
+`scripts/perf_probe.py` and `scripts/perf_probe_render.py` (both new,
+not pytest targets — kept for future regression detection).
+
+- **`_typed_clone` replaces `copy.deepcopy` in 19 cache sites** —
+  library / collections / features / parts-bin / primers / grammars /
+  entry-vectors / codon-tables / assembly-fragment caches. Shares
+  immutables by reference (strings — the bulk of `gb_text` payloads —
+  don't need re-allocation), recursively clones dict / list / tuple,
+  falls through to `deepcopy` for any unexpected type so sacred
+  invariant #17 ("caller mutations can't poison the cache") is
+  preserved end-to-end. **Bench**: 2.4–3.1× faster on every library
+  size from 10 entries × 5 kB up to 100 entries × 100 kB. `_load_library()`
+  is called from 50 sites across the codebase, so the speed-up
+  compounds on the Ctrl+S / library-add hot paths.
+- **`@lru_cache(maxsize=4)` on `_rc(seq)`** — repeated reverse-complement
+  calls on the same sequence drop from 0.95 ms to 8 µs on a 200 kb
+  cosmid (~100× on cache hit). Tiny cache (cached strings can be
+  200 kB+) covers the dominant workload (per-keystroke restriction
+  scan on the current sequence).
+- **`_PATTERN_CACHE` converted to bounded LRU(256)** — was an
+  unbounded `dict`. Defensive (memory, not speed); enzyme catalog is
+  ~120 unique sites so steady-state is well under the cap.
+- **`_BUILD_SEQ_CACHE_MAX` + `_CHUNK_LAYOUT_CACHE_MAX` bumped 4 → 16**
+  to match the downstream `_CHUNK_STATIC_CACHE` / `_CHUNK_OVERLAY_CACHE`
+  sizes. The previous cap evicted entries during multi-plasmid LRU
+  hopping; on a 50 kb × 5-plasmid cycle the working set drops from
+  19 ms to 11 ms per hop (1.8× faster). `_CHUNK_STATIC_CACHE` and
+  `_CHUNK_OVERLAY_CACHE` already absorbed cursor + selection moves
+  correctly, so no deeper render-pipeline reshape was warranted.
+
+### Tests
+
+- `tests/test_data_safety.py::TestTypedClone` — 11 tests pinning the
+  invariant-#17 contract (immutables shared, mutables cloned, mutation
+  isolation, deepcopy-equivalence for JSON-typed payloads, LRU bump,
+  max-size enforcement, bool/int discrimination, cycle awareness).
+- `tests/test_domesticator.py::TestAtgOffsetForPart` (5 tests) +
+  `TestReDerivedCdsIncludesStartCodon` (4 tests) — the start-codon
+  fix.
+- Updated existing tests touched by the GB 2.0 expansion: hardcoded
+  INSDC mapping list (`TestGbPartTypeToInsdcMap`), `test_grammar_pos_slots_includes_cds_ns_alias`
+  (made robust to grammar expansion by asserting the alias relationship
+  rather than a hardcoded slot index), and the MoClo fall-through
+  classification test (moved from `(GGTA, CGCT)` to `(AATG, AGGT)`
+  since the former now collides with the new GB `Terminator-only`).
+- Net: 2199 → 2208 passing tests (+9 from the CDS start-codon
+  regression suite; the GB 2.0 expansion contributed +41 from the
+  parametrized iterations over `_GB_POSITIONS.keys()`).
+
+### Tooling
+
+- `scripts/perf_probe.py` — microbench for the data-clone /
+  reverse-complement / restriction-scan / save-json hot paths. Reports
+  median per-call ms across multiple library sizes.
+- `scripts/perf_probe_render.py` — keystroke-to-paint bench for
+  `_build_seq_text` under cursor-move / selection-change / per-char
+  edit / rotation / 5-plasmid LRU-hop workloads. Reports cache
+  occupancy alongside timing.
+
+---
+
 ## [0.7.8.0] — 2026-05-10 — community contributions: map/seq resize + crash fix
 
 > **Thank you, Harley King ([@har1eyk](https://github.com/har1eyk)),

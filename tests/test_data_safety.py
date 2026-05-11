@@ -964,3 +964,114 @@ class TestSafeSaveJsonOversizeGuard:
         # First save — file doesn't exist yet, no oversize check triggers.
         sc._safe_save_json(target, [{"id": "X"}], "test")
         assert target.exists()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _typed_clone — perf-optimised deep-clone for JSON-typed caches.
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Sacred invariant #17 requires deep-copy on cache read AND write so a
+# caller's mutation of a returned object can't poison the cache.
+# `_typed_clone` is the 2.5-3x faster replacement for `copy.deepcopy`
+# in the library / collections / features / parts-bin / primers /
+# grammars / entry-vectors / codon-tables / assembly-fragment caches.
+# It shares immutables (str / int / float / bool / bytes / None) and
+# recursively clones dict / list / tuple, falling through to
+# `copy.deepcopy` for anything else.
+
+class TestTypedClone:
+    def test_shares_strings(self):
+        """Strings are immutable — sharing is safe and the point of
+        the optimisation (gb_text payloads can be 100 kB+ each)."""
+        s = "x" * 50_000
+        assert sc._typed_clone(s) is s
+
+    def test_returns_new_dict(self):
+        d = {"a": 1, "b": 2}
+        c = sc._typed_clone(d)
+        assert c == d
+        assert c is not d
+
+    def test_returns_new_list(self):
+        lst = [1, 2, 3]
+        c = sc._typed_clone(lst)
+        assert c == lst
+        assert c is not lst
+
+    def test_mutation_isolation_nested(self):
+        """The whole point of the invariant: caller can mutate the
+        returned object without poisoning the cache."""
+        orig = {"a": [{"name": "p1", "tags": ["t1"]}]}
+        c = sc._typed_clone(orig)
+        c["a"][0]["name"] = "MUTATED"
+        c["a"][0]["tags"].append("MUTATED")
+        c["a"].append({"name": "extra"})
+        assert orig["a"][0]["name"] == "p1"
+        assert orig["a"][0]["tags"] == ["t1"]
+        assert len(orig["a"]) == 1
+
+    def test_tuple_with_mutables_clones_contents(self):
+        t = ({"a": 1}, [{"b": 2}])
+        c = sc._typed_clone(t)
+        c[0]["a"] = 99
+        c[1][0]["b"] = 99
+        assert t[0]["a"] == 1
+        assert t[1][0]["b"] == 2
+
+    def test_falls_through_to_deepcopy_for_sets(self):
+        s = {1, 2, 3}
+        c = sc._typed_clone(s)
+        c.add(99)
+        assert 99 not in s
+
+    def test_preserves_dict_insertion_order(self):
+        d = {"z": 1, "a": 2, "m": 3}
+        c = sc._typed_clone(d)
+        assert list(c.keys()) == ["z", "a", "m"]
+
+    def test_bool_int_discrimination(self):
+        # bool is a subclass of int — make sure the clone preserves
+        # the exact type so downstream isinstance(x, bool) checks
+        # still work.
+        assert type(sc._typed_clone(True)) is bool
+        assert type(sc._typed_clone(1)) is int
+
+    def test_matches_deepcopy_for_realistic_library_entry(self):
+        """Equivalence smoke test against copy.deepcopy for the exact
+        shape a library entry takes after `_safe_load_json`."""
+        from copy import deepcopy
+        entry = {
+            "id":      "P0001",
+            "name":    "test plasmid",
+            "gb_text": "LOCUS test 100 bp\n//",
+            "size":    100,
+            "n_feats": 3,
+            "primer_pairs": [
+                {"name": "PCR1", "fwd": "AAA", "rev": "TTT",
+                 "annealing_temp": 60.0, "tm_fwd": 58.5, "tm_rev": 59.1,
+                 "amplicon_len": 800, "marks": []},
+            ],
+            "status": "VERIFIED",
+        }
+        assert sc._typed_clone(entry) == deepcopy(entry)
+
+    def test_empty_containers(self):
+        assert sc._typed_clone({}) == {}
+        assert sc._typed_clone([]) == []
+        assert sc._typed_clone(()) == ()
+        assert sc._typed_clone(None) is None
+        assert sc._typed_clone("") == ""
+
+    def test_save_reseat_then_caller_mutation_does_not_poison_cache(self):
+        """Integration: `_save_library` must reseat the cache with a
+        typed clone so a caller that keeps editing `entries` after the
+        save returns can't leak mutations into the next reader.
+        Sacred invariant #17. `_protect_user_data` (autouse) handles
+        the path redirection."""
+        entries = [{"id": "X", "name": "foo", "tags": ["a"]}]
+        sc._save_library(entries)
+        entries[0]["name"] = "POISONED"
+        entries[0]["tags"].append("POISONED")
+        reread = sc._load_library()
+        assert reread[0]["name"] == "foo"
+        assert reread[0]["tags"] == ["a"]

@@ -3229,12 +3229,25 @@ class TestGbPartTypeToInsdcMap:
     type preserved in the description."""
 
     @pytest.mark.parametrize("gb_type, insdc", [
-        ("Promoter",   "promoter"),
-        ("5' UTR",     "5'UTR"),
-        ("CDS",        "CDS"),
-        ("CDS-NS",     "CDS"),
-        ("C-tag",      "CDS"),
-        ("Terminator", "terminator"),
+        # Legacy slots:
+        ("Promoter",         "promoter"),
+        ("Promoter-only",    "promoter"),
+        ("5' UTR",           "5'UTR"),
+        ("CDS",              "CDS"),
+        ("CDS-NS",           "CDS"),
+        ("C-tag",            "CDS"),
+        ("Terminator",       "terminator"),
+        # GB 2.0 canonical additions (2026-05-10):
+        ("Operator-A",       "promoter"),
+        ("Operator-B",       "promoter"),
+        ("Min Promoter",     "promoter"),
+        ("Distal 5' UTR",    "5'UTR"),
+        ("Signal peptide",   "sig_peptide"),
+        ("CDS-NS (CT)",      "CDS"),
+        ("CT-tag",            "CDS"),
+        ("CDS-after-SP",     "CDS"),
+        ("3' UTR",           "3'UTR"),
+        ("Terminator-only",  "terminator"),
     ])
     def test_known_types_map_to_insdc(self, gb_type, insdc):
         assert sc._GB_PART_TYPE_TO_INSDC[gb_type] == insdc
@@ -6344,13 +6357,16 @@ class TestClassifyPartFromPlasmid:
         ONLY match MoClo (not the expanded GB grammar) must fall
         through to MoClo Plant rather than failing classification.
 
-        Use MoClo Pos 5 / Terminator (GGTA / CGCT) — disjoint from
-        every GB position (GB Terminator is GCTT/CGCT). The FFE 7
-        case the test originally targeted now classifies as gb_l0
-        Promoter (combined Promoter+5'UTR added in 0.7.7.2) — see
-        `test_gb_priority_over_moclo_for_shared_promoter_overhangs`.
+        Use MoClo Pos 2 / 5' UTR (AATG / AGGT) — AGGT is disjoint
+        from every GB position (canonical GB 2.0 internal overhangs
+        are GGAG/TGAC/TCCC/TACT/CCAT/AATG/AGCC/TTCG/GCAG/GCTT/GGTA/CGCT,
+        none of which is AGGT). Pre-2026-05-10 this test used
+        (GGTA, CGCT) but the 2026-05-10 GB 2.0 expansion added
+        `Terminator-only` (Pos 21, GGTA→CGCT), so that pair now
+        classifies as gb_l0 — moved to (AATG, AGGT) to keep the
+        fall-through-to-MoClo invariant testable.
         """
-        seq = _build_moclo_plant_part_seq("GGTA", "CGCT")
+        seq = _build_moclo_plant_part_seq("AATG", "AGGT")
         # Spot-check: no Esp3I (CGTCTC) in either strand.
         assert "CGTCTC" not in seq
         assert "GAGACG" not in seq
@@ -8201,4 +8217,146 @@ class TestConstructorSavePromptsForName:
             await pilot.pause()
             await pilot.pause(0.1)
             assert isinstance(app.screen, sc.NamePlasmidModal)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CDS start-codon annotation fix (regression guard for 2026-05-10).
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# User report: "CDS's cloned seem to lose the annotation of their ATG
+# because it also occupies the AATG overhang." The domesticator's
+# forward primer absorbs the ATG into the AATG fusion overhang (the
+# Pos 12→13 boundary), so a CDS L0 part's body sequence starts at
+# codon 2. When the part is assembled into an L1 plasmid, the chained
+# sequence reads ...LINK-body + A + ATG + [codon2...], and a feature
+# that only spans the body would visibly drop the start codon from
+# the cloned plasmid map. `_atg_offset_for_part` returns the 3-nt
+# upstream extension that pushes the feature's 5' boundary back into
+# the AATG overhang so the start codon is included.
+
+class TestAtgOffsetForPart:
+    """The pure helper that decides whether to extend a coding-part
+    feature 5' into its upstream AATG overhang."""
+
+    def test_returns_3_for_aatg_coding_parts(self):
+        for ptype in ("CDS", "CDS-NS", "Signal peptide", "CDS-NS (CT)"):
+            assert sc._atg_offset_for_part("AATG", ptype) == 3, (
+                f"coding part {ptype!r} with oh5=AATG should extend by 3"
+            )
+
+    def test_returns_0_for_non_aatg_coding(self):
+        # C-tag (TTCG legacy), CT-tag (GCAG canonical), CDS-after-SP
+        # (AGCC after Signal peptide) — none start with ATG so no
+        # extension is meaningful.
+        assert sc._atg_offset_for_part("TTCG", "C-tag")         == 0
+        assert sc._atg_offset_for_part("GCAG", "CT-tag")        == 0
+        assert sc._atg_offset_for_part("AGCC", "CDS-after-SP")  == 0
+
+    def test_returns_0_for_aatg_noncoding(self):
+        # Even if a custom grammar uses AATG as a non-coding part's
+        # 5' overhang, there's no biological start codon to extend
+        # into. The coding-type filter prevents a spurious +3 nt
+        # extension on the wrong slot.
+        assert sc._atg_offset_for_part("AATG", "Promoter") == 0
+        assert sc._atg_offset_for_part("AATG", "5' UTR")   == 0
+
+    def test_returns_0_for_promoter_with_aatg_oh3(self):
+        # The Promoter has oh3=AATG (downstream connector) but
+        # oh5=GGAG. The helper keys on oh5 only — the ATG is the
+        # NEXT part's responsibility, not the promoter's.
+        assert sc._atg_offset_for_part("GGAG", "Promoter") == 0
+
+    def test_defensive_against_non_strings(self):
+        assert sc._atg_offset_for_part(None, None)   == 0
+        assert sc._atg_offset_for_part("AATG", None) == 0
+        assert sc._atg_offset_for_part(None, "CDS")  == 0
+        assert sc._atg_offset_for_part(123, "CDS")   == 0
+
+
+class TestReDerivedCdsIncludesStartCodon:
+    """Integration: `_re_derive_features_in_insert` must produce a
+    CDS feature whose 5' boundary covers the ATG embedded in the
+    upstream AATG fusion overhang."""
+
+    def test_forward_cds_feature_starts_at_atg(self, isolated_parts_bin):
+        cds_body = "GGGAAATAA"  # codon-2 onward (synthetic)
+        sc._save_parts_bin([{
+            "name":     "myCDS",   "type":     "CDS",
+            "position": "Pos 3-4", "sequence": cds_body,
+            "oh5":      "AATG",    "oh3":      "GCTT",
+            "grammar":  "gb_l0",   "level":    0,
+        }])
+        upstream   = "TTTTTTTTTT"
+        downstream = "AAAAAAAAAA"
+        insert = upstream + "AATG" + cds_body + "GCTT" + downstream
+        feats = sc._reconstruct_l0_features_in_seq(
+            insert, ["myCDS"], "gb_l0",
+        )
+        assert len(feats) == 1
+        body_start = len(upstream) + 4
+        cds = feats[0]
+        # +3 nt extension — feature starts at the ATG, not at codon 2.
+        assert cds["start"] == body_start - 3
+        assert cds["end"]   == body_start + len(cds_body)
+        # And the first 3 nt of the feature's span must literally read ATG.
+        assert insert[cds["start"]:cds["start"] + 3] == "ATG"
+
+    def test_promoter_feature_unchanged(self, isolated_parts_bin):
+        """Promoter has oh5=GGAG (not AATG) — the +3 extension must
+        NOT apply, since the AATG is at the promoter's 3' end and
+        belongs to the downstream LINK / CDS, not the promoter."""
+        prom_body = "TATAATGCG"
+        sc._save_parts_bin([{
+            "name":     "myPROM",  "type":     "Promoter",
+            "position": "Pos 1",   "sequence": prom_body,
+            "oh5":      "GGAG",    "oh3":      "AATG",
+            "grammar":  "gb_l0",   "level":    0,
+        }])
+        insert = "NNNNN" + "GGAG" + prom_body + "AATG" + "NNNNN"
+        feats = sc._reconstruct_l0_features_in_seq(
+            insert, ["myPROM"], "gb_l0",
+        )
+        assert len(feats) == 1
+        body_start = 5 + 4
+        assert feats[0]["start"] == body_start
+        assert feats[0]["end"]   == body_start + len(prom_body)
+
+    def test_signal_peptide_extended_same_as_cds(self, isolated_parts_bin):
+        """Signal peptide has oh5=AATG and is a coding part — same
+        +3 extension applies (the SP also starts with ATG)."""
+        sp_body = "GCAACAGCC"
+        sc._save_parts_bin([{
+            "name":     "mySP",    "type":     "Signal peptide",
+            "position": "Pos 13",  "sequence": sp_body,
+            "oh5":      "AATG",    "oh3":      "AGCC",
+            "grammar":  "gb_l0",   "level":    0,
+        }])
+        insert = "AAAAA" + "AATG" + sp_body + "AGCC" + "TTTTT"
+        feats = sc._reconstruct_l0_features_in_seq(
+            insert, ["mySP"], "gb_l0",
+        )
+        assert len(feats) == 1
+        body_start = 5 + 4
+        assert feats[0]["start"] == body_start - 3
+        assert insert[feats[0]["start"]:feats[0]["start"] + 3] == "ATG"
+
+    def test_extension_clamps_at_insert_origin(self, isolated_parts_bin):
+        """If a CDS body lands within 3 nt of the linear insert's 5'
+        edge (rare but defensible), the extension must clamp to 0
+        rather than producing a negative start coordinate."""
+        cds_body = "GGGAAATAA"
+        sc._save_parts_bin([{
+            "name":     "myCDS",   "type":     "CDS",
+            "position": "Pos 3-4", "sequence": cds_body,
+            "oh5":      "AATG",    "oh3":      "GCTT",
+            "grammar":  "gb_l0",   "level":    0,
+        }])
+        # Body at insert[0:len(cds_body)] — no room upstream.
+        insert = cds_body + "GCTT" + "AAAAAAAAAA"
+        feats = sc._reconstruct_l0_features_in_seq(
+            insert, ["myCDS"], "gb_l0",
+        )
+        assert len(feats) == 1
+        # Clamp: start can't go negative.
+        assert feats[0]["start"] == 0
 

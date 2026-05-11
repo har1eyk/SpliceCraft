@@ -2593,6 +2593,35 @@ def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
 
 # ── Library persistence ────────────────────────────────────────────────────────
 
+# Deep-clone helper shared by every cache helper below (library /
+# collections / features / parts bin / primers / grammars / entry
+# vectors / codon tables). All of these stores are JSON-typed dict /
+# list / str / int / float / bool / None — strings are the bulk of the
+# payload (gb_text on library entries can be 100 kB each) and they're
+# immutable, so re-allocating them in `copy.deepcopy` is pure waste.
+# `_typed_clone` shares immutables by reference and only recursively
+# clones the mutable containers, which benches 2.4–3.1× faster than
+# `deepcopy` on realistic libraries (scripts/perf_probe.py). Falls
+# through to `deepcopy` for any unexpected type so the contract from
+# sacred invariant #17 ("caller-side mutations can't poison the
+# cache") is preserved.
+_IMMUTABLE_CLONE_TYPES = (str, int, float, bool, bytes, type(None))
+from typing import TypeVar as _TypeVar
+_TC = _TypeVar("_TC")
+
+def _typed_clone(obj: _TC) -> _TC:
+    t = type(obj)
+    if t is dict:
+        return {k: _typed_clone(v) for k, v in obj.items()}  # type: ignore[return-value]
+    if t is list:
+        return [_typed_clone(v) for v in obj]  # type: ignore[return-value]
+    if t is tuple:
+        return tuple(_typed_clone(v) for v in obj)  # type: ignore[return-value]
+    if isinstance(obj, _IMMUTABLE_CLONE_TYPES):
+        return obj
+    return deepcopy(obj)
+
+
 _LIBRARY_FILE = _DATA_DIR / "plasmid_library.json"
 _library_cache: "list | None" = None
 
@@ -2604,7 +2633,7 @@ def _load_library() -> list[dict]:
     # for every subsequent reader. Mirrors `_load_collections` /
     # `_load_features` / `_load_parts_bin` / `_load_primers`.
     if _library_cache is not None:
-        return deepcopy(_library_cache)
+        return _typed_clone(_library_cache)
     entries, warning = _safe_load_json(_LIBRARY_FILE, "Plasmid library")
     if warning:
         _log.warning(warning)
@@ -2612,7 +2641,7 @@ def _load_library() -> list[dict]:
     # .get() calls downstream don't raise AttributeError.
     entries = [e for e in entries if isinstance(e, dict)]
     _library_cache = entries
-    return deepcopy(_library_cache)
+    return _typed_clone(_library_cache)
 
 def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     """Persist the live library and mirror it into the active
@@ -2629,7 +2658,7 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     # that keeps editing `entries` after `_save_library` returns would
     # poison the in-memory cache with their staged-but-not-yet-saved
     # mutations — and the next `_load_library` would surface them.
-    _library_cache = deepcopy(entries)
+    _library_cache = _typed_clone(entries)
     # Keep the active collection's plasmids in sync with the library — every
     # add / remove / rename on the panel feeds through here, so a single
     # mirror call covers all CRUD without changing call sites.
@@ -2665,12 +2694,12 @@ def _load_collections() -> list[dict]:
         if warning:
             _log.warning(warning)
         _collections_cache = [e for e in entries if isinstance(e, dict)]
-    return deepcopy(_collections_cache)
+    return _typed_clone(_collections_cache)
 
 def _save_collections(entries: list[dict]) -> None:
     global _collections_cache
     _safe_save_json(_COLLECTIONS_FILE, entries, "Plasmid collections")
-    _collections_cache = deepcopy(entries)
+    _collections_cache = _typed_clone(entries)
     # Invalidate any cached BLAST databases so a freshly-renamed /
     # deleted / edited collection doesn't keep returning hits from the
     # old contents. The engine helpers are defined later in this file,
@@ -2909,7 +2938,7 @@ def _restore_library_from_active_collection() -> None:
     # mutations on the collection's `plasmids` list (a separate code
     # path) would leak into the cache and the next reader would see
     # stale-but-different-from-disk library entries.
-    _library_cache = deepcopy(plasmids)
+    _library_cache = _typed_clone(plasmids)
 
 
 # ── Restriction sites ──────────────────────────────────────────────────────────
@@ -3181,14 +3210,24 @@ _IUPAC_RE: dict[str, str] = {
 }
 
 
-_PATTERN_CACHE: dict[str, "re.Pattern[str]"] = {}
+# Pattern cache (sacred invariant #4). Bounded LRU so a long-lived
+# process scanning many recognition sites can't grow the cache
+# indefinitely; the catalog is ~120 enzymes (palindromic + RC variants
+# < 256), so 256 is comfortably above steady state. Public dict so
+# tests can `.clear()` and inspect membership.
+_PATTERN_CACHE: "_OD[str, re.Pattern[str]]" = _OD()
+_PATTERN_CACHE_MAX = 256
 
 def _iupac_pattern(site: str) -> "re.Pattern[str]":
-    if site not in _PATTERN_CACHE:
-        _PATTERN_CACHE[site] = re.compile(
-            "".join(_IUPAC_RE.get(c, c) for c in site.upper())
-        )
-    return _PATTERN_CACHE[site]
+    pat = _PATTERN_CACHE.get(site)
+    if pat is not None:
+        _PATTERN_CACHE.move_to_end(site)
+        return pat
+    pat = re.compile("".join(_IUPAC_RE.get(c, c) for c in site.upper()))
+    _PATTERN_CACHE[site] = pat
+    if len(_PATTERN_CACHE) > _PATTERN_CACHE_MAX:
+        _PATTERN_CACHE.popitem(last=False)
+    return pat
 
 
 _IUPAC_COMP = str.maketrans(
@@ -3200,6 +3239,12 @@ _IUPAC_COMP = str.maketrans(
 _DNA_COMP_PRESERVE_CASE = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
 
 
+# Tiny LRU on `_rc` — the cached value of a 200 kb plasmid's RC is
+# itself ~200 kb, so a 4-entry cap is enough to cover the working set
+# (current sequence + a couple of recent rotations / undo snapshots)
+# without ballooning RAM. Benches show 35–113× speedup on cache hit
+# for cosmid-size sequences (scripts/perf_probe.py).
+@_functools.lru_cache(maxsize=4)
 def _rc(seq: str) -> str:
     return seq.upper().translate(_IUPAC_COMP)[::-1]
 
@@ -4845,7 +4890,16 @@ def _chunk_lane_groups(
 # blanket-`.clear()` policy threw away the working set every Nth call,
 # which hurt users hopping between several open plasmids.
 _BUILD_SEQ_CACHE: _OD = _OD()
-_BUILD_SEQ_CACHE_MAX = 4
+# Bumped from 4 to 16 (2026-05-10) to match the downstream
+# _CHUNK_STATIC_CACHE / _CHUNK_OVERLAY_CACHE sizes. The previous cap of
+# 4 evicted entries during multi-plasmid LRU hopping — a user cycling
+# through 5+ open plasmids paid a full styles + annot_feats rebuild on
+# every hop. scripts/perf_probe_render.py::probe_lru_workload showed
+# the cache at 4/4 capacity with 50 kb × 5 plasmids; bumping the cap
+# to 16 keeps the working set warm without bloating memory (the
+# cached value is a styles list (one ref per bp) + a sorted feats
+# list, ~50 kB per cosmid entry × 16 = ~800 kB worst case).
+_BUILD_SEQ_CACHE_MAX = 16
 
 
 # Per-(seq_id, feats_id, line_width) cache for chunk decomposition. Keyed
@@ -4862,7 +4916,11 @@ _BUILD_SEQ_CACHE_MAX = 4
 # Total rows before chunk i for arbitrary rpg:
 #   prefix_dna2[i] + (rpg - 2) * prefix_lanes[i]
 _CHUNK_LAYOUT_CACHE: _OD = _OD()
-_CHUNK_LAYOUT_CACHE_MAX = 4
+# Bumped from 4 to 16 (2026-05-10) to match _BUILD_SEQ_CACHE_MAX. Same
+# reason: a multi-plasmid LRU workload was evicting layout entries the
+# user was about to revisit. See `_BUILD_SEQ_CACHE_MAX` for the bench
+# that motivated this.
+_CHUNK_LAYOUT_CACHE_MAX = 16
 
 
 # Per-(seq_id, feats_id, line_width, show_connectors) cache of pre-rendered
@@ -9398,7 +9456,6 @@ class FeatureSidebar(Widget):
     DEFAULT_CSS = """
     FeatureSidebar {
         width: 32;
-        border-left: solid $primary;
     }
     /* Subtle "you are here" brighten when the inner DataTable
        holds focus. See PlasmidMap for the colour rationale. */
@@ -10107,7 +10164,7 @@ class LibraryPanel(Widget):
     LibraryPanel {
         /* Panel width is fixed at the sum of the plasmid-view button
            row: 4 buttons × min-width 5 + 4 × 1 left-margin = 24, plus
-           the 1-cell `border-right` = 25. Names / status / bp wider
+           1 cell of trailing slack = 25. Names / status / bp wider
            than the panel show via the DataTable's built-in horizontal
            scrollbar (overflow-x: auto on the tables below). Pre-2026-05-06
            the panel grew to fit the longest plasmid name (capped at 30+
@@ -10115,7 +10172,6 @@ class LibraryPanel(Widget):
            names; the fixed-width + scroll model gives the map the most
            real estate while still letting the user pan to any cell. */
         width: 25;
-        border-right: solid $primary;
     }
     /* Subtle "you are here" brighten when focus is anywhere inside
        the panel (collections table, plasmids table, search input).
@@ -11141,13 +11197,11 @@ class MapSequenceResizeHandle(Widget):
     DEFAULT_CSS = """
     MapSequenceResizeHandle {
         height: 1;
-        background: $primary-darken-2;
         color: $text-muted;
         content-align: center middle;
     }
     MapSequenceResizeHandle.dragging {
-        background: $accent;
-        color: $text;
+        color: $accent;
     }
     """
 
@@ -11168,7 +11222,20 @@ class MapSequenceResizeHandle(Widget):
 
     def render(self) -> Text:
         width = max(1, self.size.width)
-        return Text("─" * width, style="dim")
+        # Thin light line across the full width with a half-height
+        # block `▄` filling the bottom of the cell in the centre as the
+        # visual grab affordance. The whole row is still the click
+        # target — the chunkier centre just signals where to grab.
+        tab_width = 25
+        if width <= tab_width:
+            return Text("▄" * width)
+        side = (width - tab_width) // 2
+        extra = (width - tab_width) - 2 * side
+        text = Text()
+        text.append("─" * side, style="dim")
+        text.append("▄" * tab_width)
+        text.append("─" * (side + extra), style="dim")
+        return text
 
     def _clamp_sequence_height(self, height: int) -> int:
         """Clamp the requested seq-panel height to [MIN_SEQ, max_available].
@@ -11318,7 +11385,6 @@ class SequencePanel(Widget):
     DEFAULT_CSS = """
     SequencePanel {
         height: 14;
-        border-top: solid $primary;
     }
     /* Subtle "you are here" brighten when focus is anywhere inside
        the panel (the inner ScrollableContainer takes focus on
@@ -17271,48 +17337,124 @@ _GB_L0_PARTS: list[tuple] = [
 ]
 
 _GB_TYPE_COLORS: dict[str, str] = {
-    "Promoter":      "green",
-    "Promoter-only": "green",
-    "5' UTR":        "cyan",
-    "CDS":           "yellow",
-    "CDS-NS":        "dark_orange",
-    "C-tag":         "magenta",
-    "Terminator":    "blue",
+    # Legacy slots:
+    "Promoter":         "green",
+    "Promoter-only":    "green",
+    "5' UTR":           "cyan",
+    "CDS":              "yellow",
+    "CDS-NS":           "dark_orange",
+    "C-tag":            "magenta",
+    "Terminator":       "blue",
+    # GB 2.0 canonical additions (2026-05-10) — pick colors that group
+    # with their nearest legacy equivalent so the palette stays
+    # readable (5'NT shades of green, 5'UTR shades of cyan, translated
+    # shades of yellow/orange, 3'NT shades of blue).
+    "Operator-A":       "dark_green",   # OP-PROM 5'NT variant
+    "Operator-B":       "dark_green",
+    "Min Promoter":     "green",
+    "Distal 5' UTR":    "cyan",
+    "Signal peptide":   "dark_orange",  # N-terminal coding extension
+    "CDS-NS (CT)":      "dark_orange",  # canonical no-stop CDS
+    "CT-tag":           "magenta",      # canonical C-tag
+    "CDS-after-SP":     "yellow",       # full CDS after SP cleavage
+    "3' UTR":           "blue",
+    "Terminator-only":  "blue",
 }
 
-# Golden Braid L0 part positions — expanded GB 2.0 grammar.
+# Golden Braid L0 part positions — full GB 2.0 grammar.
 # Each entry maps a part-type name → (position label, 5' overhang,
 # 3' overhang).
 #
-# Promoter-class parts come in two interchangeable flavours:
-#   * `Promoter` (Pos 1) — combined Promoter+5'UTR ("PromUTR" in GB
-#     2.0). Cassettes that bundle a promoter with its RBS / 5'UTR end
-#     at AATG (the start codon of the downstream CDS). This is the
-#     default shape for both the user catalog and most commercial L0
-#     plasmid distributions (Anderson promoters with built-in RBS,
-#     pICH-family vectors, etc.).
-#   * `Promoter-only` (Pos 1a) + `5' UTR` (Pos 1b) — when the promoter
-#     and 5'UTR are domesticated as separate parts and ligated together
-#     in the L1 reaction. Connector overhang `CCAT` between them
-#     follows the canonical GB 2.0 fusion-site table.
+# The full GB 2.0 fusion-site chain (Sarrion-Perdigones et al., 2013):
 #
-# Both shapes share the same TU boundary (positions[0].oh5 = GGAG;
-# positions[-1].oh3 = CGCT), so `_grammar_tu_overhangs` keeps working.
-# Pre-2026-05-10 the Promoter slot was (GGAG, TGAC) with `TGAC` as the
-# Promoter→5'UTR connector — that doesn't match any documented GB 2.0
-# variant or the typical post-cloning J23100/J23114 cassette and was
-# replaced when the user reported MoClo mis-classification.
+#   GGAG  TGAC  TCCC  TACT  CCAT  AATG  AGCC  TTCG  GCAG  GCTT  GGTA  CGCT
+#   ┊──01──┊──02──┊──03──┊──11──┊──12──┊──13──┊──14──┊──15──┊──16──┊──17──┊──21──┊
+#   ┊  5' Non-Transcribed   ┊   5'UTR  ┊LINK ┊   Translated CDS    ┊  3' UTR / TER
+#
+# Common workflow shapes (combined slots; spans multiple positions):
+#   * `Promoter` (Pos 01-12)       — PromUTR+ATG; the default BASIC shape
+#   * `Promoter-only` (Pos 01-11)  — PromUTR without LINK/+ATG
+#   * `5' UTR` (Pos 12)            — LINK / +ATG context (historical name;
+#                                     technically the LINK position, not
+#                                     the canonical 5'UTR which is Pos
+#                                     03-11. Kept under this name for
+#                                     backward compat — existing user
+#                                     parts classified under "5' UTR"
+#                                     keep working.)
+#   * `CDS` (Pos 13-16)            — full CDS with stop codon
+#   * `CDS-NS` (Pos 13-14)         — legacy 2-part split (non-canonical;
+#                                     splits CDS in half at TL2/TL3
+#                                     boundary). The canonical no-stop
+#                                     CDS is `CDS-NS (CT)` below.
+#   * `C-tag` (Pos 15-16)          — legacy 2-part C-tag partner to CDS-NS
+#   * `Terminator` (Pos 17-21)     — combined 3'UTR+TER
+#
+# Canonical GB 2.0 atomic parts (added 2026-05-10 to match the figure's
+# row-B variants — SECRETED, CT-FUSION, NT-FUSION, OP-PROM-A/B):
+#   * `Operator-A` (Pos 01-02)     — OP-PROM-A operator slot
+#   * `Operator-B` (Pos 02)        — OP-PROM-B operator slot
+#   * `Min Promoter` (Pos 03-12)   — minimal promoter, pairs with either
+#                                     Operator-A or Operator-B
+#   * `Distal 5' UTR` (Pos 03-11)  — canonical 5'UTR (the actual one,
+#                                     before LINK)
+#   * `Signal peptide` (Pos 13)    — SECRETED workflow N-terminal SP
+#   * `CDS-NS (CT)` (Pos 13-15)    — CDS no-stop for CT-FUSION; canonical
+#                                     no-stop ending boundary (vs legacy)
+#   * `CT-tag` (Pos 16)            — canonical C-terminal tag for CT-FUSION
+#   * `CDS-after-SP` (Pos 14-16)   — SECRETED workflow CDS body (after SP)
+#   * `3' UTR` (Pos 17)            — 3'UTR alone (split from Terminator)
+#   * `Terminator-only` (Pos 21)   — TER alone (split from Terminator)
+#
+# TU boundary unchanged: positions[0].oh5 = GGAG; outermost 3' OH = CGCT
+# (still matches `Promoter` and `Terminator` so `_grammar_tu_overhangs`
+# keeps working without a code edit).
+#
+# History note: pre-2026-05-10 the Promoter slot was (GGAG, TGAC) with
+# `TGAC` as the Promoter→5'UTR connector — that doesn't match any
+# documented GB 2.0 variant or the typical post-cloning J23100/J23114
+# cassette and was replaced when the user reported MoClo mis-classification.
+# The 2026-05-10 expansion adds the granular positions without removing
+# the legacy combined slots so existing user parts keep classifying.
 _GB_POSITIONS: dict[str, tuple[str, str, str]] = {
-    # Combined Promoter+5'UTR (GB 2.0 PromUTR; the common form).
-    "Promoter":      ("Pos 1",   "GGAG", "AATG"),
-    # Separate Promoter (no 5'UTR) — for the split workflow.
-    "Promoter-only": ("Pos 1a",  "GGAG", "CCAT"),
-    # Separate 5'UTR — partner to Promoter-only via CCAT connector.
-    "5' UTR":        ("Pos 1b",  "CCAT", "AATG"),
-    "CDS":           ("Pos 3-4", "AATG", "GCTT"),
-    "CDS-NS":        ("Pos 3",   "AATG", "TTCG"),
-    "C-tag":         ("Pos 4",   "TTCG", "GCTT"),
-    "Terminator":    ("Pos 5",   "GCTT", "CGCT"),
+    # ── 5' Non-Transcribed (combined Promoter + 5'UTR + Link) ─────────
+    # Combined Promoter+5'UTR+ATG (GB 2.0 PromUTR; the common BASIC form).
+    # Legacy position label "Pos 1" preserved for back-compat with
+    # existing user parts in `parts_bin.json` that were stored under
+    # this label string.
+    "Promoter":         ("Pos 1",     "GGAG", "AATG"),
+    # Separate Promoter (no LINK/+ATG) — pairs with a `5' UTR` part.
+    "Promoter-only":    ("Pos 1a",    "GGAG", "CCAT"),
+    # ── Operator/Promoter variants (OP-PROM-A/B workflow) ─────────────
+    "Operator-A":       ("Pos 01-02", "GGAG", "TCCC"),  # OP-PROM-A operator
+    "Operator-B":       ("Pos 02",    "TGAC", "TCCC"),  # OP-PROM-B operator
+    "Min Promoter":     ("Pos 03-12", "TCCC", "AATG"),  # pairs with either Operator
+    # ── 5' UTR ────────────────────────────────────────────────────────
+    # Historical "5' UTR" slot — technically the LINK position (Pos 12)
+    # in canonical GB 2.0. Kept under this name for backward compat.
+    "5' UTR":           ("Pos 1b",    "CCAT", "AATG"),
+    # Canonical GB 2.0 5'UTR (Pos 03-11), distinct from the LINK above.
+    "Distal 5' UTR":    ("Pos 03-11", "TCCC", "CCAT"),
+    # ── Translated region ─────────────────────────────────────────────
+    # Signal peptide (SECRETED workflow N-terminal extension; coding).
+    "Signal peptide":   ("Pos 13",    "AATG", "AGCC"),
+    # Full CDS with stop codon (BASIC workflow).
+    "CDS":              ("Pos 3-4",   "AATG", "GCTT"),
+    # Legacy 2-part CDS split (splits at TL2/TL3 boundary, non-canonical
+    # but kept for backward compat with existing user parts).
+    "CDS-NS":           ("Pos 3",     "AATG", "TTCG"),
+    "C-tag":            ("Pos 4",     "TTCG", "GCTT"),
+    # Canonical GB 2.0 CDS variants (added 2026-05-10):
+    # CDS-no-stop for CT-FUSION (positions 13-15; pairs with `CT-tag`).
+    "CDS-NS (CT)":      ("Pos 13-15", "AATG", "GCAG"),
+    "CT-tag":           ("Pos 16",    "GCAG", "GCTT"),  # canonical C-term tag
+    # CDS body for SECRETED workflow (after Signal peptide, full to stop).
+    "CDS-after-SP":     ("Pos 14-16", "AGCC", "GCTT"),
+    # ── 3' Non-Translated ─────────────────────────────────────────────
+    # Combined 3'UTR+Terminator (BASIC workflow).
+    "Terminator":       ("Pos 5",     "GCTT", "CGCT"),
+    # Canonical split variants (added 2026-05-10):
+    "3' UTR":           ("Pos 17",    "GCTT", "GGTA"),
+    "Terminator-only":  ("Pos 21",    "GGTA", "CGCT"),
 }
 
 # Coding-DNA part types: these are the only types where silent (synonymous)
@@ -17320,22 +17462,78 @@ _GB_POSITIONS: dict[str, tuple[str, str, str]] = {
 # domestication. Non-coding parts (promoters, UTRs, terminators) have no
 # reading frame, so internal sites must be fixed manually or by picking a
 # different template region.
-_GB_CODING_PART_TYPES: frozenset[str] = frozenset({"CDS", "CDS-NS", "C-tag"})
+_GB_CODING_PART_TYPES: frozenset[str] = frozenset({
+    # Legacy splits:
+    "CDS", "CDS-NS", "C-tag",
+    # GB 2.0 canonical translational parts (added 2026-05-10):
+    "Signal peptide", "CDS-NS (CT)", "CT-tag", "CDS-after-SP",
+})
+
+
+def _atg_offset_for_part(part_oh5: str, part_type: str) -> int:
+    """Return the number of bases the 5' boundary of a coding-part
+    feature should extend upstream to include its embedded start codon.
+
+    GB 2.0 puts the ATG start codon inside the AATG fusion overhang
+    (Pos 12→13 boundary): AATG = A + ATG, where the A is the spacer
+    base and ATG is the start codon. The domesticator's forward primer
+    encodes AATG as the part's 5' fusion overhang and PCR-binds at
+    codon 2 of the source CDS — so the L0 part's body sequence
+    (`part["sequence"]`) starts at codon 2, NOT at the ATG.
+
+    When the part is assembled into an L1 plasmid the upstream LINK
+    contributes its AATG (Pos 12 oh3) which fuses with the part's
+    AATG oh5; the resulting cloned sequence reads
+    ``...LINK-body...A + ATG + [codon2]...`` and the ATG sits in the
+    last 3 nt of the fusion overhang. A feature annotation that only
+    spans [body-start, body-end) would therefore drop the user's
+    start codon — visibly broken in the L1 plasmid map.
+
+    This helper returns ``3`` when the part needs the upstream
+    extension (any coding part type with ``oh5 == AATG``: Signal
+    peptide, CDS, CDS-NS, CDS-NS (CT)), and ``0`` otherwise. Returning
+    a numeric offset rather than a bool lets callers do
+    ``feature_start -= _atg_offset_for_part(oh5, ptype)`` without
+    branching on every feature loop iteration.
+
+    Regression guard for 2026-05-10: user reported "CDS's cloned seem
+    to lose the annotation of their ATG because it also occupies the
+    AATG overhang."
+    """
+    if not isinstance(part_oh5, str) or not isinstance(part_type, str):
+        return 0
+    if part_oh5.upper() == "AATG" and part_type in _GB_CODING_PART_TYPES:
+        return 3
+    return 0
 
 # Parts-bin TitleCase type → INSDC feature_type. Used by
 # `PartsBinModal._save_as_feature` to round-trip a Golden Braid part into
 # the feature library, where types follow the INSDC vocabulary.
-# CDS-NS / C-tag have no INSDC equivalent — they're GB-specific
-# coding-DNA shapes — so they collapse to plain CDS; the GB position
-# survives in the feature's description string instead.
+# GB-specific shapes that don't have a 1:1 INSDC equivalent collapse to
+# the closest standard type — the GB position survives in the feature's
+# description string instead. Signal peptide → `sig_peptide` (a valid
+# INSDC feature type for the N-terminal cleavage signal); C-tag /
+# CT-tag / CDS-NS variants → CDS.
 _GB_PART_TYPE_TO_INSDC: dict[str, str] = {
-    "Promoter":      "promoter",
-    "Promoter-only": "promoter",
-    "5' UTR":        "5'UTR",
-    "CDS":           "CDS",
-    "CDS-NS":        "CDS",
-    "C-tag":         "CDS",
-    "Terminator":    "terminator",
+    # Legacy slots:
+    "Promoter":         "promoter",
+    "Promoter-only":    "promoter",
+    "5' UTR":           "5'UTR",
+    "CDS":              "CDS",
+    "CDS-NS":           "CDS",
+    "C-tag":            "CDS",
+    "Terminator":       "terminator",
+    # GB 2.0 canonical additions (2026-05-10):
+    "Operator-A":       "promoter",   # operator+promoter assembled together
+    "Operator-B":       "promoter",
+    "Min Promoter":     "promoter",
+    "Distal 5' UTR":    "5'UTR",
+    "Signal peptide":   "sig_peptide",
+    "CDS-NS (CT)":      "CDS",
+    "CT-tag":           "CDS",
+    "CDS-after-SP":     "CDS",
+    "3' UTR":           "3'UTR",
+    "Terminator-only":  "terminator",
 }
 
 # Type IIS recognition + tail used for all Golden Braid L0 domestication
@@ -17883,9 +18081,24 @@ def _reconstruct_l0_features_in_seq(
                 continue
             strand = -1
         ptype = str(p.get("type") or "misc_feature")
+        # Extend the 5' boundary into the upstream AATG overhang so a
+        # CDS-like part's annotation includes its start codon. The ATG
+        # of AATG (Pos 12→13 fusion) IS the start codon — see
+        # `_atg_offset_for_part`. Direction depends on strand: forward
+        # parts get the extension at the lower coordinate; reverse-
+        # strand parts get it at the upper coordinate. Clamps to
+        # [0, insert_len] so the linear-insert case can't underflow.
+        atg_off = _atg_offset_for_part(p.get("oh5", ""), ptype)
+        feat_start = pos
+        feat_end   = pos + len(body)
+        if atg_off:
+            if strand == 1:
+                feat_start = max(0, pos - atg_off)
+            else:
+                feat_end = min(len(insert_seq), feat_end + atg_off)
         out.append({
-            "start":  pos,
-            "end":    pos + len(body),
+            "start":  feat_start,
+            "end":    feat_end,
             "strand": strand,
             "type":   _GB_PART_TYPE_TO_INSDC.get(
                 ptype, "misc_feature",
@@ -18084,11 +18297,13 @@ def _assembly_fragment_from_source(
         _ASSEMBLY_FRAGMENT_CACHE.move_to_end(cache_key)
         # Cached value can legitimately be None (digest failed once,
         # will fail the same way again until parts/grammar change).
-        # Return a deep copy so callers can mutate the dict (e.g.
+        # Return a typed clone so callers can mutate the dict (e.g.
         # palette code rewrites name) without poisoning the cache.
+        # Same contract as the library / collections cache helpers —
+        # immutables are shared, mutables are cloned. See `_typed_clone`.
         if cached is None:
             return None
-        return deepcopy(cached)
+        return _typed_clone(cached)
     try:
         rec = _gb_text_to_record(gb_text)
     except Exception:
@@ -18322,11 +18537,11 @@ def _assembly_fragment_from_source(
     }
     # Cache result. Bound the cache to `_ASSEMBLY_FRAGMENT_CACHE_MAX`
     # via FIFO eviction (the LRU semantics — `move_to_end` on hit —
-    # already keeps the working set warm). Stores a deepcopy so a
+    # already keeps the working set warm). Stores a typed clone so a
     # caller mutating the returned dict can't poison subsequent
-    # readers; a separate deepcopy is returned so the cached version
-    # stays canonical.
-    _ASSEMBLY_FRAGMENT_CACHE[cache_key] = deepcopy(result)
+    # readers; a separate clone is returned on each read so the cached
+    # version stays canonical.
+    _ASSEMBLY_FRAGMENT_CACHE[cache_key] = _typed_clone(result)
     while len(_ASSEMBLY_FRAGMENT_CACHE) > _ASSEMBLY_FRAGMENT_CACHE_MAX:
         _ASSEMBLY_FRAGMENT_CACHE.popitem(last=False)
     return result
@@ -18422,12 +18637,16 @@ def _clone_assembly_into_entry_vector(
         # Terminator, etc.); colour from the grammar's per-type
         # colour table when available, else falls back to "white".
         frag_feats = list(f.get("features") or [])
+        # Resolve the part type once per fragment (used by both the
+        # synth-feature path below and the AATG start-codon extension
+        # in the per-feature loop). Hoisted out of the synth branch so
+        # the start-codon fix can run for carried features too.
+        ptype = ""
+        for s in sources:
+            if (s.get("name") or "") == f["name"]:
+                ptype = str(s.get("type") or "")
+                break
         if not frag_feats and body:
-            ptype = ""
-            for s in sources:
-                if (s.get("name") or "") == f["name"]:
-                    ptype = str(s.get("type") or "")
-                    break
             color = _GB_TYPE_COLORS.get(ptype, "white")
             frag_feats = [{
                 "start":  0,
@@ -18437,6 +18656,15 @@ def _clone_assembly_into_entry_vector(
                 "label":  f["name"],
                 "color":  color,
             }]
+        # Start-codon extension: when this fragment's 5' overhang is
+        # AATG and the part is a coding type, a feature that lands at
+        # body-start (fs == 0) needs to extend 3 nt upstream to include
+        # the ATG embedded in the AATG fusion overhang. Only applies
+        # to non-first fragments — the first fragment's body sits at
+        # offset 0 with no AATG upstream in the chain (the AATG would
+        # only appear when the entry-vector half ligates in later).
+        # See `_atg_offset_for_part` for the biology rationale.
+        atg_off = _atg_offset_for_part(f.get("oh5", ""), ptype) if i > 0 else 0
         for fr in frag_feats:
             try:
                 fs = int(fr.get("start", 0))
@@ -18445,10 +18673,14 @@ def _clone_assembly_into_entry_vector(
                 continue
             if fe <= fs:
                 continue
+            start_in_chain = cursor + fs
+            end_in_chain   = cursor + fe
+            if atg_off and fs == 0:
+                start_in_chain = max(0, start_in_chain - atg_off)
             chained_features.append({
                 **fr,
-                "start": cursor + fs,
-                "end":   cursor + fe,
+                "start": start_in_chain,
+                "end":   end_in_chain,
             })
         cursor += len(body)
     combined_seq = "".join(seq_parts)
@@ -19092,19 +19324,19 @@ _grammars_cache: "list | None" = None
 def _load_custom_grammars() -> list[dict]:
     global _grammars_cache
     if _grammars_cache is not None:
-        return deepcopy(_grammars_cache)
+        return _typed_clone(_grammars_cache)
     entries, warning = _safe_load_json(_GRAMMARS_FILE, "Cloning grammars")
     if warning:
         _log.warning(warning)
     entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("id"), str)]
     _grammars_cache = entries
-    return deepcopy(_grammars_cache)
+    return _typed_clone(_grammars_cache)
 
 
 def _save_custom_grammars(entries: list[dict]) -> None:
     global _grammars_cache
     _safe_save_json(_GRAMMARS_FILE, entries, "Cloning grammars")
-    _grammars_cache = deepcopy(entries)
+    _grammars_cache = _typed_clone(entries)
     # Invalidate the assembly-fragment digest cache: a grammar enzyme
     # / level_up_enzyme change shifts which fragment a TU/MOD
     # releases, so the cached overhangs from the previous grammar
@@ -19173,7 +19405,7 @@ _entry_vectors_cache: "list | None" = None
 def _load_entry_vectors() -> list[dict]:
     global _entry_vectors_cache
     if _entry_vectors_cache is not None:
-        return deepcopy(_entry_vectors_cache)
+        return _typed_clone(_entry_vectors_cache)
     entries, warning = _safe_load_json(_ENTRY_VECTORS_FILE,
                                          "Entry vectors")
     if warning:
@@ -19182,13 +19414,13 @@ def _load_entry_vectors() -> list[dict]:
                  if isinstance(e, dict)
                  and isinstance(e.get("grammar_id"), str)]
     _entry_vectors_cache = entries
-    return deepcopy(_entry_vectors_cache)
+    return _typed_clone(_entry_vectors_cache)
 
 
 def _save_entry_vectors(entries: list[dict]) -> None:
     global _entry_vectors_cache
     _safe_save_json(_ENTRY_VECTORS_FILE, entries, "Entry vectors")
-    _entry_vectors_cache = deepcopy(entries)
+    _entry_vectors_cache = _typed_clone(entries)
     # Drop the digest cache built around the previous EV list — old
     # entries hanging on after a reconfigure waste cache slots and,
     # for users who rotate vectors often (testing custom grammars),
@@ -20302,13 +20534,13 @@ def _load_parts_bin() -> list[dict]:
         # primer pairs, mutation lists). Caller mutations of those nested
         # objects would otherwise poison the in-memory cache for every
         # subsequent reader (sacred invariant #17).
-        return deepcopy(_parts_bin_cache)
+        return _typed_clone(_parts_bin_cache)
     entries, warning = _safe_load_json(_PARTS_BIN_FILE, "Parts bin")
     if warning:
         _log.warning(warning)
     entries = [e for e in entries if isinstance(e, dict)]
     _parts_bin_cache = entries
-    return deepcopy(_parts_bin_cache)
+    return _typed_clone(_parts_bin_cache)
 
 def _save_parts_bin(entries: list[dict]) -> None:
     global _parts_bin_cache
@@ -20317,7 +20549,7 @@ def _save_parts_bin(entries: list[dict]) -> None:
     # reference — pre-fix `list(entries)` shared dict refs with the
     # caller, so subsequent caller mutations (e.g. modal Cancel that
     # didn't actually save) leaked back into the next `_load_parts_bin`.
-    _parts_bin_cache = deepcopy(entries)
+    _parts_bin_cache = _typed_clone(entries)
     # Invalidate the assembly-fragment digest cache: a part edit
     # (re-domestication, gb_text rewrite, deleted entry) shifts what
     # `_assembly_fragment_from_source` yields, so stale digests
@@ -20344,13 +20576,13 @@ def _load_primers() -> list[dict]:
         # Deep-copy on read: primer entries carry nested dicts (qualifiers,
         # binding-region info, per-pair attribute dicts). Caller mutations
         # of nested objects would poison the cache (sacred invariant #17).
-        return deepcopy(_primers_cache)
+        return _typed_clone(_primers_cache)
     entries, warning = _safe_load_json(_PRIMERS_FILE, "Primer library")
     if warning:
         _log.warning(warning)
     entries = [e for e in entries if isinstance(e, dict)]
     _primers_cache = entries
-    return deepcopy(_primers_cache)
+    return _typed_clone(_primers_cache)
 
 def _save_primers(entries: list[dict]) -> None:
     global _primers_cache
@@ -20359,7 +20591,7 @@ def _save_primers(entries: list[dict]) -> None:
     # reference — pre-fix `list(entries)` shared dict refs with the
     # caller, so subsequent caller mutations (e.g. an aborted modal)
     # leaked back into the next `_load_primers`.
-    _primers_cache = deepcopy(entries)
+    _primers_cache = _typed_clone(entries)
 
 
 # ── Feature library persistence ───────────────────────────────────────────────
@@ -20475,7 +20707,7 @@ def _load_features() -> list[dict]:
     """
     global _features_cache, _features_generation
     if _features_cache is not None:
-        return deepcopy(_features_cache)
+        return _typed_clone(_features_cache)
     entries, warning = _safe_load_json(_FEATURES_FILE, "Feature library")
     if warning:
         _log.warning(warning)
@@ -20487,7 +20719,7 @@ def _load_features() -> list[dict]:
     # may have changed since the last write, so bump the generation so
     # consumers know to rebuild any derived indices.
     _features_generation += 1
-    return deepcopy(_features_cache)
+    return _typed_clone(_features_cache)
 
 
 def _save_features(entries: list[dict]) -> None:
@@ -20501,7 +20733,7 @@ def _save_features(entries: list[dict]) -> None:
     """
     global _features_cache, _features_generation
     _safe_save_json(_FEATURES_FILE, entries, "Feature library")
-    _features_cache = deepcopy(entries)
+    _features_cache = _typed_clone(entries)
     _features_generation += 1
 
 
@@ -20858,7 +21090,7 @@ def _codon_tables_load() -> list[dict]:
     E. coli K12 on first run so the library is never empty."""
     global _codon_tables_cache
     if _codon_tables_cache is not None:
-        return deepcopy(_codon_tables_cache)
+        return _typed_clone(_codon_tables_cache)
     entries, warning = _safe_load_json(_CODON_TABLES_FILE, "Codon table library")
     if warning:
         _log.warning("Codon table library: %s", warning)
@@ -20889,7 +21121,7 @@ def _codon_tables_load() -> list[dict]:
         _codon_tables_save(fixed)
     else:
         _codon_tables_cache = fixed
-    return deepcopy(_codon_tables_cache)
+    return _typed_clone(_codon_tables_cache)
 
 
 def _codon_tables_save(entries: list[dict]) -> None:
@@ -20906,7 +21138,7 @@ def _codon_tables_save(entries: list[dict]) -> None:
         "raw":    _codon_raw_to_json(e.get("raw", {})),
     } for e in entries]
     _safe_save_json(_CODON_TABLES_FILE, serializable, "Codon table library")
-    _codon_tables_cache = deepcopy(entries)
+    _codon_tables_cache = _typed_clone(entries)
 
 
 def _codon_tables_add(name: str, taxid: str, raw: dict,
