@@ -14279,11 +14279,12 @@ class HistoryViewerModal(ModalScreen):
 
     @staticmethod
     def _tree_label_for(node: "_CommercialSaaSHistoryNode") -> str:
-        """One-line tree label: name · size · operation · circular flag.
-        Kept compact so a deep tree still fits the column width."""
-        topo = "circular" if node.circular else "linear"
-        return (f"{node.name}  ·  {node.seq_len:,} bp  ·  "
-                 f"{topo}  ·  {node.operation}")
+        """One-line tree label — thin wrapper around the module-level
+        `_history_tree_label` helper so the legacy modal and the
+        fullscreen `HistoryScreen` render identical rows. Kept as a
+        staticmethod for backwards compatibility with code that calls
+        `HistoryViewerModal._tree_label_for(node)`."""
+        return _history_tree_label(node)
 
     @on(Button.Pressed, "#btn-hist-close")
     def _on_close(self, _: Button.Pressed) -> None:
@@ -14334,6 +14335,303 @@ class HistoryViewerModal(ModalScreen):
                           f"({', '.join(p.name for p in hist.parents)})")
         else:
             lines.append("  [dim](leaf — no recorded parents)[/]")
+        detail.update("\n".join(lines))
+
+
+_HISTORY_TITLE_NAME_MAX: int = 60
+_HISTORY_LABEL_NAME_MAX: int = 40
+_HISTORY_DETAIL_LIST_MAX: int = 12
+
+
+def _history_tree_label(node: "_CommercialSaaSHistoryNode") -> str:
+    """One-line tree label for the History viewer:
+    ``name · N bp · circular · operation``.
+
+    Names + operations are escaped against Rich markup injection (the
+    fields come from XML attributes which can legally contain `[`)
+    and truncated against extremely long values that would push the
+    tree column off-screen. Empty strings render as ``(unnamed)`` /
+    ``(no operation)`` so the row never collapses to whitespace."""
+    from rich.markup import escape as _esc
+    raw_name = node.name or "(unnamed)"
+    name = _esc(raw_name)
+    if len(raw_name) > _HISTORY_LABEL_NAME_MAX:
+        name = _esc(raw_name[: _HISTORY_LABEL_NAME_MAX - 1] + "…")
+    topo = "circular" if node.circular else "linear"
+    op = _esc(node.operation) if node.operation else "(no operation)"
+    return f"{name}  ·  {node.seq_len:,} bp  ·  {topo}  ·  {op}"
+
+
+def _history_node_count(root: "_CommercialSaaSHistoryNode") -> int:
+    """Number of nodes in the history tree, counting the root.
+    Iterative so a hostile / pathologically deep XML can't trip the
+    CPython recursion limit (mirrors `_CommercialSaaSHistoryNode.walk`)."""
+    n = 0
+    stack: list = [root]
+    while stack:
+        node = stack.pop()
+        n += 1
+        stack.extend(node.parents)
+    return n
+
+
+class HistoryScreen(Screen):
+    """Full-screen construction-history viewer for the loaded plasmid.
+
+    Same data shape as `HistoryViewerModal` — a `_CommercialSaaSHistoryNode`
+    tree rendered into a Textual `Tree` widget plus a detail pane for
+    the selected node — but takes the entire terminal. Opened from the
+    `History` top-bar menu, the `F5` key, or `Ctrl+H`.
+
+    Read-only. Closing returns to the main app; the tree is rebuilt
+    fresh each open so the rendered lineage matches the current
+    library state.
+
+    Hardening notes (2026-05-11):
+      * Tree assembly is iterative (`_build_tree`) — a 1000-deep
+        history can't blow the recursion limit.
+      * All user-controlled XML fields (`name`, `operation`,
+        `manipulation`, enzyme names, parent labels) route through
+        `rich.markup.escape` before reaching the detail pane / tree
+        labels, so a `name="x[red]boom[/red]"` can't poison styling.
+      * Long values (plasmid names, operation strings, enzyme lists,
+        parent-name joins) are truncated with an ellipsis so the
+        viewport stays usable on hostile / deeply-nested trees.
+      * Empty XML attributes render as ``(unnamed)`` / ``(no
+        operation)`` placeholders rather than collapsing to
+        whitespace.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close",          "Close"),
+        Binding("q",      "close",          "Close"),
+        Binding("e",      "expand_all",     "Expand all", show=True),
+        Binding("c",      "collapse_all",   "Collapse",   show=True),
+    ]
+
+    DEFAULT_CSS = """
+    HistoryScreen { layout: vertical; background: $surface; }
+    #hist-scr-title {
+        background: $accent-darken-2; padding: 0 2; height: 1;
+        text-style: bold;
+    }
+    #hist-scr-subtitle {
+        background: $primary-darken-3; padding: 0 2; height: 1;
+        color: $text-muted;
+    }
+    #hist-scr-main { layout: horizontal; height: 1fr; }
+    #hist-scr-tree-col {
+        width: 2fr; padding: 1 2;
+        border-right: solid $primary-darken-2;
+    }
+    #hist-scr-detail-col { width: 1fr; padding: 1 2; }
+    #hist-scr-tree-label, #hist-scr-detail-label {
+        text-style: bold; color: $accent; margin-bottom: 1;
+    }
+    #hist-scr-tree { height: 1fr; }
+    #hist-scr-detail {
+        height: 1fr; border: solid $primary-darken-2;
+        padding: 0 1; overflow-y: auto;
+    }
+    #hist-scr-detail Static { padding: 0 1; }
+    #hist-scr-btns { height: 3; align: right middle; padding: 0 2; }
+    #hist-scr-btns Button { min-width: 12; margin: 0 0 0 1; }
+    """
+
+    def __init__(self, title: str,
+                  root_node: "_CommercialSaaSHistoryNode") -> None:
+        super().__init__()
+        # Truncate the title up front so the colored title bar can't
+        # wrap or push the subtitle off-screen on narrow terminals.
+        if len(title) > _HISTORY_TITLE_NAME_MAX:
+            title = title[: _HISTORY_TITLE_NAME_MAX - 1] + "…"
+        self._title = title
+        self._root_node = root_node
+        self._node_by_id: "dict[int, _CommercialSaaSHistoryNode]" = {}
+
+    def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
+        yield Static(f" Construction history — {_esc(self._title)} ",
+                      id="hist-scr-title")
+        n_nodes = _history_node_count(self._root_node)
+        yield Static(
+            f"  {n_nodes} node{'s' if n_nodes != 1 else ''}  ·  "
+            "Esc / Q to close  ·  E expand all  ·  C collapse",
+            id="hist-scr-subtitle",
+        )
+        with Horizontal(id="hist-scr-main"):
+            with Vertical(id="hist-scr-tree-col"):
+                yield Static("Lineage", id="hist-scr-tree-label")
+                yield Tree("History", id="hist-scr-tree")
+            with Vertical(id="hist-scr-detail-col"):
+                yield Static("Step details", id="hist-scr-detail-label")
+                with Vertical(id="hist-scr-detail"):
+                    yield Static(
+                        "[dim]Pick a node to see its details.[/]",
+                        id="hist-scr-detail-text", markup=True,
+                    )
+        with Horizontal(id="hist-scr-btns"):
+            yield Button("Close  [Esc]", id="btn-hist-scr-close")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        tree = self.query_one("#hist-scr-tree", Tree)
+        tree.show_root = False
+        tree.guide_depth = 4
+        self._build_tree(tree)
+        try:
+            top = tree.root.children[0]
+            tree.select_node(top)
+        except (IndexError, Exception):
+            pass
+
+    def _build_tree(self, tree: Tree) -> None:
+        """Populate the Textual `Tree` with our history nodes.
+
+        Iterative DFS so a 1000+ deep history (hostile XML or a long
+        chain of L0 → L1 → L2 → … builds) can't trip the CPython
+        recursion limit. Mirrors `_CommercialSaaSHistoryNode.walk`'s
+        iteration shape and `_history_node_count` so the three
+        traversal helpers stay consistent.
+        """
+        stack: list[tuple] = [(tree.root, self._root_node)]
+        while stack:
+            parent_tree_node, hist_node = stack.pop()
+            label = _history_tree_label(hist_node)
+            child = parent_tree_node.add(label, expand=True)
+            self._node_by_id[child.id] = hist_node
+            # Push children reversed so the first parent pops next —
+            # preserves the original pre-order traversal.
+            stack.extend(
+                (child, p) for p in reversed(hist_node.parents)
+            )
+
+    @on(Button.Pressed, "#btn-hist-scr-close")
+    def _on_close(self, _: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def action_expand_all(self) -> None:
+        """Force every tree node open. Useful when a deeply-nested
+        lineage was collapsed by C and the user wants the full view
+        back."""
+        try:
+            tree = self.query_one("#hist-scr-tree", Tree)
+        except NoMatches:
+            return
+        try:
+            tree.root.expand_all()
+        except Exception:
+            # Older Textual: fall back to manual walk.
+            _stack = [tree.root]
+            while _stack:
+                n = _stack.pop()
+                try:
+                    n.expand()
+                except Exception:
+                    pass
+                _stack.extend(n.children)
+
+    def action_collapse_all(self) -> None:
+        """Collapse every node but the root's direct children. The
+        root itself is hidden so collapsing all the way would make
+        the panel look empty — leave the first generation visible."""
+        try:
+            tree = self.query_one("#hist-scr-tree", Tree)
+        except NoMatches:
+            return
+        for top in list(tree.root.children):
+            _stack = list(top.children)
+            while _stack:
+                n = _stack.pop()
+                try:
+                    n.collapse()
+                except Exception:
+                    pass
+                _stack.extend(n.children)
+
+    @on(Tree.NodeSelected, "#hist-scr-tree")
+    def _on_node_selected(self, event) -> None:
+        """Render the picked node's full details into the right pane.
+        Every dynamic field is escaped through `rich.markup.escape`
+        so a name like ``[red]boom[/red]`` can't bend styling, and
+        long joins are truncated so a node with hundreds of
+        regenerated sites or parents doesn't blow up the column.
+
+        Defence-in-depth — a stale dict lookup or missing widget
+        returns silently rather than tracing back at the user."""
+        from rich.markup import escape as _esc
+        hist = self._node_by_id.get(event.node.id)
+        if hist is None:
+            return
+        try:
+            detail = self.query_one("#hist-scr-detail-text", Static)
+        except NoMatches:
+            return
+        name_disp = _esc(hist.name) if hist.name else "[dim](unnamed)[/]"
+        op_raw = hist.operation
+        op_disp = (
+            f"[cyan]{_esc(op_raw)}[/]" if op_raw
+            else "[dim](not recorded)[/]"
+        )
+        strandedness = hist.element.get("strandedness") or "?"
+        lines: list[str] = []
+        lines.append(f"[b]{name_disp}[/]")
+        lines.append("")
+        lines.append("[b]Properties[/]")
+        lines.append(f"  Length:        {hist.seq_len:,} bp")
+        lines.append("  Topology:      "
+                       f"{'circular' if hist.circular else 'linear'}")
+        lines.append(f"  Strandedness:  {_esc(strandedness)}")
+        lines.append(f"  Node ID:       {hist.node_id}")
+        lines.append("")
+        lines.append("[b]Operation[/]")
+        lines.append(f"  {op_disp}")
+        if hist.resurrectable:
+            lines.append("  [green]✓ resurrectable[/] "
+                          "[dim](parent can be re-extracted)[/]")
+        sites = hist.regenerated_sites
+        if sites:
+            lines.append("")
+            lines.append("[b]Regenerated sites[/]")
+            shown = sites[: _HISTORY_DETAIL_LIST_MAX]
+            joined = ", ".join(
+                f"{_esc(str(s['name']) or '(unnamed)')}@{s['pos']}"
+                for s in shown
+            )
+            if len(sites) > _HISTORY_DETAIL_LIST_MAX:
+                joined += f", … (+{len(sites) - _HISTORY_DETAIL_LIST_MAX} more)"
+            lines.append(f"  {joined}")
+        sums = hist.input_summaries
+        if sums:
+            lines.append("")
+            lines.append("[b]Inputs[/]")
+            for sm in sums[: _HISTORY_DETAIL_LIST_MAX]:
+                manip = _esc(str(sm.get('manipulation') or "(unknown)"))
+                n1 = _esc(str(sm.get('name1') or "?"))
+                n2 = _esc(str(sm.get('name2') or "?"))
+                lines.append(f"  {manip}  ({n1} ↔ {n2})")
+            if len(sums) > _HISTORY_DETAIL_LIST_MAX:
+                lines.append(
+                    f"  [dim]… (+{len(sums) - _HISTORY_DETAIL_LIST_MAX} more)[/]"
+                )
+        parents = hist.parents
+        lines.append("")
+        if parents:
+            lines.append(f"[b]Parents ({len(parents)})[/]")
+            shown = parents[: _HISTORY_DETAIL_LIST_MAX]
+            joined = ", ".join(
+                _esc(p.name or "(unnamed)") for p in shown
+            )
+            if len(parents) > _HISTORY_DETAIL_LIST_MAX:
+                joined += (
+                    f", … (+{len(parents) - _HISTORY_DETAIL_LIST_MAX} more)"
+                )
+            lines.append(f"  {joined}")
+        else:
+            lines.append("[dim](leaf — no recorded parents)[/]")
         detail.update("\n".join(lines))
 
 
@@ -17560,7 +17858,7 @@ class MenuBar(Widget):
     """
 
     MENUS = ["File", "Settings", "Edit", "Enzymes", "Features", "Primers",
-             "Mutagenize", "Parts", "Constructor"]
+             "Mutagenize", "Parts", "Constructor", "History"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -17576,10 +17874,14 @@ class MenuBar(Widget):
             region = item.region
             if (region.x <= event.screen_x < region.x + region.width and
                     region.y <= event.screen_y < region.y + region.height):
-                # "Features" is a direct-open workbench (no dropdown).
-                # Every other menu surfaces items via DropdownScreen.
+                # "Features" + "History" are direct-open screens (no
+                # dropdown). Every other menu surfaces items via
+                # DropdownScreen.
                 if name == "Features":
                     self.app.push_screen(FeatureLibraryScreen())
+                    break
+                if name == "History":
+                    self.app.action_show_history()
                     break
                 x = region.x
                 y = region.y + 1
@@ -34592,6 +34894,85 @@ class ConstructorModal(ModalScreen):
         full = f"{vector_name} · {joined}" if vector_name else joined
         return full[:60].rstrip()
 
+    def _build_history_for_assembly(self, *, name: str,
+                                        product_seq_len: int,
+                                        gid: str, grammar: dict,
+                                        entry_vector: dict,
+                                        parts: list[dict],
+                                        source_level: int) -> "str | None":
+        """Build a `<HistoryTree>` XML for a freshly-saved Constructor
+        assembly — Golden Braid / MoClo Type IIS ligation.
+
+        Mirrors `TraditionalCloningPane._build_history_for_product`:
+        a root node for the product, plus a parent node per source
+        input (the entry vector + every part on the lane). Parents
+        that themselves came from an earlier save inherit their full
+        nested subtree (via `_parent_node_for_entry`'s parse-existing
+        path), so the lineage chains through multi-step builds.
+
+        Parts on the Constructor lane come from `parts_bin.json`
+        which doesn't carry `history_xml`, so we cross-reference back
+        to the library by part name to recover their lineage. Parts
+        with no matching library entry fall back to a leaf node.
+
+        Returns None when the grammar has no enzyme registered for
+        this level (best-effort: the save still proceeds without
+        history).
+        """
+        enzyme = _enzyme_for_level_up(grammar, source_level + 1)
+        if not enzyme:
+            return None
+        root = _CommercialSaaSHistoryNode.new(
+            name=name + ".dna",
+            seq_len=product_seq_len,
+            circular=True,
+            operation="insertFragment",
+            node_id=0,
+        )
+        root.add_regenerated_site(enzyme, pos=0, site_count=1)
+        vector_name = str(entry_vector.get("name") or "backbone")
+        parts_label = "+".join(
+            str(p.get("name") or "?") for p in parts
+        )[:60]
+        root.add_input_summary(
+            manipulation=f"{gid}Assembly",
+            name1=vector_name, name2=parts_label,
+            site_count1=len(parts), site_count2=source_level + 1,
+        )
+        # Cross-reference back to the library to recover history for
+        # parts that came from an earlier Save. Build a single dict
+        # so the parts-loop is O(n) not O(n²).
+        lib_by_name: dict[str, dict] = {}
+        for e in _load_library():
+            if isinstance(e, dict):
+                nm = e.get("name")
+                if nm:
+                    lib_by_name[str(nm)] = e
+        vec_entry_for_history = (
+            lib_by_name.get(vector_name) or entry_vector
+        )
+        vec_node = TraditionalCloningPane._parent_node_for_entry(
+            vec_entry_for_history,
+        )
+        if vec_node is not None:
+            root.add_parent(vec_node)
+        for p in parts:
+            p_name = str(p.get("name") or "")
+            p_entry = lib_by_name.get(p_name)
+            if p_entry is None:
+                # Leaf fallback — parts-bin row only carries the
+                # name/size/overhang info, no nested lineage.
+                p_entry = {
+                    "name": p_name or "?",
+                    "size": int(p.get("size") or 0),
+                }
+            p_node = TraditionalCloningPane._parent_node_for_entry(
+                p_entry,
+            )
+            if p_node is not None:
+                root.add_parent(p_node)
+        return _serialize_commercialsaas_history(root)
+
     def _persist_assembly(self, new_rec, gid: str, *,
                             source_level: int,
                             entry_vector: dict,
@@ -34619,6 +35000,13 @@ class ConstructorModal(ModalScreen):
         while unique_id in existing:
             unique_id = f"{plasmid_id}_{suffix}"
             suffix += 1
+        # Grammar lookup is shared by the history record below and
+        # the level-up overhang probe further down — hoist it so both
+        # paths use the same dict.
+        grammar_for_digest = (
+            _all_grammars().get(gid)
+            or _BUILTIN_GRAMMARS.get("gb_l0", {})
+        )
         from datetime import date
         lib_entry = {
             "id":      unique_id,
@@ -34629,6 +35017,26 @@ class ConstructorModal(ModalScreen):
             "added":   date.today().isoformat(),
             "gb_text": gb_text,
         }
+        # Construction-history auto-record (parity with the
+        # Traditional cloning pane). Each Constructor save lands in
+        # the History viewer with the backbone + every part as parent
+        # fragments; parents that themselves came from an earlier
+        # save inherit their own subtrees, so the lineage chains
+        # through multi-step builds (L0 → TU → MOD → …). Best-effort
+        # — failures log + drop the field rather than block the save.
+        try:
+            history_xml = self._build_history_for_assembly(
+                name=new_rec.id or new_rec.name or unique_id,
+                product_seq_len=len(new_rec.seq),
+                gid=gid, grammar=grammar_for_digest,
+                entry_vector=entry_vector, parts=parts,
+                source_level=source_level,
+            )
+            if history_xml:
+                lib_entry["history_xml"] = history_xml
+        except Exception:
+            _log.exception("constructor: failed to record history "
+                            "for %s", unique_id)
         lib_entries = _load_library()
         lib_entries.insert(0, lib_entry)
         _save_library(lib_entries)
@@ -34657,10 +35065,8 @@ class ConstructorModal(ModalScreen):
         # doesn't carry the level-up enzyme outside its dropout, fake
         # records in unit tests with no IIS sites, etc.) so legacy
         # assertions and oddly-designed vectors still get a value.
-        grammar_for_digest = (
-            _all_grammars().get(gid)
-            or _BUILTIN_GRAMMARS.get("gb_l0", {})
-        )
+        # (`grammar_for_digest` is hoisted at the top of this method
+        # because the history-recording path needs it too.)
         next_oh5 = str(parts[0].get("oh5") or "")
         next_oh3 = str(parts[-1].get("oh3") or "")
         try:
@@ -43623,7 +44029,13 @@ SpeciesPickerModal { align: center middle; }
         Binding("f2",          "focus_panel_map",      "Map only",     show=False, priority=True),
         Binding("f3",          "focus_panel_sidebar",  "Features only",show=False, priority=True),
         Binding("f4",          "focus_panel_seq",      "Sequence only",show=False, priority=True),
-        Binding("f5",          "focus_panel_all",      "All panels",   show=False, priority=True),
+        # F5 → construction-history viewer for the loaded plasmid;
+        # F6 → restore the multi-panel main view (the previous F5 role,
+        # now also reachable on Ctrl+0). Ctrl+H is the cross-app
+        # muscle-memory alias for History.
+        Binding("f5",          "show_history",         "History",      show=False, priority=True),
+        Binding("ctrl+h",      "show_history",         "History",      show=False, priority=True),
+        Binding("f6",          "focus_panel_all",      "All panels",   show=False, priority=True),
         # Ctrl+# aliases for the F-key fullscreen views — SnapGene
         # muscle memory (Koeng101 + Cory Tobin in issue #1). Ctrl+1
         # is Library (=F1), Ctrl+2 is Sequence (=F4 because that's the
@@ -45675,6 +46087,51 @@ SpeciesPickerModal { align: center middle; }
             ExportGenBankModal(self._current_record, default_path=default),
             callback=_on_done,
         )
+
+    def action_show_history(self) -> None:
+        """Open the full-screen construction-history viewer for the
+        loaded plasmid. Triggered by F5, Ctrl+H, and the `History`
+        top-bar menu tab.
+
+        Looks the loaded record up in the active library (by
+        ``record.id``) and parses its ``history_xml`` if present.
+        Records with no recorded history surface a gentle notify
+        rather than pushing a blank screen — same UX as the
+        library-panel `h` keybind for non-loaded entries.
+        """
+        rec = self._current_record
+        if rec is None:
+            self.notify("No plasmid loaded.", severity="warning")
+            return
+        record_id = getattr(rec, "id", None)
+        entry: "dict | None" = None
+        if record_id:
+            for e in _load_library():
+                if e.get("id") == record_id:
+                    entry = e
+                    break
+        history_xml = entry.get("history_xml") if entry else None
+        if not history_xml:
+            self.notify(
+                f"No construction history recorded for "
+                f"{getattr(rec, 'name', '?')}.",
+                severity="information", timeout=4,
+            )
+            return
+        try:
+            root = _parse_commercialsaas_history(history_xml)
+        except ValueError as exc:
+            self.notify(f"Couldn't parse history: {exc}",
+                         severity="error", timeout=8)
+            _log.warning("history: malformed history_xml on %r: %s",
+                          getattr(rec, "name", "?"), exc)
+            return
+        if root is None:
+            self.notify("History is empty.", severity="information")
+            return
+        title = str(getattr(rec, "name", None)
+                       or record_id or "?")
+        self.push_screen(HistoryScreen(title, root))
 
     def action_restore_from_backup(self) -> None:
         """Open the multi-tier backup-restore modal. On commit, the

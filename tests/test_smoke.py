@@ -5151,14 +5151,13 @@ class TestShiftClickFeatureExtend:
 
     async def test_focus_panel_f_key_bindings_fire(
             self, isolated_library):
-        """End-to-end binding test: pressing F1 / F2 / F3 / F4 / F5
-        actually triggers the matching `action_focus_*`. Regression
-        guard for the 2026-05-04 binding settle: started as Ctrl+N
-        (terminals collapse Ctrl+digit to a bare digit), tried Alt+N
-        (Windows Terminal / iTerm2 / GNOME Terminal eat Alt+digit
-        for tab-switching), landed on F-keys which send dedicated
-        CSI/SS3 sequences no terminal hijacks. Catches a future
-        binding-string regression at CI time."""
+        """End-to-end binding test: F1–F4 fire the matching
+        `action_focus_*`; Ctrl+0 restores the multi-panel view.
+        Regression guard for the 2026-05-04 binding settle (F-keys
+        chosen because terminals collapse Ctrl+digit and eat Alt+digit
+        for tab-switching). F5 was the original "all panels" key but
+        moved to `show_history` on 2026-05-11; Ctrl+0 stayed bound
+        to `focus_panel_all` as the surviving full-restore key."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         rec = SeqRecord(Seq("A" * 200), id="L", name="L",
@@ -5184,7 +5183,7 @@ class TestShiftClickFeatureExtend:
             await pilot.pause()
             assert app.query_one("#top-row").display is False
             assert app.query_one("#seq-panel").display is True
-            await pilot.press("f5")
+            await pilot.press("ctrl+0")
             await pilot.pause()
             assert app.query_one("#library").display is True
             assert app.query_one("#plasmid-map").display is True

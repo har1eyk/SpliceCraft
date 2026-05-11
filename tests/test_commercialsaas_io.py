@@ -681,6 +681,435 @@ class TestHistoryViewerModal:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Full-screen HistoryScreen + menu / key wiring
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestHistoryScreen:
+    """Cover the full-screen viewer (`HistoryScreen`) and the
+    `action_show_history` path that drives it from the `History` menu
+    tab, F5, and Ctrl+H. Regression guard for 2026-05-11: the panel
+    promotion (modal → fullscreen Screen) must not lose either the
+    tree-rendering behaviour from `HistoryViewerModal` or the
+    "current-record / library-entry lookup" semantics."""
+
+    async def test_renders_root_and_parents_in_tree(self, tiny_record):
+        """Same data-shape assertion as the modal: a 3-deep history
+        tree round-trips through `HistoryScreen.on_mount` into the
+        Textual Tree widget."""
+        from textual.widgets import Tree as _TreeWidget
+        gp = sc._CommercialSaaSHistoryNode.new(
+            name="grandparent.dna", seq_len=1000, circular=True,
+            operation="insertFragment", node_id=2,
+        )
+        parent = sc._CommercialSaaSHistoryNode.new(
+            name="parent.dna", seq_len=2500, circular=True,
+            operation="insertFragment", node_id=1,
+        )
+        parent.add_parent(gp)
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="result.dna", seq_len=5000, circular=True,
+            operation="insertFragment", node_id=0,
+        )
+        root.add_parent(parent)
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library=None)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            screen = sc.HistoryScreen("test-plasmid", root)
+            await app.push_screen(screen)
+            await pilot.pause()
+            tree = screen.query_one("#hist-scr-tree", _TreeWidget)
+            labels: list[str] = []
+            def _walk(n):
+                if n is not tree.root:
+                    labels.append(str(n.label))
+                for c in n.children:
+                    _walk(c)
+            _walk(tree.root)
+            assert len(labels) == 3, labels
+            assert any("result.dna" in lab for lab in labels)
+            assert any("parent.dna" in lab for lab in labels)
+            assert any("grandparent.dna" in lab for lab in labels)
+
+    async def test_action_show_history_pushes_screen_when_loaded(
+            self, tiny_record, isolated_library):
+        """`PlasmidApp.action_show_history` looks the loaded record up
+        in the active library by id and, if it has `history_xml`,
+        pushes `HistoryScreen` (not the legacy modal). Wired to F5 /
+        Ctrl+H / the `History` top-bar menu tab.
+
+        Seeds the library AFTER the app mounts so the auto-persist
+        of the preloaded record doesn't overwrite our seed — the
+        app's load path saves the record without `history_xml` if it
+        wasn't already on disk."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        history_xml = sc._serialize_commercialsaas_history(
+            sc._CommercialSaaSHistoryNode.new(
+                name=tiny_record.id, seq_len=len(tiny_record.seq),
+                circular=True, operation="insertFragment", node_id=0,
+            )
+        )
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            # Stamp history_xml onto the auto-persisted entry.
+            entries = sc._load_library()
+            for e in entries:
+                if e.get("id") == tiny_record.id:
+                    e["history_xml"] = history_xml
+            sc._save_library(entries)
+            app.action_show_history()
+            await pilot.pause()
+            assert any(isinstance(s, sc.HistoryScreen)
+                        for s in app.screen_stack)
+
+    async def test_action_show_history_notifies_when_no_history(
+            self, tiny_record, isolated_library):
+        """Loaded record with no library entry (or library entry
+        without `history_xml`) — `action_show_history` notifies rather
+        than pushing a blank screen. The default auto-persist path
+        produces an entry without `history_xml`, so the empty case
+        falls out of `_build_app` naturally."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            app.action_show_history()
+            await pilot.pause()
+            assert not any(isinstance(s, sc.HistoryScreen)
+                            for s in app.screen_stack)
+
+    def test_history_in_menu_bar(self):
+        """The `History` menu tab is registered alongside `Features`
+        as a direct-open (no-dropdown) entry."""
+        assert "History" in sc.MenuBar.MENUS
+
+    def test_app_has_history_and_restore_bindings(self):
+        """F5 + Ctrl+H route to `show_history`; F6 restores the
+        multi-panel view via `focus_panel_all`. Surface assertions
+        only — the click and modal-stack tests above cover behavior."""
+        keys_to_action = {
+            (b.key, b.action) for b in sc.PlasmidApp.BINDINGS
+        }
+        assert ("f5", "show_history") in keys_to_action
+        assert ("ctrl+h", "show_history") in keys_to_action
+        assert ("f6", "focus_panel_all") in keys_to_action
+
+
+class TestHistoryScreenHardening:
+    """Edge-case coverage for `HistoryScreen` — the visible-from-the-
+    outside-world history viewer. Catches recursion-limit blowouts on
+    deep trees, Rich-markup injection from XML-controlled fields,
+    overflow on long names / many regenerated sites / many parents,
+    and the `Tree` iteration helpers (`_build_tree`, `expand_all`,
+    `collapse_all`). Regression guard for 2026-05-11 hardening."""
+
+    def _make_chain(self, depth: int) -> "sc._CommercialSaaSHistoryNode":
+        """Build a single-chain history tree N levels deep, returning
+        the root. Each node hangs off its child's `parents` list."""
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="leaf_0.dna", seq_len=100, circular=True,
+            operation="insertFragment", node_id=0,
+        )
+        cur = root
+        for i in range(1, depth):
+            up = sc._CommercialSaaSHistoryNode.new(
+                name=f"gen_{i}.dna", seq_len=100 + i, circular=True,
+                operation="insertFragment", node_id=i,
+            )
+            cur.add_parent(up)
+            cur = up
+        return root
+
+    def test_node_count_helper_counts_all_nodes(self):
+        """`_history_node_count` must walk iteratively (mirrors
+        `_CommercialSaaSHistoryNode.walk`) — a deep chain shouldn't
+        require a deep recursion."""
+        root = self._make_chain(200)
+        assert sc._history_node_count(root) == 200
+
+    def test_node_count_root_only(self):
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="solo.dna", seq_len=10, circular=True,
+            operation="insertFragment", node_id=0,
+        )
+        assert sc._history_node_count(node) == 1
+
+    def test_tree_label_truncates_long_name(self):
+        """Names longer than `_HISTORY_LABEL_NAME_MAX` are truncated
+        with an ellipsis so the tree column stays usable on hostile
+        / pathologically-long names."""
+        long_name = "x" * (sc._HISTORY_LABEL_NAME_MAX + 50)
+        node = sc._CommercialSaaSHistoryNode.new(
+            name=long_name, seq_len=100, circular=True,
+            operation="insertFragment", node_id=0,
+        )
+        label = sc._history_tree_label(node)
+        # No bare `[` in the rendered string (markup injection would
+        # show up as a literal Rich tag mid-label).
+        assert long_name not in label
+        # Display name is bounded.
+        assert "…" in label
+
+    def test_tree_label_escapes_markup_in_name(self):
+        """Rich markup characters in the node name must be escaped
+        — a node named ``pUC[red]boom[/red]`` should NOT paint red
+        text in the tree. `rich.markup.escape` rewrites the leading
+        `[` as `\\[`, so the output carries `\\[red]` (literal) rather
+        than the active tag form. We assert the escape sentinel was
+        applied; Rich's rendering pipeline treats `\\[red]` as plain
+        text and will not turn on the `red` style."""
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="pUC[red]boom[/red]", seq_len=100, circular=True,
+            operation="insertFragment", node_id=0,
+        )
+        label = sc._history_tree_label(node)
+        assert "\\[red]" in label, label
+
+    def test_tree_label_empty_fields_render_placeholders(self):
+        """An XML node with no operation / no name produces a
+        readable row rather than a whitespace-only label."""
+        import xml.etree.ElementTree as ET
+        # Build a node with empty operation + name attributes — bypassing
+        # `.new()` because it always sets them.
+        el = ET.Element("Node")
+        el.set("name", "")
+        el.set("seqLen", "0")
+        el.set("circular", "0")
+        el.set("operation", "")
+        node = sc._CommercialSaaSHistoryNode(el)
+        label = sc._history_tree_label(node)
+        assert "(unnamed)" in label
+        assert "(no operation)" in label
+
+    def test_title_truncates_long_plasmid_name(self):
+        """A library plasmid with a 200-char name shouldn't blow the
+        title bar — HistoryScreen ellipsises the title up front."""
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="x.dna", seq_len=10, circular=True,
+            operation="insertFragment", node_id=0,
+        )
+        long_title = "Z" * 200
+        screen = sc.HistoryScreen(long_title, root)
+        assert len(screen._title) <= sc._HISTORY_TITLE_NAME_MAX
+        assert screen._title.endswith("…")
+
+    async def test_screen_handles_deep_history_without_recursion(
+            self, tiny_record):
+        """Pushing a HistoryScreen with a 200-deep chain must mount
+        without tripping CPython's recursion limit. Smoke for
+        `_build_tree`'s iterative shape."""
+        from textual.widgets import Tree as _TreeWidget
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        root = self._make_chain(200)
+        app = _build_app(tiny_record, isolated_library=None)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            screen = sc.HistoryScreen("deep", root)
+            await app.push_screen(screen)
+            await pilot.pause()
+            tree = screen.query_one("#hist-scr-tree", _TreeWidget)
+            # Count labels — must equal node count.
+            cnt = 0
+            stack = [tree.root]
+            while stack:
+                n = stack.pop()
+                if n is not tree.root:
+                    cnt += 1
+                stack.extend(n.children)
+            assert cnt == 200
+
+    async def test_detail_pane_truncates_many_sites_and_parents(
+            self, tiny_record):
+        """A node with 50 regenerated sites + 50 parents renders only
+        the cap (`_HISTORY_DETAIL_LIST_MAX`) inline, with a
+        `(+N more)` suffix so the detail column doesn't blow up."""
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="result.dna", seq_len=5000, circular=True,
+            operation="insertFragment", node_id=0,
+        )
+        for i in range(50):
+            root.add_regenerated_site(f"Enz{i}", pos=i, site_count=1)
+        for i in range(50):
+            root.add_parent(sc._CommercialSaaSHistoryNode.new(
+                name=f"parent_{i}.dna", seq_len=100, circular=True,
+                operation="insertFragment", node_id=i + 1,
+            ))
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library=None)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            screen = sc.HistoryScreen("packed", root)
+            await app.push_screen(screen)
+            await pilot.pause()
+            # Force a detail render by selecting the root.
+            from textual.widgets import Tree as _TreeWidget
+            tree = screen.query_one("#hist-scr-tree", _TreeWidget)
+            top = tree.root.children[0]
+            tree.select_node(top)
+            await pilot.pause(); await pilot.pause(0.05)
+            from textual.widgets import Static
+            detail = screen.query_one("#hist-scr-detail-text", Static)
+            txt = str(detail.content)
+            assert "more" in txt, txt
+            # And the per-list cap is respected — Enz25 should not
+            # appear (only Enz0..Enz11 shown for cap=12).
+            assert "Enz25" not in txt
+
+    async def test_expand_and_collapse_actions_no_error(self, tiny_record):
+        """Pressing `e` / `c` while the tree has focus drives the
+        expand-all / collapse-all helpers without raising."""
+        from textual.widgets import Tree as _TreeWidget
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        root = self._make_chain(5)
+        app = _build_app(tiny_record, isolated_library=None)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            screen = sc.HistoryScreen("toggle", root)
+            await app.push_screen(screen)
+            await pilot.pause()
+            screen.action_collapse_all()
+            await pilot.pause()
+            screen.action_expand_all()
+            await pilot.pause()
+            # No assertion needed — the test fails if either call raises.
+
+    async def test_viewport_fits_key_widgets_at_160x48(self, tiny_record):
+        """Smoke check that every load-bearing widget — title bar,
+        subtitle, tree, detail pane, button row, footer — has a
+        non-zero rendered region inside the 160×48 standard terminal
+        size. Regression guard against accidentally cropping critical
+        UI when restyling."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        root = self._make_chain(3)
+        app = _build_app(tiny_record, isolated_library=None)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            screen = sc.HistoryScreen("vp", root)
+            await app.push_screen(screen)
+            await pilot.pause(); await pilot.pause(0.05)
+            for sel in (
+                "#hist-scr-title", "#hist-scr-subtitle",
+                "#hist-scr-tree", "#hist-scr-detail",
+                "#hist-scr-btns", "#btn-hist-scr-close",
+            ):
+                w = screen.query_one(sel)
+                r = w.region
+                assert r.width > 0 and r.height > 0, (sel, r)
+                # Inside the terminal bounds (top-left at 0,0).
+                assert r.x >= 0 and r.y >= 0, (sel, r)
+                assert r.x + r.width <= TERMINAL_SIZE[0], (sel, r)
+                assert r.y + r.height <= TERMINAL_SIZE[1], (sel, r)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Constructor → history wiring
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestConstructorHistory:
+    """Constructor assemblies attach a `history_xml` to their library
+    entry, parents (the entry vector + every L0 part) appear as
+    nested nodes, and previously-saved parents inherit their full
+    subtree so the lineage chains through multi-step builds."""
+
+    def test_persist_assembly_attaches_history_xml(
+            self, isolated_library, isolated_parts_bin):
+        """`_persist_assembly` writes `history_xml` onto the library
+        entry. The root node carries the assembly's name + size; the
+        vector and every part hang off the root as parents."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("AAAA" * 100), id="MyTU", name="MyTU")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "alpha1_vec",
+                            "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[
+                {"name": "P", "oh5": "GGAG", "oh3": "TGAC", "level": 0},
+                {"name": "T", "oh5": "TGAC", "oh3": "CGCT", "level": 0},
+            ],
+            backbone_role="Alpha1",
+        )
+        entry = sc._load_library()[0]
+        assert "history_xml" in entry, entry
+        root = sc._parse_commercialsaas_history(entry["history_xml"])
+        assert root is not None
+        assert root.name == "MyTU.dna"
+        assert root.seq_len == len(rec.seq)
+        # 3 parents: backbone + 2 parts.
+        parents = root.parents
+        names = sorted(p.name for p in parents)
+        assert names == ["P.dna", "T.dna", "alpha1_vec.dna"], names
+        # Input summary records the grammar id so a downstream reader
+        # can identify which assembly style produced the plasmid.
+        sums = root.input_summaries
+        assert sums and "gb_l0" in sums[0]["manipulation"], sums
+
+    def test_persist_assembly_nests_parent_history(
+            self, isolated_library, isolated_parts_bin):
+        """When a part used in the assembly already has its OWN
+        `history_xml` in the library (because it came from an earlier
+        Save), the parent node in the new tree carries that full
+        subtree — so the lineage chains through L0 → TU → MOD."""
+        # Seed library with a "part_with_lineage" that itself has a
+        # one-step history (representing an earlier assembly).
+        parent_history = sc._serialize_commercialsaas_history(
+            sc._CommercialSaaSHistoryNode.new(
+                name="part_with_lineage.dna", seq_len=500,
+                circular=True, operation="insertFragment", node_id=0,
+            )
+        )
+        sc._save_library([{
+            "id":          "lineage_part",
+            "name":        "part_with_lineage",
+            "size":        500,
+            "n_feats":     0,
+            "source":      "test",
+            "added":       "2026-05-11",
+            "gb_text":     "LOCUS x 500 bp DNA\n//\n",
+            "history_xml": parent_history,
+        }])
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("AAAA" * 100), id="MyTU2", name="MyTU2")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "alpha1_vec",
+                            "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[
+                {"name": "part_with_lineage", "oh5": "GGAG",
+                  "oh3": "CGCT", "level": 0},
+            ],
+            backbone_role="Alpha1",
+        )
+        entry = next(e for e in sc._load_library()
+                       if e.get("id") == "MyTU2")
+        assert "history_xml" in entry
+        root = sc._parse_commercialsaas_history(entry["history_xml"])
+        assert root is not None
+        # Locate the nested parent — it must be the same node that
+        # was serialised above, not a freshly synthesised leaf.
+        nested = [p for p in root.parents
+                    if p.name == "part_with_lineage.dna"]
+        assert nested, [p.name for p in root.parents]
+        # `_parent_node_for_entry` re-uses parent's existing element,
+        # so node attributes round-trip through the parse.
+        nested_node = nested[0]
+        assert nested_node.seq_len == 500
+        assert nested_node.operation == "insertFragment"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Sidecar storage + .dna export (Phase 4d)
 # ──────────────────────────────────────────────────────────────────────────────
 
