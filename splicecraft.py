@@ -8048,6 +8048,90 @@ def _pairwise_align(query_seq: str, target_seq: str,
     }
 
 
+def _alignment_to_target_segments(
+    aligned_q: str, aligned_t: str, t_start: int = 0,
+) -> "list[tuple[int, int, str]]":
+    """Collapse a pairwise alignment into per-state runs in *target*
+    coordinates — the data the linear-map alignment overlay paints
+    as blue / red / gray bars.
+
+    Walk the two gapped strings in lockstep. Target position advances
+    only on `t != '-'`; columns where the target gaps (insertions in
+    the query) consume zero target bp and so don't appear as their
+    own segment — they fold into the surrounding state at target
+    resolution. Caller can recover insertion positions from the raw
+    gapped strings if it ever needs to render an insertion marker.
+
+    Per-target-column state:
+        match     — both bases non-gap, ``q == t`` (case-insensitive)
+        mismatch  — both bases non-gap, ``q != t``
+        gap       — ``q == '-'``, ``t != '-'`` (deletion in the read)
+
+    Returns ``[(t_pos, t_end, state)]`` ascending, half-open target
+    ranges. ``t_start`` shifts the returned positions (use it when
+    the alignment is local with a non-zero target offset).
+    """
+    if len(aligned_q) != len(aligned_t):
+        raise ValueError(
+            f"aligned strings differ in length: q={len(aligned_q)} "
+            f"vs t={len(aligned_t)}"
+        )
+    segs: "list[tuple[int, int, str]]" = []
+    t_pos = t_start
+    cur_state: "str | None" = None
+    cur_start = t_pos
+    for q, t in zip(aligned_q.upper(), aligned_t.upper()):
+        if t == "-":
+            continue
+        if q == "-":
+            state = "gap"
+        elif q == t:
+            state = "match"
+        else:
+            state = "mismatch"
+        if state != cur_state:
+            if cur_state is not None:
+                segs.append((cur_start, t_pos, cur_state))
+            cur_state = state
+            cur_start = t_pos
+        t_pos += 1
+    if cur_state is not None:
+        segs.append((cur_start, t_pos, cur_state))
+    return segs
+
+
+def _alignment_to_target_letters(
+    aligned_q: str, aligned_t: str, t_start: int = 0,
+) -> "dict[int, tuple[str, str]]":
+    """Per-target-bp ``(query_letter, state)`` map — the data the
+    linear-map alignment overlay paints at high zoom (≥ 1 col / bp).
+
+    Companion to `_alignment_to_target_segments`: same walk, same
+    state classification, but emits one entry per target column
+    instead of coalescing into runs. ``query_letter`` is the raw
+    query base at that column (``'-'`` for a gap).
+    """
+    if len(aligned_q) != len(aligned_t):
+        raise ValueError(
+            f"aligned strings differ in length: q={len(aligned_q)} "
+            f"vs t={len(aligned_t)}"
+        )
+    out: "dict[int, tuple[str, str]]" = {}
+    t_pos = t_start
+    for q, t in zip(aligned_q.upper(), aligned_t.upper()):
+        if t == "-":
+            continue
+        if q == "-":
+            state = "gap"
+        elif q == t:
+            state = "match"
+        else:
+            state = "mismatch"
+        out[t_pos] = (q, state)
+        t_pos += 1
+    return out
+
+
 # ── GenBank export (NCBI-compliant normalization + atomic write) ──────────────
 #
 # Biopython's SeqIO.write produces compliant GenBank output when annotations
@@ -8625,13 +8709,48 @@ class PlasmidMap(Widget):
         self.record  = None
         self._feats:          list[dict] = []
         self._restr_feats:    list[dict] = []   # restriction site overlay
+        # Linear-view alignment overlay — list of dicts owned by the
+        # App (PlasmidApp._alignments) and mirrored here for the
+        # renderer. Each entry carries `name`, `segments` (the
+        # precomputed `_alignment_to_target_segments` output),
+        # `aligned_q/t`, `target_record` (for click drill-in to
+        # AlignmentScreen), `result` (the full `_pairwise_align`
+        # dict), and `t_lo`/`t_hi` (precomputed extents for lane
+        # packing). Empty unless the user has registered alignments
+        # via `PlasmidsaurusAlignModal` / Alt+A multi-align / inline
+        # diff.
+        self._alignments:     list[dict] = []
         self._total:          int  = 0
         self._show_connectors: bool = False
+        # Per-frame populated by `_draw_linear_flag` so on_click can
+        # match a click against a rendered alignment row. Schema mirrors
+        # `_label_bboxes`: (cx0, cx1, row, align_idx).
+        self._align_bboxes:    list[tuple[int, int, int, int]] = []
+        # Currently-selected alignment row (reverse-style highlight),
+        # -1 = none. Mirrors `selected_idx` for features.
+        self._selected_align_idx: int = -1
 
     def on_mount(self) -> None:
         detected = _detect_char_aspect()
         if detected != self._aspect:
             self._aspect = detected
+
+    def set_alignments(self, alignments: "list[dict]") -> None:
+        """Replace the alignment overlay list and trigger a redraw.
+
+        Called by PlasmidApp's `_register_alignment` / `_clear_alignments`
+        helpers after the app's `_alignments` mutates. Shallow-copies
+        the list so a downstream caller can keep mutating the original
+        without flicker; dict payloads are shared (deepcopy would be
+        gratuitous — entries are write-once after registration).
+        """
+        self._alignments = list(alignments)
+        # Clear any selection that no longer references a valid row —
+        # the bbox list will be repopulated by the next render pass.
+        if self._selected_align_idx >= len(self._alignments):
+            self._selected_align_idx = -1
+        self._align_bboxes = []
+        self.refresh()
 
     def load_record(self, record) -> None:
         self.record       = record
@@ -9146,6 +9265,21 @@ class PlasmidMap(Widget):
         self.notify(f"Aspect {self._aspect:.2f}  (press . to heighten)", timeout=1.5)
 
     def action_toggle_map_view(self):
+        # Linear-view alignment overlay can't be rendered on a circle —
+        # the bars would have to bend around the rim and the lane stack
+        # would clip wherever the rotation lands. Refuse to flip back
+        # to circular while any alignment row is registered; the user
+        # must clear them (Alt+Shift+A) first.
+        if self._map_mode == "linear" and self._alignments:
+            try:
+                self.app.notify(
+                    "Clear alignments (Alt+Shift+A) before switching to "
+                    "circular view.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
+            return
         self._map_mode = "linear" if self._map_mode == "circular" else "circular"
         self.refresh()
 
@@ -9246,10 +9380,67 @@ class PlasmidMap(Widget):
                 best_idx  = i
         return (best_idx, bp) if best_idx >= 0 else (-1, -1)
 
+    def _align_at_click(self, x: int, y: int) -> int:
+        """Linear-view alignment hit-test. Returns the alignment index
+        under (x, y) or -1 if none. Mirrors the `_label_bboxes` lookup
+        pattern used for features. Circular mode never paints alignment
+        rows, so we short-circuit there."""
+        if self._map_mode != "linear":
+            return -1
+        for cx0, cx1, row, ai in self._align_bboxes:
+            if row == y and cx0 <= x <= cx1:
+                return ai
+        return -1
+
     def on_click(self, event: Click):
         if not self.record:
             return
         if self._map_mode == "linear":
+            # Alignment lane hit-test runs BEFORE the feature lookup —
+            # alignment rows sit in their own band below the rev features
+            # and a click should open the alignment (AlignmentScreen
+            # drill-in), not select whatever feature happens to share
+            # the column. Bbox list is repopulated by
+            # `_draw_alignment_band` every render so it always reflects
+            # the current view.
+            ai = self._align_at_click(event.x, event.y)
+            if ai >= 0:
+                try:
+                    align = self._alignments[ai]
+                except (IndexError, KeyError):
+                    return
+                self._selected_align_idx = ai
+                self.refresh()
+                # Defensive None-guard: AlignmentScreen._body_text
+                # dereferences `target_record.seq` and `.features`, so
+                # a malformed entry would crash the modal push. Workers
+                # currently never produce a None target_record, but if
+                # the schema ever drifts (e.g., persistence path that
+                # loses the record), surface a notify instead.
+                target_record = align.get("target_record")
+                result = align.get("result") or {}
+                if target_record is None or not result:
+                    try:
+                        self.app.notify(
+                            "Alignment entry is incomplete — can't open "
+                            "detail view. Re-run the alignment.",
+                            severity="warning", timeout=4,
+                        )
+                    except Exception:
+                        pass
+                    return
+                try:
+                    self.app.push_screen(AlignmentScreen(
+                        query_label=align.get("query_label", "query"),
+                        target_label=align.get("target_label", "target"),
+                        target_record=target_record,
+                        result=result,
+                    ))
+                except Exception:
+                    _log.exception(
+                        "alignment lane click: push_screen failed"
+                    )
+                return
             idx, bp = self._feat_at_linear(event.x, event.y)
         else:
             idx, bp = self._feat_at(event.x, event.y)
@@ -9916,6 +10107,20 @@ class PlasmidMap(Widget):
                     if existing == " ":
                         canvas.put(stem_col, sr, "│", color)
 
+        # ── Alignment overlay band ──
+        # Sequencing-read / library-diff alignments stack below the
+        # reverse-feature lanes. Rows are packed IGV-style (greedy
+        # first-fit so short alignments share lanes when their target
+        # spans don't overlap). Bar mode at <1 col/bp (blue match /
+        # red mismatch / gray gap blocks); letter mode at ≥1 col/bp
+        # (query base letter in the same 3-colour scheme).
+        self._align_bboxes = []
+        if self._alignments:
+            self._draw_alignment_band(
+                canvas, w, h, margin_l, usable_w, view_s, view_e,
+                visible_bp, bp_to_col, rail_row, rev_lanes,
+            )
+
         # ── Header ──
         name = (self.record.name or self.record.id or "?")[:w // 3]
         canvas.put_text(margin_l, 0, f"{name}  {total:,} bp", "bold white")
@@ -9923,6 +10128,200 @@ class PlasmidMap(Widget):
         canvas.put_text(w - len(hint) - 1, 0, hint, "dim")
 
         return bc.combine(canvas)
+
+    def _draw_alignment_band(
+        self, canvas, w: int, h: int, margin_l: int, usable_w: int,
+        view_s: int, view_e: int, visible_bp: int,
+        bp_to_col, rail_row: int, rev_lanes: "list",
+    ) -> None:
+        """Paint the linear-view alignment overlay onto `canvas`.
+
+        Helper extracted from `_draw_linear_flag` so the main render
+        stays readable. The contract is: caller has already drawn the
+        rail, ticks, restriction marks, and forward/reverse feature
+        lanes; `rev_lanes` is the list-of-lists used by the feature
+        packer so we know how far below the rail the feature band ends.
+
+        Per-frame work:
+          * filter `self._alignments` to those overlapping the visible bp window
+          * IGV-style greedy first-fit lane packing on column extents
+          * per-alignment bar render (bar mode <1 col/bp, letter mode otherwise)
+          * strand arrowhead at the right end
+          * click bboxes appended to `self._align_bboxes`
+          * "+N more" overflow indicator if alignments exceed available rows
+
+        2026-05-12: separate coverage-histogram row removed per user
+        request — the lane stack alone carries enough information and
+        the histogram read as a confusing second band.
+        """
+        # 1. Filter alignments to those touching the visible window.
+        visible_aligns: "list[tuple[int, dict]]" = []
+        for ai, align in enumerate(self._alignments):
+            t_lo = align.get("t_lo", 0)
+            t_hi = align.get("t_hi", 0)
+            if t_hi <= view_s or t_lo >= view_e:
+                continue
+            visible_aligns.append((ai, align))
+        if not visible_aligns:
+            return
+
+        # 2. Lane packing — sort by target start asc, then length desc
+        #    so longest spans claim low lanes (closest to rail). This
+        #    matches the feature-pack order in the parent function.
+        visible_aligns.sort(
+            key=lambda t: (
+                t[1].get("t_lo", 0),
+                -(t[1].get("t_hi", 0) - t[1].get("t_lo", 0)),
+            )
+        )
+        align_lanes: "list[list[tuple[int, int]]]" = []
+        align_placed: "list[tuple[int, dict, int, int, int]]" = []
+        for ai, align in visible_aligns:
+            t_lo = align.get("t_lo", 0)
+            t_hi = align.get("t_hi", 0)
+            cx0 = bp_to_col(max(view_s, t_lo))
+            cx1 = bp_to_col(min(view_e, t_hi))
+            cx0 = max(margin_l, min(cx0, w - 1))
+            cx1 = max(margin_l, min(cx1, margin_l + usable_w))
+            if cx1 <= cx0:
+                cx1 = cx0 + 1
+            chosen = -1
+            for li, lane in enumerate(align_lanes):
+                if all(cx1 <= a or cx0 >= b for a, b in lane):
+                    chosen = li
+                    break
+            if chosen < 0:
+                align_lanes.append([])
+                chosen = len(align_lanes) - 1
+            align_lanes[chosen].append((cx0, cx1))
+            align_placed.append((ai, align, chosen, cx0, cx1))
+
+        # 3. Compute row positions for the band.
+        # Last row consumed by the rev-feature band: tick label row
+        # (rail+1) plus one row per reverse lane. One blank separator,
+        # then alignment lanes start.
+        rev_lane_count = len(rev_lanes) if rev_lanes else 0
+        rev_last_used  = rail_row + 1 + rev_lane_count
+        align_band_top = rev_last_used + 2
+        if align_band_top >= h:
+            # Terminal too short — surface a single-row hint where the
+            # rev band ends rather than silently dropping the lanes.
+            hint_row = rev_last_used + 1
+            if 0 <= hint_row < h:
+                hint = f"[{len(self._alignments)} alignment(s) — terminal too short]"
+                canvas.put_text(
+                    margin_l, hint_row,
+                    hint[: w - margin_l - 1], "color(196)",
+                )
+            return
+        # Leave room for an overflow row at the very bottom; one less
+        # available lane row when overflow needs to be indicated.
+        max_lane_rows = max(0, h - align_band_top)
+        will_overflow = len(align_placed) > max_lane_rows or any(
+            lane_idx >= max_lane_rows for (_ai, _a, lane_idx, _c0, _c1) in align_placed
+        )
+        max_lane_idx_render = (
+            max_lane_rows - 2 if will_overflow else max_lane_rows - 1
+        )
+
+        # 4. Render alignment lanes.
+        col_per_bp  = usable_w / max(1, visible_bp)
+        letter_mode = col_per_bp >= 1.0
+        rendered    = 0
+        skipped     = 0
+        for ai, align, lane_idx, cx0_align, cx1_align in align_placed:
+            row = align_band_top + lane_idx
+            if lane_idx > max_lane_idx_render or row >= h:
+                skipped += 1
+                continue
+            is_selected = (ai == self._selected_align_idx)
+            base_style  = "reverse" if is_selected else ""
+
+            # Lazy-build per-bp letter dict on first letter-mode draw.
+            letters = align.get("letters")
+            if letter_mode and letters is None:
+                letters = _alignment_to_target_letters(
+                    align.get("aligned_q", ""),
+                    align.get("aligned_t", ""),
+                    align.get("t_start", 0),
+                )
+                align["letters"] = letters
+
+            # Walk segments and paint each visible chunk.
+            for seg_s, seg_e, state in align.get("segments", []):
+                s = max(seg_s, view_s)
+                e = min(seg_e, view_e)
+                if s >= e:
+                    continue
+                if state == "match":
+                    color = "color(39)"
+                    glyph = "█"
+                elif state == "mismatch":
+                    color = "color(196)"
+                    glyph = "█"
+                else:  # gap
+                    color = "color(240)"
+                    glyph = "░"
+                if letter_mode and letters:
+                    letter_style = (
+                        f"{base_style} bold {color}".strip()
+                    )
+                    for bp in range(s, e):
+                        col = bp_to_col(bp)
+                        if not (margin_l <= col <= margin_l + usable_w):
+                            continue
+                        ch, _ = letters.get(bp, ("-", state))
+                        canvas.put(col, row, ch, letter_style)
+                else:
+                    seg_cx0 = max(margin_l, bp_to_col(s))
+                    seg_cx1 = min(margin_l + usable_w, bp_to_col(e))
+                    bar_style = f"{base_style} {color}".strip()
+                    for col in range(seg_cx0, seg_cx1):
+                        canvas.put(col, row, glyph, bar_style)
+
+            # Strand arrowhead at the right tip of the bar. All
+            # registered alignments are forward against the target;
+            # reverse-strand reads have already been RC'd by the
+            # aligner before reaching us.
+            t_hi_a = align.get("t_hi", 0)
+            if view_s < t_hi_a <= view_e:
+                arrow_col = bp_to_col(t_hi_a) - 1
+                if margin_l <= arrow_col <= margin_l + usable_w:
+                    canvas.put(
+                        arrow_col, row, "▶",
+                        f"{base_style} color(39)".strip(),
+                    )
+
+            # Read name to the LEFT of the bar if there's room. Truncated
+            # silently when the name is wider than the gap to the left
+            # margin; an "[…]" indicator would just eat more of the bar.
+            name = align.get("name") or ""
+            t_lo_a = align.get("t_lo", 0)
+            if name and t_lo_a >= view_s:
+                name_col_end = bp_to_col(t_lo_a) - 1
+                room = max(0, name_col_end - margin_l)
+                if room >= 3:
+                    show = name[: min(len(name), room)]
+                    canvas.put_text(
+                        name_col_end - len(show), row, show,
+                        f"{base_style} dim white".strip(),
+                    )
+
+            # Click bbox for drill-in to AlignmentScreen.
+            self._align_bboxes.append((
+                cx0_align, max(cx0_align, cx1_align - 1), row, ai,
+            ))
+            rendered += 1
+
+        # 5. Overflow indicator.
+        if skipped > 0:
+            overflow_row = align_band_top + max_lane_idx_render + 1
+            if 0 <= overflow_row < h:
+                label = f"+{skipped} more (Alt+Shift+A to clear)"
+                col   = max(margin_l, w - len(label) - 1)
+                canvas.put_text(
+                    col, overflow_row, label, "bold color(196)",
+                )
 
 
 # ── Sidebar feature table ──────────────────────────────────────────────────────
@@ -14186,6 +14585,8 @@ _HELP_BODY_MD = """\
 |---|---|
 | `Ctrl+P` | Primer design |
 | `Ctrl+B` | BLAST (BLASTN / BLASTP / HMMscan) |
+| `Alt+A` | Align current plasmid against one or more library plasmids — each pick adds a row to the linear-map alignment overlay (blue match · red mismatch · gray gap, with a coverage histogram above). Click a read lane to drill into AlignmentScreen. |
+| `Alt+Shift+A` | Clear every alignment row from the overlay. |
 
 ### Map / view
 
@@ -32700,7 +33101,13 @@ class PlasmidsaurusAlignModal(ModalScreen):
                        target_record, entry_counter: int) -> None:
         """Worker: run `_pairwise_align` off the UI thread, then push
         the visualisation screen. Inputs captured at entry; stale-load
-        guard on the load counter (mirrors `_restr_scan_worker`)."""
+        guard on the load counter (mirrors `_restr_scan_worker`).
+
+        Also captures `_alignments_generation` so a user who hits
+        Clear Alignments while the C-loop ran doesn't see this stale
+        result reappear on the overlay band when the worker lands.
+        """
+        gen_at_entry = getattr(self.app, "_alignments_generation", 0)
         try:
             result = _pairwise_align(
                 query_seq, target_seq, mode="global",
@@ -32736,18 +33143,43 @@ class PlasmidsaurusAlignModal(ModalScreen):
                 return
             # Cancel guard: the C-loop can't be cancelled mid-flight,
             # so if the user clicked Cancel while it ran, the result
-            # is still here. Don't surface it — pushing AlignmentScreen
-            # after the modal dismissed surprises the user.
+            # is still here. Don't surface it — registering an alignment
+            # for a modal the user has dismissed would surprise them.
             if self._cancelled:
                 return
-            self.app.push_screen(
-                AlignmentScreen(
+            # Clear-alignments guard: if the user hit Alt+Shift+A while
+            # the worker ran, the generation counter advanced; resurrect-
+            # ing this result would surprise them.
+            if (getattr(self.app, "_alignments_generation", 0)
+                    != gen_at_entry):
+                return
+            # Register on the linear-map overlay band instead of pushing
+            # AlignmentScreen — the user can click the lane to drill
+            # into the full-screen viewer (kept for base-level review).
+            try:
+                self.app._register_alignment(
+                    name=query_label,
                     query_label=query_label,
                     target_label=target_label,
                     target_record=target_record,
                     result=result,
                 )
-            )
+            except Exception:
+                _log.exception(
+                    "PlasmidsaurusAlignModal: _register_alignment failed"
+                )
+            ident_total = result.get("identity_pct", 0.0)
+            ident_ungap = result.get("ungapped_identity_pct", ident_total)
+            try:
+                self.app.notify(
+                    f"Aligned {query_label} → {target_label} · "
+                    f"{ident_ungap:.1f}% identity (aligned region) · "
+                    f"click read on map to inspect.",
+                    title="Alignment added",
+                    severity="information", timeout=6,
+                )
+            except Exception:
+                pass
             self.dismiss(result)
         self.app.call_from_thread(_show)
 
@@ -32987,6 +33419,183 @@ class AlignmentScreen(Screen):
 
     def action_close(self) -> None:
         self.app.pop_screen()
+
+
+# ── Multi-target alignment picker ─────────────────────────────────────────────
+#
+# `MultiAlignPickerModal` is the entry point for Alt+A: pick one or more
+# library plasmids to pairwise-align against the currently-loaded record.
+# Each selected target produces one read lane on the linear-map alignment
+# overlay band (`_draw_alignment_band`).
+#
+# Multi-select via space-toggle on the row cursor — DataTable doesn't
+# carry native checkbox support, so we render a `✓` / `·` column 0 cell
+# and maintain the selection set in Python.
+
+class MultiAlignPickerModal(ModalScreen):
+    """Modal: pick multiple library plasmids to align against the
+    currently-loaded record. Each pick becomes one row on the linear-
+    map alignment overlay.
+
+    Layout: leading checkbox column + standard library columns. Space
+    toggles the cursor row's selection; Align runs all picks. Filters
+    the current plasmid out of the list (no self-self alignment).
+
+    Dismiss payload:
+      ``None``         — cancelled (Esc / Cancel)
+      ``list[str]``    — selected entry IDs (may be empty if user
+                          hit Align with nothing selected)
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("space",  "toggle",         "Toggle"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    MultiAlignPickerModal { align: center middle; }
+    #mam-dlg {
+        width: 96;
+        height: 36;
+        background: $surface;
+        border: heavy $primary;
+        padding: 1 2;
+    }
+    #mam-title {
+        text-align: center;
+        background: $primary-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
+    #mam-help { color: $text-muted; padding: 0 1; margin-top: 1; }
+    #mam-table { height: 1fr; margin-top: 1; }
+    #mam-status { color: $text-muted; padding: 0 1; }
+    #mam-btns { height: 3; align: right middle; padding-top: 1; }
+    """
+
+    _CHECK_ON  = "[bold green]✓[/]"
+    _CHECK_OFF = "[dim]·[/]"
+
+    # Hard cap so a user with a 500-entry library can't kick off a
+    # 500-target pairwise sweep in one click. The notify still
+    # surfaces a count.
+    _MAX_TARGETS = 20
+
+    def __init__(self, current_id: "str | None" = None):
+        super().__init__()
+        self._current_id = current_id
+        self._selected_ids: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="mam-dlg"):
+            yield Static(" Align with library plasmids ", id="mam-title")
+            yield Static(
+                "Space toggles selection · Align runs pairwise "
+                "alignments against the current plasmid · Esc cancels",
+                id="mam-help", markup=False,
+            )
+            yield DataTable(id="mam-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("0 selected", id="mam-status")
+            with Horizontal(id="mam-btns"):
+                yield Button("Align", id="btn-mam-ok", variant="primary")
+                yield Button("Cancel", id="btn-mam-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#mam-table", DataTable)
+        t.add_columns("", "Name", "ID", "Size", "Features")
+        # Natural-sort by display name; current plasmid (if any)
+        # filtered out so the picker never offers self-self alignment.
+        entries = sorted(
+            (
+                e for e in _load_library()
+                if e.get("id") and e.get("id") != self._current_id
+            ),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
+        for e in entries:
+            t.add_row(
+                Text.from_markup(self._CHECK_OFF),
+                Text(e.get("name", "?"), style="bold"),
+                e.get("id", "?"),
+                f"{e.get('size', 0):,} bp",
+                f"{e.get('n_feats', 0)}",
+                key=e.get("id"),
+            )
+        if entries:
+            t.move_cursor(row=0)
+            t.focus()
+        else:
+            try:
+                self.query_one("#mam-status", Static).update(
+                    "No other plasmids in the active collection."
+                )
+            except NoMatches:
+                pass
+
+    def action_toggle(self) -> None:
+        """Flip the cursor row's selection state. Updates the column-0
+        marker and the running count line."""
+        t = self.query_one("#mam-table", DataTable)
+        key = _cursor_row_key(t)
+        if not key:
+            return
+        if key in self._selected_ids:
+            self._selected_ids.remove(key)
+            mark = self._CHECK_OFF
+        else:
+            if len(self._selected_ids) >= self._MAX_TARGETS:
+                self.app.notify(
+                    f"At most {self._MAX_TARGETS} targets per batch — "
+                    "deselect one first.",
+                    severity="warning", timeout=4,
+                )
+                return
+            self._selected_ids.add(key)
+            mark = self._CHECK_ON
+        # Update the marker cell at the cursor row.
+        try:
+            from textual.coordinate import Coordinate
+            row_idx = t.cursor_row
+            t.update_cell_at(
+                Coordinate(row_idx, 0), Text.from_markup(mark),
+            )
+        except Exception:
+            _log.exception("MultiAlignPickerModal: cell update failed")
+        # Refresh the running count.
+        try:
+            self.query_one("#mam-status", Static).update(
+                f"{len(self._selected_ids)} selected"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-mam-ok")
+    def _ok(self, _):
+        # Empty-selection guard: closing with [] would silently no-op
+        # the action handler. Surface a notify and keep the modal open
+        # so the user can fix their pick.
+        if not self._selected_ids:
+            try:
+                self.app.notify(
+                    "Select at least one plasmid (space toggles the "
+                    "cursor row), then press Align.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
+            return
+        self.dismiss(list(self._selected_ids))
+
+    @on(Button.Pressed, "#btn-mam-cancel")
+    def _cancel_btn(self, _):
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ── Constructor modal ──────────────────────────────────────────────────────────
@@ -44679,6 +45288,24 @@ class PlasmidApp(App):
     _restr_min_len: int = 6
     _show_restr: bool = False
     _restr_cache: "list" = []
+    # Linear-map alignment overlay state. Each entry is one alignment
+    # row stacked below the rail — same shape as the dict returned by
+    # `_pairwise_align`, plus `name` / `query_label` / `target_label` /
+    # `target_record` for click drill-in to AlignmentScreen, and a
+    # `segments` precompute (see `_alignment_to_target_segments`) so
+    # we don't walk the gapped strings on every frame. Cleared on
+    # fresh record loads via `_apply_record(clear_undo=True)`; in-place
+    # edits (primer add, feature merge) preserve the band. The first
+    # alignment registered against a circular plasmid pins the map
+    # mode to "linear" — overlay on a circle is not supported.
+    _alignments: "list[dict]" = []
+    # Monotonic counter bumped by `_clear_alignments`. Workers capture
+    # this at entry and refuse to register their result if it advanced
+    # — defends against the race where the user hits Alt+Shift+A while
+    # a multi-align worker still has pending `_apply` callbacks. Without
+    # this guard the cleared alignments would partially reappear as
+    # each in-flight `_apply` lands.
+    _alignments_generation: int = 0
     # User preferences (loaded from settings.json on mount, saved on
     # change). The Settings menu in the menu bar is the user-facing
     # toggle surface; entries here are the in-memory mirror so hot
@@ -45739,6 +46366,14 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+slash",  "find_annotation",  "Find feature",  show=True, priority=True),
         # Off-footer (still bound):
         Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=False),
+        # Linear-map alignment overlay: Alt+A opens the multi-align
+        # picker (target plasmid(s) from the library), Alt+Shift+A
+        # clears every registered alignment row. Both are priority=True
+        # so they fire even while a panel-level DataTable / Input has
+        # focus — alignments are a global record-level concept and the
+        # user shouldn't have to refocus the map first.
+        Binding("alt+a",       "open_align_picker", "Align…",       show=False, priority=True),
+        Binding("alt+shift+a", "clear_alignments", "Clear aligns",  show=False, priority=True),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
         Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
         # Alt+D — capture a Markdown UI snapshot to <DATA_DIR>/
@@ -45864,6 +46499,12 @@ SpeciesPickerModal { align: center middle; }
         # Both helpers are idempotent.
         _ensure_default_collection()
         _restore_library_from_active_collection()
+        # Per-instance alignment list — class-level [] would be shared
+        # across instances. Test fixtures (and a hypothetical future
+        # multi-app process) must not leak alignment state between
+        # plasmids running side by side.
+        self._alignments = []
+        self._alignments_generation = 0
         # Hydrate user-preference toggles from settings.json. Defaults
         # match the class-level annotations above; missing keys (fresh
         # data dir) take the default. Done in compose() so the value
@@ -48369,6 +49010,7 @@ SpeciesPickerModal { align: center middle; }
         result if the canvas has moved on.
         """
         entry_counter = self._record_load_counter
+        gen_at_entry  = self._alignments_generation
         try:
             result = _pairwise_align(
                 str(query_record.seq),
@@ -48400,14 +49042,340 @@ SpeciesPickerModal { align: center middle; }
                     severity="warning", timeout=4,
                 )
                 return
-            self.push_screen(AlignmentScreen(
-                query_label=query_record.name or query_record.id or "query",
-                target_label=target_record.name or target_record.id or "target",
-                target_record=target_record,
-                result=result,
-            ))
+            if self._alignments_generation != gen_at_entry:
+                # User hit Alt+Shift+A while the C-loop ran; honour the
+                # intent and drop this result rather than letting it pop
+                # back onto the freshly-cleared overlay.
+                return
+            # Register on the linear-map overlay band — same flow as
+            # `PlasmidsaurusAlignModal`. AlignmentScreen still reachable
+            # via click drill-in on the read lane.
+            q_name = (query_record.name or query_record.id or "query")
+            t_name = (target_record.name or target_record.id or "target")
+            try:
+                self._register_alignment(
+                    name=q_name,
+                    query_label=q_name,
+                    target_label=t_name,
+                    target_record=target_record,
+                    result=result,
+                )
+            except Exception:
+                _log.exception(
+                    "_diff_align_worker: _register_alignment failed"
+                )
+            ident_ungap = result.get("ungapped_identity_pct",
+                                      result.get("identity_pct", 0.0))
+            self.notify(
+                f"Aligned {q_name} → {t_name} · "
+                f"{ident_ungap:.1f}% identity (aligned region) · "
+                f"click read on map to inspect.",
+                title="Alignment added",
+                severity="information", timeout=6,
+            )
 
         self.call_from_thread(_show)
+
+    # ── Linear-map alignment overlay helpers ────────────────────────────────
+    #
+    # The overlay band on the linear plasmid map (`_draw_linear_flag`)
+    # paints one row per registered alignment. The app owns the list;
+    # PlasmidMap mirrors it via `set_alignments`. Producers (Plasmidsaurus
+    # zip, inline diff, Alt+A multi-align) call `_register_alignment`;
+    # `action_clear_alignments` and fresh record loads clear it.
+
+    def _register_alignment(self, name: str, query_label: str,
+                            target_label: str, target_record,
+                            result: dict) -> None:
+        """Append one alignment to the overlay band.
+
+        Pre-computes the per-target-column segment list once at
+        registration (`_alignment_to_target_segments`) so the renderer
+        doesn't walk gapped strings on every frame. First alignment
+        against a circular plasmid pins the map to linear topology —
+        rendering the overlay on a circle would mean bending bars
+        around the rim, which we don't support.
+
+        Defensive: refuses to register a degenerate alignment (no
+        gapped strings, or both empty) — those would paint nothing
+        and surface as a phantom row in the lane stack. Workers that
+        produced bad results should surface the failure as a notify,
+        not register an invisible entry.
+        """
+        aq = result.get("aligned_q", "")
+        at = result.get("aligned_t", "")
+        if not aq or not at:
+            _log.warning(
+                "_register_alignment: empty aligned strings for %r "
+                "(q_label=%r); refusing to register",
+                name, query_label,
+            )
+            try:
+                self.notify(
+                    f"Alignment for {name!r} produced no aligned region "
+                    "— not added to the map.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
+            return
+        segs = _alignment_to_target_segments(aq, at)
+        if segs:
+            t_lo = segs[0][0]
+            t_hi = segs[-1][1]
+        else:
+            t_lo = 0
+            t_hi = 0
+        entry = {
+            "name":          name,
+            "query_label":   query_label,
+            "target_label":  target_label,
+            "target_record": target_record,
+            "result":        result,
+            "aligned_q":     aq,
+            "aligned_t":     at,
+            "t_start":       0,
+            "segments":      segs,
+            "t_lo":          t_lo,
+            "t_hi":          t_hi,
+            # Per-bp letter cache built lazily on first letter-mode
+            # render. For a 5 kb alignment the dict is ~5k entries
+            # (~250 KB); at our `_PAIRWISE_MAX_LEN` cap of 200 kb that
+            # could grow to 10 MB per alignment. Lazy keeps memory
+            # proportional to actually-zoomed alignments rather than
+            # registered count.
+            "letters":       None,
+        }
+        self._alignments.append(entry)
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            return
+        # First overlay registration on a circular plasmid pins linear
+        # topology. Subsequent registrations preserve whatever the user
+        # has since chosen (we don't keep snapping back).
+        if len(self._alignments) == 1 and pm._map_mode != "linear":
+            pm._map_mode = "linear"
+        pm.set_alignments(self._alignments)
+
+    def _clear_alignments(self) -> None:
+        """Drop every alignment from the overlay band and refresh the map.
+
+        Called from `action_clear_alignments` (user-triggered) and from
+        `_apply_record(clear_undo=True)` (fresh record load — the existing
+        alignments would no longer reflect the active plasmid). Idempotent
+        on an already-empty band so callers don't have to guard.
+
+        Bumps `_alignments_generation` unconditionally — even a no-op
+        clear should poison any pending `_apply` callbacks from workers
+        that started before the user clicked Clear, so a "delayed second
+        wave" of registrations doesn't surprise the user.
+        """
+        self._alignments_generation += 1
+        if not self._alignments:
+            return
+        self._alignments = []
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            return
+        pm.set_alignments([])
+
+    def action_open_align_picker(self) -> None:
+        """Open the multi-target alignment picker (Alt+A).
+
+        Push `MultiAlignPickerModal`, multi-select library entries to
+        align against the currently-loaded plasmid. On dismiss, spawn
+        one pairwise-align worker per picked entry — each completion
+        registers a row on the linear-map alignment overlay band.
+
+        Picks are capped at `MultiAlignPickerModal._MAX_TARGETS`; size
+        guards mirror `action_diff_plasmid` (refuse if either side
+        exceeds `_PAIRWISE_MAX_LEN`).
+        """
+        if self._current_record is None:
+            self.notify(
+                "Load a plasmid first — Alt+A aligns against the "
+                "currently-loaded record.",
+                severity="warning", timeout=4,
+            )
+            return
+
+        current_id = getattr(self._current_record, "id", None)
+
+        def _on_picked(picked_ids):
+            if not picked_ids:
+                return
+            q_len = len(self._current_record.seq)
+            # Resolve + size-check each target on the UI thread so we
+            # can surface friendly errors before the worker starts.
+            # The worker only sees pre-validated SeqRecords.
+            targets: "list[tuple[str, object]]" = []
+            for entry_id in picked_ids:
+                target_entry = None
+                for e in _load_library():
+                    if e.get("id") == entry_id:
+                        target_entry = e
+                        break
+                if target_entry is None:
+                    self.notify(
+                        f"Library entry {entry_id!r} not found — skipping.",
+                        severity="warning", timeout=3,
+                    )
+                    continue
+                gb_text = target_entry.get("gb_text", "")
+                if not gb_text:
+                    self.notify(
+                        f"{entry_id!r} has no embedded sequence — skipping.",
+                        severity="warning", timeout=3,
+                    )
+                    continue
+                try:
+                    target_record = _gb_text_to_record(gb_text)
+                except Exception as exc:
+                    _log.exception(
+                        "Multi-align target parse failed for %r", entry_id,
+                    )
+                    self.notify(
+                        f"Could not parse {entry_id!r}: {exc}",
+                        severity="error", timeout=4,
+                    )
+                    continue
+                t_len = len(target_record.seq)
+                if max(q_len, t_len) > _PAIRWISE_MAX_LEN:
+                    self.notify(
+                        f"{entry_id!r} too long for pairwise align "
+                        f"(cap {_PAIRWISE_MAX_LEN:,} bp).",
+                        severity="warning", timeout=4,
+                    )
+                    continue
+                targets.append((entry_id, target_record))
+            if not targets:
+                return
+            self.notify(
+                f"Aligning {len(targets)} target(s) against "
+                f"{self._current_record.name}…",
+                timeout=4,
+            )
+            self._multi_align_worker(self._current_record, targets)
+
+        self.push_screen(
+            MultiAlignPickerModal(current_id=current_id),
+            callback=_on_picked,
+        )
+
+    @work(thread=True, exclusive=False, group="multi_align")
+    def _multi_align_worker(self, query_record, targets) -> None:
+        """Worker: pairwise-align the current plasmid against each
+        target in turn, registering each result as a separate row on
+        the linear-map alignment overlay.
+
+        Stale-load guard between targets — a record swap mid-batch
+        terminates the loop and surfaces a cancel toast. Per-target
+        failures are logged + tallied; the batch continues so one
+        unparseable target doesn't drop the rest.
+
+        Workers run concurrently (one per Alt+A invocation) since
+        each target produces an independent overlay row. Unlike
+        `_diff_align_worker` (`exclusive=True`), we DON'T want a
+        second batch to cancel a first — both should complete.
+
+        Stale-state guards:
+          * `_record_load_counter` — record swap mid-batch ⇒ stop.
+          * `_alignments_generation` — Alt+Shift+A mid-batch ⇒ stop
+            (so a "cleared" alignment list doesn't partially repopulate
+            as later targets finish).
+        """
+        entry_counter = self._record_load_counter
+        gen_at_entry  = self._alignments_generation
+        q_seq  = str(query_record.seq)
+        q_name = (
+            query_record.name or query_record.id or "query"
+        )
+        successes = 0
+        failures  = 0
+        for entry_id, target_record in targets:
+            if self._record_load_counter != entry_counter:
+                self.call_from_thread(
+                    self.notify,
+                    "Multi-align cancelled — active plasmid changed.",
+                    severity="warning", timeout=4,
+                )
+                return
+            if self._alignments_generation != gen_at_entry:
+                self.call_from_thread(
+                    self.notify,
+                    "Multi-align cancelled — alignments cleared.",
+                    severity="warning", timeout=4,
+                )
+                return
+            t_name = (
+                target_record.name or target_record.id or entry_id
+            )
+            try:
+                result = _pairwise_align(
+                    q_seq, str(target_record.seq), mode="global",
+                )
+            except Exception as exc:
+                _log.exception(
+                    "Multi-align: %r failed (%s)", entry_id, exc,
+                )
+                failures += 1
+                continue
+
+            def _apply(r=result, qn=q_name, tn=t_name, tr=target_record):
+                if self._record_load_counter != entry_counter:
+                    return
+                if self._alignments_generation != gen_at_entry:
+                    return
+                try:
+                    self._register_alignment(
+                        name=tn, query_label=qn,
+                        target_label=tn, target_record=tr,
+                        result=r,
+                    )
+                except Exception:
+                    _log.exception(
+                        "Multi-align: _register_alignment failed for %r",
+                        tn,
+                    )
+            self.call_from_thread(_apply)
+            successes += 1
+
+        # Final summary toast on completion.
+        def _summary():
+            if self._record_load_counter != entry_counter:
+                return
+            if self._alignments_generation != gen_at_entry:
+                return
+            msg = f"{successes} alignment(s) added."
+            if failures:
+                msg += f" {failures} failed (see log)."
+            self.notify(
+                msg, title="Multi-align complete",
+                severity="information" if successes else "warning",
+                timeout=5,
+            )
+        self.call_from_thread(_summary)
+
+    def action_clear_alignments(self) -> None:
+        """User-triggered: clear every alignment row from the linear map.
+
+        Bound to Ctrl+Shift+A (App-level). Notifies with the count
+        cleared so the user knows the keystroke landed; empty-band
+        case surfaces a friendly "nothing to clear" rather than a
+        silent no-op.
+        """
+        n = len(self._alignments)
+        if not n:
+            self.notify("No alignments to clear.", severity="information",
+                        timeout=3)
+            return
+        self._clear_alignments()
+        self.notify(
+            f"Cleared {n} alignment{'s' if n != 1 else ''}.",
+            severity="information", timeout=3,
+        )
 
     def action_find_plasmid(self) -> None:
         """Open the cross-collection plasmid search modal. Pre-fix the
@@ -48681,6 +49649,11 @@ SpeciesPickerModal { align: center middle; }
             new_key = record.id if record.id else None
             self._stash_current_undo_and_load(new_key)
             self._source_path = None   # caller sets this if it came from a file
+            # Drop the linear-map alignment overlay — entries referred to
+            # the outgoing record's coordinates and are no longer valid.
+            # In-place edits (`clear_undo=False`, e.g. primer add) keep
+            # the band because the underlying sequence is unchanged.
+            self._clear_alignments()
         self._current_record = record
         # Monotonic stale-load token — see `_record_load_counter` docstring.
         self._record_load_counter += 1
