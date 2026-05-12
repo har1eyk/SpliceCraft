@@ -2,6 +2,347 @@
 
 ---
 
+## [0.7.14.0] — 2026-05-12 — Linear-map alignment overlay
+
+Stack sequencing reads / library diffs as a band of coloured bars below
+the rev-feature lanes on the linear plasmid map. Blue match · red
+mismatch · gray gap, with the same 3-colour scheme switching from bars
+to query base letters once zoom exceeds 1 col/bp. IGV-style greedy
+first-fit packing so short reads share rows; click a read lane to drill
+into the full AlignmentScreen viewer.
+
+### Added: stacked alignment overlay below the linear-map rev features
+
+- New band paints each registered alignment as a single row. Bar mode
+  at <1 col/bp uses solid `█` blocks (blue match, red mismatch) and
+  dithered `░` for gaps; letter mode at ≥1 col/bp renders the query
+  base at each target column in the same 3-colour palette so per-base
+  divergence is visible without leaving the map.
+- IGV-style greedy first-fit lane packing — alignments sort by target
+  start ascending, length descending, and each one slots into the
+  first lane where its column extent doesn't overlap an already-placed
+  read. Short alignments pile into the same row; the lane count grows
+  only when there's no fitting row.
+- Strand arrowhead `▶` at the right tip of each bar; read name drawn
+  in dim white to the left if there's room.
+- Force-linear when alignments are present: the first registration
+  against a circular plasmid pins `_map_mode` to "linear" and
+  `action_toggle_map_view` refuses to flip back until the band is
+  cleared (Alt+Shift+A), with an explanatory toast.
+
+### Added: Alt+A multi-target alignment picker
+
+- New `MultiAlignPickerModal` — multi-select library plasmids (space
+  toggles the cursor row's checkbox column) to align against the
+  currently-loaded record. Filters the current plasmid out so you
+  can't accidentally self-align. Capped at 20 targets per batch.
+- `_multi_align_worker` runs the picks sequentially in a non-exclusive
+  worker group. Unlike `_diff_align_worker`'s `exclusive=True`, a
+  second Alt+A doesn't cancel the first — both batches contribute to
+  the overlay band.
+- **Alt+Shift+A** clears every registered alignment with the count
+  surfaced in a toast. Help modal lists both keybinds under Cloning +
+  analysis.
+
+### Changed: alignment entry points register on the overlay instead of pushing AlignmentScreen
+
+- `PlasmidsaurusAlignModal`'s worker and `_diff_align_worker` (the
+  "Compare against library plasmid" path) now append to
+  `app._alignments` and refresh the map rather than auto-pushing the
+  full-screen viewer. AlignmentScreen stays reachable via a click on
+  the read lane, so detail review is one click away — but the default
+  after each alignment is the in-context overlay row, which is what
+  users actually want for comparing against features + restriction
+  sites in the same view.
+
+### Hardened: clear-vs-worker race + degenerate-result rejection
+
+- `_alignments_generation` counter bumps on every `_clear_alignments`
+  call (even when the band is already empty). All three worker
+  callbacks (`_multi_align_worker._apply` / `_summary`,
+  `_diff_align_worker._show`,
+  `PlasmidsaurusAlignModal._align_worker._show`) capture the counter
+  at entry and refuse to register if it advanced — so hitting
+  Alt+Shift+A mid-batch doesn't leave the user with "cleared"
+  alignments partially reappearing as later workers land.
+- `_register_alignment` refuses degenerate input (empty `aligned_q`
+  or `aligned_t`); without this a corrupted result would surface as a
+  phantom zero-width row in the lane stack.
+- Lane click drill-in guards against missing `target_record` or empty
+  `result` before pushing AlignmentScreen — the viewer's body
+  dereferences `target_record.seq`, so a malformed entry would crash
+  the push.
+- `MultiAlignPickerModal._ok` refuses to dismiss with an empty
+  selection — surfaces a notify nudging the user to space-toggle a
+  row.
+
+### Tests
+
+- 28 unit tests for `_alignment_to_target_segments` +
+  `_alignment_to_target_letters` covering match / mismatch / gap
+  classification, target-resolution coordinate math (target gaps
+  consume no target column), case-insensitive matching, and
+  segmenter↔letters consistency across 7 parametrized inputs.
+- 4 pilot-driven lifecycle tests asserting the clear-generation
+  contract, that empty-band clear still bumps, and that
+  `_register_alignment` rejects degenerate input.
+- `MultiAlignPickerModal` registered in
+  `tests/test_modal_boundaries.py::_MODAL_CASES`; fits in 160 × 48.
+
+---
+
+## [0.7.13.1] — 2026-05-12 — UI safety + honesty sweep: 18 fixes from a misleading-display audit
+
+Audited the codebase for UI features that mislead the user — silent
+failures, lying success notifications, wrong-coordinate displays, stale
+state, and contract violations. Eighteen fixes across three severity
+tiers.
+
+### Fixed: HIGH severity (scientifically wrong or data-loss)
+
+- **HMMscan "id%" column was `-log10(evalue)`, not identity.**
+  Biologists read "50.0" in an id% column as 50 % identity; it was
+  actually a score transform. Now computes real identity from the
+  best domain alignment; score-only hits render "—" rather than fake
+  a percentage.
+- **AnnotationTransferModal displayed 0-based half-open coords under
+  GenBank-style "Target start" / "Target end" headers.** Every other
+  coord display in the app is 1-based inclusive; this modal silently
+  disagreed by one.
+- **`action_add_to_library` / library rename / 9 other `_save_*`
+  callsites fired green "Saved" toasts regardless of write outcome.**
+  `add_entry` now returns `bool` and all paths route success
+  notifications through `_notify_save_failure` (the existing helper
+  that re-raises and notifies on disk-full / RO mount / permission
+  denied) instead of green-lighting writes that didn't happen.
+- **8 agent-API write endpoints bypassed the documented
+  `_agent_dirty_guard` contract** (`delete-from-library`, create /
+  delete / rename collection, `set-active-collection`,
+  `bulk-import-folder`, `set-plasmid-status`, `set-entry-vector`).
+  Without the guard, an agent could mutate persisted state while the
+  user has unsaved record edits, leaving the on-disk library
+  inconsistent with what the user sees.
+
+### Fixed: MEDIUM severity
+
+- **PlasmidsaurusAlign Cancel didn't stop the worker pushing
+  AlignmentScreen on completion.** PairwiseAligner's C-loop is
+  uncancellable, so a clicked Cancel left the worker mid-compute;
+  when it finished, it happily painted an alignment screen the user
+  had dismissed. Cooperative cancel flag added.
+- **Trad cloning + diff_align stale-record drops left "Simulating…" /
+  "Aligning…" placeholders hanging forever.** Workers that captured
+  `_record_load_counter` and detected staleness silently exited; the
+  modal's status string never updated, so the user assumed the
+  operation had hung. Now notify "Cancelled — active plasmid
+  changed".
+- **BLAST modal showed previous Program / Source results until the
+  next Run.** Stale cache wasn't invalidated when the modal reopened.
+- **Restriction-scan worker swallowed exceptions silently.** A scan
+  failure produced empty overlays with no toast — the user assumed
+  the plasmid had no sites. Now surfaces a notify.
+- **PrimerDuplicatesModal said "X entries share" where X was the
+  to-be-removed count.** Off by one per group; the entry that wins
+  the dedupe wasn't part of "X".
+- **`_feat_span_label` produced 0-based output while every callsite
+  expected 1-based.** FeatureSearchModal and trad cloning span
+  columns silently disagreed with the sidebar / tooltip by one
+  position.
+- **LibraryPanel didn't refresh after agent-API library mutations.**
+  Agent-driven add / delete / rename happened on disk but the
+  in-process panel never reloaded.
+
+### Fixed: LOW severity (polish + consistency)
+
+- EditSeq / ORFFinder / AnnotationTransfer apply paths now check
+  `_record_load_counter` — guards against agent-driven plasmid swap
+  while a modal is open.
+- `_h_save` returns `{"error": "<reason>"}` from a new
+  `_last_save_error` attribute so agents can distinguish disk-full
+  from "no source path" without parsing the user-facing toast.
+- Truncation ellipsis on primer seq, BLAST subject / collection, plus
+  a `S+1..0..E` wrap-feature indicator in FeatureSidebar.
+- Primer delete count reports actual entries removed, not requested.
+- `_pairwise_align` grew `ungapped_identity_pct`; AlignmentScreen
+  summary shows both flavours to disambiguate gap-inflated global
+  alignments (a 200 bp insert vs 5 kb backbone reads as ~4 %
+  gap-inclusive even when the aligned region is 100 % matched).
+
+---
+
+## [0.7.13.0] — 2026-05-11 — Biology audit: enzyme catalog + `codon_start` + wrap-cut highlight
+
+Cory Mozza (issue #14) led a deep biology audit that surfaced
+24 cleavage-tuple errors in the enzyme catalog, a `/codon_start`
+qualifier ignored everywhere except GFF3 export, and several
+wrap-feature edge cases that flattened to whole-plasmid spans.
+
+### Fixed: enzyme catalog drift vs REBASE
+
+- ~24 enzyme cleavage tuples corrected against BioPython / REBASE.
+- **BsbI** and **BspLU11III** removed (no commercial supplier / not a
+  real enzyme).
+- **BtsImutI** renamed to **BtsIMutI** (canonical REBASE
+  capitalisation).
+- Recognition sites corrected for **BstXI**, **AccI**, **BaeI**.
+- Four new regression-test classes lock the catalog: existence,
+  recognition, cleavage tuple, and HF / v2 isoschizomer parent
+  agreement.
+
+### Fixed: GenBank `/codon_start` qualifier silently ignored
+
+- `_translate_cds`, `_cds_aa_list`, `_paint_cds_aa`, the AA-click
+  handler, and Ctrl+C protein copy all assumed `codon_start=1`. Any
+  NCBI-fetched fragment with `codon_start=2` or `3` was frame-shifted
+  by 1–2 bp past the leading partial codon — protein sequences
+  silently wrong on every operation that wasn't GFF3 export.
+- All five paths now honour the qualifier.
+
+### Fixed: wrap-CDS rendering + Type IIS wrap-cut classification
+
+- `_resite_highlight_dict`: Type IIS cuts that wrap the origin no
+  longer drag `hi_start` across the plasmid. Wrap-encoded as
+  `hi_end < hi_start`, with a wrap-aware renderer and per-strand cut
+  classification.
+- Mutagenize wrap-CDS loader: routed through `_feat_bounds` so
+  `CompoundLocation` head-first `join()` ordering no longer flattens
+  the wrap to whole-plasmid.
+- `_design_detection_primers`: `% total` gating prevents a primer
+  3'-ending at `bp total - 1` from being encoded as a wrap
+  `CompoundLocation`.
+- `_rebuild_record_with_edit`: insertion at bp 0 or bp `total`
+  preserves the wrap-feature canonical shape (head / tail anchor
+  invariants survive origin-edge inserts).
+- `_prefill_from_feature`: wrap-aware via `_feat_bounds`;
+  wrap-feature qualifiers no longer drop silently when capturing
+  through AddFeatureModal.
+
+### Changed: GFF3 split-feature ordering + mutagenize alt-start warning
+
+- GFF3 split-feature rows now in 5'→3' biological order (was
+  insertion order, which surprised downstream tools that assume
+  monotonic ascending coords).
+- Mutagenize modal: explicit warning when the target feature starts
+  with GTG or TTG. The AATG fusion overhang silently substitutes ATG;
+  users designing primers against alt-start ORFs were ending up with
+  ATG-replaced inserts and didn't realise.
+
+**Contributors:** Cory Mozza (issue #14).
+
+---
+
+## [0.7.12.0] — 2026-05-11 — Robustness sweep #3: worker conversions + primer dedupe modal
+
+22-finding audit closed. The headline change is a fanout of synchronous
+heavy operations to background workers — exports, primer design,
+mutagenize, trad cloning, constructor, multi-FASTA import. Worker-shaped
+now also = stale-record cancellable now, extending sacred invariant
+#28 from canvas-mutating workers to modal / screen workers.
+
+### Changed: heavy operations now run off the UI thread
+
+- **3 export modals** (GenBank / GFF / FASTA) → `@work`-decorated with
+  `is_mounted` dismiss guards.
+- **PrimerDesignScreen**: 4 handlers fan out via a shared
+  `_design_worker`.
+- **MutagenizeModal**: `_optimize` + `_design` workers.
+- **TraditionalCloningPane**: full off-thread via
+  `_trad_simulate_worker`; `_build_*_fragment` refactored to return
+  `(frag, err_msg)` tuples so the worker can surface failures cleanly.
+  UI thread pre-captures `_collect_simulate_inputs` to avoid touching
+  widgets from a thread.
+- **ConstructorModal**: `_save_to_library_worker` for the 5–15 s
+  persist (deep multi-step assemblies were freezing the UI).
+- **OpenFileModal**: `_fasta_collection_worker` for multi-FASTA
+  import.
+- **Agent-API `_h_replace_sequence`**: rebuild runs off-thread against
+  a deepcopy snapshot via a new `source_record=` param on
+  `_rebuild_record_with_edit`; `_apply` guarded by `entry_counter`.
+
+All new workers capture `_record_load_counter` at entry and drop
+results if the canvas reloaded mid-flight — extends invariant #28 from
+canvas-mutating workers to modal/screen workers.
+
+### Added: PrimerDuplicatesModal — two-pass primer DB cleanup
+
+- Runs at splash dismiss when the legacy primer DB carries duplicates
+  (common after `.dna` imports).
+- Two passes: sequence-collisions (existing sacred dedupe policy) AND
+  name-collisions (longest-sequence wins). Defaults to KEEP (focus +
+  Escape both choose Keep) so a stray Enter during splash dismiss
+  can't accidentally delete data.
+- `_skip_primer_dedupe_check` test flag matches the existing
+  `_skip_seed` / `_skip_update_check` / `_skip_snapshot` pattern.
+
+### Changed: primer dedup UX in PrimerDesignScreen
+
+- Save-time warning now names the colliding entry: "matches
+  `P-amp-1-F`, saved 2026-04-15".
+- Design-time results pane shows a yellow "⚠ Already in primer
+  library — Save will be refused" hint so users see the collision
+  before they get to the naming step.
+
+### Hardened
+
+- `_snapshot_data_files` iterates all 10 `_USER_DATA_FILE_ATTRS`
+  (was 4).
+- `_restore_from_backup` preserves higher-than-current
+  `_schema_version` so a v2 backup restored on v1 doesn't demote
+  the on-disk version.
+- OpenFileModal `lstat` + `S_ISLNK` rejects symlinks at the
+  large-file confirm step.
+- `_augment_dna_record_from_packets` wrap-aware via `_feat_bounds`.
+- `_record_to_gff3` per-part strand for mixed-strand compound joins.
+- `_save_settings` deepcopy on read AND save (closes a
+  cache-poisoning hole, see invariant #17).
+- `_blocks_undo` annotation on Constructor / Domesticator /
+  Mutagenize / PrimerDuplicates modals.
+- 3 unwrapped `_save_library` callsites routed through
+  `_notify_save_failure`.
+- `FetchModal._do_fetch` got `exclusive=True, group="ncbi_fetch"` to
+  prevent racing fetches on rapid clicks.
+- `_load_part_worker` `is_mounted` check.
+- Trademark scrub closed 5 verbatim regressions.
+
+---
+
+## [0.7.11.0] — 2026-05-11 — History viewer + Constructor history wiring
+
+New top-bar **History** tab + fullscreen `HistoryScreen` for the loaded
+plasmid's construction lineage. `ConstructorModal` now attaches
+`history_xml` to every saved entry, with parents inheriting their
+nested subtree so L0 → TU → MOD lineage chains correctly through
+multi-step builds (matches the TraditionalCloningPane pattern).
+
+### Added: construction-history viewer
+
+- New `History` menu tab + fullscreen `HistoryScreen` for the loaded
+  plasmid.
+- Bound to **Ctrl+H** and **F5**; the previous F5 binding
+  (`focus_panel_all`) moved to **F6**.
+
+### Changed: ConstructorModal persists assembly history
+
+- `_persist_assembly` attaches `history_xml` to the library entry on
+  every save.
+- Parent records inherit their nested subtree so L0 → TU → MOD
+  multi-step lineage chains correctly (matches the
+  TraditionalCloningPane pattern).
+
+### Hardened: history viewer + CLAUDE.md trim
+
+- Iterative tree build with a node-count cap (no recursion-limit
+  ceiling on deep histories).
+- `rich.markup.escape` on every XML-controlled string (name,
+  operation, manipulation, enzyme, parents) so a hostile `.dna`
+  import can't inject styling into the viewer.
+- Title / label / list truncation with `+N more` overflow indicators
+  when the lineage is wider than the viewport.
+- CLAUDE.md trimmed from 41 k → 32 k chars (items #36–41 condensed to
+  operational summaries; full rationale lives in git).
+
+---
+
 ## [0.7.10.1] — 2026-05-11 — `.dna` import recovers colours, primers, and feeds the primer library
 
 The 0.7.10.0 release shipped the `.dna` augmentation path that recovers

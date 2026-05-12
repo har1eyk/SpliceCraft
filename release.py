@@ -36,6 +36,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 SPLICECRAFT = REPO_ROOT / "splicecraft.py"
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 
 # Accept canonical X.Y.Z plus PEP-440 suffixes (rc1, post1, dev0, …).
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+([a-z0-9.-]*)?$")
@@ -89,6 +90,34 @@ def _ensure_tag_unused(version: str) -> None:
     )
     if rev.returncode == 0:
         _die(f"tag v{version} already exists.")
+
+
+def _ensure_changelog_entry(version: str) -> None:
+    """Refuse to proceed if `CHANGELOG.md` doesn't carry a heading for
+    the new version.
+
+    The What's New modal in-app reads `CHANGELOG.md` to render the per-
+    release brief; without an entry, users upgrading to this version
+    open the modal and see stale older releases at the top. We caught
+    this 2026-05-12 only after five sequential releases (0.7.11.0
+    through 0.7.14.0) shipped without entries — this gate prevents the
+    same lapse going forward.
+
+    Looks for an exact `## [<version>]` heading (matches the format
+    used everywhere else in the file). Missing CHANGELOG.md falls
+    through with a friendlier message than ``FileNotFoundError``.
+    """
+    if not CHANGELOG.is_file():
+        _die(f"{CHANGELOG.name} not found at {CHANGELOG}. "
+             "Add it before releasing.")
+    text = CHANGELOG.read_text(encoding="utf-8")
+    needle = f"## [{version}]"
+    if needle not in text:
+        _die(
+            f"{CHANGELOG.name} has no `{needle}` heading. The What's "
+            "New modal reads this file to render the per-release brief; "
+            "add a section for the new version before releasing."
+        )
 
 
 def _bump_version_in_file(path: Path, pattern: re.Pattern[str],
@@ -146,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _ensure_clean_tree()
     _ensure_tag_unused(new_version)
+    _ensure_changelog_entry(new_version)
 
     _heading(f"Bumping version to {new_version}")
     _bump_version_in_file(
