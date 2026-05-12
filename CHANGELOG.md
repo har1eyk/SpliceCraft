@@ -2,6 +2,36 @@
 
 ---
 
+## [0.7.14.1] — 2026-05-12 — CHANGELOG backfill + release.py gate
+
+Five releases (0.7.11.0 through 0.7.14.0) shipped without
+`CHANGELOG.md` entries; the What's New modal users saw on upgrade
+still showed 0.7.10.x at the top of the brief list. Backfilled every
+missing entry from the matching feature commit, then gated
+`release.py` on a `## [<new_version>]` heading so the gap can't
+recur silently.
+
+### Fixed: missing CHANGELOG entries for 0.7.11.0 → 0.7.14.0
+
+- All five releases now have full entries in the same voice as the
+  existing 0.7.10.x sections (intro paragraph + categorised
+  bullets). Users upgrading to this version (or any prior 0.7.1x
+  release) will see the actual change list when they open
+  `File → What's New…`, instead of the stale 0.7.10.x top entries.
+
+### Hardened: release.py gates on CHANGELOG entry
+
+- New `_ensure_changelog_entry(version)` check runs before the
+  version bump and tag check in `release.py`. Aborts the release
+  with a friendly message if the target version doesn't have a
+  `## [<version>]` heading in `CHANGELOG.md`.
+- Prevents the silent five-release drift from recurring. Trying to
+  release `X.Y.Z` without a CHANGELOG entry now fails fast before
+  the test suite even runs, so the writer notices and fixes the
+  brief before the version is bumped.
+
+---
+
 ## [0.7.14.0] — 2026-05-12 — Linear-map alignment overlay
 
 Stack sequencing reads / library diffs as a band of coloured bars below
