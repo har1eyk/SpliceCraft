@@ -40,7 +40,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.7.14.1"
+__version__ = "0.7.15.0"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -52128,6 +52128,15 @@ SpeciesPickerModal { align: center middle; }
              `self._current_record.name` in place, invalidate the
              PlasmidMap render cache, refresh the map, and update the
              window title bar
+
+        2026-05-13: split into "in-memory update + UI refresh" (sync,
+        instant) and "disk write" (async worker). With a 150 MB
+        library + 150 MB collections mirror the synchronous
+        `_save_library` was burning ~600 MB of disk I/O (plus .bak
+        rotation) on every rename — 5-15 s of frozen UI. The async
+        path drops the in-memory state into the cache immediately so
+        the panel + title bar update without delay; the disk catches
+        up off-thread.
         """
         entries = _load_library()
         for e in entries:
@@ -52152,17 +52161,25 @@ SpeciesPickerModal { align: center middle; }
         else:
             self.notify("Library entry vanished.", severity="warning")
             return
-        try:
-            _save_library(entries)
-        except (OSError, RuntimeError) as exc:
-            # Disk-full / RO-mount / EACCES per invariant #7. Pre-fix
-            # this fired "Renamed to X" even when the write failed,
-            # so the user saw the new name in the title bar but the
-            # next launch showed the old one with no warning.
-            _notify_save_failure(self, "Plasmid library", exc)
-            return
 
-        # Refresh the library table so the new name shows.
+        # Update the in-memory cache synchronously so the next read
+        # (panel repopulate, current-record name lookup) sees the new
+        # state immediately. The disk write fires asynchronously
+        # below; the cache update is what makes the UI feel instant.
+        # Deep-copy matches `_save_library`'s contract (invariant #17).
+        global _library_cache
+        _library_cache = _typed_clone(entries)
+        # Match `_save_library`'s primer-usage cache invalidation —
+        # the rename doesn't change the primer-bind set, but a future
+        # refactor could surface name-keyed primer indexing and the
+        # invalidation should track regardless.
+        _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+        if _clear_primer_cache is not None:
+            _clear_primer_cache()
+
+        # Refresh the library table now — reads from the freshly-
+        # updated cache, so the new name shows without waiting for
+        # disk.
         lib = self.query_one("#library", LibraryPanel)
         lib._repopulate()
 
@@ -52186,7 +52203,54 @@ SpeciesPickerModal { align: center middle; }
             # from self._current_record.name).
             self._mark_clean()
 
-        self.notify(f"Renamed to {new_name}.")
+        self.notify(
+            f"Renamed to {new_name} — writing to disk in the background.",
+            timeout=3,
+        )
+        # Disk write off-thread. Failure (disk full / RO mount / EACCES)
+        # surfaces a notify; the cache is already updated so the user
+        # still sees the rename in the panel — they just need to retry
+        # the save before quitting to persist it. Worst case the next
+        # in-place save (`Ctrl+S` on the renamed record, or any further
+        # library mutation that calls `_save_library`) re-writes the
+        # whole library and picks up the rename then.
+        self._rename_save_to_disk(entries)
+
+    @work(thread=True, exclusive=True, group="rename_save")
+    def _rename_save_to_disk(self, entries: "list[dict]") -> None:
+        """Worker: perform the slow disk write for a library rename.
+
+        Off-loads the `_safe_save_json` call (writes a 100+ MB JSON +
+        .bak rotation) and the active-collection mirror (another
+        100+ MB write). Uses `async_sync=True` so the collection
+        mirror itself also runs through its own coalescing background
+        thread.
+
+        Exclusive group: a second rename mid-flight cancels the
+        first. Cancellation is safe because the second worker's
+        `entries` includes both renames (in-memory cache was updated
+        sync before each call), so the second write captures the
+        cumulative state.
+        """
+        try:
+            _safe_save_json(
+                _LIBRARY_FILE, entries, "Plasmid library",
+            )
+        except (OSError, RuntimeError) as exc:
+            _log.exception("rename: disk save failed")
+            self.call_from_thread(
+                _notify_save_failure, self, "Plasmid library", exc,
+            )
+            return
+        # Mirror the rename into the active collection — also slow,
+        # also gets the async coalescing treatment so a burst of
+        # renames doesn't queue up 5 sequential 150 MB writes.
+        try:
+            _sync_active_collection_plasmids(entries, async_write=True)
+        except Exception:
+            _log.exception(
+                "rename: active-collection mirror dispatch failed",
+            )
 
     # ── Menu bar ───────────────────────────────────────────────────────────────
 
