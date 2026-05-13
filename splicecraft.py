@@ -15951,7 +15951,8 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False) -> "l
 _USER_DATA_FILE_ATTRS: tuple = (
     "_LIBRARY_FILE",          # plasmid_library.json — the user's plasmids
     "_COLLECTIONS_FILE",      # collections.json — collection definitions
-    "_PARTS_BIN_FILE",        # parts_bin.json — Golden Braid / MoClo parts
+    "_PARTS_BIN_FILE",        # parts_bin.json — active bin's parts (mirror)
+    "_PARTS_BIN_COLLECTIONS_FILE",   # parts_bin_collections.json — all bins
     "_PRIMERS_FILE",          # primers.json — primer designs
     "_FEATURES_FILE",         # features.json — feature library
     "_FEATURE_COLORS_FILE",   # feature_colors.json — feature colours
@@ -19516,7 +19517,17 @@ def _pick_insert_fragment(
        single-TU / first-cycle plasmids where backbone > insert.
 
     Returns the picked fragment dict, or ``None`` when ``fragments``
-    is empty."""
+    is empty.
+
+    Logs a warning at fallback (strategy 3) when **no** fragment
+    carries a backbone marker — the pick is ambiguous in that case
+    and the user's library entry may be missing rep_origin /
+    resistance annotations. Callers who depend on a correct pick
+    (Traditional cloning's `_build_insert_from_plasmid`) should
+    surface this to the user; classifiers that scan both fragments
+    (like `_classify_part_from_plasmid` since 2026-05-13) don't
+    care.
+    """
     if not fragments:
         return None
     # Strategy 1 — exclude backbone-marker fragments.
@@ -19540,6 +19551,20 @@ def _pick_insert_fragment(
             if (left == e3_rc and right == e5_rc):
                 return f
     # Strategy 3 — smallest fragment (legacy, robust for ≤1-cycle).
+    # Surface an ambiguity warning when NEITHER fragment carries a
+    # backbone marker: the size fallback can pick the wrong half if
+    # the user's insert outgrew the carrier (MAV 26 family, 2026-
+    # 05-13). Traditional cloning callers should display this to the
+    # user; the classifier path doesn't hit this branch anymore.
+    if not any(_fragment_has_backbone_marker(f) for f in fragments):
+        sizes = [len(f.get("top_seq") or "") for f in fragments]
+        _log.warning(
+            "_pick_insert_fragment: no backbone markers on any "
+            "fragment; falling back to smallest (sizes=%r). The "
+            "picked fragment may not be the biological insert — "
+            "library entry likely missing rep_origin / antibiotic "
+            "resistance annotations.", sizes,
+        )
     return min(fragments, key=lambda f: len(f.get("top_seq") or ""))
 
 
@@ -19557,7 +19582,12 @@ def _pick_backbone_fragment(fragments: list[dict]) -> "dict | None":
 
     Used by traditional cloning to keep the user's intended
     backbone choice stable as inserts grow over multiple cloning
-    cycles. Returns ``None`` when ``fragments`` is empty."""
+    cycles. Returns ``None`` when ``fragments`` is empty.
+
+    Same ambiguity warning as `_pick_insert_fragment` fires when
+    NEITHER fragment carries a backbone marker — fallback to size
+    is a guess in that case (2026-05-13 audit).
+    """
     if not fragments:
         return None
     backbone_candidates = [
@@ -19566,6 +19596,15 @@ def _pick_backbone_fragment(fragments: list[dict]) -> "dict | None":
     ]
     if len(backbone_candidates) == 1:
         return backbone_candidates[0]
+    if not backbone_candidates:
+        sizes = [len(f.get("top_seq") or "") for f in fragments]
+        _log.warning(
+            "_pick_backbone_fragment: no backbone markers on any "
+            "fragment; falling back to largest (sizes=%r). The "
+            "picked fragment may not be the biological backbone — "
+            "library entry likely missing rep_origin / antibiotic "
+            "resistance annotations.", sizes,
+        )
     return max(fragments, key=lambda f: len(f.get("top_seq") or ""))
 
 
@@ -19629,7 +19668,40 @@ def _assembly_fragment_from_source(
         return None
     gb_text = source.get("gb_text") or ""
     if not gb_text:
-        return None
+        # Back-compat: parts saved by Load Part before 2026-05-13 only
+        # carried `sequence` (the released insert body) without the full
+        # plasmid gb_text. Cross-reference the library to recover the
+        # gb_text so old parts-bin entries don't need to be reloaded
+        # for Constructor assembly to work.
+        #
+        # The parts-bin entry's `name` field is sanitised from the
+        # source plasmid's GenBank LOCUS, which by convention matches
+        # the library entry's `id`. Try both `id` and `name` matching
+        # so user-facing renames don't break the lookup.
+        src_name = str(source.get("name") or "").strip()
+        if src_name:
+            for e in _load_library():
+                if not isinstance(e, dict):
+                    continue
+                if not e.get("gb_text"):
+                    continue
+                if (str(e.get("id") or "").strip() == src_name
+                        or str(e.get("name") or "").strip() == src_name):
+                    gb_text = e["gb_text"]
+                    _log.info(
+                        "assembly_fragment: recovered gb_text for %r "
+                        "from library (parts bin entry was pre-2026-05-13)",
+                        src_name,
+                    )
+                    break
+        if not gb_text:
+            _log.info(
+                "assembly_fragment: %r has no gb_text and no matching "
+                "library entry — can't digest at level %d. Re-Load Part "
+                "from the source plasmid to refresh.",
+                source.get("name"), source_level,
+            )
+            return None
     # Cache key: gb_text length + a sha-derived hash + grammar id +
     # source_level + both enzyme candidates. We don't use the raw
     # gb_text as a key because it can be hundreds of KB and Python
@@ -20789,6 +20861,13 @@ def _save_entry_vectors(entries: list[dict]) -> None:
     cache = globals().get("_VECTOR_MATCH_CACHE")
     if isinstance(cache, dict):
         cache.clear()
+    # Same hygiene for the per-acceptor TU-boundary cache that backs
+    # `_classify_part_from_plasmid`'s third-pass match: a reconfigured
+    # EV changes which stuffer overhangs we'd hit, so the previous
+    # entries must not survive the save.
+    acceptor_cache = globals().get("_ACCEPTOR_TU_PAIRS_CACHE")
+    if isinstance(acceptor_cache, dict):
+        acceptor_cache.clear()
 
 
 def _get_entry_vector(
@@ -21078,6 +21157,110 @@ def _check_vector_match(
     return None
 
 
+# Per-(grammar_id, enzyme) cache of acceptor-stuffer overhang pairs.
+# Invalidated by `_save_entry_vectors` so a reconfigured EV doesn't
+# leave stale entries behind. Keyed by str → list of tuples so the
+# values are independently copy-able when returned to callers (we
+# return a `list(...)` so callers can mutate without poisoning).
+_ACCEPTOR_TU_PAIRS_CACHE: "dict[tuple[str, str], list[tuple[str, str, str, str]]]" = {}
+
+
+def _grammar_acceptor_tu_pairs(
+    grammar_id: str, enzyme: str,
+) -> "list[tuple[str, str, str, str]]":
+    """Return ``[(role, ev_name, oh5, oh3), ...]`` — the stuffer's
+    overhang pair released by digesting each configured entry vector
+    for ``grammar_id`` with ``enzyme``.
+
+    The L0 → L1 entry vector for Golden Braid has four canonical
+    roles (Alpha1 / Alpha2 / Omega1 / Omega2), each receiving a TU
+    in a different orientation. When BsaI digests the assembled TU
+    plasmid (a TU INSIDE one of those acceptors), the released
+    insert carries that acceptor's specific overhang pair — which
+    is the SAME pair as the stuffer's overhangs in the empty
+    acceptor itself. Pre-2026-05-13 the classifier only knew the
+    canonical (Promoter.oh5, Terminator.oh3) pair via
+    `_grammar_tu_overhangs`, so a TU in Alpha2 / Omega1 / Omega2
+    silently failed to classify (the bug Cory hit on MAV-25 in
+    alpha-2).
+
+    Singleton entry vectors (role == "") are skipped — those are L0
+    acceptors (pUPD2 et al.), not TU acceptors, and the L0 position
+    table check upstream covers them.
+
+    Result is cached per ``(grammar_id, enzyme)`` and invalidated by
+    `_save_entry_vectors`. A multi-select Load Part batch that
+    classifies 50 plasmids against 2 grammars × 2 enzymes was
+    re-digesting every configured EV 200× without this cache.
+
+    Failures (no gb_text, parse error, digest yields ≠ 2 fragments)
+    are logged at warning level so a misconfigured EV surfaces in
+    the diagnostic bundle — the user otherwise sees their TU silently
+    fall through to None classification with no hint why.
+    """
+    cache_key = (grammar_id, enzyme)
+    cached = _ACCEPTOR_TU_PAIRS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    out: "list[tuple[str, str, str, str]]" = []
+    for ev in _load_entry_vectors():
+        if ev.get("grammar_id") != grammar_id:
+            continue
+        role = ev.get("role") or ""
+        if not role:
+            continue   # singleton L0 vector — not a TU acceptor
+        ev_gb = ev.get("gb_text") or ""
+        ev_name = ev.get("name") or "?"
+        if not ev_gb:
+            _log.warning(
+                "_grammar_acceptor_tu_pairs: entry vector %r "
+                "(role=%r, grammar=%r) has no gb_text — skipping",
+                ev_name, role, grammar_id,
+            )
+            continue
+        try:
+            record = _gb_text_to_record(ev_gb)
+            ev_seq = str(getattr(record, "seq", "") or "").upper()
+            if not ev_seq:
+                _log.warning(
+                    "_grammar_acceptor_tu_pairs: entry vector %r "
+                    "parsed to empty sequence — skipping",
+                    ev_name,
+                )
+                continue
+            frags, err = _excise_fragment_pair(
+                ev_seq, [enzyme], circular=True,
+            )
+        except Exception:
+            _log.exception(
+                "_grammar_acceptor_tu_pairs: digest failed for "
+                "ev=%r role=%r enzyme=%r", ev_name, role, enzyme,
+            )
+            continue
+        if err is not None or len(frags) != 2:
+            _log.info(
+                "_grammar_acceptor_tu_pairs: ev=%r role=%r digest "
+                "with %r produced %d fragment(s) (err=%r) — skipped",
+                ev_name, role, enzyme, len(frags), err,
+            )
+            continue
+        # Stuffer = the smaller fragment (the placeholder lacZα or
+        # ccdB cassette that gets replaced by the assembled TU). Its
+        # 5' / 3' overhangs ARE the TU-boundary overhangs for this
+        # acceptor.
+        insert = min(frags, key=lambda f: len(f.get("top_seq", "")))
+        oh5 = (insert.get("left")  or {}).get(
+            "overhang_seq", "",
+        ).upper()
+        oh3 = (insert.get("right") or {}).get(
+            "overhang_seq", "",
+        ).upper()
+        if oh5 and oh3:
+            out.append((role, ev_name, oh5, oh3))
+    _ACCEPTOR_TU_PAIRS_CACHE[cache_key] = list(out)
+    return out
+
+
 def _classify_part_from_plasmid(
     seq: str,
     *,
@@ -21099,44 +21282,49 @@ def _classify_part_from_plasmid(
     Callers can re-tag manually via the Parts Bin Edit modal if they
     really need to, but the classifier itself stays mechanical.
 
-    Detection cases (per grammar, in registry order):
-      * Primary enzyme cuts → 2 fragments → overhangs match an L0
-        position → returns ``level=0`` (pre-cloning L0 part: native
-        primary cut sites still flank the part body).
-      * Primary enzyme cuts → overhangs match TU boundary → returns
-        ``level=2`` (MOD: parity flips back to primary at L2, so a
-        multi-TU module assembled into an L2 acceptor releases its
-        insert via primary).
-      * Secondary (level-up) enzyme cuts → 2 fragments → overhangs
-        match an L0 position → returns ``level=0`` (post-cloning L0
-        part: the L0 part has already been ligated into its L0 entry
-        vector — pUPD2 et al. — so the primary sites have been
-        consumed and the secondary sites flank the part body, ready
-        for L1 assembly).
-      * Secondary enzyme cuts → overhangs match TU boundary →
-        returns ``level=1`` (TU: a complete L0-ligated transcription
-        unit assembled into an L1 α/Ω acceptor).
+    Detection cases (per grammar, in registry order, for each
+    enzyme; **both fragments** are tried in each pass so a library
+    entry without backbone-marker annotations still classifies
+    correctly when the insert outgrew the backbone):
+
+      * Either fragment's overhangs match an L0 position → ``level=0``
+        (L0 part, regardless of which side of the cycle produced it).
+      * Either fragment's overhangs match the canonical TU boundary
+        OR a configured entry vector's stuffer pair → ``level=1`` (TU).
+
+    Pre-2026-05-13 the classifier picked a single "insert" fragment
+    via `_pick_insert_fragment` and inferred level from enzyme
+    parity ("primary release ⇒ MOD"). Both heuristics broke for
+    real-world plasmids:
+
+      * `_pick_insert_fragment` falls through to "smallest fragment"
+        when no `rep_origin`/`selection_marker` features are present;
+        for a TU whose body is larger than its alpha backbone
+        (common for any cassette ~2 kbp+) the backbone half got
+        picked as the "insert" and its mirrored overhangs matched
+        nothing. MAV 26 in the EDEN collection: 3250 bp body with
+        the correct (GGAG, GTCA) overhangs, 1850 bp backbone with
+        the mirrored (GTCA, GGAG) — the body was discarded.
+
+      * Enzyme parity assumed the splicecraft convention
+        (Esp3I = primary = L0 release, BsaI = secondary = L1
+        release). The actual pDGB1 / GB 2.0 convention used by
+        Sarrion-Perdigones 2013 and the user's EDEN collection has
+        these REVERSED (BsaI = L0 release from pUPD2, Esp3I = L1
+        release from α-vectors). Under that convention, the user's
+        TUs were being mis-classified as MOD (level=2).
+
+    Auto MOD (level=2) detection from overhangs alone is unreliable
+    across both conventions — a fragment with TU-boundary overhangs
+    could be a TU or a MOD depending on which enzyme cycle the lab
+    uses, and we can't tell from the overhangs alone. TUs that are
+    actually MODs in the user's lab can be re-tagged via the
+    Parts Bin Edit modal.
 
     Returns ``None`` when no grammar gives a clean (exactly 2-fragment)
     digest with recognised overhangs. Otherwise returns
     ``{grammar_id, grammar_name, level, position, insert, vector,
-       release_enzyme, entry_vector}`` where:
-      * ``level`` is 0 / 1 / 2 — what the user-facing Parts Bin tab
-        should land it under (mapped by `_part_level_label`).
-      * ``release_enzyme`` is the enzyme that produced the digest,
-        so the caller knows which one will release the insert in
-        downstream assembly.
-      * ``entry_vector`` is None or a `_check_vector_match` result —
-        flags which configured entry vector (if any) the user's
-        vector half matches.
-
-    Built-in grammars are tried in registry order (Golden Braid L0
-    first, then MoClo Plant) followed by user-defined grammars. Per-
-    grammar enzyme order is primary → secondary so a pre-cloning L0
-    plasmid (cuts on primary) classifies before falling through to
-    the secondary check; for a post-cloning L0 plasmid (no primary
-    sites) the primary digest yields 0 fragments and the secondary
-    pass picks it up.
+       release_enzyme, entry_vector}``.
 
     Linear records skip the digest — a linear "part" can't be cleanly
     excised, and the overhangs in the .gb annotation are the source
@@ -21174,30 +21362,65 @@ def _classify_part_from_plasmid(
                 continue
             if err is not None or len(frags) != 2:
                 continue
-            # Feature-aware pick: insert = no rep_origin / selection
-            # marker, vector = the carrier with those markers.
-            # Falls back to size when the feature signal is
-            # ambiguous, so a properly-annotated plasmid is
-            # classified correctly even when its insert outgrew
-            # the backbone in deep cycles.
-            insert = _pick_insert_fragment(frags) or frags[0]
-            vector = _pick_backbone_fragment(frags) or frags[1 if frags[0] is insert else 0]
-            oh5 = (insert.get("left")  or {}).get("overhang_seq", "").upper()
-            oh3 = (insert.get("right") or {}).get("overhang_seq", "").upper()
-            if not oh5 or not oh3:
-                continue
-            # First check: the L0 position table. Both pre- and post-
-            # cloning L0 parts land here — only the enzyme differs
-            # (primary for pre-cloning, secondary for post-cloning).
-            for pos in (grammar.get("positions") or []):
-                pos_oh5 = str(pos.get("oh5", "")).upper()
-                pos_oh3 = str(pos.get("oh3", "")).upper()
-                if pos_oh5 == oh5 and pos_oh3 == oh3:
+            # Try BOTH fragments — sized assumptions about which half
+            # is the "insert" break when the user's library entries
+            # don't carry rep_origin/selection-marker annotations
+            # AND the assembled cassette is larger than its carrier
+            # backbone (MAV 26 family, 2026-05-13). For each fragment,
+            # match its overhangs against the L0 position table, the
+            # canonical TU boundary, and the per-acceptor stuffer
+            # pairs; the FIRST match wins, with the other fragment
+            # becoming the vector half by elimination.
+            for insert_idx, insert in enumerate(frags):
+                vector = frags[1 - insert_idx]
+                oh5 = (insert.get("left")  or {}).get(
+                    "overhang_seq", "",
+                ).upper()
+                oh3 = (insert.get("right") or {}).get(
+                    "overhang_seq", "",
+                ).upper()
+                if not oh5 or not oh3:
+                    continue
+                # First check: the L0 position table. Both pre- and
+                # post-cloning L0 parts land here — only the enzyme
+                # differs depending on the lab's GB convention.
+                for pos in (grammar.get("positions") or []):
+                    pos_oh5 = str(pos.get("oh5", "")).upper()
+                    pos_oh3 = str(pos.get("oh3", "")).upper()
+                    if pos_oh5 == oh5 and pos_oh3 == oh3:
+                        return {
+                            "grammar_id":     gid,
+                            "grammar_name":   grammar.get("name", gid),
+                            "level":          0,
+                            "position":       dict(pos),
+                            "insert":         insert,
+                            "vector":         vector,
+                            "release_enzyme": enzyme,
+                            "entry_vector":   _check_vector_match(
+                                gid, enzyme, vector,
+                            ),
+                        }
+                # Second check: canonical TU boundary overhangs
+                # (Pos 1's oh5 + last position's oh3). Matches a TU
+                # assembled into the canonical L1 acceptor — the
+                # orientation that lines up with the grammar's L0
+                # positions.
+                tu_start, tu_end = _grammar_tu_overhangs(grammar)
+                if (tu_start and tu_end
+                        and tu_start.upper() == oh5
+                        and tu_end.upper()   == oh3):
+                    position = {
+                        "name":  _part_level_label(1),
+                        "type":  _part_level_label(1),
+                        "oh5":   tu_start,
+                        "oh3":   tu_end,
+                        "color": "white",
+                    }
                     return {
                         "grammar_id":     gid,
                         "grammar_name":   grammar.get("name", gid),
-                        "level":          0,
-                        "position":       dict(pos),
+                        "level":          1,
+                        "position":       position,
                         "insert":         insert,
                         "vector":         vector,
                         "release_enzyme": enzyme,
@@ -21205,33 +21428,35 @@ def _classify_part_from_plasmid(
                             gid, enzyme, vector,
                         ),
                     }
-            # Second check: TU boundary overhangs. The level depends
-            # on enzyme parity — secondary release ⇒ TU (L1), primary
-            # release ⇒ MOD (L2).
-            tu_start, tu_end = _grammar_tu_overhangs(grammar)
-            if (tu_start and tu_end
-                    and tu_start.upper() == oh5
-                    and tu_end.upper()   == oh3):
-                level = 1 if enzyme_role == "secondary" else 2
-                position = {
-                    "name":  _part_level_label(level),
-                    "type":  _part_level_label(level),
-                    "oh5":   tu_start,
-                    "oh3":   tu_end,
-                    "color": "white",
-                }
-                return {
-                    "grammar_id":     gid,
-                    "grammar_name":   grammar.get("name", gid),
-                    "level":          level,
-                    "position":       position,
-                    "insert":         insert,
-                    "vector":         vector,
-                    "release_enzyme": enzyme,
-                    "entry_vector":   _check_vector_match(
-                        gid, enzyme, vector,
-                    ),
-                }
+                # Third check: per-acceptor TU boundary overhangs.
+                # Each configured entry vector's stuffer carries a
+                # specific (oh5, oh3) pair; a TU assembled into
+                # that acceptor will release with the same pair.
+                # MAV-25 in alpha-2 hit this pass (2026-05-13).
+                for role, ev_name, acc_oh5, acc_oh3 in (
+                    _grammar_acceptor_tu_pairs(gid, enzyme)
+                ):
+                    if acc_oh5 == oh5 and acc_oh3 == oh3:
+                        label = _part_level_label(1)
+                        position = {
+                            "name":  f"{label} ({role})",
+                            "type":  label,
+                            "oh5":   acc_oh5,
+                            "oh3":   acc_oh3,
+                            "color": "white",
+                        }
+                        return {
+                            "grammar_id":     gid,
+                            "grammar_name":   grammar.get("name", gid),
+                            "level":          1,
+                            "position":       position,
+                            "insert":         insert,
+                            "vector":         vector,
+                            "release_enzyme": enzyme,
+                            "entry_vector":   _check_vector_match(
+                                gid, enzyme, vector,
+                            ),
+                        }
     return None
 
 
@@ -21914,6 +22139,155 @@ def _save_parts_bin(entries: list[dict]) -> None:
     # `_assembly_fragment_from_source` yields, so stale digests
     # would surface old overhangs in the constructor palette.
     _clear_assembly_fragment_cache()
+    # Mirror into the active parts-bin collection so multi-bin users
+    # don't lose state. Same contract as `_save_library` invariant #10:
+    # every writeable parts-bin path goes through this helper. Silent
+    # no-op if there's no active bin (first-launch race; the migration
+    # in App.compose() establishes one before any UI write).
+    _sync_active_parts_bin_parts(entries)
+
+
+# ── Parts-bin collections (multi-bin storage) ───────────────────────────────
+#
+# Mirrors the plasmid-collections architecture: each bin is a named
+# snapshot of parts. `parts_bin.json` holds the ACTIVE bin's parts
+# (back-compat with all existing readers / writers); the canonical
+# multi-bin record is `parts_bin_collections.json`. Every write through
+# `_save_parts_bin` mirrors into the active bin's entry — see invariant
+# #10 (the plasmid-side equivalent) for the rationale.
+#
+# Schema (entry):
+#   {"name": str, "description": str,
+#    "parts": list[dict], "saved": "YYYY-MM-DD"}
+#
+# `name` is the user-visible identifier (unique per the picker's
+# dup-name guard). Active-bin pointer lives in `settings.json` under
+# `active_parts_bin` so it persists across launches.
+
+_PARTS_BIN_COLLECTIONS_FILE = _DATA_DIR / "parts_bin_collections.json"
+_parts_bin_collections_cache: "list | None" = None
+_DEFAULT_PARTS_BIN_NAME = "Main Parts Bin"
+
+
+def _load_parts_bin_collections() -> list[dict]:
+    """Return a deepcopy of the parts-bin collections list so callers
+    can mutate entries (rename, edit parts list) without poisoning the
+    in-memory cache. Mirrors the `_load_collections` contract per
+    invariant #17.
+    """
+    global _parts_bin_collections_cache
+    if _parts_bin_collections_cache is None:
+        entries, warning = _safe_load_json(
+            _PARTS_BIN_COLLECTIONS_FILE, "Parts-bin collections",
+        )
+        if warning:
+            _log.warning(warning)
+        _parts_bin_collections_cache = [
+            e for e in entries if isinstance(e, dict)
+        ]
+    return _typed_clone(_parts_bin_collections_cache)
+
+
+def _save_parts_bin_collections(entries: list[dict]) -> None:
+    """Persist the full parts-bin collections list. Deepcopies into the
+    cache so caller mutations after save can't poison subsequent
+    loaders (invariant #17). Clears the assembly-fragment digest cache
+    because a bin add / delete / rename can shift the active bin's
+    parts identity.
+    """
+    global _parts_bin_collections_cache
+    _safe_save_json(
+        _PARTS_BIN_COLLECTIONS_FILE, entries, "Parts-bin collections",
+    )
+    _parts_bin_collections_cache = _typed_clone(entries)
+    # Same cache-invalidation hygiene as `_save_collections`: a bin
+    # rename / delete / parts-list edit changes what
+    # `_assembly_fragment_from_source` digests.
+    _clear = globals().get("_clear_assembly_fragment_cache")
+    if _clear is not None:
+        _clear()
+
+
+def _get_active_parts_bin_name() -> "str | None":
+    val = _get_setting("active_parts_bin", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_parts_bin_name(name: "str | None") -> None:
+    _set_setting("active_parts_bin", name or "")
+
+
+def _find_parts_bin(name: str) -> "dict | None":
+    for b in _load_parts_bin_collections():
+        if b.get("name") == name:
+            return b
+    return None
+
+
+def _parts_bin_name_taken(name: str) -> bool:
+    """Dup-name guard for create / rename / duplicate. Pure check,
+    no side effects."""
+    return _find_parts_bin(name) is not None
+
+
+def _ensure_default_parts_bin() -> None:
+    """Idempotent: guarantee at least one parts bin exists.
+
+    First-run users have a (possibly empty) `parts_bin.json` but no
+    `parts_bin_collections.json` — migrate by wrapping their existing
+    parts in "Main Parts Bin" and marking it active. Empty parts on
+    first run still produces an empty Main Parts Bin so the picker
+    always has something to show.
+
+    Like `_ensure_default_collection`, this MUST run in
+    `PlasmidApp.compose()` (NOT `on_mount`) — Textual mounts
+    leaves→root, so a child reading the active bin during mount sees
+    stale state if the migration hasn't run.
+    """
+    bins = _load_parts_bin_collections()
+    if bins:
+        if not _get_active_parts_bin_name():
+            first = bins[0].get("name")
+            if first:
+                _set_active_parts_bin_name(first)
+        return
+    existing_parts = _load_parts_bin()
+    _save_parts_bin_collections([{
+        "name":        _DEFAULT_PARTS_BIN_NAME,
+        "description": "Default parts bin",
+        "parts":       existing_parts,
+        "saved":       _date.today().isoformat(),
+    }])
+    _set_active_parts_bin_name(_DEFAULT_PARTS_BIN_NAME)
+
+
+def _sync_active_parts_bin_parts(entries: list[dict]) -> None:
+    """Mirror the live `parts_bin.json` contents into the active bin's
+    `parts` list inside `parts_bin_collections.json`. Silent no-op if
+    no active bin (first-launch race) or if the active name has been
+    deleted by the user via the picker.
+
+    Synchronous: parts bins are typically far smaller than plasmid
+    collections (a few KB to ~hundred KB), so the async coalescing
+    pattern that `_sync_active_collection_plasmids` uses for 100+ MB
+    libraries isn't worth the thread overhead here. Revisit if a user
+    surfaces a bin with > 1000 parts.
+    """
+    name = _get_active_parts_bin_name()
+    if not name:
+        return
+    snapshot = [dict(e) for e in entries if isinstance(e, dict)]
+    bins = _load_parts_bin_collections()
+    for b in bins:
+        if b.get("name") == name:
+            b["parts"] = snapshot
+            try:
+                _save_parts_bin_collections(bins)
+            except (OSError, RuntimeError):
+                _log.exception(
+                    "parts-bin sync: save failed for %r", name,
+                )
+            return
 
 
 # ── Primer design (Primer3-backed) ─────────────────────────────────────────────
@@ -30749,6 +31123,334 @@ class PartEditModal(ModalScreen):
         self.dismiss({"idx": self._idx, "entry": out})
 
 
+class PartsBinPickerModal(ModalScreen):
+    """Browse, create, rename, delete, and duplicate parts bins.
+
+    Mirrors `CollectionsModal` for the parts-bin side of the
+    multi-bin architecture. Each entry in the table is a named bin
+    from `parts_bin_collections.json`; selecting one sets it active
+    and dismisses with the bin name so the caller can open
+    `PartsBinModal` against the freshly-active bin.
+
+    Refuses to delete the last remaining bin — empty parts state is
+    fine, but a bin-less state would orphan the `_save_parts_bin`
+    mirror and the migration would re-create "Main Parts Bin" on
+    next launch anyway. The cleaner UX is to nudge the user.
+
+    Dismiss payload:
+      ``None``  — cancelled (Esc / Close / no selection on Open)
+      ``str``   — name of the bin to open; caller pushes
+                  `PartsBinModal` after switching the active pointer.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="binpick-dlg"):
+            yield Static(" Parts Bins ", id="binpick-title")
+            yield Label(
+                "Pick a bin to open, or use the buttons to "
+                "create / rename / delete / duplicate one.",
+                id="binpick-help",
+            )
+            yield DataTable(id="binpick-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="binpick-status", markup=True)
+            with Horizontal(id="binpick-btns"):
+                yield Button("Open", id="btn-binpick-open",
+                             variant="primary")
+                yield Button("New", id="btn-binpick-new")
+                yield Button("Rename", id="btn-binpick-rename")
+                yield Button("Duplicate", id="btn-binpick-dup")
+                yield Button("Delete", id="btn-binpick-del",
+                             variant="error")
+                yield Button("Close", id="btn-binpick-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#binpick-table", DataTable)
+        t.add_columns("Name", "# Parts", "Description", "Saved")
+        self._repopulate()
+        t.focus()
+
+    def _repopulate(self) -> None:
+        """Rebuild the bin table from disk and cursor onto the active
+        bin (so the user's most-recent context is highlighted by
+        default). Natural-sort by name so `bin2` lands before `bin10`.
+        """
+        t = self.query_one("#binpick-table", DataTable)
+        t.clear()
+        bins = sorted(
+            _load_parts_bin_collections(),
+            key=lambda b: _natural_sort_key(b.get("name") or ""),
+        )
+        active = _get_active_parts_bin_name()
+        cursor = 0
+        for i, b in enumerate(bins):
+            name = b.get("name") or "?"
+            n_parts = len(b.get("parts", []) or [])
+            desc = (b.get("description") or "")[:50]
+            saved = b.get("saved") or ""
+            t.add_row(name, str(n_parts), desc, saved, key=name)
+            if active and name == active:
+                cursor = i
+        if bins:
+            t.move_cursor(row=cursor)
+
+    def _selected_bin_name(self) -> "str | None":
+        return _cursor_row_key(self.query_one("#binpick-table", DataTable))
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#binpick-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    # ── Open ──────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-binpick-open")
+    def _open(self, _) -> None:
+        name = self._selected_bin_name()
+        if not name:
+            self._set_status("[red]No bin selected.[/red]")
+            return
+        if _find_parts_bin(name) is None:
+            self._set_status(f"[red]Bin '{name}' not found.[/red]")
+            self._repopulate()
+            return
+        _set_active_parts_bin_name(name)
+        # Refresh `parts_bin.json` mirror to match the newly-active bin
+        # so the next `_load_parts_bin()` returns the right parts. We
+        # bypass `_save_parts_bin` here because that would re-mirror
+        # back into the bin we just switched to (the bin IS the source
+        # of truth in this direction).
+        target = _find_parts_bin(name)
+        raw_parts = (target or {}).get("parts", [])
+        # Defensive: a hand-edited `parts_bin_collections.json` could
+        # carry a non-list `parts` field or non-dict entries; refuse
+        # to mirror anything that isn't shaped like a parts row so the
+        # next `_load_parts_bin` doesn't trip on a schema surprise.
+        if not isinstance(raw_parts, list):
+            raw_parts = []
+        target_parts = [p for p in raw_parts if isinstance(p, dict)]
+        try:
+            _safe_save_json(
+                _PARTS_BIN_FILE, target_parts, "Parts bin",
+            )
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Parts bin", exc)
+            return
+        # Invalidate the parts-bin in-memory cache so the next reader
+        # sees the new bin's parts (the file just changed underneath).
+        globals()["_parts_bin_cache"] = None
+        # Same digest-cache hygiene as `_save_parts_bin`.
+        _clear_assembly_fragment_cache()
+        self.dismiss(name)
+
+    @on(DataTable.RowSelected, "#binpick-table")
+    def _row_selected(self, event) -> None:
+        # Enter on a row = Open. Mirrors PlasmidPickerModal so the
+        # picker behaves consistently across the app.
+        self._open(None)
+
+    # ── New ───────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-binpick-new")
+    def _new(self, _) -> None:
+        def _on_named(name):
+            if not name:
+                return
+            if _parts_bin_name_taken(name):
+                self._set_status(
+                    f"[red]A bin named '{name}' already exists.[/red]"
+                )
+                return
+            bins = _load_parts_bin_collections()
+            bins.append({
+                "name":        name,
+                "description": "New parts bin",
+                "parts":       [],
+                "saved":       _date.today().isoformat(),
+            })
+            try:
+                _save_parts_bin_collections(bins)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Parts-bin collections", exc)
+                return
+            self._set_status(f"[green]Created bin '{name}'.[/green]")
+            self._repopulate()
+        self.app.push_screen(
+            CollectionNameModal(
+                title="New parts bin",
+                placeholder="Parts bin name",
+            ),
+            callback=_on_named,
+        )
+
+    # ── Rename ────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-binpick-rename")
+    def _rename(self, _) -> None:
+        old = self._selected_bin_name()
+        if not old:
+            self._set_status("[red]No bin selected.[/red]")
+            return
+
+        def _on_named(new_name):
+            if not new_name or new_name == old:
+                return
+            if _parts_bin_name_taken(new_name):
+                self._set_status(
+                    f"[red]A bin named '{new_name}' already exists.[/red]"
+                )
+                return
+            bins = _load_parts_bin_collections()
+            for b in bins:
+                if b.get("name") == old:
+                    b["name"] = new_name
+                    break
+            else:
+                self._set_status(
+                    f"[red]Bin '{old}' has vanished — refresh.[/red]"
+                )
+                self._repopulate()
+                return
+            try:
+                _save_parts_bin_collections(bins)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Parts-bin collections", exc)
+                return
+            # Carry the active-bin pointer if we just renamed it.
+            if _get_active_parts_bin_name() == old:
+                _set_active_parts_bin_name(new_name)
+            self._set_status(
+                f"[green]Renamed '{old}' → '{new_name}'.[/green]"
+            )
+            self._repopulate()
+        self.app.push_screen(
+            CollectionNameModal(
+                title=f"Rename parts bin '{old}'",
+                current=old,
+                placeholder="New name",
+            ),
+            callback=_on_named,
+        )
+
+    # ── Duplicate ─────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-binpick-dup")
+    def _duplicate(self, _) -> None:
+        source = self._selected_bin_name()
+        if not source:
+            self._set_status("[red]No bin selected.[/red]")
+            return
+
+        def _on_named(new_name):
+            if not new_name or new_name == source:
+                return
+            if _parts_bin_name_taken(new_name):
+                self._set_status(
+                    f"[red]A bin named '{new_name}' already exists.[/red]"
+                )
+                return
+            src = _find_parts_bin(source)
+            if src is None:
+                self._set_status(
+                    f"[red]Source bin '{source}' has vanished.[/red]"
+                )
+                self._repopulate()
+                return
+            bins = _load_parts_bin_collections()
+            bins.append({
+                "name":        new_name,
+                "description": (
+                    f"Duplicated from '{source}'"
+                ),
+                # Deep-copy so subsequent edits to either bin don't
+                # touch the other (the loader deepcopies on read, but
+                # explicit here makes the intent obvious).
+                "parts":       _typed_clone(src.get("parts", []) or []),
+                "saved":       _date.today().isoformat(),
+            })
+            try:
+                _save_parts_bin_collections(bins)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Parts-bin collections", exc)
+                return
+            self._set_status(
+                f"[green]Duplicated '{source}' → '{new_name}'.[/green]"
+            )
+            self._repopulate()
+        self.app.push_screen(
+            CollectionNameModal(
+                title=f"Duplicate parts bin '{source}'",
+                current=f"{source} copy",
+                placeholder="New bin name",
+            ),
+            callback=_on_named,
+        )
+
+    # ── Delete ────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-binpick-del")
+    def _delete(self, _) -> None:
+        name = self._selected_bin_name()
+        if not name:
+            self._set_status("[red]No bin selected.[/red]")
+            return
+        bins = _load_parts_bin_collections()
+        # Refuse to delete the last remaining bin — a bin-less state
+        # would orphan the `_save_parts_bin` mirror, and migration
+        # would re-create "Main Parts Bin" on next launch anyway.
+        if len(bins) <= 1:
+            self._set_status(
+                "[red]Can't delete the last remaining bin — "
+                "create another first.[/red]"
+            )
+            return
+        remaining = [b for b in bins if b.get("name") != name]
+        try:
+            _save_parts_bin_collections(remaining)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Parts-bin collections", exc)
+            return
+        # If the user deleted the active bin, promote the first
+        # remaining one to active so subsequent `_save_parts_bin`
+        # mirror writes land somewhere valid.
+        if _get_active_parts_bin_name() == name:
+            promoted = remaining[0].get("name")
+            if promoted:
+                _set_active_parts_bin_name(promoted)
+                # Re-seed `parts_bin.json` with the promoted bin's
+                # parts so the next `_load_parts_bin` doesn't return
+                # the deleted bin's contents.
+                try:
+                    _safe_save_json(
+                        _PARTS_BIN_FILE,
+                        list(remaining[0].get("parts", []) or []),
+                        "Parts bin",
+                    )
+                    globals()["_parts_bin_cache"] = None
+                    _clear_assembly_fragment_cache()
+                except (OSError, RuntimeError):
+                    _log.exception(
+                        "delete-bin: re-seed parts_bin.json failed",
+                    )
+        self._set_status(f"[dim]Deleted bin '{name}'.[/dim]")
+        self._repopulate()
+
+    # ── Close ─────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-binpick-close")
+    def _close_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class PartsBinModal(Screen):
     """Modular cloning parts library — full-screen view.
 
@@ -31665,24 +32367,24 @@ class PartsBinModal(Screen):
 
     @on(Button.Pressed, "#btn-load-part")
     def _load_part(self, _) -> None:
-        """Open the source picker; on dismiss with a SeqRecord, classify
-        it against every cloning grammar via Type IIS digest, and save
-        the matched insert as a Parts Bin row tagged with the detected
-        grammar / position / marker.
+        """Open the source picker; on dismiss with a list of SeqRecords,
+        classify each against every cloning grammar via Type IIS digest
+        and save the matched insert(s) as Parts Bin rows tagged with
+        the detected grammar / position / marker.
 
-        Pre-2026-05-10 this took ``self.app._current_record`` directly,
-        forcing the user to load the candidate plasmid onto the main
-        canvas first. The picker covers the common cases (any saved
-        plasmid in any collection, or a fresh ``.gb`` / ``.dna`` from
-        disk) without disturbing whatever the user already has open.
+        Pre-2026-05-13 this took a single SeqRecord; the picker now
+        supports multi-select (space / click toggles each row) and
+        dismisses with a list, so a user importing a stack of MoClo
+        plasmids no longer has to re-open the picker N times.
 
-        Pre-flight (circular topology) runs on the picker's callback
-        so the user sees the warning toast immediately; the digest +
-        serialise + save still happens in a ``@work`` thread so a
-        50 kbp plasmid × N grammars doesn't freeze the modal.
+        Pre-flight (empty seq, circular topology) ran per-record inside
+        the picker so anything reaching here is already classifier-
+        ready. The digest + serialise + save runs in a ``@work``
+        thread so a batch of 20 plasmids × N grammars doesn't freeze
+        the modal.
         """
-        def _on_picked(record) -> None:
-            if record is None:
+        def _on_picked(records) -> None:
+            if not records:
                 return
             # Defensive: PartsBin may have unmounted between the
             # picker's dismiss and this callback firing (rare, but
@@ -31690,55 +32392,194 @@ class PartsBinModal(Screen):
             # spawning a worker against a dead screen.
             if not self.is_mounted:
                 return
-            # Empty / missing seq → classifier returns None → useless
-            # toast. Catch here so the warning is specific (the
-            # picker pre-flights the same case but defensive layering
-            # is cheap).
-            seq_len = len(getattr(record, "seq", "") or "")
-            if seq_len == 0:
+            payloads: "list[tuple[str, list, str, str]]" = []
+            for record in records:
+                seq_len = len(getattr(record, "seq", "") or "")
+                if seq_len == 0:
+                    continue
+                circular = (
+                    (record.annotations or {}).get("topology", "").lower()
+                    == "circular"
+                )
+                if not circular:
+                    continue
+                seq = str(record.seq).upper()
+                plasmid_name = (
+                    getattr(record, "name", "")
+                    or getattr(record, "id", "")
+                    or "imported"
+                )
+                gb_text = getattr(record, "_tui_gb_text", None)
+                if not gb_text:
+                    try:
+                        gb_text = _record_to_gb_text(record)
+                    except Exception:
+                        _log.exception(
+                            "Load Part: GenBank serialise failed",
+                        )
+                        gb_text = ""
+                payloads.append((seq, [], plasmid_name, gb_text))
+            if not payloads:
                 self.app.notify(
-                    "Picked record has no sequence content.",
+                    "No classifiable records in the batch.",
                     severity="warning",
                 )
                 return
-            circular = (
-                (record.annotations or {}).get("topology", "").lower()
-                == "circular"
-            )
-            if not circular:
-                self.app.notify(
-                    "Load Part needs a circular plasmid (digest into "
-                    "2 fragments). The picked record is linear.",
-                    severity="warning",
-                )
-                return
-            seq = str(record.seq).upper()
-            plasmid_name = (getattr(record, "name", "")
-                            or getattr(record, "id", "")
-                            or "imported")
-            # Reuse the original library `gb_text` if the picker
-            # stashed it (`record._tui_gb_text`) — saves a parse →
-            # serialise round-trip and preserves the exact qualifier
-            # formatting `_detect_selection_marker` regex-matches
-            # against. Falls back to a fresh serialise for the
-            # OpenFile path (where only the parsed record is
-            # available).
-            gb_text = getattr(record, "_tui_gb_text", None)
-            if not gb_text:
-                try:
-                    gb_text = _record_to_gb_text(record)
-                except Exception:
-                    _log.exception(
-                        "Load Part: GenBank serialise failed",
-                    )
-                    gb_text = ""
-            # The classifier reads only `top_seq` + overhangs off the
-            # post-digest fragments, so feature plumbing is unnecessary
-            # here (was previously sourced from the canvas's PlasmidMap;
-            # the picker no longer touches the canvas).
-            self._load_part_worker(seq, [], plasmid_name, gb_text)
+            # Single-item batch goes through the legacy single worker
+            # (preserves the existing notify copy + active-grammar
+            # auto-flip behaviour). Multi-item batches use the bulk
+            # worker so we save once at the end instead of N times.
+            if len(payloads) == 1:
+                seq, feats, plasmid_name, gb_text = payloads[0]
+                self._load_part_worker(seq, feats, plasmid_name, gb_text)
+            else:
+                self._load_parts_bulk_worker(payloads)
 
         self.app.push_screen(LoadPartSourceModal(), callback=_on_picked)
+
+    @work(thread=True)
+    def _load_parts_bulk_worker(
+        self,
+        payloads: "list[tuple[str, list, str, str]]",
+    ) -> None:
+        """Worker body for the multi-select Load path. Classifies each
+        plasmid against every grammar, accumulates the matched inserts,
+        and writes them to the active parts bin in ONE save call at
+        the end (avoids N round-trips through `_save_parts_bin` for a
+        20-item batch).
+
+        Per-record failures are logged + tallied; the batch always
+        continues so a single unclassifiable plasmid doesn't drop
+        siblings. Summary toast fires from the UI thread on completion.
+        """
+        new_parts: list[dict] = []
+        unclassified: list[str] = []
+        failed:       list[str] = []
+        last_grammar = ""
+        for seq, feats, plasmid_name, gb_text in payloads:
+            try:
+                match = _classify_part_from_plasmid(
+                    seq, circular=True, features=feats,
+                )
+            except Exception as exc:
+                _log.exception(
+                    "Load Parts (bulk): classify failed for %r",
+                    plasmid_name,
+                )
+                failed.append(f"{plasmid_name}: classify error ({exc})")
+                continue
+            if match is None:
+                unclassified.append(plasmid_name)
+                continue
+            insert = match["insert"]
+            position = match["position"]
+            grammar_id = match["grammar_id"]
+            last_grammar = grammar_id
+            marker = _detect_selection_marker(gb_text) or "—"
+            backbone_label = plasmid_name
+            insert_seq = (insert.get("top_seq") or "").upper()
+            oh5 = str(
+                (insert.get("left")  or {}).get("overhang_seq", ""),
+            ).upper()
+            oh3 = str(
+                (insert.get("right") or {}).get("overhang_seq", ""),
+            ).upper()
+            if oh5 and insert_seq.startswith(oh5):
+                insert_seq = insert_seq[len(oh5):]
+            level_int = int(match.get("level", 0) or 0)
+            part_entry = {
+                "name":       plasmid_name,
+                "type":       position.get("type") or "?",
+                "position":   position.get("name") or "?",
+                "oh5":        oh5,
+                "oh3":        oh3,
+                "backbone":   backbone_label,
+                "marker":     marker,
+                "sequence":   insert_seq,
+                "fwd_primer": "",
+                "rev_primer": "",
+                "fwd_tm":     0.0,
+                "rev_tm":     0.0,
+                "grammar":    grammar_id,
+                "level":      level_int,
+            }
+            # L1+ parts need gb_text for `_assembly_fragment_from_source`
+            # to re-digest them in the Constructor's next cycle (TU →
+            # MOD, MOD → next-MOD). See the single-pick worker's
+            # equivalent guard for the rationale.
+            if level_int >= 1 and gb_text:
+                part_entry["gb_text"] = gb_text
+            new_parts.append(part_entry)
+        if new_parts:
+            try:
+                entries = _load_parts_bin()
+                # Insert newest-first at the top so the user sees them
+                # at the head of the table after the modal refreshes.
+                entries = new_parts + entries
+                _save_parts_bin(entries)
+            except OSError as exc:
+                _log.exception(
+                    "Load Parts (bulk): parts bin save failed",
+                )
+                self.app.call_from_thread(
+                    self.app.notify,
+                    f"Load Parts: couldn't save parts bin ({exc}).",
+                    severity="error",
+                )
+                return
+            # Adopt the most-recently-classified grammar as active —
+            # mirrors the single-pick worker so the user lands on the
+            # tab where their new parts live. Best-effort; persist
+            # failure isn't fatal.
+            if last_grammar:
+                try:
+                    _set_setting("active_grammar", last_grammar)
+                except OSError:
+                    _log.debug(
+                        "Load Parts (bulk): active_grammar persist failed",
+                    )
+        # Compose summary toast on the UI thread. Bounce table
+        # repopulate through the same path the single worker uses
+        # (the parts table is owned by the PartsBinModal screen).
+        n_added = len(new_parts)
+        n_unc   = len(unclassified)
+        n_fail  = len(failed)
+
+        def _summary():
+            if not self.is_mounted:
+                return
+            try:
+                self._populate()   # type: ignore[attr-defined]
+            except Exception:
+                _log.debug(
+                    "Load Parts (bulk): repopulate failed",
+                )
+            sev = (
+                "information" if n_added and not (n_unc or n_fail)
+                else "warning" if n_added
+                else "error"
+            )
+            parts_word = "part" if n_added == 1 else "parts"
+            msg = f"Loaded {n_added} {parts_word}."
+            if n_unc:
+                msg += (
+                    f" {n_unc} couldn't classify "
+                    "(overhangs didn't match a grammar position)."
+                )
+            if n_fail:
+                msg += f" {n_fail} failed (see log)."
+            self.app.notify(
+                msg, title="Load Parts (batch)",
+                severity=sev, timeout=8,
+            )
+            for name in unclassified:
+                _log.info(
+                    "Load Parts (bulk): unclassified plasmid %r",
+                    name,
+                )
+            for entry in failed:
+                _log.warning("Load Parts (bulk): %s", entry)
+        self.app.call_from_thread(_summary)
 
     @work(thread=True)
     def _load_part_worker(self, seq: str, feats: list,
@@ -31799,6 +32640,7 @@ class PartsBinModal(Screen):
         # level=2, and an L0 part (with either primary or secondary
         # release enzyme) at level=0. Pre-2026-05-10 this was hardcoded
         # 0, which mis-tabbed every TU/MOD plasmid into the L0 tab.
+        level_int = int(match.get("level", 0) or 0)
         part = {
             "name":       plasmid_name,
             "type":       position.get("type") or "?",
@@ -31813,8 +32655,20 @@ class PartsBinModal(Screen):
             "fwd_tm":     0.0,
             "rev_tm":     0.0,
             "grammar":    grammar_id,
-            "level":      int(match.get("level", 0) or 0),
+            "level":      level_int,
         }
+        # L1+ parts need the full plasmid `gb_text` so
+        # `_assembly_fragment_from_source` can digest with the level-up
+        # enzyme when chaining TUs into a MOD (or further). Pre-2026-
+        # 05-13 the Load Part flow only stashed `sequence` (the
+        # released body) — which is enough for L0 chaining but the
+        # Constructor's L1→L2 path needs to re-digest the full assembled
+        # plasmid. Constructor's own save path already carried gb_text;
+        # this matches the contract so TUs loaded via the picker are
+        # also assembly-ready. (Bug surfaced by MAV-25-in-Omega1
+        # rejections, 2026-05-13.)
+        if level_int >= 1 and gb_text:
+            part["gb_text"] = gb_text
         try:
             entries = _load_parts_bin()
             entries.insert(0, part)
@@ -41089,6 +41943,7 @@ class LoadPartSourceModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
+        Binding("space",  "toggle",         "Toggle"),
         Binding("tab",    "app.focus_next", "Next",   show=False),
     ]
 
@@ -41097,25 +41952,36 @@ class LoadPartSourceModal(ModalScreen):
     # the modal stays snappy on multi-thousand-plasmid libraries.
     _LIVE_FILTER_DEBOUNCE_S = 0.15
 
+    # Sel-column markers — match the convention used by
+    # `MultiAlignPickerModal` so the multi-select UX feels consistent
+    # across the app.
+    _CHECK_ON  = "[bold green]✓[/]"
+    _CHECK_OFF = "[dim]·[/]"
+
     def __init__(self) -> None:
         super().__init__()
         self._matches: list[dict] = []
         self._filter_timer = None
+        # Set of (collection, id) tuples that the user has toggled.
+        # Survives filter-driven repopulates so a typed-then-cleared
+        # query doesn't drop the user's prior selections.
+        self._selected_keys: set[tuple[str, str]] = set()
         # Latch flipped on the first dismiss so a Select+Enter race or
-        # a double-click on a row can't fire `dismiss(record)` twice
+        # a double-click on a row can't fire `dismiss(...)` twice
         # (the second call lands on an already-popped screen and
         # crashes Textual's screen stack).
         self._dismissing: bool = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="loadpart-box"):
-            yield Static(" Pick plasmid to classify as a part ",
+            yield Static(" Pick plasmid(s) to classify as parts ",
                          id="loadpart-title")
             yield Static(
-                "[dim]Pick a saved plasmid from any collection — or "
-                "[b]Open file…[/b] to import one from disk. The "
-                "plasmid is digested with each grammar's Type IIS "
-                "enzyme; the matched insert lands in the Parts Bin."
+                "[dim]Toggle any number of saved plasmids "
+                "([b]space[/b] or [b]click[/b]) — or [b]Open file…[/b] "
+                "to import one from disk. Each toggled plasmid is "
+                "digested with each grammar's Type IIS enzyme; the "
+                "matched insert lands in the active parts bin."
                 "[/dim]",
                 id="loadpart-hint", markup=True,
             )
@@ -41129,7 +41995,7 @@ class LoadPartSourceModal(ModalScreen):
             yield Static("", id="loadpart-status", markup=True)
             with Horizontal(id="loadpart-btns"):
                 yield Button("Open file…", id="btn-loadpart-file")
-                yield Button("Select",     id="btn-loadpart-ok",
+                yield Button("Load Selected", id="btn-loadpart-ok",
                              variant="primary",
                              # Disabled until the first refresh confirms
                              # there's at least one row to select; the
@@ -41142,7 +42008,9 @@ class LoadPartSourceModal(ModalScreen):
             t = self.query_one("#loadpart-table", DataTable)
         except NoMatches:
             return
-        t.add_columns("Plasmid", "Collection", "Status", "bp")
+        # Sel column first so the checkbox marker is the leftmost cell,
+        # mirroring `MultiAlignPickerModal`'s layout.
+        t.add_columns("Sel", "Plasmid", "Collection", "Status", "bp")
         self._refresh()
         try:
             self.query_one("#loadpart-input", Input).focus()
@@ -41205,16 +42073,20 @@ class LoadPartSourceModal(ModalScreen):
             status_cell = (Text(status, style=f"{color} bold")
                            if status and color is not None
                            else Text("—", style="dim"))
+            key_tuple = (m["collection"], m["id"])
+            marker = (self._CHECK_ON if key_tuple in self._selected_keys
+                      else self._CHECK_OFF)
             t.add_row(
+                Text.from_markup(marker),
                 Text(m["name"], no_wrap=True, overflow="ellipsis"),
                 Text(m["collection"], no_wrap=True, overflow="ellipsis"),
                 status_cell,
                 f"{m.get('size', 0):,}",
                 key=f"{m['collection']}\x00{m['id']}",
             )
-        # Toggle Select disabled state with the match count so the
-        # button can't fire on an empty table; mirrors the empty-
-        # collection / no-results UX in LibrarySearchModal.
+        # Toggle the Load button's disabled state with the match
+        # count so it can't fire on an empty table. Mirrors the
+        # empty-collection / no-results UX in LibrarySearchModal.
         try:
             self.query_one("#btn-loadpart-ok", Button).disabled = (
                 not self._matches
@@ -41222,20 +42094,34 @@ class LoadPartSourceModal(ModalScreen):
         except NoMatches:
             pass
         try:
-            if search_failed:
-                self.query_one("#loadpart-status", Static).update(
-                    "[red]Library load failed — see log. Esc to "
-                    "cancel.[/red]"
-                )
-            else:
-                n = len(self._matches)
-                label = "plasmid" if n == 1 else "plasmids"
-                self.query_one("#loadpart-status", Static).update(
-                    f"[dim]{n} {label} — Esc to cancel, "
-                    f"[b]Open file…[/b] for a fresh import.[/dim]"
-                )
+            self._update_status_line(search_failed=search_failed)
         except NoMatches:
             pass
+
+    def _update_status_line(self, *, search_failed: bool = False) -> None:
+        """Refresh the dim status line with the match count, the count
+        of toggled rows, and a brief hint. Extracted from `_refresh`
+        because `action_toggle` also needs to update the line without
+        rebuilding the whole table."""
+        if search_failed:
+            self.query_one("#loadpart-status", Static).update(
+                "[red]Library load failed — see log. Esc to "
+                "cancel.[/red]"
+            )
+            return
+        n = len(self._matches)
+        label = "plasmid" if n == 1 else "plasmids"
+        sel = len(self._selected_keys)
+        sel_part = (
+            f" · [b]{sel} selected[/b]" if sel else
+            " · [dim]no selection[/dim]"
+        )
+        self.query_one("#loadpart-status", Static).update(
+            f"[dim]{n} {label}{sel_part}[dim] · "
+            f"space / click toggles · "
+            f"[b]Load Selected[/b] adds to active bin · "
+            f"Esc to cancel[/dim]"
+        )
 
     @on(Input.Changed, "#loadpart-input")
     def _on_query_changed(self, _event: Input.Changed) -> None:
@@ -41250,118 +42136,159 @@ class LoadPartSourceModal(ModalScreen):
 
     @on(Input.Submitted, "#loadpart-input")
     def _on_query_submitted(self, _event) -> None:
-        # Enter in the input == press Select if there's a match.
-        if not self._matches or self._dismissing:
+        # Enter in the input fires "Load Selected".
+        if self._dismissing:
+            return
+        self._submit_selection()
+
+    @on(Button.Pressed, "#btn-loadpart-ok")
+    def _ok_btn(self, _) -> None:
+        self._submit_selection()
+
+    @on(DataTable.RowSelected, "#loadpart-table")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        # Row click / Enter on row → toggle, not immediate-dismiss.
+        # Multi-select is the new default; users who want single-pick
+        # still get it via toggle-one + Load Selected.
+        if self._dismissing:
+            return
+        idx = event.cursor_row
+        if 0 <= idx < len(self._matches):
+            self._toggle_index(idx)
+
+    def action_toggle(self) -> None:
+        """Space-bar toggle on the cursor row. Mirrors
+        `MultiAlignPickerModal.action_toggle`."""
+        if self._dismissing:
             return
         try:
             t = self.query_one("#loadpart-table", DataTable)
         except NoMatches:
             return
-        idx = t.cursor_row if t.cursor_row is not None else 0
-        if 0 <= idx < len(self._matches):
-            self._dismiss_with_match(self._matches[idx])
-
-    @on(Button.Pressed, "#btn-loadpart-ok")
-    def _ok_btn(self, _) -> None:
-        self._on_query_submitted(None)  # type: ignore[arg-type]
-
-    @on(DataTable.RowSelected, "#loadpart-table")
-    def _row_selected(self, event: DataTable.RowSelected) -> None:
-        if self._dismissing:
+        idx = t.cursor_row
+        if idx is None or not (0 <= idx < len(self._matches)):
             return
-        idx = event.cursor_row
-        if 0 <= idx < len(self._matches):
-            self._dismiss_with_match(self._matches[idx])
+        self._toggle_index(idx)
 
-    def _dismiss_with_match(self, match: dict) -> None:
-        """Resolve the picked (collection, id) pair to a parsed
-        ``SeqRecord`` and dismiss with it. Looks up the gb_text in
-        ``collections.json`` (cross-collection — we deliberately do
-        NOT switch active collection; the classifier doesn't need
-        the canvas, it just needs the sequence).
+    def _toggle_index(self, idx: int) -> None:
+        """Flip selection state on the i'th row of `_matches`, repaint
+        the column-0 marker, and refresh the status line."""
+        m = self._matches[idx]
+        key_tuple = (m["collection"], m["id"])
+        if key_tuple in self._selected_keys:
+            self._selected_keys.remove(key_tuple)
+            marker = self._CHECK_OFF
+        else:
+            self._selected_keys.add(key_tuple)
+            marker = self._CHECK_ON
+        try:
+            from textual.coordinate import Coordinate
+            t = self.query_one("#loadpart-table", DataTable)
+            t.update_cell_at(
+                Coordinate(idx, 0), Text.from_markup(marker),
+            )
+        except Exception:
+            _log.exception("LoadPartSourceModal: cell update failed")
+        try:
+            self._update_status_line()
+        except NoMatches:
+            pass
 
-        Pre-dismiss validation runs here so the picker (not the
-        downstream worker) is the place a user sees "this plasmid
-        won't classify" feedback. Failures notify + stay open so the
-        user can pick another row without re-launching the modal.
+    def _submit_selection(self) -> None:
+        """Resolve every toggled (collection, id) pair to a parsed
+        SeqRecord and dismiss with the list. Per-row failures (missing
+        plasmid, parse error, linear topology) drop that row from the
+        batch with a notify and continue; the batch proceeds with
+        whatever resolved cleanly.
+
+        Refuses to dismiss with an empty selection — better to nudge
+        the user than to silently no-op.
         """
         if self._dismissing:
             return
-        coll_name = match.get("collection") or ""
-        entry_id  = match.get("id") or ""
-        coll = _find_collection(coll_name)
-        if coll is None:
+        if not self._selected_keys:
             self.app.notify(
-                f"Collection '{coll_name}' is no longer present.",
-                severity="warning",
+                "Toggle at least one plasmid (space or click), "
+                "then press Load Selected.",
+                severity="warning", timeout=4,
             )
             return
+        records: list = []
+        skipped: list[str] = []
+        for (coll_name, entry_id) in self._selected_keys:
+            record, err = self._resolve_match_to_record(coll_name, entry_id)
+            if record is None:
+                skipped.append(f"{entry_id or '?'}: {err or 'unknown'}")
+                continue
+            records.append(record)
+        if not records:
+            # Every toggled row failed to resolve — surface a summary
+            # and keep the modal open so the user can pick others.
+            self.app.notify(
+                "None of the toggled plasmids could be loaded:\n"
+                + "\n".join(skipped[:5])
+                + (f"\n…and {len(skipped) - 5} more" if len(skipped) > 5 else ""),
+                severity="warning", timeout=8,
+            )
+            return
+        if skipped:
+            self.app.notify(
+                f"Skipped {len(skipped)} of {len(self._selected_keys)} "
+                "toggled plasmid(s) — see log.",
+                severity="warning", timeout=5,
+            )
+            for s in skipped:
+                _log.warning("LoadPartSourceModal: skipped %s", s)
+        self._dismissing = True
+        self.dismiss(records)
+
+    def _resolve_match_to_record(
+        self, coll_name: str, entry_id: str,
+    ) -> "tuple[object, str | None]":
+        """Look up (collection, id) in `collections.json` and parse the
+        gb_text into a SeqRecord. Pre-flights for empty sequence and
+        non-circular topology (the classifier needs a ring).
+
+        Returns ``(record, None)`` on success; ``(None, reason)`` on
+        any failure. Callers decide whether to notify per-row or
+        accumulate into a batch summary.
+        """
+        coll = _find_collection(coll_name)
+        if coll is None:
+            return None, f"collection '{coll_name}' is no longer present"
         entry = next(
             (e for e in (coll.get("plasmids") or [])
              if isinstance(e, dict) and e.get("id") == entry_id),
             None,
         )
         if entry is None:
-            self.app.notify(
-                "Plasmid not found — it may have been deleted.",
-                severity="warning",
-            )
-            return
+            return None, "plasmid not found in collection"
         gb_text = entry.get("gb_text") or ""
         if not gb_text:
-            self.app.notify(
-                "Library entry has no embedded sequence.",
-                severity="warning",
-            )
-            return
+            return None, "library entry has no embedded sequence"
         try:
             record = _gb_text_to_record(gb_text)
         except Exception as exc:
             _log.exception(
                 "LoadPartSourceModal: parse failed for %r", entry_id,
             )
-            self.app.notify(
-                f"Could not parse plasmid: {exc}",
-                severity="error",
-            )
-            return
-        # Sequence-level pre-flight: zero-length and linear records
-        # can't classify (digest needs a circular ring). Catch them
-        # here so the user gets feedback in-modal rather than seeing
-        # the picker close + a useless toast appear.
-        seq_len = len(getattr(record, "seq", "") or "")
-        if seq_len == 0:
-            self.app.notify(
-                "Plasmid has no sequence content — pick another.",
-                severity="warning",
-            )
-            return
+            return None, f"parse failed: {exc}"
+        if len(getattr(record, "seq", "") or "") == 0:
+            return None, "empty sequence"
         topology = (record.annotations or {}).get("topology", "")
         if str(topology).lower() != "circular":
-            self.app.notify(
-                "Load Part needs a circular plasmid (digest into 2 "
-                "fragments). Pick a circular record.",
-                severity="warning",
-            )
-            return
+            return None, "linear topology (digest needs circular)"
         # Stash the ORIGINAL gb_text on the record so the caller can
         # forward it to the worker without paying for a parse →
-        # serialise round-trip. The original is also what
-        # `_detect_selection_marker` should see — re-serialised text
-        # might lose qualifier formatting that the marker matcher
-        # relies on. Mirrors `OpenFileModal`'s `_tui_source`
+        # serialise round-trip. Mirrors OpenFileModal's _tui_source
         # convention.
         try:
             record._tui_gb_text = gb_text
         except Exception:
-            # SeqRecord allows attribute assignment, but in case a
-            # subclass forbids it (defensive — unlikely), fall back
-            # to the worker-side serialise.
             _log.debug(
                 "LoadPartSourceModal: couldn't stash gb_text on record",
             )
-        self._dismissing = True
-        self.dismiss(record)
+        return record, None
 
     @on(Button.Pressed, "#btn-loadpart-file")
     def _file_btn(self, _) -> None:
@@ -41405,8 +42332,12 @@ class LoadPartSourceModal(ModalScreen):
                     severity="warning",
                 )
                 return
+            # Wrap into a single-item list so the caller can iterate
+            # uniformly regardless of source (file or library multi-
+            # select). Open file… ignores any pending library
+            # selection — it's an immediate single-record path.
             self._dismissing = True
-            self.dismiss(result)
+            self.dismiss([result])
 
         self.app.push_screen(OpenFileModal(), callback=_on_file)
 
@@ -42567,8 +43498,14 @@ class NamePlasmidModal(ModalScreen):
     ``_sanitize_plasmid_name`` so even a hand-pasted weird character
     can't reach the library.
 
+    Shows a reference table of every plasmid already in the active
+    collection so the user can pick a non-colliding name at a glance.
+    Live duplicate-name check on `Input.Changed`: when the sanitised
+    name matches an existing entry's name (case-insensitive) the Save
+    button is disabled and the status line flags the collision.
+
     Dismiss payload:
-      ``str``  — the sanitised name (always non-empty).
+      ``str``  — the sanitised name (always non-empty, non-duplicate).
       ``None`` — user cancelled; caller should NOT save.
     """
 
@@ -42586,6 +43523,39 @@ class NamePlasmidModal(ModalScreen):
         # ``target_label`` ("TU", "MOD", or just "plasmid") shows up
         # in the title so the user knows which level they're naming.
         self._target_label = target_label or "plasmid"
+        # Snapshot existing names / ids at modal-construct time —
+        # the library doesn't mutate while the modal is open so a
+        # one-shot read is enough and keeps the dup-check O(1) on
+        # every keystroke. Names are case-folded so a user typing
+        # "Mav 26" still flags the existing "MAV 26".
+        self._existing_names: dict[str, str] = {}
+        self._existing_ids:   dict[str, str] = {}
+        seen_name_keys: set[str] = set()
+        dup_name_log: list[str] = []
+        for e in _load_library():
+            if not isinstance(e, dict):
+                continue
+            nm = (e.get("name") or "").strip()
+            eid = (e.get("id") or "").strip()
+            if nm:
+                key = nm.casefold()
+                if key in seen_name_keys:
+                    dup_name_log.append(nm)
+                seen_name_keys.add(key)
+                self._existing_names[key] = nm
+            if eid:
+                self._existing_ids[eid.casefold()] = eid
+        # Surface data-integrity oddities: two library entries that
+        # case-fold to the same display name are likely the
+        # downstream of an unintended duplicate-save. The modal
+        # itself prevents new duplicates; this log lets a user
+        # diagnose existing ones via the diagnostic bundle.
+        if dup_name_log:
+            _log.warning(
+                "NamePlasmidModal: library contains %d case-fold "
+                "duplicate name(s): %s — first/last wins for dup-check",
+                len(dup_name_log), dup_name_log[:5],
+            )
 
     def compose(self) -> ComposeResult:
         with Vertical(id="nameplasmid-dlg"):
@@ -42603,17 +43573,125 @@ class NamePlasmidModal(ModalScreen):
                 id="nameplasmid-input",
             )
             yield Static("", id="nameplasmid-status", markup=True)
+            # Reference table of existing plasmids in the active
+            # collection — read-only, sorted alphabetically (natural-
+            # sort) so the user can scan for collisions at a glance.
+            active_coll = _get_active_collection_name() or "library"
+            yield Label(
+                f"Existing plasmids in '{active_coll}' "
+                f"({len(self._existing_names)}):",
+                id="nameplasmid-list-label",
+            )
+            yield DataTable(
+                id="nameplasmid-list",
+                cursor_type="row",
+                zebra_stripes=True,
+                show_header=False,
+            )
             with Horizontal(id="nameplasmid-btns"):
                 yield Button("Save",   id="btn-nameplasmid-save",
                              variant="primary")
                 yield Button("Cancel", id="btn-nameplasmid-cancel")
 
     def on_mount(self) -> None:
+        # Populate the reference table — natural-sort by name so
+        # `MAV 2` lands before `MAV 10`. Use the underlying display
+        # names (not the case-folded keys) for visual fidelity.
+        try:
+            t = self.query_one("#nameplasmid-list", DataTable)
+        except NoMatches:
+            t = None
+        if t is not None:
+            t.add_columns("Name")
+            display_names = sorted(
+                set(self._existing_names.values()),
+                key=_natural_sort_key,
+            )
+            if display_names:
+                for nm in display_names:
+                    t.add_row(
+                        Text(nm, no_wrap=True, overflow="ellipsis"),
+                    )
+            else:
+                # Empty-collection placeholder — better than a bare
+                # empty DataTable which reads as "loading" or "broken".
+                t.add_row(Text(
+                    "(no plasmids yet in this collection)",
+                    style="dim italic",
+                ))
         try:
             inp = self.query_one("#nameplasmid-input", Input)
         except NoMatches:
             return
         inp.focus()
+        # Run the dup check once on the default value so the user
+        # sees the warning + the Save button reflects state without
+        # having to type a character first.
+        self._refresh_dup_state(inp.value)
+
+    @on(Input.Changed, "#nameplasmid-input")
+    def _on_input_changed(self, event: Input.Changed) -> None:
+        self._refresh_dup_state(event.value)
+
+    def _refresh_dup_state(self, raw_value: str) -> "str | None":
+        """Run the sanitise + duplicate check against the current
+        Input value. Updates the status line + Save button. Returns
+        the cleaned name when valid + non-duplicate, else ``None``.
+        Centralised so `on_mount`, `Input.Changed`, and `_try_submit`
+        all see consistent state without re-implementing the logic.
+        """
+        try:
+            status = self.query_one("#nameplasmid-status", Static)
+            save_btn = self.query_one(
+                "#btn-nameplasmid-save", Button,
+            )
+        except NoMatches:
+            return None
+        cleaned = _sanitize_plasmid_name(
+            raw_value, fallback=self._default_name,
+        )
+        if not cleaned:
+            status.update("[red]Name cannot be empty.[/red]")
+            save_btn.disabled = True
+            return None
+        # Cleaning-only mismatch (whitespace / illegal chars stripped).
+        # Not an error — surface as info so the user can confirm.
+        cleaning_hint = ""
+        if cleaned != raw_value.strip():
+            cleaning_hint = (
+                f" [yellow](will save as[/yellow] [b]{cleaned}[/b]"
+                f"[yellow])[/yellow]"
+            )
+        # Case-fold for matching — typing "Mav 26" still flags the
+        # existing "MAV 26". Check both name and sanitised id space
+        # since the library disambiguates by id.
+        cleaned_cf = cleaned.casefold()
+        cleaned_id = re.sub(r"[^A-Za-z0-9_]+", "_", cleaned)
+        cleaned_id_cf = cleaned_id.casefold()
+        if cleaned_cf in self._existing_names:
+            actual = self._existing_names[cleaned_cf]
+            status.update(
+                f"[red]Already in use:[/red] [b]{actual}[/b]"
+                f"{cleaning_hint}"
+            )
+            save_btn.disabled = True
+            return None
+        if cleaned_id_cf in self._existing_ids:
+            actual = self._existing_ids[cleaned_id_cf]
+            status.update(
+                f"[red]Name conflicts with existing id[/red] "
+                f"[b]{actual}[/b] (would auto-rename on save){cleaning_hint}"
+            )
+            save_btn.disabled = True
+            return None
+        if cleaning_hint:
+            status.update(
+                f"[yellow]Will save as[/yellow] [b]{cleaned}[/b]"
+            )
+        else:
+            status.update("[dim green]✓ Name available.[/dim green]")
+        save_btn.disabled = False
+        return cleaned
 
     @on(Button.Pressed, "#btn-nameplasmid-save")
     def _save(self, _) -> None:
@@ -42626,30 +43704,25 @@ class NamePlasmidModal(ModalScreen):
     def _try_submit(self) -> None:
         try:
             inp = self.query_one("#nameplasmid-input", Input)
-            status = self.query_one("#nameplasmid-status", Static)
         except NoMatches:
             return
-        cleaned = _sanitize_plasmid_name(
-            inp.value, fallback=self._default_name,
-        )
-        if not cleaned:
-            status.update("[red]Name cannot be empty.[/red]")
+        # Final guard — `_refresh_dup_state` already disables Save on
+        # dup / empty cases, but pressing Enter on the Input bypasses
+        # the button so we re-validate here. Same dup-check the
+        # button uses; returns None when not OK, in which case the
+        # status line already shows why.
+        cleaned = self._refresh_dup_state(inp.value)
+        if cleaned is None:
             return
-        # If sanitisation changed the user's input materially (more
-        # than just trimming trailing whitespace), surface a hint.
-        # The sanitised version is what gets dismissed regardless;
-        # the hint just lets the user know.
-        if cleaned != inp.value.strip():
-            status.update(
-                f"[yellow]Cleaned to:[/yellow] [b]{cleaned}[/b]"
-            )
-            # Don't auto-dismiss yet — let the user confirm by
-            # pressing Save / Enter again, OR edit further.
-            try:
+        # If sanitisation reshaped the user's input, reflect that
+        # back into the field before dismiss so the next caller (rare
+        # but possible — e.g. an agent inspecting the modal's last
+        # value) sees the canonical form.
+        try:
+            if cleaned != inp.value:
                 inp.value = cleaned
-            except Exception:
-                pass
-            return
+        except Exception:
+            pass
         self.dismiss(cleaned)
 
     @on(Button.Pressed, "#btn-nameplasmid-cancel")
@@ -45657,6 +46730,19 @@ CollectionsModal { align: center middle; }
 #coll-btns     { height: 3; margin-top: 1; }
 #coll-btns Button { margin-right: 1; min-width: 12; }
 
+/* ── Parts-bin picker modal ──────────────────────────────── */
+PartsBinPickerModal { align: center middle; }
+#binpick-dlg {
+    width: 110; height: 30;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#binpick-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#binpick-help   { color: $text-muted; height: auto; margin-bottom: 1; }
+#binpick-table  { height: 1fr; }
+#binpick-status { height: 1; margin-top: 1; }
+#binpick-btns   { height: 3; margin-top: 1; }
+#binpick-btns Button { margin-right: 1; min-width: 10; }
+
 /* ── Collection name prompt + delete confirm ───────────────── */
 CollectionNameModal { align: center middle; }
 #collname-dlg {
@@ -45845,12 +46931,14 @@ RenamePlasmidModal { align: center middle; }
 /* ── Name new plasmid (Constructor → Save To Library) ─────── */
 NamePlasmidModal { align: center middle; }
 #nameplasmid-dlg {
-    width: 70; height: auto;
+    width: 80; height: 32;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #nameplasmid-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #nameplasmid-input  { margin-top: 1; margin-bottom: 1; }
 #nameplasmid-status { height: 2; color: $text-muted; }
+#nameplasmid-list-label { color: $text-muted; margin-top: 1; }
+#nameplasmid-list   { height: 1fr; margin-top: 1; border: solid $primary-darken-2; }
 #nameplasmid-btns   { height: 3; margin-top: 1; }
 #nameplasmid-btns Button { margin-right: 1; }
 
@@ -46499,6 +47587,13 @@ SpeciesPickerModal { align: center middle; }
         # Both helpers are idempotent.
         _ensure_default_collection()
         _restore_library_from_active_collection()
+        # Same idempotent migration for parts bins — wraps legacy
+        # `parts_bin.json` into "Main Parts Bin" on first run; no-op
+        # afterwards. MUST run here (not on_mount) for the same
+        # leaves→root mount-ordering reason that collections do —
+        # children that read the active bin during mount would
+        # otherwise see no active bin.
+        _ensure_default_parts_bin()
         # Per-instance alignment list — class-level [] would be shared
         # across instances. Test fixtures (and a hypothetical future
         # multi-app process) must not leak alignment state between
@@ -51937,7 +53032,24 @@ SpeciesPickerModal { align: center middle; }
         )
 
     def action_open_parts_bin(self) -> None:
-        self.push_screen(PartsBinModal())
+        """Open the parts toolbar tab.
+
+        Two-step flow: first push `PartsBinPickerModal` so the user
+        picks (or creates / renames / duplicates / deletes) a parts
+        bin; on dismiss with a bin name, the picker has already set
+        it active and we push the existing `PartsBinModal` against
+        the active bin. Cancel / Close from the picker = no-op.
+
+        The migration in `compose()` (`_ensure_default_parts_bin`)
+        guarantees at least one bin exists, so the picker always has
+        something to show — first-run users see "Main Parts Bin"
+        wrapping any pre-existing `parts_bin.json` contents.
+        """
+        def _on_picked(bin_name):
+            if not bin_name:
+                return
+            self.push_screen(PartsBinModal())
+        self.push_screen(PartsBinPickerModal(), callback=_on_picked)
 
     def action_open_collections(self) -> None:
         """Open the plasmid-collections manager."""

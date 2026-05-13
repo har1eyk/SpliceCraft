@@ -2,6 +2,158 @@
 
 ---
 
+## [0.7.15.0] — 2026-05-12 — Multi-bin parts + GB classifier rewrite + naming-modal duplicate guard
+
+Five threads land in this release: multi-bin parts storage (mirrors the
+plasmid Collections architecture), a multi-select Load Part picker
+(bulk-classify TUs in one shot), a classifier rewrite that fixes
+MAV-25-in-Alpha-2 + MoClo TUs in any acceptor (try BOTH digest
+fragments + drop enzyme-parity inference + per-acceptor stuffer-pair
+matching), `gb_text` storage on L1+ parts so the Constructor can chain
+them into MODs (with a library-fallback for existing parts-bin entries
+saved before this version), and a NamePlasmidModal that lists existing
+library entries + refuses duplicate names in real time.
+
+### Added: parts-bin collections (multi-bin storage)
+
+- New `parts_bin_collections.json` mirrors the plasmid
+  `collections.json` architecture: each bin is a named snapshot with
+  ``{name, description, parts, saved}``. Active-bin pointer in
+  `settings.json` (`active_parts_bin`).
+- New `PartsBinPickerModal` opens before the parts bin proper: list
+  bins with name / #parts / description / saved date, plus
+  **New / Rename / Duplicate / Delete / Open** buttons. Refuses to
+  delete the last remaining bin (notify rather than dismiss).
+- `_ensure_default_parts_bin` migration runs in `App.compose()` —
+  wraps any pre-existing `parts_bin.json` contents into a "Main Parts
+  Bin" wrapper on first launch; idempotent on subsequent launches.
+- `_save_parts_bin` mirrors into the active bin's `parts` list via
+  the new `_sync_active_parts_bin_parts` helper (same sacred-contract
+  as `_save_library`'s collection mirror — invariant #10).
+- Constructor scope = active bin only (mirrors the plasmid
+  Library / Collections architecture so bins are project-isolated).
+
+### Added: multi-select Load Part picker
+
+- `LoadPartSourceModal` now has a Sel-checkbox column; **space** or
+  **click** toggles the cursor row. Renamed the action button to
+  **Load Selected**.
+- Dismiss payload changed from a single `SeqRecord` to
+  `list[SeqRecord]`; the Open file… path wraps its single record in
+  a 1-item list for uniform downstream handling.
+- New `_load_parts_bulk_worker` classifies every toggled plasmid in
+  one batch, accumulates the resulting parts, and writes them to the
+  active bin in ONE `_save_parts_bin` call. Per-record failures
+  (linear topology, parse error, unclassifiable overhangs) skip with
+  per-row diagnostics; the batch always proceeds. Single summary
+  toast on completion.
+- Empty-selection on Load Selected is refused with a notify (no more
+  silent no-op dismiss).
+
+### Fixed: TU/MOD classifier rewrite — covers both Golden Braid conventions
+
+- `_classify_part_from_plasmid` now iterates **both** digest fragments
+  instead of `_pick_insert_fragment`'s single guess. Library entries
+  without `rep_origin` / antibiotic-resistance annotations no longer
+  fall through to the wrong half when the insert outgrew the carrier
+  (the MAV 26 family in Cory's EDEN collection: 3250 bp body with
+  the correct GGAG/GTCA overhangs but a 1850 bp backbone with the
+  mirrored GTCA/GGAG — pre-fix, the backbone got picked and matched
+  nothing).
+- **Dropped the enzyme-parity-based MOD vs TU distinction.** Overhang
+  shape alone can't tell L1 from L2 across both Golden Braid
+  conventions — the pDGB1 / GB 2.0 convention used in real labs has
+  BsaI at L0 and Esp3I at L1, opposite from splicecraft's earlier
+  assumption (Esp3I = primary = L0). Any TU-boundary or per-acceptor
+  match now returns `level=1`; users tag L2 MODs manually via Parts
+  Bin → Edit when needed.
+- New `_grammar_acceptor_tu_pairs(grammar_id, enzyme)` helper digests
+  each configured entry vector and extracts its stuffer's overhang
+  pair. The classifier's third-pass check matches against these
+  pairs so a TU assembled into Alpha2 / Omega1 / Omega2 (with
+  non-canonical boundary overhangs) classifies as
+  `TU ({role})`. Cached per `(grammar_id, enzyme)` and invalidated
+  by `_save_entry_vectors`.
+- Verified live on EDEN: all 7 MAV 25-31 plasmids now classify
+  correctly with the right Alpha role surfaced.
+
+### Fixed: Constructor assembly from Load-Part-saved TUs (MOD-from-TU chaining)
+
+- `_load_part_worker` + `_load_parts_bulk_worker` now stash `gb_text`
+  on the parts-bin entry when `level >= 1`. The Constructor's
+  `_assembly_fragment_from_source` needs the full plasmid gb_text to
+  re-digest TUs at the level-up enzyme for chaining into MODs.
+  Pre-fix, parts-bin entries only carried the released body
+  sequence — enough for L0 chaining but not for L1 → L2 cycles.
+- `_assembly_fragment_from_source` library fallback: when a
+  parts-bin entry has no inline gb_text, cross-reference the library
+  by `id` OR `name` to recover it. Parts-bin entries saved before
+  this version auto-fix on next Constructor use without re-Load.
+- Verified live on EDEN: all six possible MAV 26-31 × MAV 25 → Omega1
+  MOD assemblies now succeed (each 10,409 bp or 10,730 bp depending
+  on insert variant).
+
+### Added: NamePlasmidModal — duplicate guard + reference list
+
+- Reference DataTable below the Input lists every plasmid in the
+  active collection (natural-sorted; dim italic placeholder when the
+  collection is empty).
+- Live duplicate-name detection on `Input.Changed`: case-folded
+  match against existing display names AND against the sanitised
+  id space (catches `MAV 32` vs `MAV/32` both → `MAV_32`).
+- Save button disabled while a duplicate is detected; red status
+  line names the existing entry. Cleaning hint preview as the user
+  types ("will save as: X") replaces the old 2-press confirmation
+  cycle.
+- `_try_submit` re-validates on Enter so a programmatic Enter
+  bypassing the disabled button is still refused.
+- Logs a warning at modal open if the library already contains
+  case-fold duplicate names — surfaces pre-existing data-integrity
+  issues via the diagnostic bundle.
+
+### Hardened
+
+- `_pick_insert_fragment` / `_pick_backbone_fragment` log a warning
+  when falling back to size-based pick AND no fragment has any
+  backbone-marker features. Surfaces the "wrong fragment because no
+  `rep_origin` annotation" failure mode in the diagnostic bundle —
+  relevant for Traditional cloning paths.
+- `PartsBinPickerModal._open` defensively filters the bin's `parts`
+  field through `isinstance` before re-seeding `parts_bin.json` —
+  a hand-edited `parts_bin_collections.json` with non-list `parts`
+  no longer corrupts the live bin.
+- `_grammar_acceptor_tu_pairs` exception handling promoted from
+  debug to warning — a misconfigured EV (missing gb_text, parse
+  failure) is now surfaced in the diagnostic bundle instead of
+  silently failing the classification.
+- `_alignments_generation` counter (alignment overlay): bumps on
+  `_clear_alignments` even when the band is already empty, so
+  in-flight workers stop registering after Alt+Shift+A.
+- `_register_alignment` refuses degenerate input (empty
+  `aligned_q` / `aligned_t`).
+
+### Tests
+
+- 17 new tests for `tests/test_parts_bins.py` (round-trip + deepcopy
+  hygiene, active-bin pointer, migration edge cases, mirror sync).
+- 4 tests for per-acceptor TU classification
+  (`TestClassifyPartFromPlasmidPerAcceptor`).
+- 4 tests for MoClo classifier paths
+  (`TestClassifyPartFromPlasmidMoClo`).
+- 3 tests for `_assembly_fragment_from_source` library fallback
+  (`TestAssemblyFragmentFromSourceGbTextFallback`).
+- 5 new tests for `NamePlasmidModal` (existing-library listed,
+  empty-library placeholder, duplicate-name detection, duplicate-id
+  collision, Enter-on-duplicate refused).
+- `PartsBinPickerModal` registered in
+  `tests/test_modal_boundaries.py::_MODAL_CASES`; fits in 160 × 48.
+- `NamePlasmidModal` CSS bumped 70 × auto → 80 × 32; still fits.
+
+**Contributors:** Cory Mozza (issue: MAV-25-in-Alpha-2 misclassification,
+EDEN collection diagnostic data).
+
+---
+
 ## [0.7.14.1] — 2026-05-12 — CHANGELOG backfill + release.py gate
 
 Five releases (0.7.11.0 through 0.7.14.0) shipped without

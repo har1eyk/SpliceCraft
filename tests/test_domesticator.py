@@ -2427,6 +2427,11 @@ class TestLoadPartSourceModal:
             t = picker.query_one("#loadpart-table", sc.DataTable)
             t.move_cursor(row=0)
             await pilot.pause()
+            # 2026-05-13: picker is now multi-select via toggle — the
+            # cursor row must be toggled (space) before Load Selected
+            # has anything to do.
+            picker.action_toggle()
+            await pilot.pause()
             picker.query_one("#btn-loadpart-ok", sc.Button).press()
             await pilot.pause()
             # Worker runs in a `@work(thread=True)` — give it room to
@@ -2631,9 +2636,12 @@ class TestLoadPartSourceModalHardening:
 
     async def test_double_dismiss_guard(
             self, isolated_library, isolated_parts_bin):
-        """Calling `_dismiss_with_match` twice (simulating a Select +
+        """Calling `_submit_selection` twice (simulating a Load Selected +
         Enter race or a duplicate RowSelected event) must not crash —
-        only the first call dismisses, the second is a no-op."""
+        only the first call dismisses, the second is a no-op.
+
+        2026-05-13: picker is now multi-select; the latch lives on
+        `_submit_selection` instead of `_dismiss_with_match`."""
         self._seed_one_circular()
         app = sc.PlasmidApp()
         async with app.run_test(size=_BASELINE) as pilot:
@@ -2643,13 +2651,15 @@ class TestLoadPartSourceModalHardening:
             await pilot.pause(0.1)
             picker = app.screen
             match = picker._matches[0]
+            # Seed the selection set directly (bypasses the UI toggle
+            # round-trip — same effect on the modal's state machine).
+            picker._selected_keys.add((match["collection"], match["id"]))
             # First dismissal: real one — flips the latch.
-            picker._dismiss_with_match(match)
+            picker._submit_selection()
             assert picker._dismissing is True
             # Second call: must short-circuit. No exception, no
-            # second screen-pop. Still on PartsBin path though we
-            # never opened it; just ensure no crash.
-            picker._dismiss_with_match(match)
+            # second screen-pop. Just ensure no crash.
+            picker._submit_selection()
 
     async def test_action_cancel_idempotent(
             self, isolated_library, isolated_parts_bin):
@@ -2723,8 +2733,13 @@ class TestLoadPartSourceModalHardening:
             await pilot.pause()
             await pilot.pause(0.1)
             picker = app.screen
-            picker._dismiss_with_match(picker._matches[0])
-            # The empty-seq pre-flight kept the modal open.
+            match = picker._matches[0]
+            picker._selected_keys.add((match["collection"], match["id"]))
+            picker._submit_selection()
+            # The empty-seq pre-flight failed for every toggled row,
+            # so the batch resolved zero records and the modal stays
+            # open. Latch must NOT have flipped (so the user can pick
+            # a different row without the dismiss-guard tripping).
             assert picker._dismissing is False
 
 
@@ -2970,7 +2985,14 @@ class TestLoadPartSourceModalShutdown:
             inp.value = "p"
             await pilot.pause()
             assert picker._filter_timer is not None
-            # Select via OK button — dismisses with the record.
+            # 2026-05-13: multi-select picker — must toggle a row
+            # before Load Selected actually dismisses.
+            t = picker.query_one("#loadpart-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            picker.action_toggle()
+            await pilot.pause()
+            # Select via OK button — dismisses with the record list.
             picker.query_one("#btn-loadpart-ok", sc.Button).press()
             await pilot.pause()
             await pilot.pause(0.1)
@@ -3065,10 +3087,12 @@ class TestLoadPartSourceModalRobustness:
             await pilot.pause()
             await pilot.pause(0.1)
             picker = app.screen
-            picker._dismiss_with_match(picker._matches[0])
-            # Parse failed → notify + stay open. Latch must NOT have
-            # flipped (so the user can pick a different row without
-            # the dismiss-guard short-circuiting them).
+            match = picker._matches[0]
+            picker._selected_keys.add((match["collection"], match["id"]))
+            picker._submit_selection()
+            # Parse failed → batch resolved zero records → notify +
+            # stay open. Latch must NOT have flipped so the user can
+            # pick a different row.
             assert picker._dismissing is False
             assert isinstance(app.screen, sc.LoadPartSourceModal)
 
@@ -3132,12 +3156,13 @@ class TestLoadPartSourceModalRobustness:
             "size": len(gb_seq), "n_feats": 0,
             "gb_text": original_gb,
         }])
-        # Capture the dismissed record so we can inspect it post-
-        # dismiss.
-        captured = {}
+        # Capture the dismissed record list so we can inspect it
+        # post-dismiss. 2026-05-13: picker now dismisses with
+        # list[SeqRecord] (multi-select).
+        captured: dict = {}
 
-        def _capture(record):
-            captured["record"] = record
+        def _capture(records):
+            captured["records"] = records
 
         app = sc.PlasmidApp()
         async with app.run_test(size=_BASELINE) as pilot:
@@ -3147,11 +3172,14 @@ class TestLoadPartSourceModalRobustness:
             await pilot.pause()
             await pilot.pause(0.1)
             picker = app.screen
-            picker._dismiss_with_match(picker._matches[0])
+            match = picker._matches[0]
+            picker._selected_keys.add((match["collection"], match["id"]))
+            picker._submit_selection()
             await pilot.pause()
             await pilot.pause(0.1)
-        rec = captured.get("record")
-        assert rec is not None
+        records = captured.get("records") or []
+        assert len(records) == 1, f"expected 1 record, got {records!r}"
+        rec = records[0]
         # Stashed gb_text matches the library entry's original.
         assert getattr(rec, "_tui_gb_text", None) == original_gb
 
@@ -6517,11 +6545,22 @@ class TestClassifyPartFromPlasmidLevels:
         assert result["position"]["name"] == "TU"
         assert result["release_enzyme"] == "BsaI"
 
-    def test_mod_classifies_as_level_2(self):
-        """A GB MOD (Esp3I-flanked, GGAG/CGCT boundary, no internal
-        BsaI) must classify as gb_l0 / level=2. The primary enzyme
-        produces the digest at L2 — same enzyme as L0, distinguished
-        by overhang pattern (TU boundary vs L0 position table)."""
+    def test_mod_shape_classifies_as_tu_overhang_shape_only(self):
+        """Pre-2026-05-13 a `_build_gb_mod_seq()` plasmid (Esp3I-
+        flanked, canonical TU-boundary overhangs) classified as
+        level=2 (MOD) via enzyme-parity inference (`primary release
+        ⇒ MOD`). That inference assumed splicecraft's enzyme
+        convention (Esp3I=primary=L0); the pDGB1 convention used by
+        EDEN flips parity — Esp3I IS the L1→L2 release in their
+        labs, and the user's TUs cut with Esp3I.
+
+        Overhang shape alone can't tell TU from MOD across both
+        conventions, so the classifier now returns level=1 for any
+        TU-boundary match regardless of which enzyme cut. Users who
+        need to tag a MOD specifically can do so via Parts Bin →
+        Edit. Regression guard for the MAV-25-in-alpha-2 fix
+        (2026-05-13).
+        """
         seq = _build_gb_mod_seq()
         # Sanity: no BsaI on either strand.
         assert "GGTCTC" not in seq
@@ -6529,8 +6568,11 @@ class TestClassifyPartFromPlasmidLevels:
         result = sc._classify_part_from_plasmid(seq, circular=True)
         assert result is not None
         assert result["grammar_id"]    == "gb_l0"
-        assert result["level"]         == 2
-        assert result["position"]["name"] == "MOD"
+        # New behaviour: overhang-only classification can't
+        # distinguish MOD from TU — both have the same canonical
+        # boundary pair. Returns level=1 with the bare "TU" label.
+        assert result["level"]            == 1
+        assert result["position"]["name"] == "TU"
         assert result["release_enzyme"] in ("Esp3I", "BsmBI")
 
     def test_random_overhangs_still_return_none(self):
@@ -6718,6 +6760,10 @@ class TestClassifyPartFromPlasmidLevels:
             t = picker.query_one("#loadpart-table", sc.DataTable)
             t.move_cursor(row=0)
             await pilot.pause()
+            # 2026-05-13: picker is now multi-select via toggle —
+            # toggle the cursor row before Load Selected.
+            picker.action_toggle()
+            await pilot.pause()
             picker.query_one("#btn-loadpart-ok", sc.Button).press()
             # Worker runs `@work(thread=True)` — give it room to land.
             await pilot.pause()
@@ -6728,6 +6774,392 @@ class TestClassifyPartFromPlasmidLevels:
             f"expected one part saved, got {entries!r}"
         assert entries[0]["level"]   == 1
         assert entries[0]["grammar"] == "gb_l0"
+
+
+class TestClassifyPartFromPlasmidPerAcceptor:
+    """A TU assembled into an Alpha2 / Omega1 / Omega2 acceptor releases
+    with overhangs DIFFERENT from the canonical (Promoter.oh5,
+    Terminator.oh3) pair — `_grammar_tu_overhangs` only covers Alpha1.
+    The third-pass check in `_classify_part_from_plasmid` digests each
+    configured entry vector and compares the stuffer's overhangs to
+    the user's plasmid digest. This regression guards the
+    MAV-25-in-alpha-2 bug Cory reported on 2026-05-13.
+    """
+
+    def test_tu_in_alpha2_classifies_via_acceptor_pair(
+            self, isolated_library, isolated_parts_bin):
+        """Alpha2 EV configured with non-canonical BsaI-release
+        overhangs; a TU plasmid whose BsaI digest releases the same
+        overhangs classifies as level=1 with the Alpha2 role surfaced
+        in the position name.
+
+        Per the `_make_l1_alpha_vector` shape, `alpha_oh5` / `alpha_oh3`
+        are the BsaI-release overhangs (the acceptor's L2-input
+        identity); `tu_start` / `tu_end` are the inner Esp3I overhangs
+        (L0→L1 assembly). The classifier's third-pass match runs on
+        the BsaI-release pair.
+        """
+        # Use overhangs that are NOT (GGAG, CGCT) so the canonical
+        # `_grammar_tu_overhangs` first-pass check fails and the
+        # per-acceptor lookup is the only thing that can match.
+        alpha2_bsai_5 = "TACA"
+        alpha2_bsai_3 = "GACT"
+        alpha2_ev = _make_l1_alpha_vector(
+            "pAlpha2",
+            alpha_oh5=alpha2_bsai_5, alpha_oh3=alpha2_bsai_3,
+        )
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0",
+            "role":       "Alpha2",
+            "name":       "pAlpha2",
+            "gb_text":    alpha2_ev["gb_text"],
+        }])
+        # TU plasmid synthesised with the alpha-2 BsaI-release
+        # overhangs at its boundary — same shape as a real TU
+        # assembled into pAlpha2.
+        tu_seq = _build_gb_tu_seq(oh5=alpha2_bsai_5, oh3=alpha2_bsai_3)
+        result = sc._classify_part_from_plasmid(tu_seq, circular=True)
+        assert result is not None, (
+            "Alpha2 TU should classify via the per-acceptor pass"
+        )
+        assert result["grammar_id"] == "gb_l0"
+        assert result["level"] == 1
+        # Position name surfaces the role so the user can confirm
+        # which acceptor the classifier matched against.
+        assert "Alpha2" in result["position"]["name"]
+        assert result["position"]["oh5"] == alpha2_bsai_5
+        assert result["position"]["oh3"] == alpha2_bsai_3
+
+    def test_canonical_tu_still_classifies_after_acceptor_added(
+            self, isolated_library, isolated_parts_bin):
+        """Sanity: adding non-canonical acceptors to entry_vectors
+        must NOT break the canonical (Alpha1) TU detection path —
+        Alpha1's overhang pair IS the canonical (Promoter.oh5,
+        Terminator.oh3) pair so it should match via the original
+        `_grammar_tu_overhangs` check before the acceptor pass runs."""
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0",
+            "role":       "Alpha2",
+            "name":       "pAlpha2",
+            "gb_text":    _make_l1_alpha_vector(
+                "pAlpha2", alpha_oh5="TACA", alpha_oh3="GACT",
+            )["gb_text"],
+        }])
+        # Canonical TU with the GB Promoter→Terminator overhangs.
+        tu_seq = _build_gb_tu_seq(oh5="GGAG", oh3="CGCT")
+        result = sc._classify_part_from_plasmid(tu_seq, circular=True)
+        assert result is not None
+        assert result["level"] == 1
+        # Canonical pair → position name is the bare level label,
+        # NOT a per-acceptor label.
+        assert result["position"]["name"] == "TU"
+
+    def test_no_match_when_acceptor_overhangs_differ(
+            self, isolated_library, isolated_parts_bin):
+        """The acceptor pass only matches plasmids whose overhangs
+        match a CONFIGURED entry vector's stuffer. A TU with
+        overhangs that don't match any acceptor should still return
+        None — no silent false-positive."""
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0",
+            "role":       "Alpha2",
+            "name":       "pAlpha2",
+            "gb_text":    _make_l1_alpha_vector(
+                "pAlpha2", alpha_oh5="TACA", alpha_oh3="GACT",
+            )["gb_text"],
+        }])
+        # Overhangs match neither Alpha1 canonical (GGAG/CGCT) nor
+        # the configured Alpha2 (TACA/GACT).
+        tu_seq = _build_gb_tu_seq(oh5="ATTC", oh3="GGCA")
+        result = sc._classify_part_from_plasmid(tu_seq, circular=True)
+        assert result is None
+
+    def test_acceptor_cache_invalidates_on_entry_vector_save(
+            self, isolated_library, isolated_parts_bin):
+        """`_save_entry_vectors` MUST drop `_ACCEPTOR_TU_PAIRS_CACHE`
+        so a reconfigured EV doesn't keep the old overhangs alive
+        for the next classification pass. Without this, a user who
+        swaps Alpha2 to a new plasmid would see stale matches
+        against the old plasmid's overhangs."""
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0",
+            "role":       "Alpha2",
+            "name":       "pAlpha2-v1",
+            "gb_text":    _make_l1_alpha_vector(
+                "pAlpha2-v1",
+                alpha_oh5="TACA", alpha_oh3="GACT",
+            )["gb_text"],
+        }])
+        pairs_v1 = sc._grammar_acceptor_tu_pairs("gb_l0", "BsaI")
+        assert pairs_v1 and pairs_v1[0][2] == "TACA"
+        # Reconfigure with different BsaI-release overhangs.
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0",
+            "role":       "Alpha2",
+            "name":       "pAlpha2-v2",
+            "gb_text":    _make_l1_alpha_vector(
+                "pAlpha2-v2",
+                alpha_oh5="ACGT", alpha_oh3="TGCA",
+            )["gb_text"],
+        }])
+        pairs_v2 = sc._grammar_acceptor_tu_pairs("gb_l0", "BsaI")
+        # Cache must have invalidated — the new overhangs replaced
+        # the v1 pair, not appended to it.
+        assert pairs_v2 and pairs_v2[0][2] == "ACGT"
+        assert all(p[2] != "TACA" for p in pairs_v2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MoClo classifier — same logic as GB, different enzyme + position table
+# ═══════════════════════════════════════════════════════════════════════════════
+# The classifier loops over every grammar in `_all_grammars()`, so the
+# Golden-Braid fixes (try-both-fragments + per-acceptor pair matching +
+# drop parity inference) ALSO benefit MoClo. These tests guard against
+# a future refactor specialising one grammar's pass against another.
+
+
+def _build_moclo_tu_seq(insert: str = "ATG" * 30,
+                         oh5: str = "GGAG", oh3: str = "CGCT") -> str:
+    """Synthetic MoClo Plant TU: BpiI sites flank a body that releases
+    with the requested 4-nt overhangs. BpiI / BbsI (GAAGAC(2/6)) has a
+    2-nt spacer between recognition and overhang — fixture mirrors the
+    GB equivalent with the spacer baked in."""
+    core = "GAAGACAA" + oh5 + insert + oh3 + "AAGTCTTC"
+    backbone = "AAAAATTTTT" * 50
+    return core + backbone
+
+
+def _make_moclo_acceptor(name: str, alpha_oh5: str, alpha_oh3: str) -> dict:
+    """MoClo Plant L1 acceptor: BpiI sites release the stuffer with
+    (alpha_oh5, alpha_oh3). Matches the `_make_l1_alpha_vector` shape
+    for GB so tests look symmetric across grammars."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    bpii_left  = "GAAGACAA"
+    bpii_right = "AAGTCTTC"
+    dropout    = "ACGTAGCT" * 10
+    backbone   = "GGGGTTTTAAAA" * 30
+    seq = backbone + bpii_left + alpha_oh5 + dropout + alpha_oh3 + bpii_right + "TTTGGG" * 30
+    rec = SeqRecord(Seq(seq), id=name, name=name)
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"]      = "circular"
+    return {"name": name, "gb_text": sc._record_to_gb_text(rec)}
+
+
+class TestClassifyPartFromPlasmidMoClo:
+    """Same detection cases as the GB tests, but for the MoClo Plant
+    grammar (BsaI at L0, BpiI at L1). The classifier code is shared
+    between grammars — these tests are mostly insurance that a future
+    refactor specialising one grammar's pass doesn't regress the
+    other.
+    """
+
+    def test_l0_part_classifies_against_moclo_position(
+            self, isolated_library, isolated_parts_bin):
+        """MoClo Pos 3 (CDS) — overhangs AGGT/GCTT. A synthetic L0
+        with those overhangs classifies as moclo_plant / level=0."""
+        seq = _build_moclo_plant_part_seq("AGGT", "GCTT")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"] == "moclo_plant"
+        assert result["level"]      == 0
+        assert result["position"]["type"] == "CDS"
+
+    def test_canonical_tu_classifies_via_grammar_boundary(
+            self, isolated_library, isolated_parts_bin):
+        """MoClo canonical TU boundary is GGAG/CGCT (Pos 1's oh5 +
+        Pos 5's oh3). A BpiI-released TU with that pair returns
+        level=1."""
+        tu_seq = _build_moclo_tu_seq(oh5="GGAG", oh3="CGCT")
+        result = sc._classify_part_from_plasmid(tu_seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"] == "moclo_plant"
+        assert result["level"]      == 1
+        assert result["position"]["name"] == "TU"
+        assert result["release_enzyme"] in ("BpiI", "BbsI")
+
+    def test_tu_in_non_canonical_acceptor_classifies_via_pair(
+            self, isolated_library, isolated_parts_bin):
+        """MoClo's Acceptor2 role with non-canonical BpiI-release
+        overhangs — a TU built into that acceptor should classify
+        via the per-acceptor pass (same path as the GB Alpha2 fix)."""
+        acc2 = _make_moclo_acceptor("pMoCloA2",
+                                      alpha_oh5="TACA", alpha_oh3="GACT")
+        sc._save_entry_vectors([{
+            "grammar_id": "moclo_plant",
+            "role":       "Acceptor2",
+            "name":       "pMoCloA2",
+            "gb_text":    acc2["gb_text"],
+        }])
+        tu_seq = _build_moclo_tu_seq(oh5="TACA", oh3="GACT")
+        result = sc._classify_part_from_plasmid(tu_seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"] == "moclo_plant"
+        assert result["level"]      == 1
+        assert "Acceptor2" in result["position"]["name"]
+
+    def test_tu_with_insert_larger_than_backbone_still_picks_correctly(
+            self, isolated_library, isolated_parts_bin):
+        """Try-both-fragments regression: a MoClo TU whose body
+        outgrew its backbone (common for any multi-kb cassette)
+        used to mis-pick the backbone via `_pick_insert_fragment`'s
+        smallest-fallback. The classifier now tries both fragments,
+        so the body's overhangs ARE matched against the position /
+        TU / acceptor checks regardless of fragment size."""
+        # A 5 kb insert with canonical TU boundary; backbone is the
+        # short "AAAAATTTTT"*50 = 500 bp padding.
+        big_insert = "GCATGCAT" * 600   # ~4800 bp
+        tu_seq = _build_moclo_tu_seq(oh5="GGAG", oh3="CGCT",
+                                       insert=big_insert)
+        result = sc._classify_part_from_plasmid(tu_seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"] == "moclo_plant"
+        assert result["level"]      == 1
+
+
+class TestAssemblyFragmentFromSourceGbTextFallback:
+    """`_assembly_fragment_from_source` needs the full plasmid gb_text
+    to digest L1+ parts at the level-up enzyme. Parts saved by
+    `_load_part_worker` before 2026-05-13 lacked `gb_text` (only
+    `sequence` was stored). Library fallback recovers it by matching
+    the parts-bin entry's `name` against library `id` / `name`."""
+
+    def test_fallback_recovers_gb_text_from_library_by_id(
+            self, isolated_library, isolated_parts_bin):
+        """A parts-bin entry without `gb_text` whose name matches a
+        library entry's `id` recovers the gb_text via the fallback —
+        Constructor assembly works without reloading the part."""
+        # Build a real GB TU plasmid: BsaI sites flank an Esp3I-
+        # released body (matches the splicecraft GB grammar's
+        # secondary=BsaI, primary=Esp3I parity for L1 release).
+        tu_seq = _build_gb_tu_seq(oh5="GGAG", oh3="CGCT")
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq(tu_seq), id="my_tu_id", name="my_tu_name",
+            annotations={"topology": "circular", "molecule_type": "DNA"},
+        )
+        gb_text = sc._record_to_gb_text(rec)
+        # Library entry — has gb_text.
+        sc._save_library([{
+            "id":      "my_tu_id",
+            "name":    "my_tu_name",
+            "size":    len(tu_seq),
+            "n_feats": 0,
+            "gb_text": gb_text,
+        }])
+        # Parts bin entry — NO gb_text (pre-2026-05-13 shape).
+        # name field intentionally set to the library's id so the
+        # cross-reference can find it.
+        sc._save_parts_bin([{
+            "name":     "my_tu_id",
+            "type":     "TU",
+            "position": "TU",
+            "oh5":      "GGAG",
+            "oh3":      "CGCT",
+            "backbone": "test",
+            "marker":   "—",
+            "sequence": "AAAA",   # bogus; fallback will redigest
+            "grammar":  "gb_l0",
+            "level":    1,
+        }])
+        # Fetch the parts-bin entry as-loaded.
+        part_entry = next(
+            p for p in sc._load_parts_bin()
+            if p.get("name") == "my_tu_id"
+        )
+        assert "gb_text" not in part_entry or not part_entry.get("gb_text")
+        # Drive the fragment extraction at source_level=1 — would have
+        # returned None pre-fix. With the library fallback it should
+        # recover gb_text and return a valid fragment.
+        grammar = sc._all_grammars()["gb_l0"]
+        sc._ASSEMBLY_FRAGMENT_CACHE.clear()
+        frag = sc._assembly_fragment_from_source(
+            part_entry, grammar, source_level=1,
+        )
+        assert frag is not None, (
+            "Library fallback should have recovered gb_text"
+        )
+        assert frag["oh5"] == "GGAG"
+        assert frag["oh3"] == "CGCT"
+
+    def test_no_fallback_when_no_matching_library_entry(
+            self, isolated_library, isolated_parts_bin):
+        """When the parts-bin entry has no gb_text AND no library
+        entry matches by id/name, the function returns None with a
+        log line (rather than silently picking the wrong gb_text)."""
+        sc._save_library([])
+        sc._save_parts_bin([{
+            "name":     "orphan_part",
+            "type":     "TU",
+            "position": "TU",
+            "oh5":      "GGAG",
+            "oh3":      "CGCT",
+            "sequence": "AAAA",
+            "grammar":  "gb_l0",
+            "level":    1,
+        }])
+        part_entry = next(
+            p for p in sc._load_parts_bin()
+            if p.get("name") == "orphan_part"
+        )
+        grammar = sc._all_grammars()["gb_l0"]
+        sc._ASSEMBLY_FRAGMENT_CACHE.clear()
+        frag = sc._assembly_fragment_from_source(
+            part_entry, grammar, source_level=1,
+        )
+        assert frag is None
+
+    def test_inline_gb_text_takes_precedence_over_library_lookup(
+            self, isolated_library, isolated_parts_bin):
+        """When the parts-bin entry already carries `gb_text`, the
+        library-fallback path doesn't fire — the inline value wins.
+        Defends against a future regression where a library rename
+        / move could silently change which gb_text the fragment
+        extraction sees."""
+        tu_seq = _build_gb_tu_seq(oh5="GGAG", oh3="CGCT")
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq(tu_seq), id="my_tu", name="my_tu",
+            annotations={"topology": "circular", "molecule_type": "DNA"},
+        )
+        gb_text = sc._record_to_gb_text(rec)
+        # Library entry with DIFFERENT (corrupted) gb_text — if the
+        # fallback fires, the fragment will fail to extract.
+        sc._save_library([{
+            "id":      "my_tu",
+            "name":    "my_tu",
+            "size":    len(tu_seq),
+            "n_feats": 0,
+            "gb_text": "not valid genbank",
+        }])
+        # Parts-bin entry WITH gb_text (post-2026-05-13 shape).
+        sc._save_parts_bin([{
+            "name":     "my_tu",
+            "type":     "TU",
+            "position": "TU",
+            "oh5":      "GGAG",
+            "oh3":      "CGCT",
+            "sequence": "AAAA",
+            "gb_text":  gb_text,
+            "grammar":  "gb_l0",
+            "level":    1,
+        }])
+        part_entry = next(
+            p for p in sc._load_parts_bin()
+            if p.get("name") == "my_tu"
+        )
+        assert part_entry.get("gb_text")
+        grammar = sc._all_grammars()["gb_l0"]
+        sc._ASSEMBLY_FRAGMENT_CACHE.clear()
+        frag = sc._assembly_fragment_from_source(
+            part_entry, grammar, source_level=1,
+        )
+        # Inline gb_text was valid → fragment extraction succeeded.
+        # Library's bogus gb_text never consulted.
+        assert frag is not None
+        assert frag["oh5"] == "GGAG"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7970,11 +8402,16 @@ class TestNamePlasmidModal:
             await pilot.pause(0.1)
         assert captured.get("name") == "my_clean_name"
 
-    async def test_dirty_name_normalises_first_then_dismisses(self):
-        """A name with leading/trailing whitespace + path chars goes
-        through one normalisation press (status banner shows the
-        cleaned value, Input is updated), then a second press
-        dismisses with the cleaned name."""
+    async def test_dirty_name_normalises_and_dismisses_in_one_press(self):
+        """A name with leading/trailing whitespace + path chars
+        dismisses cleanly on a single Save press. The live status
+        line shows the cleaned form as the user types so they can
+        see the substitution before committing.
+
+        2026-05-13: simplified from the old two-press cycle — live
+        feedback via `Input.Changed` replaces the prior "confirm the
+        cleaning" intermediate step.
+        """
         captured = {}
 
         def _capture(name):
@@ -7990,13 +8427,7 @@ class TestNamePlasmidModal:
             modal = app.screen
             inp = modal.query_one("#nameplasmid-input", sc.Input)
             inp.value = "  ../foo  "
-            modal.query_one("#btn-nameplasmid-save",
-                            sc.Button).press()
             await pilot.pause()
-            # First press normalised + showed status; modal still open.
-            assert isinstance(app.screen, sc.NamePlasmidModal)
-            assert inp.value == ".. foo"
-            # Second press dismisses with the cleaned name.
             modal.query_one("#btn-nameplasmid-save",
                             sc.Button).press()
             await pilot.pause()
@@ -8041,6 +8472,145 @@ class TestNamePlasmidModal:
             await pilot.pause()
             await pilot.pause(0.1)
         assert captured.get("name") is None
+
+    # ── Duplicate detection (2026-05-13) ─────────────────────────────
+
+    async def test_existing_library_listed_in_modal(
+            self, isolated_library, isolated_parts_bin):
+        """The reference table shows every plasmid in the active
+        collection so the user can scan for naming collisions before
+        committing."""
+        sc._save_library([
+            {"id": "p1", "name": "MAV 26 some_tu", "size": 1, "n_feats": 0},
+            {"id": "p2", "name": "MAV 27 another_tu", "size": 1, "n_feats": 0},
+            {"id": "p3", "name": "pUC19", "size": 1, "n_feats": 0},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            t = modal.query_one("#nameplasmid-list", sc.DataTable)
+            assert t.row_count == 3
+            # Natural-sort: pUC19 lands AFTER the MAV entries.
+            # (Names sort lexicographically here since the numbers
+            # don't collide with any non-numeric prefix.)
+            names = [str(t.get_row_at(i)[0])
+                      for i in range(t.row_count)]
+            assert "MAV 26 some_tu" in names
+            assert "pUC19" in names
+
+    async def test_empty_library_shows_placeholder_row(
+            self, isolated_library, isolated_parts_bin):
+        """Empty collection → reference table shows a single dim
+        placeholder row rather than a bare empty table that reads
+        as "loading" or "broken"."""
+        sc._save_library([])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            t = modal.query_one("#nameplasmid-list", sc.DataTable)
+            # One placeholder row.
+            assert t.row_count == 1
+            cell = str(t.get_row_at(0)[0])
+            assert "no plasmids" in cell.lower()
+
+    async def test_duplicate_name_disables_save_button(
+            self, isolated_library, isolated_parts_bin):
+        """Typing a name that case-folds to an existing library
+        entry's name disables the Save button and surfaces a red
+        status line. The user can't dismiss with a duplicate.
+        """
+        sc._save_library([
+            {"id": "existing_id", "name": "MAV 32 O1MOD",
+             "size": 1, "n_feats": 0},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            save_btn = modal.query_one(
+                "#btn-nameplasmid-save", sc.Button,
+            )
+            # Type the exact existing name → Save disabled.
+            inp.value = "MAV 32 O1MOD"
+            await pilot.pause()
+            assert save_btn.disabled is True
+            # Case-insensitive variant ALSO disables.
+            inp.value = "mav 32 o1mod"
+            await pilot.pause()
+            assert save_btn.disabled is True
+            # Change to a unique name → re-enabled.
+            inp.value = "MAV 33 unique"
+            await pilot.pause()
+            assert save_btn.disabled is False
+
+    async def test_duplicate_id_collision_disables_save(
+            self, isolated_library, isolated_parts_bin):
+        """Two different display names can sanitise to the same id
+        (e.g. ``MAV 32`` and ``MAV/32`` both → ``MAV_32``). The dup
+        check covers the id collision too so the user doesn't save
+        a name that would auto-suffix on persist."""
+        sc._save_library([
+            {"id": "MAV_32_O1MOD", "name": "MAV 32 O1MOD",
+             "size": 1, "n_feats": 0},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            save_btn = modal.query_one(
+                "#btn-nameplasmid-save", sc.Button,
+            )
+            # Different display name but sanitises to the same id.
+            inp.value = "MAV/32/O1MOD"
+            await pilot.pause()
+            assert save_btn.disabled is True
+
+    async def test_enter_on_duplicate_is_refused(
+            self, isolated_library, isolated_parts_bin):
+        """Pressing Enter on the Input bypasses the disabled Save
+        button — `_try_submit` re-runs the dup check and refuses
+        rather than dismissing with a duplicate."""
+        sc._save_library([
+            {"id": "p1", "name": "TAKEN", "size": 1, "n_feats": 0},
+        ])
+        captured: dict = {}
+
+        def _capture(name):
+            captured["name"] = name
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"),
+                            callback=_capture)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            inp.value = "TAKEN"
+            await pilot.pause()
+            # Simulate Enter on the Input via the submit handler.
+            modal._try_submit()
+            await pilot.pause()
+            # Modal still open, no dismissal happened.
+            assert isinstance(app.screen, sc.NamePlasmidModal)
+            assert "name" not in captured
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
