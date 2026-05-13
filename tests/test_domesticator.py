@@ -8364,6 +8364,46 @@ class TestSanitizePlasmidName:
 # NamePlasmidModal — Constructor save-flow naming prompt
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class TestRecordDisplayName:
+    """`PlasmidApp._record_display_name` prefers the typed display
+    name (stashed as `record._tui_display_name` when loading from
+    library) over the sanitised GenBank LOCUS / id. Critical for
+    showing "MAV 32 + Test" in the title bar instead of "MAV_32_Test"
+    after a round-trip through .gb serialisation.
+    """
+
+    def test_prefers_tui_display_name(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ATGC"), id="MAV_32", name="MAV_32")
+        rec._tui_display_name = "MAV 32 + Test"
+        assert sc.PlasmidApp._record_display_name(rec) == "MAV 32 + Test"
+
+    def test_falls_back_to_record_name_when_no_tui_display(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ATGC"), id="my_id", name="my_name")
+        assert sc.PlasmidApp._record_display_name(rec) == "my_name"
+
+    def test_falls_back_to_id_when_name_missing(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ATGC"), id="my_id", name="")
+        assert sc.PlasmidApp._record_display_name(rec) == "my_id"
+
+    def test_question_mark_for_none(self):
+        assert sc.PlasmidApp._record_display_name(None) == "?"
+
+    def test_empty_tui_display_falls_through(self):
+        """Whitespace-only or empty `_tui_display_name` falls through
+        to the standard fields rather than rendering as blank."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ATGC"), id="real_id", name="real_name")
+        rec._tui_display_name = "   "
+        assert sc.PlasmidApp._record_display_name(rec) == "real_name"
+
+
 class TestNamePlasmidModal:
     """The naming prompt sanitises every dismiss path so the saved
     plasmid name lands cleanly in the library and parts bin."""
@@ -8580,6 +8620,74 @@ class TestNamePlasmidModal:
             inp.value = "MAV/32/O1MOD"
             await pilot.pause()
             assert save_btn.disabled is True
+
+    async def test_markup_chars_in_existing_name_dont_break_status(
+            self, isolated_library, isolated_parts_bin):
+        """A library entry with `[` / `]` in its name (e.g.,
+        ``TU [draft]``) would, without escape, interpret `[draft]`
+        as a Rich-markup tag in the dup-check status line — visually
+        broken or a `MarkupError` at worst. The status update must
+        survive on `Static(markup=True)` regardless of payload."""
+        sc._save_library([
+            {"id": "p1", "name": "TU [draft]",
+             "size": 1, "n_feats": 0},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            status = modal.query_one(
+                "#nameplasmid-status", sc.Static,
+            )
+            # Exact dup → should NOT crash + status text should
+            # contain the literal name (escape leaves "TU [draft]"
+            # visible as text, not parsed as markup).
+            inp.value = "TU [draft]"
+            await pilot.pause()
+            rendered = str(status.render()).lower()
+            assert "duplicate" in rendered
+            assert "[draft]" in rendered or "draft" in rendered
+
+    async def test_substring_match_shows_soft_warning_save_enabled(
+            self, isolated_library, isolated_parts_bin):
+        """When the typed name is a substring of an existing entry
+        (or vice versa) but NOT an exact match, surface a yellow
+        soft-warning in the status line WITHOUT disabling Save.
+        Lets the user spot near-misses while still saving distinct
+        names that happen to share a prefix.
+        """
+        sc._save_library([
+            {"id": "p1", "name": "MAV 32 O1MOD FuGFP+RUBY",
+             "size": 1, "n_feats": 0},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            save_btn = modal.query_one(
+                "#btn-nameplasmid-save", sc.Button,
+            )
+            status = modal.query_one(
+                "#nameplasmid-status", sc.Static,
+            )
+            # Prefix of the existing name.
+            inp.value = "MAV 32"
+            await pilot.pause()
+            assert save_btn.disabled is False
+            assert "similar" in str(status.render()).lower()
+            # Distinct name with no overlap.
+            inp.value = "totally unique"
+            await pilot.pause()
+            assert save_btn.disabled is False
+            assert "available" in str(status.render()).lower()
 
     async def test_enter_on_duplicate_is_refused(
             self, isolated_library, isolated_parts_bin):

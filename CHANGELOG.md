@@ -2,6 +2,111 @@
 
 ---
 
+## [0.7.15.1] — 2026-05-13 — Async rename + display-name preservation + markup hygiene
+
+Three threads: rename now writes off-thread so the UI doesn't freeze
+on multi-hundred-MB libraries; saved plasmid / part / TU / MOD names
+preserve spaces, `+`, and other printable symbols (id stays sanitised
+for GenBank LOCUS validity, but the user-facing `name` field carries
+the typed string verbatim); NamePlasmidModal's live-dup-check status
+line and the rename Label now `rich.markup.escape` every user-
+controlled string so a saved entry like `TU [draft]` can't break the
+markup parser.
+
+### Fixed: rename no longer freezes the UI
+
+- `_rename_library_entry` updates the in-memory `_library_cache`
+  synchronously (panel + title bar refresh instantly), then
+  dispatches the actual disk write to a `@work(exclusive=True,
+  group="rename_save")` worker. With a 156 MB plasmid_library.json
+  + 160 MB collections.json mirror, the sync save was burning
+  ~600 MB of disk I/O (including `.bak` rotation) on every rename
+  — 5-15 s of frozen UI. The async path keeps the rename feel
+  instant; the disk catches up in the background.
+- Exclusive group on the worker means rapid back-to-back renames
+  cancel the in-flight write; the second worker's `entries`
+  already includes both renames (cache updated sync between
+  mutations), so the cumulative state still lands on disk.
+
+### Fixed: spaces and `+` survive in saved display names
+
+- `_persist_assembly` (Constructor TU / MOD save) gained a
+  `display_name` parameter; both `lib_entry["name"]` and
+  `bin_entry["name"]` use it. SeqRecord `.id` / `.name` stay
+  sanitised so the GenBank LOCUS line is valid, but the library /
+  parts-bin display name carries the user's typed string verbatim.
+  History XML's parent-label also uses the display name.
+- `LibraryPanel.add_entry` (Ctrl+Shift+A) reads
+  `record._tui_display_name` if set (re-saving an already-loaded
+  entry no longer downgrades "MAV 32 + Test" to the sanitised
+  LOCUS form).
+- `LoadPartSourceModal._resolve_match_to_record` stashes the
+  library entry's `name` on the picked record as
+  `_tui_display_name`. The Load Part worker (single + bulk) reads
+  it so parts-bin entries inherit the user-typed name instead of
+  the sanitised LOCUS.
+- Existing path / control-char sanitisation in
+  `_sanitize_plasmid_name` is untouched — `/`, `\`, NUL, and C0
+  control chars are still stripped before any name reaches the
+  persist layer.
+
+### Added: title bar + map header show the typed display name on reload
+
+- New `PlasmidApp._record_display_name(record)` helper reads
+  `_tui_display_name` (stashed on every library-load path) with a
+  fallback to `record.name` for unsaved records.
+- Three callsites updated: plasmid map circular header (`_draw`),
+  linear flag header (`_draw_linear_flag`), and window title in
+  `_mark_dirty` / `_mark_clean`. Reload "MAV 32 + Test" from the
+  library and every visible header reads it back exactly as
+  typed — the underscored LOCUS form lives on the on-disk file
+  only.
+- `_rename_library_entry` also updates the loaded record's
+  `_tui_display_name` so the title bar reflects the rename
+  immediately.
+
+### Hardened: Rich markup injection in NamePlasmidModal + RenamePlasmidModal
+
+- `NamePlasmidModal._refresh_dup_state` now `rich.markup.escape`s
+  every user-controlled string (existing entry names, soft-hit
+  list, the cleaned-input preview) before interpolating into the
+  `Static(markup=True)` status line. Without this, a library
+  entry called `TU [draft]` would render `[draft]` as a malformed
+  Rich-markup tag.
+- `RenamePlasmidModal` escapes `current_name` before passing it
+  to the "Current name:" Label. Same hygiene that the History
+  viewer (invariant #11) already follows.
+- New test `test_markup_chars_in_existing_name_dont_break_status`
+  guards.
+
+### Added: live dup-check is more sensitive
+
+- Three severity tiers replace the prior exact-only check:
+  * **Exact** case-folded name OR sanitised-id match → bold red
+    `✗ DUPLICATE` + Save disabled.
+  * **Substring** match in either direction (typed name is a
+    substring of an existing entry, or vice versa, and not an
+    exact match) → yellow `⚠ similar to: ...` (up to 3) + Save
+    enabled. Catches "MAV 32" while you're typing "MAV 32 V2"
+    without blocking the legit distinct name.
+  * **Available** → bold green `✓ Name available`.
+- Cleaning-hint preview ("will save as: X") shows as the user
+  types, replacing the prior 2-press confirmation cycle.
+- Reference table below the input lists every library entry in
+  the active collection (natural-sorted; dim placeholder when
+  empty) so the user can scan for collisions at a glance.
+
+### Tests
+
+- 5 new tests for `PlasmidApp._record_display_name` (precedence:
+  `_tui_display_name` > `record.name` > `record.id` > `"?"`;
+  whitespace-only stash falls through).
+- 4 new tests for `NamePlasmidModal` (existing library listed,
+  empty-library placeholder, substring soft warning, markup chars
+  don't break status).
+
+---
+
 ## [0.7.15.0] — 2026-05-12 — Multi-bin parts + GB classifier rewrite + naming-modal duplicate guard
 
 Five threads land in this release: multi-bin parts storage (mirrors the

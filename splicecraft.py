@@ -9784,7 +9784,12 @@ class PlasmidMap(Widget):
                 self._label_bboxes.append((lbl_x0, lbl_x1, ly, feat_idx))
 
         # ── Center info ───────────────────────────────────────────────────────
-        name     = (self.record.name or self.record.id or "?")[:w // 3]
+        # Prefer the user-typed display name (stashed by `_library_load`
+        # as `_tui_display_name`) so spaces and `+` survive the round-
+        # trip through the GenBank LOCUS sanitiser. Falls back to
+        # `record.name` for fresh records that haven't been saved yet.
+        name     = (getattr(self.record, "_tui_display_name", None)
+                    or self.record.name or self.record.id or "?")[:w // 3]
         size_txt = f"{total:,} bp"
         orig_txt = f"▲ {self.origin_bp:,}"
         for i, (txt, sty) in enumerate([
@@ -10122,7 +10127,10 @@ class PlasmidMap(Widget):
             )
 
         # ── Header ──
-        name = (self.record.name or self.record.id or "?")[:w // 3]
+        # Same display-name preference as the circular header (see
+        # `_draw` for rationale).
+        name = (getattr(self.record, "_tui_display_name", None)
+                or self.record.name or self.record.id or "?")[:w // 3]
         canvas.put_text(margin_l, 0, f"{name}  {total:,} bp", "bold white")
         hint = "[ flag  ·  v = circular ]"
         canvas.put_text(w - len(hint) - 1, 0, hint, "dim")
@@ -11457,8 +11465,19 @@ class LibraryPanel(Widget):
                 prev_status = _sanitize_plasmid_status(e.get("status"))
                 break
         entries = [e for e in entries if e.get("id") != record.id]
+        # Prefer the user-typed display name (stashed by `_library_load`
+        # / Constructor save) so re-saving an already-loaded entry
+        # doesn't downgrade "MAV 32 + Test" to the sanitised LOCUS form.
+        # Fresh records (never opened via library) fall back to
+        # `record.name` which is the LOCUS — only ever underscored when
+        # the source file's LOCUS was underscored, so this preserves
+        # GenBank-format names that happen to be space-free.
+        display_name = (
+            getattr(record, "_tui_display_name", None)
+            or record.name or record.id
+        )
         entries.insert(0, {
-            "name":    record.name or record.id,
+            "name":    display_name,
             "id":      record.id,
             "size":    len(record.seq),
             "n_feats": len([f for f in record.features if f.type != "source"]),
@@ -32404,8 +32423,15 @@ class PartsBinModal(Screen):
                 if not circular:
                     continue
                 seq = str(record.seq).upper()
+                # Prefer the library entry's display name (stashed by
+                # `LoadPartSourceModal._resolve_match_to_record`) so
+                # parts-bin entries carry "MAV 32 + Test" instead of
+                # the sanitised LOCUS form. Falls back to record.name
+                # for Open-file… records where no library entry name
+                # exists.
                 plasmid_name = (
-                    getattr(record, "name", "")
+                    getattr(record, "_tui_display_name", None)
+                    or getattr(record, "name", "")
                     or getattr(record, "id", "")
                     or "imported"
                 )
@@ -37498,6 +37524,7 @@ class ConstructorModal(ModalScreen):
                 new_rec, gid, source_level=source_level,
                 entry_vector=entry_vector, parts=parts,
                 backbone_role=bb_key,
+                display_name=name,
             )
         except Exception as exc:
             _log.exception("Save To Library: persist failed")
@@ -37646,12 +37673,25 @@ class ConstructorModal(ModalScreen):
                             source_level: int,
                             entry_vector: dict,
                             parts: list[dict],
-                            backbone_role: str) -> str:
+                            backbone_role: str,
+                            display_name: "str | None" = None) -> str:
         """Add the newly-cloned plasmid to plasmid_library.json AND
         mirror a parts-bin entry so the result can be picked from the
         L1+ assembly palette in subsequent cycles. Both go through
         their respective `_save_*` helpers (sacred invariant #7 — no
         bypassing `_safe_save_json`).
+
+        ``display_name`` carries the user's original typed name (with
+        spaces, ``+``, and other non-path-injection symbols preserved)
+        so it lands as-is in the library row and the Parts Bin name
+        column. The SeqRecord's `.id` / `.name` stay sanitised (no
+        spaces) because the GenBank LOCUS line can't carry whitespace
+        — but those fields are technical / persistence-layer; the
+        library entry's `name` field is the user-facing display string
+        and we use the typed name there. Falls back to the sanitised
+        id when no display_name is supplied (back-compat for callers
+        that haven't been updated to thread the typed name through —
+        currently none, but defensive).
 
         Returns the disambiguated library id of the new plasmid so
         the caller can focus it in the LibraryPanel after save."""
@@ -37676,10 +37716,22 @@ class ConstructorModal(ModalScreen):
             _all_grammars().get(gid)
             or _BUILTIN_GRAMMARS.get("gb_l0", {})
         )
+        # Resolve the user-facing display name. `display_name` from the
+        # caller takes precedence; fall back to the sanitised id so
+        # legacy callers + edge cases never produce an empty name.
+        # 2026-05-13: pre-fix this read `new_rec.id` directly, which
+        # had every space + `+` flattened to underscores. The typed
+        # name now flows through unchanged so library rows show
+        # "MAV 32 O1MOD FuGFP+RUBY" exactly the way the user spelled it.
+        final_display_name = (
+            display_name.strip()
+            if isinstance(display_name, str) and display_name.strip()
+            else (new_rec.id or new_rec.name or unique_id)
+        )
         from datetime import date
         lib_entry = {
             "id":      unique_id,
-            "name":    new_rec.id or new_rec.name or unique_id,
+            "name":    final_display_name,
             "size":    len(new_rec.seq),
             "n_feats": len(new_rec.features or []),
             "source":  f"constructor:{gid}:{backbone_role}",
@@ -37695,7 +37747,7 @@ class ConstructorModal(ModalScreen):
         # — failures log + drop the field rather than block the save.
         try:
             history_xml = self._build_history_for_assembly(
-                name=new_rec.id or new_rec.name or unique_id,
+                name=final_display_name,
                 product_seq_len=len(new_rec.seq),
                 gid=gid, grammar=grammar_for_digest,
                 entry_vector=entry_vector, parts=parts,
@@ -37763,7 +37815,7 @@ class ConstructorModal(ModalScreen):
                 next_oh5, next_oh3,
             )
         bin_entry = {
-            "name":     new_rec.id or new_rec.name or unique_id,
+            "name":     final_display_name,
             "type":     target_label,
             "position": target_label,
             "oh5":      next_oh5,
@@ -42281,12 +42333,23 @@ class LoadPartSourceModal(ModalScreen):
         # Stash the ORIGINAL gb_text on the record so the caller can
         # forward it to the worker without paying for a parse →
         # serialise round-trip. Mirrors OpenFileModal's _tui_source
-        # convention.
+        # convention. ALSO stash the library entry's display name
+        # so the part the worker writes into the parts bin carries
+        # the user-typed name (with spaces / `+` preserved) instead
+        # of the sanitised LOCUS form `record.name` falls back to.
         try:
             record._tui_gb_text = gb_text
         except Exception:
             _log.debug(
                 "LoadPartSourceModal: couldn't stash gb_text on record",
+            )
+        try:
+            display = (entry.get("name") or "").strip()
+            if display:
+                record._tui_display_name = display
+        except Exception:
+            _log.debug(
+                "LoadPartSourceModal: couldn't stash display name",
             )
         return record, None
 
@@ -43631,6 +43694,16 @@ class NamePlasmidModal(ModalScreen):
 
     @on(Input.Changed, "#nameplasmid-input")
     def _on_input_changed(self, event: Input.Changed) -> None:
+        # Live dup-check on every keystroke. `event.value` is the
+        # post-keystroke string. Status-line update covers exact
+        # match (red) AND substring near-miss (yellow) — see
+        # `_refresh_dup_state` for the policy. The reference table
+        # below the Input stays unfiltered so the user can scan all
+        # existing names regardless of what they've typed.
+        _log.debug(
+            "NamePlasmidModal: Input.Changed value=%r len(value)=%d",
+            event.value, len(event.value),
+        )
         self._refresh_dup_state(event.value)
 
     def _refresh_dup_state(self, raw_value: str) -> "str | None":
@@ -43639,6 +43712,17 @@ class NamePlasmidModal(ModalScreen):
         the cleaned name when valid + non-duplicate, else ``None``.
         Centralised so `on_mount`, `Input.Changed`, and `_try_submit`
         all see consistent state without re-implementing the logic.
+
+        Three severity levels:
+          * **Exact dup** (case-folded name OR sanitised id matches an
+            existing entry) → red status, Save disabled.
+          * **Soft warning** (typed string is a substring of an
+            existing name, OR an existing name is a substring of the
+            typed string) → yellow status, Save enabled. User has to
+            confirm by pressing Save anyway — soft warnings catch
+            near-misses without blocking legitimate distinct names
+            that happen to share a prefix.
+          * **Available** → green status, Save enabled.
         """
         try:
             status = self.query_one("#nameplasmid-status", Static)
@@ -43651,15 +43735,26 @@ class NamePlasmidModal(ModalScreen):
             raw_value, fallback=self._default_name,
         )
         if not cleaned:
-            status.update("[red]Name cannot be empty.[/red]")
+            status.update("[bold red]Name cannot be empty.[/bold red]")
             save_btn.disabled = True
             return None
+        # Markup-escape every user-controlled string that interpolates
+        # into a `markup=True` Static. Without this, a saved entry
+        # named "TU [draft]" would render the trailing "[draft]" as a
+        # Rich-markup tag — visually broken at best, malformed-string
+        # exception at worst. Sacred hygiene rule the History viewer
+        # already follows (CLAUDE.md invariant #11). `cleaned` itself
+        # comes from `_sanitize_plasmid_name` which strips paths and
+        # control chars BUT preserves `[`, `]`, `<`, `>`, `&` so the
+        # display side has to escape.
+        from rich.markup import escape as _md_escape
+        cleaned_safe = _md_escape(cleaned)
         # Cleaning-only mismatch (whitespace / illegal chars stripped).
         # Not an error — surface as info so the user can confirm.
         cleaning_hint = ""
         if cleaned != raw_value.strip():
             cleaning_hint = (
-                f" [yellow](will save as[/yellow] [b]{cleaned}[/b]"
+                f" [yellow](will save as[/yellow] [b]{cleaned_safe}[/b]"
                 f"[yellow])[/yellow]"
             )
         # Case-fold for matching — typing "Mav 26" still flags the
@@ -43669,27 +43764,51 @@ class NamePlasmidModal(ModalScreen):
         cleaned_id = re.sub(r"[^A-Za-z0-9_]+", "_", cleaned)
         cleaned_id_cf = cleaned_id.casefold()
         if cleaned_cf in self._existing_names:
-            actual = self._existing_names[cleaned_cf]
+            actual = _md_escape(self._existing_names[cleaned_cf])
             status.update(
-                f"[red]Already in use:[/red] [b]{actual}[/b]"
-                f"{cleaning_hint}"
+                f"[bold red]✗ DUPLICATE — already in use:[/bold red] "
+                f"[b]{actual}[/b]{cleaning_hint}"
             )
             save_btn.disabled = True
             return None
         if cleaned_id_cf in self._existing_ids:
-            actual = self._existing_ids[cleaned_id_cf]
+            actual = _md_escape(self._existing_ids[cleaned_id_cf])
             status.update(
-                f"[red]Name conflicts with existing id[/red] "
+                f"[bold red]✗ DUPLICATE — id conflicts with[/bold red] "
                 f"[b]{actual}[/b] (would auto-rename on save){cleaning_hint}"
             )
             save_btn.disabled = True
             return None
+        # Soft warning: substring overlap with an existing name.
+        # Either direction matters — a user typing "MAV 32" sees the
+        # existing "MAV 32 O1MOD" as a near-match, and a user typing
+        # "MAV 32 NEW CDS" sees the existing "MAV 32" as a near-match.
+        # Save stays enabled — the names are distinct so the user can
+        # legitimately commit. Just keeps near-misses visible.
+        soft_hits: list[str] = []
+        for existing_name in self._existing_names.values():
+            ecf = existing_name.casefold()
+            if (cleaned_cf in ecf or ecf in cleaned_cf) \
+                    and cleaned_cf != ecf:
+                soft_hits.append(existing_name)
+                if len(soft_hits) >= 3:
+                    break
+        if soft_hits:
+            preview = ", ".join(
+                f"[b]{_md_escape(n)}[/b]" for n in soft_hits[:3]
+            )
+            status.update(
+                f"[yellow]⚠ similar to:[/yellow] {preview}"
+                f"{cleaning_hint}"
+            )
+            save_btn.disabled = False
+            return cleaned
         if cleaning_hint:
             status.update(
-                f"[yellow]Will save as[/yellow] [b]{cleaned}[/b]"
+                f"[yellow]Will save as[/yellow] [b]{cleaned_safe}[/b]"
             )
         else:
-            status.update("[dim green]✓ Name available.[/dim green]")
+            status.update("[bold green]✓ Name available.[/bold green]")
         save_btn.disabled = False
         return cleaned
 
@@ -43753,9 +43872,17 @@ class RenamePlasmidModal(ModalScreen):
         self.entry_id     = entry_id
 
     def compose(self) -> ComposeResult:
+        from rich.markup import escape as _md_escape
         with Vertical(id="rename-dlg"):
             yield Static(" Rename plasmid ", id="rename-title")
-            yield Label(f"Current name:  {self.current_name}")
+            # Escape — `current_name` is user-controlled and Label
+            # interprets Rich markup by default, so a name like
+            # "TU [draft]" would otherwise eat the trailing bracket
+            # as a malformed tag. Same hygiene as NamePlasmidModal's
+            # status line + the History viewer's parent-name render.
+            yield Label(
+                f"Current name:  {_md_escape(self.current_name)}",
+            )
             yield Label("New name:")
             yield Input(
                 value=self.current_name,
@@ -49219,11 +49346,30 @@ SpeciesPickerModal { align: center middle; }
 
     # ── Dirty-state helpers ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _record_display_name(record) -> str:
+        """User-facing display name for a SeqRecord — preserves
+        spaces / ``+`` / etc. from the typed name the user gave
+        when the entry was saved.
+
+        Reads `record._tui_display_name` (stashed when loading from
+        library) with a fallback to `record.name` (sanitised LOCUS).
+        New records that were never saved fall through to `.name`
+        which is fine — they don't have a typed name yet.
+        """
+        if record is None:
+            return "?"
+        display = getattr(record, "_tui_display_name", None)
+        if isinstance(display, str) and display.strip():
+            return display.strip()
+        return record.name or record.id or "?"
+
     def _mark_dirty(self) -> None:
         self._unsaved = True
         if self._current_record:
             n = len(self._current_record.seq)
-            self.title = f"SpliceCraft — *{self._current_record.name}  ({n:,} bp)"
+            display = self._record_display_name(self._current_record)
+            self.title = f"SpliceCraft — *{display}  ({n:,} bp)"
         try:
             self.query_one("#library", LibraryPanel).set_dirty(True)
         except NoMatches:
@@ -49234,7 +49380,8 @@ SpeciesPickerModal { align: center middle; }
         self._unsaved = False
         if self._current_record:
             n = len(self._current_record.seq)
-            self.title = f"SpliceCraft — {self._current_record.name}  ({n:,} bp)"
+            display = self._record_display_name(self._current_record)
+            self.title = f"SpliceCraft — {display}  ({n:,} bp)"
         try:
             self.query_one("#library", LibraryPanel).set_dirty(False)
         except NoMatches:
@@ -51728,6 +51875,22 @@ SpeciesPickerModal { align: center middle; }
             return
         try:
             record = _gb_text_to_record(gb_text)
+            # Stash the library entry's display name on the record so
+            # title bars + map headers can show the user's typed
+            # version (e.g., "MAV 32 + Test") instead of the sanitised
+            # GenBank LOCUS (e.g., "MAV_32___Test"). GenBank
+            # serialisation never reads `_tui_display_name`; round-trip
+            # via `_record_to_gb_text` still uses `record.name`. Same
+            # `_tui_*` private-attribute convention as `_tui_gb_text`
+            # and `_tui_source`.
+            display = event.entry.get("name")
+            if isinstance(display, str) and display.strip():
+                try:
+                    record._tui_display_name = display.strip()
+                except Exception:
+                    _log.debug(
+                        "library_load: couldn't stash _tui_display_name",
+                    )
             self._apply_record(record)
         except Exception as exc:
             _log.exception("Library load failed for entry %r",
@@ -52189,6 +52352,17 @@ SpeciesPickerModal { align: center middle; }
         if (self._current_record is not None
                 and self._current_record.id == entry_id):
             self._current_record.name = new_name
+            # Update the display-name stash too so the title bar +
+            # map header reflect the rename. Without this, the cached
+            # `_tui_display_name` from the prior library load lingers
+            # and the title bar shows the old name until reload.
+            try:
+                self._current_record._tui_display_name = new_name
+            except Exception:
+                _log.debug(
+                    "rename: couldn't update _tui_display_name on "
+                    "current record",
+                )
             try:
                 pm = self.query_one("#plasmid-map", PlasmidMap)
             except NoMatches:
