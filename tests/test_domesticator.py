@@ -1083,7 +1083,11 @@ class TestParseFastaSingle:
             sc._parse_fasta_single(str(p))
 
     def test_nonexistent_path_raises(self, tmp_path):
-        with pytest.raises(ValueError, match="Failed to read FASTA"):
+        # Post-2026-05-14 audit fix: `_parse_fasta_single` now runs
+        # `_safe_file_size_check` upfront, so a missing path surfaces
+        # as a "could not stat" ValueError (faster than letting SeqIO
+        # discover the missing file and reformat the error).
+        with pytest.raises(ValueError, match="could not stat|Failed to read"):
             sc._parse_fasta_single(str(tmp_path / "does-not-exist.fa"))
 
     def test_non_iupac_chars_rejected(self, tmp_path):

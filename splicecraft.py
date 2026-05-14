@@ -12002,12 +12002,24 @@ class LibraryPanel(Widget):
     def _repopulate(self) -> None:
         # Re-measure the longest name on every repopulate — content
         # can change underfoot via add/remove/rename, library load,
-        # or collection swap.
-        self._apply_panel_width()
+        # or collection swap. Pre-fix (audit HIGH-2, 2026-05-14)
+        # `_apply_panel_width` and the per-view repopulate methods
+        # each independently called `_compute_name_col_width`, which
+        # fired `_load_library() + _load_collections()` twice (three
+        # `_typed_clone`s per repop). Now: load each once, compute
+        # the width once, pass both into the per-view methods.
+        lib_entries = _load_library()
+        coll_entries = _load_collections()
+        name_w = self._compute_name_col_width(lib_entries, coll_entries)
+        self._apply_panel_width(name_w)
         if self._view_mode == "collections":
-            self._repopulate_collections()
+            self._repopulate_collections(
+                name_w=name_w, coll_entries=coll_entries,
+            )
         else:
-            self._repopulate_plasmids()
+            self._repopulate_plasmids(
+                name_w=name_w, lib_entries=lib_entries,
+            )
 
     # Column-width budget. The panel itself is fixed-width (CSS), so
     # these only size the columns inside the DataTable; columns wider
@@ -12021,7 +12033,11 @@ class LibraryPanel(Widget):
     _STATUS_COL_W    = 12
     _BP_COL_W        = 9
 
-    def _compute_name_col_width(self) -> int:
+    def _compute_name_col_width(
+            self,
+            lib_entries: "list[dict] | None" = None,
+            coll_entries: "list[dict] | None" = None,
+    ) -> int:
         """Longest plasmid + collection name in cells, clamped to
         `[_NAME_COL_FLOOR, _NAME_COL_CEIL]`. Both DataTables share
         this so the two views stay visually aligned when the user
@@ -12032,13 +12048,22 @@ class LibraryPanel(Widget):
         names don't shift left/right when the user assigns a
         status. Collection names skip the circle but are still
         sized against the same width so the panel doesn't reflow.
+
+        Callers pre-loading the library / collections for a
+        repopulate cycle can pass them as args to avoid the duplicate
+        `_typed_clone` cost; standalone callers (rare) fall back to
+        a fresh load.
         """
+        if lib_entries is None:
+            lib_entries = _load_library()
+        if coll_entries is None:
+            coll_entries = _load_collections()
         max_name = 0
-        for entry in _load_library():
+        for entry in lib_entries:
             n = len(str(entry.get("name") or entry.get("id") or ""))
             if n > max_name:
                 max_name = n
-        for c in _load_collections():
+        for c in coll_entries:
             n = len(str(c.get("name") or ""))
             if n > max_name:
                 max_name = n
@@ -12046,13 +12071,20 @@ class LibraryPanel(Widget):
         return max(self._NAME_COL_FLOOR,
                     min(max_name + 2, self._NAME_COL_CEIL))
 
-    def _apply_panel_width(self) -> None:
+    def _apply_panel_width(self, name_w: "int | None" = None) -> None:
         """Resize the plasmid DataTable's name column to fit the
         longest current entry. The panel itself is fixed-width via
         CSS — pre-2026-05-06 this method also grew the panel to fit
         the longest name, which ate map real estate; now over-wide
-        column content scrolls horizontally inside the table."""
-        name_w = self._compute_name_col_width()
+        column content scrolls horizontally inside the table.
+
+        ``name_w`` is the pre-computed width when called from
+        `_repopulate` (avoiding a duplicate `_compute_name_col_width`
+        invocation); legacy callers without the arg get the fresh
+        compute.
+        """
+        if name_w is None:
+            name_w = self._compute_name_col_width()
         # Resize the column itself so the rendered name occupies
         # the new width. Textual's DataTable uses content-driven
         # auto-sizing by default, so explicit column widths keep
@@ -12066,15 +12098,22 @@ class LibraryPanel(Widget):
         except (NoMatches, AttributeError, StopIteration):
             pass
 
-    def _repopulate_collections(self) -> None:
+    def _repopulate_collections(
+            self,
+            name_w: "int | None" = None,
+            coll_entries: "list[dict] | None" = None,
+    ) -> None:
         t = self.query_one("#lib-coll-table", DataTable)
         t.clear()
         flt = self._filter_text
-        name_w = self._compute_name_col_width()
+        if coll_entries is None:
+            coll_entries = _load_collections()
+        if name_w is None:
+            name_w = self._compute_name_col_width(coll_entries=coll_entries)
         # Natural sort by display name so `Backbones 2`, `Backbones 10`
         # land in human-readable order instead of lexicographic
         # `Backbones 10`, `Backbones 2`.
-        for c in sorted(_load_collections(),
+        for c in sorted(coll_entries,
                          key=lambda x: _natural_sort_key(x.get("name") or "")):
             name = c.get("name") or "?"
             if not _fuzzy_match(flt, name):
@@ -12085,11 +12124,18 @@ class LibraryPanel(Widget):
             # opaque to Rich's markup parser, unlike a bare string.
             t.add_row(Text(name[:name_w]), str(n_plas), key=name)
 
-    def _repopulate_plasmids(self) -> None:
+    def _repopulate_plasmids(
+            self,
+            name_w: "int | None" = None,
+            lib_entries: "list[dict] | None" = None,
+    ) -> None:
         t = self.query_one("#lib-table", DataTable)
         t.clear()
         flt = self._filter_text
-        name_w = self._compute_name_col_width()
+        if lib_entries is None:
+            lib_entries = _load_library()
+        if name_w is None:
+            name_w = self._compute_name_col_width(lib_entries=lib_entries)
         # Inner name budget after the 2-cell circle prefix is
         # reserved on every plasmid row.
         name_inner = max(1, name_w - 2)
@@ -12178,18 +12224,53 @@ class LibraryPanel(Widget):
             "gb_text": gb_text,
             "status":  prev_status,
         })
-        try:
-            _save_library(entries)
-        except (OSError, RuntimeError) as exc:
-            # Disk-full / RO-mount / EACCES bubbles from `_save_library`
-            # per invariant #7. Surface to the user rather than letting
-            # a raw stacktrace exit the key-press handler.
-            _notify_save_failure(self.app, "Plasmid library", exc)
-            return False
+        # Sync-cache + async-disk pattern (mirrors `_delete_save_to_disk`
+        # added in 0.7.15.1 for delete; HIGH-1 audit finding 2026-05-14
+        # extends it to add). Updating `_library_cache` synchronously
+        # means the panel repopulate immediately below sees the new
+        # entry; the disk write fires off-thread so a 100+ MB
+        # plasmid_library.json save doesn't freeze the UI for 5–8 s.
+        global _library_cache
+        _library_cache = _typed_clone(entries)
+        _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+        if _clear_primer_cache is not None:
+            _clear_primer_cache()
         if self._view_mode == "plasmids":
             self._apply_panel_width()
             self._repopulate_plasmids()
+        # Disk write off-thread. Failure surfaces via
+        # `_notify_save_failure` from inside the worker — the caller's
+        # `True` return now means "cache updated + disk dispatched",
+        # matching the delete path's contract.
+        self._add_save_to_disk(entries)
         return True
+
+    @work(thread=True, exclusive=True, group="library_add_save")
+    def _add_save_to_disk(self, entries: "list[dict]") -> None:
+        """Worker: persist an add_entry off-thread.
+
+        Mirrors `_delete_save_to_disk`. Disk save + active-collection
+        mirror (the latter via ``async_write=True`` so back-to-back
+        adds coalesce into a single mirror write). Cache update
+        already happened on the UI thread before dispatch.
+        """
+        try:
+            _safe_save_json(
+                _LIBRARY_FILE, entries, "Plasmid library",
+            )
+        except (OSError, RuntimeError) as exc:
+            _log.exception("Plasmid add: library save failed")
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Plasmid library", exc,
+            )
+            return
+        try:
+            _sync_active_collection_plasmids(entries, async_write=True)
+        except Exception:
+            _log.exception(
+                "Plasmid add: active-collection mirror dispatch failed",
+            )
 
     def reveal_entry_id(self, entry_id: str) -> None:
         """Switch to the plasmids view, repopulate, and move the
@@ -18244,7 +18325,7 @@ class OpenFileModal(ModalScreen):
             pass
         self._do_load(path)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="file_open_load")
     def _do_load(self, path: str) -> None:
         """Background loader: dispatches by file extension + record count.
 
@@ -23911,10 +23992,17 @@ def _load_feature_colors() -> dict[str, str]:
     """Return the user's customised type → color map. Missing file / empty
     entries → empty dict. Callers should combine this with
     ``_DEFAULT_TYPE_COLORS`` — that precedence is handled by
-    ``_resolve_feature_color``."""
+    ``_resolve_feature_color``.
+
+    Uses ``_typed_clone`` on read so the cache contract matches every
+    other library (invariant #17). Values are ``str`` (immutable) today,
+    so the practical risk is nil — but using the canonical helper keeps
+    the pattern honest in case a future schema bump adds a nested
+    structure to the value side.
+    """
     global _feature_colors_cache
     if _feature_colors_cache is not None:
-        return dict(_feature_colors_cache)
+        return _typed_clone(_feature_colors_cache)
     entries, warning = _safe_load_json(_FEATURE_COLORS_FILE, "Feature colors")
     if warning:
         _log.warning(warning)
@@ -23926,19 +24014,24 @@ def _load_feature_colors() -> dict[str, str]:
         col = e.get("color")
         if isinstance(ft, str) and ft and isinstance(col, str) and col:
             result[ft] = col
-    _feature_colors_cache = dict(result)
-    return dict(_feature_colors_cache)
+    _feature_colors_cache = _typed_clone(result)
+    return _typed_clone(_feature_colors_cache)
 
 
 def _save_feature_colors(mapping: dict[str, str]) -> None:
     """Persist the type → color map. Written as a list of ``{"feature_type":
     ..., "color": ...}`` dicts so it shares the schema-envelope shape with
-    the other libraries (sacred invariant #7)."""
+    the other libraries (sacred invariant #7).
+
+    Re-seats the cache via ``_typed_clone`` so a caller that keeps
+    mutating its mapping after the save doesn't leak post-save edits
+    into the next reader (invariant #17, full deepcopy-on-save side).
+    """
     global _feature_colors_cache
     entries = [{"feature_type": ft, "color": col}
                for ft, col in mapping.items()]
     _safe_save_json(_FEATURE_COLORS_FILE, entries, "Feature colors")
-    _feature_colors_cache = dict(mapping)
+    _feature_colors_cache = _typed_clone(mapping)
 
 
 def _resolve_feature_color(entry: dict) -> str:
@@ -24208,7 +24301,14 @@ def _codon_tables_load() -> list[dict]:
             "raw":    dict(_CODON_BUILTIN_K12),
         })
         _codon_tables_cache = fixed
-        _codon_tables_save(fixed)
+        # Module-level seed path — no `app` context to notify. Log-only
+        # so a disk-full first launch surfaces in the log bundle and
+        # the cache (in memory) still has the K12 seed.
+        try:
+            _codon_tables_save(fixed)
+        except (OSError, RuntimeError):
+            _log.exception("Codon tables: K12 seed save failed (in-memory "
+                           "cache populated; disk write deferred)")
     else:
         _codon_tables_cache = fixed
     return _typed_clone(_codon_tables_cache)
@@ -25758,10 +25858,8 @@ class AddFeatureModal(ModalScreen):
                 defaults[ftype] = new_col
                 try:
                     _save_feature_colors(defaults)
-                except (OSError, ValueError) as exc:
-                    _log.exception("Saving type-default color failed")
-                    self.notify(f"Saving default failed: {exc}",
-                                severity="error")
+                except (OSError, RuntimeError) as exc:
+                    _notify_save_failure(self.app, "Feature colors", exc)
             self._refresh_color_swatch()
 
         self.app.push_screen(ColorPickerModal(ftype, self._color),
@@ -29318,7 +29416,7 @@ class BlastModal(ModalScreen):
         )
         self._do_build(prog, col_filter)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="blast_run")
     def _do_build(self, prog: str,
                   col_filter: "list[str] | None") -> None:
         six_frame = (prog == "blastp" and self._six_frame_active())
@@ -30826,9 +30924,19 @@ class GrammarEditorModal(ModalScreen):
         """Persist + refresh the entry-vector row. Persisting via
         `_set_entry_vector` immediately means the choice survives a
         Cancel on the rest of the grammar editor — entry vectors are
-        a separate concern from the (mutable) grammar definition."""
+        a separate concern from the (mutable) grammar definition.
+
+        Audit fix 2026-05-14: wraps the bare `_set_entry_vector` call
+        so a disk-full / RO-mount / EACCES surfaces as a friendly
+        toast via `_notify_save_failure` (invariant #7) rather than
+        bubbling up as an uncaught OSError into Textual's crash dialog.
+        """
         self._entry_vector = vector
-        _set_entry_vector(self._grammar_id, vector)
+        try:
+            _set_entry_vector(self._grammar_id, vector)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Entry vectors", exc)
+            return
         self._refresh_entry_row()
 
     @on(Button.Pressed, "#btn-ged-entry-lib")
@@ -30957,9 +31065,8 @@ class GrammarEditorModal(ModalScreen):
             return
         try:
             _save_custom_grammars(new_entries)
-        except (OSError, ValueError) as exc:
-            _log.exception("Grammar delete failed")
-            self.app.notify(f"Delete failed: {exc}", severity="error")
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Custom grammars", exc)
             return
         # Clear EVERY entry-vector binding for the deleted grammar
         # (Constructor's Alpha1/Alpha2/Omega1/Omega2 + the default
@@ -31491,11 +31598,8 @@ class GrammarManagerModal(ModalScreen):
             new_entries = [e for e in entries_now if e.get("id") != gid]
             try:
                 _save_custom_grammars(new_entries)
-            except (OSError, ValueError) as exc:
-                _log.exception("Grammar delete failed")
-                self.app.notify(
-                    f"Delete failed: {exc}", severity="error",
-                )
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Custom grammars", exc)
                 return
             # Clear EVERY entry-vector binding (Alpha1/Alpha2/Omega1/
             # Omega2 / etc.) keyed to this grammar id so a stale
@@ -33254,12 +33358,8 @@ class PartsBinModal(Screen):
                 return
             try:
                 _save_parts_bin(updated)
-            except Exception as exc:
-                _log.exception("parts-bin: edit save failed")
-                self.app.notify(
-                    f"Edit save failed: {exc}",
-                    severity="error", markup=False,
-                )
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Parts bin", exc)
                 return
             self._populate()
             self.app.notify(
@@ -33394,7 +33494,7 @@ class PartsBinModal(Screen):
 
         self.app.push_screen(LoadPartSourceModal(), callback=_on_picked)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="parts_bin_load")
     def _load_parts_bulk_worker(
         self,
         payloads: "list[tuple[str, list, str, str]]",
@@ -33538,12 +33638,18 @@ class PartsBinModal(Screen):
                 _log.warning("Load Parts (bulk): %s", entry)
         self.app.call_from_thread(_summary)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="parts_bin_load")
     def _load_part_worker(self, seq: str, feats: list,
                           plasmid_name: str, gb_text: str) -> None:
         """Worker body for `_load_part`. Classifies the plasmid against
         every grammar (the slow step — N digests in series), saves to
         the parts bin, and bounces back to the UI thread for the
+
+        Shares the `parts_bin_load` group with `_load_parts_bulk_worker`
+        so a click+bulk-click race coalesces into the latest dispatch;
+        without `exclusive=True` both workers could race the same
+        `_save_parts_bin` write and leave the in-memory cache
+        reflecting the loser's snapshot (audit fix 2026-05-14).
         repopulate + notify."""
         try:
             match = _classify_part_from_plasmid(
@@ -34066,12 +34172,8 @@ class PartsBinModal(Screen):
             n_removed = len(entries) - len(kept)
             try:
                 _save_parts_bin(kept)
-            except Exception as exc:
-                _log.exception("parts-bin: delete failed")
-                self.app.notify(
-                    f"Delete failed: {exc}",
-                    severity="error", markup=False,
-                )
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Parts bin", exc)
                 return
             extras: list[str] = []
             if skipped_for_toast:
@@ -34148,8 +34250,21 @@ def _parse_fasta_single(path: str) -> tuple[str, str]:
     (read errors, zero records, multiple records, empty or non-IUPAC
     sequence). The sequence is upper-cased on success and validated
     against the IUPAC alphabet plus ``-``/``*``/``X`` for gap / stop /
-    unknown."""
+    unknown.
+
+    Size + symlink guard via ``_safe_file_size_check`` matches the
+    `OpenFileModal` ingest pattern: rejects symlinks outright and
+    refuses files larger than ``_BULK_IMPORT_MAX_BYTES`` (50 MB) so a
+    multi-GB FASTA piped into the Domesticator's picker doesn't OOM
+    the worker. Single-record FASTAs at the 50 MB ceiling already
+    represent a 50 Mb sequence — bigger than this app supports.
+    """
     from Bio import SeqIO
+    ok, reason = _safe_file_size_check(
+        Path(path), _BULK_IMPORT_MAX_BYTES, "FASTA",
+    )
+    if not ok:
+        raise ValueError(reason or "FASTA file rejected by size check.")
     try:
         records = list(SeqIO.parse(path, "fasta"))
     except (OSError, ValueError) as exc:
@@ -38100,11 +38215,22 @@ class GibsonAssemblyPane(Vertical):
         try:
             _save_library(entries)
         except (OSError, RuntimeError) as exc:
+            _log_event(
+                "gibson.save.failed",
+                name=name, error=str(exc)[:120],
+                fragments=len(lane), circular=circular,
+            )
             self.app.call_from_thread(
                 _notify_save_failure,
                 self.app, "Plasmid library", exc,
             )
             return
+        _log_event(
+            "gibson.save.ok",
+            name=name, bp=len(rec.seq),
+            n_feats=len(rec.features or []),
+            fragments=len(lane), circular=circular,
+        )
         self.app.call_from_thread(
             self._on_gibson_save_success,
             name, len(rec.seq), len(rec.features or []),
@@ -39349,10 +39475,12 @@ class ConstructorModal(ModalScreen):
         assembly into a 100 MB library could freeze for 5–15 s.
         """
         self.app.notify("Assembling and saving…", timeout=4, markup=False)
+        entry_counter = getattr(self.app, "_record_load_counter", 0)
         self._save_to_library_worker(
             gid=gid, grammar=grammar, entry_vector=entry_vector,
             parts=parts, source_level=source_level,
             bb_key=bb_key, name=name,
+            entry_counter=entry_counter,
         )
 
     @work(thread=True, exclusive=True, group="constructor_save")
@@ -39360,11 +39488,21 @@ class ConstructorModal(ModalScreen):
                                   entry_vector: dict,
                                   parts: list[dict],
                                   source_level: int, bb_key: str,
-                                  name: str) -> None:
+                                  name: str,
+                                  entry_counter: int = 0) -> None:
         """Worker body for `_do_save_with_name`. Runs
         `_clone_assembly_into_entry_vector` (heavy assembly simulation)
         and `_persist_assembly` (library + parts-bin write + history
-        XML) off the UI thread."""
+        XML) off the UI thread.
+
+        Stale-canvas guard (audit fix 2026-05-14, invariant #28):
+        `entry_counter` is captured at dispatch; on success, if the
+        canvas record moved during the assembly, we skip the
+        ``reveal_entry_id`` scroll so the user doesn't get yanked
+        away from whatever plasmid they're now inspecting. The save
+        itself still completes — the assembly is library-bound, not
+        canvas-bound — but the UI follows the user's attention.
+        """
         new_rec = _clone_assembly_into_entry_vector(
             parts, entry_vector, grammar,
             source_level=source_level, name=name,
@@ -39392,9 +39530,13 @@ class ConstructorModal(ModalScreen):
                 f"Save failed: {exc}",
             )
             return
+        canvas_stale = (entry_counter
+                        != getattr(self.app, "_record_load_counter",
+                                     entry_counter))
         self.app.call_from_thread(
             self._on_constructor_save_success,
             new_id, len(new_rec.seq), source_level, name,
+            canvas_stale,
         )
 
     def _on_constructor_save_failed(self, msg: str) -> None:
@@ -39402,20 +39544,36 @@ class ConstructorModal(ModalScreen):
 
     def _on_constructor_save_success(self, new_id: str, seq_len: int,
                                        source_level: int,
-                                       name: str) -> None:
+                                       name: str,
+                                       canvas_stale: bool = False,
+                                       ) -> None:
         # Repopulate the LibraryPanel + focus the new row so the user
         # sees the assembly land in-list. Best-effort — the panel
         # might not be mounted (some test paths drive
         # `_do_save_with_name` without a full app), in which case the
         # persist still succeeded and the next interactive launch
         # will pick it up via `_load_library`.
+        #
+        # Stale-canvas (audit fix 2026-05-14): if the user moved the
+        # canvas to a different plasmid while the assembly worker was
+        # running, the reveal_entry_id() scroll would yank them away
+        # from their current focus. The save itself is still committed
+        # — only the auto-reveal is skipped. We refresh the panel via
+        # `_repopulate` instead so the new row is visible without
+        # stealing the cursor.
         if new_id:
             try:
                 lib = self.app.query_one("#library", LibraryPanel)
             except (NoMatches, AttributeError):
                 lib = None
             if lib is not None:
-                lib.reveal_entry_id(new_id)
+                if canvas_stale:
+                    try:
+                        lib._repopulate()
+                    except (NoMatches, AttributeError):
+                        pass
+                else:
+                    lib.reveal_entry_id(new_id)
         target_level = source_level + 1
         level_label = _part_level_label(target_level)
         # Mention the active collection in the notify so the user
@@ -40046,7 +40204,7 @@ class NcbiTaxonPickerModal(ModalScreen):
         self.query_one("#btn-ncbi-use", Button).disabled = True
         self._do_search(query.strip())
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="codon_taxid_search")
     def _do_search(self, query: str) -> None:
         try:
             hits, total, msg = _ncbi_taxid_search(query)
@@ -40242,7 +40400,11 @@ class SpeciesPickerModal(ModalScreen):
         kept = [e for e in all_entries
                 if (e.get("taxid") or e.get("name")) !=
                    (entry.get("taxid") or entry.get("name"))]
-        _codon_tables_save(kept)
+        try:
+            _codon_tables_save(kept)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Codon tables", exc)
+            return
         self._refresh_list(self.query_one("#sp-filter", Input).value)
 
     @on(Button.Pressed, "#btn-sp-fetch")
@@ -40285,7 +40447,7 @@ class SpeciesPickerModal(ModalScreen):
 
         self.app.push_screen(NcbiTaxonPickerModal(query), callback=_picked)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="codon_kazusa_fetch")
     def _do_fetch(self, taxid: str, name: str) -> None:
         try:
             raw, msg = _codon_fetch_kazusa(taxid)
@@ -47233,7 +47395,15 @@ def _h_search_library(app, payload):
 def _h_delete_from_library(app, payload):
     """Remove a plasmid library entry by `name`. Body: ``{name}``.
     Mirrors `_save_library`'s sync-to-active-collection so the
-    collection bookkeeping stays consistent."""
+    collection bookkeeping stays consistent.
+
+    Stale-state guard (audit fix 2026-05-14): when the deleted entry
+    is the currently-loaded record, clear the canvas + drop the
+    LibraryPanel's active pointer. Pre-fix the agent path left the
+    canvas pointing at the now-deleted entry; a subsequent Ctrl+S
+    would re-create the row from the stale in-memory record.
+    Mirrors `LibraryPanel._on_delete`'s cleanup at splicecraft.py:~12504.
+    """
     name = _sanitize_label(payload.get("name"), max_len=200)
     if not name:
         return ({"error": "missing 'name'"}, 400)
@@ -47243,10 +47413,27 @@ def _h_delete_from_library(app, payload):
         if guard is not None:
             return guard
         entries = _load_library()
+        # Capture the deleted entry's id BEFORE filtering so we can
+        # compare against the currently-loaded record below.
+        deleted_ids = {e.get("id") for e in entries
+                       if e.get("name") == name and e.get("id")}
         kept = [e for e in entries if e.get("name") != name]
         if len(kept) == len(entries):
             return ({"error": f"no entry named {name!r}"}, 404)
         _save_library(kept)
+        # If the deleted entry is the loaded record, clear the canvas
+        # + drop the panel's active pointer so subsequent saves can't
+        # re-resurrect it from the stale in-memory state.
+        cur = getattr(app, "_current_record", None)
+        if cur is not None and cur.id in deleted_ids:
+            try:
+                lib = app.query_one("#library", LibraryPanel)
+                lib.set_active(None)
+            except (NoMatches, AttributeError):
+                pass
+            clear = getattr(app, "_clear_canvas", None)
+            if callable(clear):
+                clear()
         _agent_refresh_library_panel(app)
         return len(entries) - len(kept)
 
@@ -48167,7 +48354,7 @@ def _h_get_settings(app, payload):
     return {"ok": True, "settings": out}
 
 
-@_agent_endpoint("set-setting")
+@_agent_endpoint("set-setting", write=True)
 def _h_set_setting(app, payload):
     """Persist a single user-toggle setting. Body: ``{key, value}``.
     `key` must be in the allowlist (see `get-settings`); `value` is
@@ -48177,7 +48364,11 @@ def _h_set_setting(app, payload):
     restart for most toggles. (The GUI re-applies certain toggles
     immediately via dedicated action methods; mirroring that
     semantically across the agent surface would require dispatching
-    each key to a UI-thread handler. Out of scope for v1.)"""
+    each key to a UI-thread handler. Out of scope for v1.)
+
+    Marked ``write=True`` so it requires the agent-API bearer token
+    same as the other mutating endpoints (closes inconsistency where
+    settings.json could be mutated token-free)."""
     key = payload.get("key")
     if not isinstance(key, str) or not key:
         return ({"error": "missing or non-string 'key'"}, 400)
@@ -48302,6 +48493,10 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             result = fn(getattr(self.server, "_app"), body)
         except Exception as exc:
             _log.exception("agent-api %s failed", path_part)
+            _log_event(
+                "agent.error", endpoint=path_part,
+                error=str(exc)[:120], type=type(exc).__name__,
+            )
             return self._send(
                 {"error": str(exc), "type": type(exc).__name__}, 500,
             )
@@ -48309,6 +48504,18 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             payload, status = result
         else:
             payload, status = result, 200
+        # Audit fix 2026-05-14: log every write endpoint's outcome at
+        # INFO so a "an agent silently overwrote my library" report has
+        # a forensic trail. Read endpoints stay at DEBUG (via the
+        # stdlib access line) to keep the log readable.
+        if write:
+            event_name = (
+                "agent.write.ok" if 200 <= status < 300
+                else "agent.write.failed"
+            )
+            _log_event(
+                event_name, endpoint=path_part, status=status,
+            )
         self._send(payload, status)
 
 
@@ -50623,7 +50830,7 @@ SpeciesPickerModal { align: center middle; }
         # unless something new lands on disk.
         _set_setting("crash_recovery_seen", current_keys)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="pypi_update_check")
     def _check_for_updates_worker(self) -> None:
         """Background PyPI update check. Threaded so the network
         round-trip never blocks startup; cached in `settings.json`
@@ -50698,7 +50905,7 @@ SpeciesPickerModal { align: center middle; }
             timeout=10,
         )
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="seed_library")
     def _seed_default_library(self) -> None:
         """Fetch MW463917.1 and pre-populate the library on first run."""
         # Capture the load counter at entry so the callback can detect
@@ -51982,6 +52189,15 @@ SpeciesPickerModal { align: center middle; }
             return
         title = str(getattr(rec, "name", None)
                        or record_id or "?")
+        # Audit fix 2026-05-14: log history-viewer opens so bug reports
+        # claiming "the history shows the wrong tree" carry the plasmid
+        # name + parent count for forensics.
+        _log_event(
+            "history.viewer.open",
+            plasmid=title,
+            operation=str(getattr(root, "operation", "") or ""),
+            n_parents=len(getattr(root, "parents", []) or []),
+        )
         self.push_screen(HistoryScreen(title, root))
 
     def action_restore_from_backup(self) -> None:
@@ -52429,6 +52645,14 @@ SpeciesPickerModal { align: center middle; }
             "letters":       None,
         }
         self._alignments.append(entry)
+        _log_event(
+            "alignment.registered",
+            name=name, query=query_label, target=target_label,
+            t_lo=t_lo, t_hi=t_hi,
+            identity_pct=round(float(result.get("identity_pct") or 0), 1),
+            n_segments=len(segs),
+            mode=str(result.get("mode") or ""),
+        )
         try:
             pm = self.query_one("#plasmid-map", PlasmidMap)
         except NoMatches:
@@ -52453,9 +52677,11 @@ SpeciesPickerModal { align: center middle; }
         that started before the user clicked Clear, so a "delayed second
         wave" of registrations doesn't surprise the user.
         """
+        n_before = len(self._alignments)
         self._alignments_generation += 1
         if not self._alignments:
             return
+        _log_event("alignment.cleared", count=n_before)
         self._alignments = []
         try:
             pm = self.query_one("#plasmid-map", PlasmidMap)
@@ -55156,9 +55382,8 @@ SpeciesPickerModal { align: center middle; }
         entries.append(entry)
         try:
             _save_features(entries)
-        except (OSError, ValueError) as exc:
-            _log.exception("Failed to save feature to library")
-            self.notify(f"Save failed: {exc}", severity="error")
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Feature library", exc)
             return False
         return True
 

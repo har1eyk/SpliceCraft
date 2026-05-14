@@ -221,6 +221,10 @@ class TestToolsHandler:
         assert eps["fetch"]["write"]       is True
         assert eps["add-feature"]["write"] is True
         assert eps["save"]["write"]        is True
+        # set-setting mutates persisted state; must be token-gated.
+        # Regression guard for 2026-05-14 security-audit fix where
+        # the @_agent_endpoint decoration was missing `write=True`.
+        assert eps["set-setting"]["write"] is True
 
 
 class TestAddFeatureHandler:

@@ -2,6 +2,140 @@
 
 ---
 
+## [0.8.3] — 2026-05-14 — Audit sweep: consistency, hardening, observability
+
+Mostly-mechanical follow-up sweep driven by four parallel audits
+(atomic persistence, event-logger coverage, agent-API completeness,
+stale-state across UI transitions). Twelve fixes landed; gap items
+are tracked for a future release.
+
+### Security + correctness
+
+* **Agent-API `set-setting` now requires the bearer token.** The
+  `@_agent_endpoint("set-setting")` decoration was missing
+  `write=True`, so the token gate was skipped — any local process on
+  the loopback (when `--agent-api` is on) could mutate `settings.json`
+  without the token. Allowlist + validators bounded the damage but
+  the contract was violated. Regression guard in
+  `test_agent_api.py::test_write_flag_is_correct` now asserts
+  `set-setting` carries `write=True`.
+
+* **Agent-API `delete-from-library` now clears the canvas when the
+  loaded record is the deleted entry.** Pre-fix the agent path left
+  the canvas pointing at the now-deleted entry; a subsequent Ctrl+S
+  would re-create the row from the stale in-memory record. Mirrors
+  the manual delete path's cleanup.
+
+* **Constructor `_save_to_library_worker` captures
+  `_record_load_counter` at dispatch.** When the user navigates the
+  canvas mid-assembly, the save still completes (the assembly is
+  library-bound, not canvas-bound) but the `reveal_entry_id` scroll
+  is skipped — the panel repopulates without yanking the user's
+  cursor away. Matches the Gibson worker's pattern (invariant #28).
+
+### Persistence consistency
+
+* **`LibraryPanel.add_entry` now uses the sync-cache + async-disk
+  pattern** the delete path adopted in 0.7.15.1. The `_save_library`
+  was synchronous on every add; a 100+ MB library froze the UI for
+  5–8 s per Save. New `_add_save_to_disk`
+  (`@work(thread=True, exclusive=True, group="library_add_save")`)
+  writes off-thread; `_notify_save_failure` via `call_from_thread`
+  surfaces disk errors.
+
+* **Eight `@work(thread=True)` decorators got `exclusive=True,
+  group=…` kwargs**: `OpenFileModal._do_load` (`file_open_load`),
+  `BlastModal._do_build` (`blast_run`),
+  `PartsBinModal._load_parts_bulk_worker` and `._load_part_worker`
+  (both `parts_bin_load`),
+  `SpeciesPickerModal._do_search` (`codon_taxid_search`),
+  `SpeciesPickerModal._do_fetch` (`codon_kazusa_fetch`),
+  `PlasmidApp._check_for_updates_worker` (`pypi_update_check`),
+  `PlasmidApp._seed_default_library` (`seed_library`). The
+  parts-bin pair is the most consequential — a click+bulk-click race
+  could otherwise leave the in-memory cache reflecting the loser's
+  snapshot.
+
+* **`notify(f"Save failed: {exc}")` → `_notify_save_failure(...)`**
+  at six callsites (feature colors at 25860, custom grammars at
+  31067 + 31600, parts-bin edit at 33360 + delete at 34174, feature
+  library at 55350). Consistent labeling + log routing.
+
+* **Wrapped bare `_save_*` callsites** in `_codon_tables_load`'s K12
+  seed (log-only — no app context) and `_codon_tables_save` from
+  SpeciesPickerModal delete (`_notify_save_failure`). Pre-fix a
+  disk-full would surface as a Textual crash dialog.
+
+* **`_load_feature_colors` / `_save_feature_colors` now use
+  `_typed_clone`** instead of shallow `dict(mapping)`, aligning
+  with the rest of invariant #17. Functionally safe today (values
+  are `str`) but breaks the pattern silently if a future schema
+  bump adds a nested value.
+
+### Observability
+
+* **Event-logger coverage** extended to four previously-unlogged
+  surfaces: `gibson.save.ok` / `gibson.save.failed`,
+  `alignment.registered`, `alignment.cleared`,
+  `history.viewer.open`, `agent.write.ok` / `agent.write.failed`.
+  Bug-report archives now carry forensic trails for these flows.
+
+### Performance
+
+* **`LibraryPanel._repopulate` eliminated triple `_typed_clone`
+  per Enter.** Pre-fix: `_apply_panel_width` →
+  `_compute_name_col_width` → `_load_library() + _load_collections()`,
+  then `_repopulate_plasmids` repeated both. Now: load each once at
+  the top of `_repopulate` and thread the results down through the
+  per-view methods.
+
+* **`_parse_fasta_single` runs `_safe_file_size_check`** before
+  parsing. The Domesticator's FASTA picker pre-fix bypassed the
+  symlink + size guard; a multi-GB FASTA piped in would OOM the
+  worker. Matches `OpenFileModal._do_load`'s protected path.
+
+### Documentation
+
+* **CLAUDE.md invariant #23** updated: `_SAFE_LOAD_JSON_MAX_BYTES`
+  is 1 GB (not 50 MB — that's the separate `_BULK_IMPORT_MAX_BYTES`
+  cap on the agent-API `load-file` endpoint).
+
+### GitHub issues
+
+* **#9, #13, #15, #16 closed** after Cory Tobin's bug-report sweep
+  in 0.8.1.
+* **#17 (whitespace → backslash in feature names)** has its
+  defensive override regression-tested via
+  `tests/test_commercialsaas_io.py::TestGH17LabelOverride` (4 new
+  tests). Awaiting Cory's retest on v0.8.2 before close.
+
+### Tests
+
+`tests/test_commercialsaas_io.py` grew by 4 tests
+(`TestGH17LabelOverride`); `tests/test_agent_api.py` got the
+`set-setting` write-flag guard; `tests/test_domesticator.py` updated
+to match the new FASTA size-check error path; `tests/test_smoke.py`
+self-isolates `_compute_name_col_width_caps_at_ceiling`. Full
+suite: 2422 passed, 5 skipped (518 s on 8 cores).
+
+### Audit findings deferred to future releases
+
+Recorded in audit reports; not addressed here:
+
+* 12 agent-API endpoints missing (Gibson, mutagenesis, GB primer
+  design, generic primers, Plasmidsaurus zip alignment, parts-bin
+  CRUD, codon-table add/delete, history viewer, restore-backup,
+  pre-update snapshots, primer-dup check, UI snapshot capture).
+* Several sync `_save_collections` UI callsites (rename / delete /
+  edit) — large collections still freeze briefly on commit.
+* `BlastModal._do_build` lacks a stale-collection guard.
+* Open screens (`FeatureLibraryScreen`, `PartsBinModal`,
+  `PrimerDesignScreen`, `BlastModal`) don't re-fetch on
+  `on_screen_resume` — agent mutations underneath aren't reflected
+  until the screen is dismissed + reopened.
+
+---
+
 ## [0.8.2] — 2026-05-14 — Gibson assembly hardening
 
 Six fixes against the new Gibson-assembly pane (introduced in this

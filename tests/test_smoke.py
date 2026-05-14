@@ -6643,6 +6643,11 @@ class TestShiftClickFeatureExtend:
         """Library + collection names beyond the cap don't push the
         panel beyond `_NAME_COL_CEIL` — a single 200-char name must
         not stretch the layout off-screen."""
+        # Defensive: clear collections cache + force an empty collection
+        # file. Prior tests in the same xdist worker may have left a
+        # "Main Collection" (15 chars) entry that would otherwise make
+        # the floor branch land at 17 instead of 12.
+        sc._save_collections([])
         # Seed a library with one absurdly long name.
         sc._save_library([{
             "id": "x", "name": "p" * 200, "size": 100,
@@ -6657,6 +6662,7 @@ class TestShiftClickFeatureExtend:
         w = panel._compute_name_col_width()
         assert w == sc.LibraryPanel._NAME_COL_CEIL
         # And short-name libraries clamp to the floor.
+        sc._save_collections([])
         sc._save_library([{
             "id": "x", "name": "p", "size": 100,
             "n_feats": 0, "source": "test", "added": "2026-05-04",

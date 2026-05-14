@@ -2269,3 +2269,156 @@ class TestColorQualifierReadInPlasmidMap:
         # malformed string.
         assert feats[0]["color"]
         assert feats[0]["color"] in sc._FEATURE_PALETTE
+
+
+class TestGH17LabelOverride:
+    """Regression guard for GH #17 (Cory Tobin, 2026-05-13): feature
+    names containing whitespace landed as `lac\\operator` instead of
+    `lac operator` after .dna import. Root cause was BioPython's
+    SnapGeneIO parser mangling whitespace on some payloads; the fix in
+    v0.8.0 (`_augment_dna_record_from_packets`) re-pins
+    `qualifiers["label"]` to the verbatim `<Feature name=...>` XML
+    attribute. This test simulates the mangle by handing the augment
+    helper a SeqRecord whose label is already corrupted and asserts
+    the override restores it from the 0x0A packet.
+    """
+
+    def test_label_override_restores_whitespace(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        seq = "A" * 100
+        # Simulate the BioPython-mangled output: the label that lands
+        # on the parsed SeqRecord has backslashes where the source
+        # XML had spaces.
+        bad = SeqFeature(
+            location=FeatureLocation(0, 12, strand=1),
+            type="misc_feature",
+            qualifiers={"label": ["lac\\operator"]},
+        )
+        rec = SeqRecord(Seq(seq), id="syn", name="syn", features=[bad])
+        # 0x0A packet carries the clean XML attribute "lac operator".
+        features_xml = (
+            '<?xml version="1.0"?>'
+            '<Features nextValidID="1">'
+            '<Feature recentID="0" name="lac operator" type="misc_feature" '
+            'directionality="1" allowSegmentOverlaps="0">'
+            '<Segment range="1-12" color="#ff0000" type="standard"/>'
+            '</Feature>'
+            '</Features>'
+        ).encode("utf-8")
+        data = _make_minimal_dna((0x0A, features_xml))
+        sc._augment_dna_record_from_packets(rec, data)
+        # Override fires: the XML name wins over the mangled value.
+        assert rec.features[0].qualifiers["label"] == ["lac operator"], (
+            f"Label override didn't restore whitespace; got "
+            f"{rec.features[0].qualifiers.get('label')!r}"
+        )
+
+    def test_label_override_preserves_other_printables(self):
+        """Confirm the override doesn't accidentally strip spaces,
+        slashes, dots, or hyphens — only the control-char set is
+        scrubbed."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        for label in (
+                "Integration Seq",
+                "M13 fwd",
+                "Lambda T0 Terminator",
+                "5'/3' UTR",
+                "promoter.minimal",
+                "tac-promoter",
+        ):
+            seq = "A" * 100
+            bad = SeqFeature(
+                location=FeatureLocation(0, 20, strand=1),
+                type="misc_feature",
+                qualifiers={"label": ["MANGLED"]},
+            )
+            rec = SeqRecord(Seq(seq), id="syn", name="syn",
+                            features=[bad])
+            # Escape XML metachars in the test data so the parser
+            # accepts the name attribute verbatim.
+            xml_label = (label
+                         .replace("&", "&amp;")
+                         .replace("<", "&lt;")
+                         .replace(">", "&gt;")
+                         .replace("'", "&apos;")
+                         .replace('"', "&quot;"))
+            features_xml = (
+                '<?xml version="1.0"?>'
+                f'<Features nextValidID="1">'
+                f'<Feature recentID="0" name="{xml_label}" type="misc_feature" '
+                f'directionality="1" allowSegmentOverlaps="0">'
+                f'<Segment range="1-20" color="#ff0000" type="standard"/>'
+                f'</Feature>'
+                f'</Features>'
+            ).encode("utf-8")
+            data = _make_minimal_dna((0x0A, features_xml))
+            sc._augment_dna_record_from_packets(rec, data)
+            assert rec.features[0].qualifiers["label"] == [label], (
+                f"label {label!r} not preserved verbatim; got "
+                f"{rec.features[0].qualifiers.get('label')!r}"
+            )
+
+    def test_label_override_skipped_when_xml_name_empty(self):
+        """Some third-party .dna writers omit the `name` attribute on
+        Feature elements. In that case the override is skipped and
+        whatever BioPython parsed survives — empty XML name must NOT
+        clobber a non-empty BioPython label with `[""]`."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        seq = "A" * 100
+        good = SeqFeature(
+            location=FeatureLocation(0, 12, strand=1),
+            type="misc_feature",
+            qualifiers={"label": ["from_biopython"]},
+        )
+        rec = SeqRecord(Seq(seq), id="syn", name="syn", features=[good])
+        features_xml = (
+            '<?xml version="1.0"?>'
+            '<Features nextValidID="1">'
+            '<Feature recentID="0" type="misc_feature" '
+            'directionality="1" allowSegmentOverlaps="0">'
+            '<Segment range="1-12" color="#ff0000" type="standard"/>'
+            '</Feature>'
+            '</Features>'
+        ).encode("utf-8")
+        data = _make_minimal_dna((0x0A, features_xml))
+        sc._augment_dna_record_from_packets(rec, data)
+        # BioPython's label survives — override only fires on non-empty xml_name.
+        assert rec.features[0].qualifiers["label"] == ["from_biopython"]
+
+    def test_label_override_strips_control_chars(self):
+        """Embedded NUL / CR / LF in the XML name would break a
+        single-row sidebar render. The override scrubs those before
+        pinning the label."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        seq = "A" * 100
+        bad = SeqFeature(
+            location=FeatureLocation(0, 12, strand=1),
+            type="misc_feature",
+            qualifiers={"label": ["x"]},
+        )
+        rec = SeqRecord(Seq(seq), id="syn", name="syn", features=[bad])
+        # XML `name` attribute carries embedded control chars (encoded
+        # as numeric character references because raw bytes are
+        # forbidden in XML 1.0). After the parser decodes them,
+        # `_CONTROL_CHARS_RE` should strip them.
+        features_xml = (
+            '<?xml version="1.0"?>'
+            '<Features nextValidID="1">'
+            '<Feature recentID="0" name="dirty&#10;name" type="misc_feature" '
+            'directionality="1" allowSegmentOverlaps="0">'
+            '<Segment range="1-12" color="#ff0000" type="standard"/>'
+            '</Feature>'
+            '</Features>'
+        ).encode("utf-8")
+        data = _make_minimal_dna((0x0A, features_xml))
+        sc._augment_dna_record_from_packets(rec, data)
+        # Newline scrubbed; the space and other text survives.
+        assert rec.features[0].qualifiers["label"] == ["dirtyname"]
