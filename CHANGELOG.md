@@ -2,6 +2,83 @@
 
 ---
 
+## [0.8.2] — 2026-05-14 — Gibson assembly hardening
+
+Six fixes against the new Gibson-assembly pane (introduced in this
+working tree, never shipped) caught by a pre-release audit pass before
+the feature went live.
+
+* **`_on_save` converted to a `@work` worker.** The save handler used
+  to call `_record_to_gb_text` + `_load_library` + `_save_library`
+  synchronously on the UI thread; a 50 kb Gibson product would freeze
+  the modal for 200–500 ms. New `_gibson_save_worker`
+  (`@work(thread=True, exclusive=True, group="gibson_save")`)
+  snapshots lane + product on the UI thread, dispatches the heavy
+  serialisation + disk write off-thread, and routes failures through
+  `_notify_save_failure` via `call_from_thread` — matching the
+  Traditional / Constructor save paths and obeying the
+  worker-pattern convention in CLAUDE.md invariant #42.
+
+* **Stale-record guard (invariant #28).** Worker captures
+  `_record_load_counter` at dispatch; if the canvas moves to a
+  different plasmid between Simulate and Save, the entry is still
+  saved (lane fragments are self-contained, not pinned to the
+  canvas) but its `source` field is tagged
+  `constructor:gibson:stale-canvas` for diagnostic clarity.
+
+* **RC-orientation hint at failed junctions.** When forward-orientation
+  overlap detection fails at a junction, the simulator now probes
+  `_rc(b_seq)` and `_rc(a_seq)` at a 10 bp threshold and surfaces a
+  targeted "did you mean to flip 'Fx'?" hint in both the
+  `overlaps[i]["rc_hint"]` payload and the user-facing error. Common
+  failure mode for PCR products whose primer-pair orientation got
+  inverted at the bench; silently failing with "no homology" hid
+  the actual problem.
+
+* **Wrap-feature shift refactor.** Old shift loop reasoned about the
+  product wrap from `ms <=> me` ordering, which is ambiguous when
+  modulo collapses both ends to the same value. New logic decides
+  product topology from `span` (linear length, invariant under
+  shift), eliminating the `else` ambiguity. Aligns the simulator's
+  wrap math with the `_feat_len` semantics every other wrap path
+  in SpliceCraft uses.
+
+* **Wrap-pair sentinel tagging + product re-merge.**
+  `GibsonAssemblyPane._record_features` now tags both halves of a
+  source-plasmid wrap feature with `_wrap_pair` / `_wrap_role` /
+  `_wrap_total` markers. The simulator's shift loop detects pair
+  adjacency at the product wrap and re-merges into a single wrap
+  feature when conditions fire (defensive — Gibson chemistry's
+  homology-arm trim makes the merge unreachable today, but the
+  scaffold is in place for future wrap-preserving assembly modes).
+  Sentinel fields are always stripped before features leave the
+  simulator.
+
+* **Negative-offset skip (was clamp).** Features that fall before the
+  product start (pathological middle-fragment exhaustion path) are
+  now skipped instead of silently clamped to `start=0`. Clamping
+  silently shifted biological coordinates; skipping is honest
+  about the lost annotation.
+
+### Tests
+
+`tests/test_gibson.py` grew by 9 tests in a new `TestGibsonHardening`
+class:
+
+* `test_rc_hint_when_second_fragment_flipped` + the upstream-flipped
+  variant + the no-hint-on-real-failure negative case
+* `test_wrap_sentinels_stripped_from_output` (no `_wrap_*` keys leak)
+* `test_wrap_pair_halves_both_survive_when_split_in_product`
+* `test_wrap_pair_remains_split_when_halves_separated`
+* `test_wrap_pair_head_inside_leading_overlap_filtered`
+* `test_record_features_marks_wrap_pair`
+* `test_save_dispatches_worker` (B1 regression — patches the worker
+  and asserts dispatch + Save-button disable-on-click)
+
+Full suite: 2418 passed, 5 skipped (310 s on 8 cores).
+
+---
+
 ## [0.8.1] — 2026-05-14 — Cory Tobin issue sweep: F5 + alignment offset + custom enzyme list
 
 Four threads, all driven by Cory Tobin's open GH issues:

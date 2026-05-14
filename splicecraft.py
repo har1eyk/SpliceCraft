@@ -4309,6 +4309,505 @@ def _simulate_traditional_cloning(insert_frag: dict,
     }
 
 
+# ── Gibson assembly ───────────────────────────────────────────────────────────
+#
+# Gibson chemistry: 5' exonuclease chews back the 5' end of each fragment,
+# exposing a 3' single-stranded tail. Tails that share a complementary
+# homology region anneal; DNA polymerase fills gaps; DNA ligase seals
+# nicks. Net result: adjacent fragments are joined seamlessly and the
+# homology region appears ONCE in the product.
+#
+# The simulator here treats each fragment as a top-strand DNA sequence
+# (5' → 3') and finds the longest exact-match suffix-of-A / prefix-of-B
+# overlap at each junction. The user is responsible for designing
+# primer tails that produce these overlaps — the simulator doesn't
+# pretend to extend short overlaps via heuristic search. Below
+# `_GIBSON_MIN_OVERLAP_BP` (15 bp by default, Gibson's commonly cited
+# floor), the junction is rejected so the user can fix the design
+# before committing the assembled product to the library.
+
+_GIBSON_MIN_OVERLAP_BP = 15
+_GIBSON_MAX_OVERLAP_BP = 200   # cap the suffix/prefix probe; longer is
+                                # unrealistic for Gibson primer tails
+
+
+def _gibson_overlap_len(a_seq: str, b_seq: str, *,
+                          min_overlap: int = _GIBSON_MIN_OVERLAP_BP,
+                          max_overlap: int = _GIBSON_MAX_OVERLAP_BP,
+                          ) -> int:
+    """Length of the longest exact-match overlap between `a_seq`'s 3'
+    end and `b_seq`'s 5' end, in `[min_overlap, max_overlap]`.
+    Returns 0 if no overlap of at least `min_overlap` bp matches.
+
+    Comparison is case-insensitive. Bigger overlap preferred —
+    biologically, the homology arm the user designed is the longest
+    exact match, not a degenerate short one inside it.
+
+    When `a_seq` is identical to `b_seq` (e.g. the n=1 circular
+    self-circularisation probe, where the simulator passes the same
+    fragment as both a and b), the probe caps at `len(a) - 1` so the
+    trivial whole-string match is skipped — without the cap, the user's
+    intended short homology arm at the fragment ends would be masked
+    by the always-matching full string.
+    """
+    if min_overlap <= 0:
+        min_overlap = 1
+    a = a_seq.upper()
+    b = b_seq.upper()
+    # Whole-string match is degenerate when the two sides are the same
+    # sequence — cap one shorter so the probe finds a real arm overlap.
+    # For distinct sequences a full-length match is biologically legal
+    # (one fragment is a prefix/suffix of the other); the downstream
+    # body-length validation in `_simulate_gibson_assembly` decides.
+    full_match_safe = (a != b)
+    max_check = min(max_overlap, len(a), len(b))
+    if not full_match_safe:
+        max_check = min(max_check, len(a) - 1)
+    if max_check < min_overlap:
+        return 0
+    for k in range(max_check, min_overlap - 1, -1):
+        if a[-k:] == b[:k]:
+            return k
+    return 0
+
+
+def _simulate_gibson_assembly(fragments: list[dict], *,
+                                min_overlap: int = _GIBSON_MIN_OVERLAP_BP,
+                                circular: bool = True,
+                              ) -> dict:
+    """Simulate a Gibson assembly of N linear top-strand fragments.
+
+    Each ``fragments[i]`` dict shape:
+        {
+          "name":     str,
+          "sequence": str,            # linear DNA 5' → 3'
+          "features": list[dict],     # optional, in fragment-local coords
+        }
+
+    For each junction (consecutive pair plus the wrap junction when
+    ``circular=True``) the longest exact-match suffix/prefix overlap
+    is detected. Any junction below ``min_overlap`` bp fails the
+    assembly. The product sequence has each overlap appearing once
+    (the trailing copy is dropped: ``frag[i] + frag[i+1][overlap:]``).
+    Features are shifted into product coordinates; features wholly
+    inside a fragment's leading-overlap region are skipped (they're
+    already represented by the preceding fragment's trailing copy).
+
+    Returns ``{success, product_seq, circular, features, overlaps,
+    errors, warnings}`` — see UI consumer (``GibsonAssemblyPane``)
+    for the rendering convention. ``overlaps`` always has one entry
+    per junction so the UI can show the full chain even on partial
+    failure.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    overlaps: list[dict] = []
+
+    if not fragments:
+        return {
+            "success": False, "product_seq": "", "circular": circular,
+            "features": [], "overlaps": [],
+            "errors": ["No fragments supplied."], "warnings": [],
+        }
+
+    # Normalise each input: uppercase + strip whitespace. We keep the
+    # original ``fragments`` list intact for caller-side identity (and
+    # for the feature-shifting loop below); the normalised view is a
+    # parallel list of (name, seq, features) tuples.
+    norm_fragments: list[dict] = []
+    for f in fragments:
+        if not isinstance(f, dict):
+            return {
+                "success": False, "product_seq": "", "circular": circular,
+                "features": [], "overlaps": [],
+                "errors": ["Each fragment must be a dict."],
+                "warnings": [],
+            }
+        raw = str(f.get("sequence") or "")
+        cleaned = "".join(ch for ch in raw.upper() if not ch.isspace())
+        norm_fragments.append({
+            "name":     str(f.get("name") or "?"),
+            "sequence": cleaned,
+            "features": list(f.get("features") or []),
+        })
+
+    # Reject zero-length fragments up front — they can't carry homology.
+    for f in norm_fragments:
+        if not f["sequence"]:
+            return {
+                "success": False, "product_seq": "", "circular": circular,
+                "features": [], "overlaps": [],
+                "errors": [
+                    f"Fragment {f['name']!r} has no sequence."
+                ],
+                "warnings": [],
+            }
+
+    if len(norm_fragments) == 1 and not circular:
+        # A single linear fragment doesn't need Gibson — pass through.
+        f = norm_fragments[0]
+        return {
+            "success":     True,
+            "product_seq": f["sequence"],
+            "circular":    False,
+            "features":    list(f["features"]),
+            "overlaps":    [],
+            "errors":      [],
+            "warnings":    [
+                "Single linear fragment — no Gibson junctions to "
+                "validate. Product is the fragment as supplied.",
+            ],
+        }
+
+    n = len(norm_fragments)
+    n_junctions = n if circular else n - 1
+    overlap_lens: list[int] = []
+    for i in range(n_junctions):
+        a = norm_fragments[i]
+        b = norm_fragments[(i + 1) % n]
+        a_seq = a["sequence"]
+        b_seq = b["sequence"]
+        k = _gibson_overlap_len(
+            a_seq, b_seq, min_overlap=min_overlap,
+        )
+        ok = k >= min_overlap
+        # Reverse-orientation diagnostic. If the forward overlap fails,
+        # probe RC of B (would-be insert flipped) and RC of A (would-be
+        # upstream flipped) at a lower threshold so we can surface a
+        # "did you mean to RC this fragment?" hint. We probe at the
+        # lower of `min_overlap` and 10 bp so the user sees the hint
+        # for plausible-but-flipped designs even when their min is
+        # set high.
+        rc_hint = ""
+        if not ok:
+            probe_min = min(min_overlap, 10)
+            k_b_rc = _gibson_overlap_len(
+                a_seq, _rc(b_seq), min_overlap=probe_min,
+            )
+            k_a_rc = _gibson_overlap_len(
+                _rc(a_seq), b_seq, min_overlap=probe_min,
+            )
+            if k_b_rc >= probe_min and k_b_rc >= k_a_rc:
+                rc_hint = (
+                    f" — but reverse-complement of {b['name']!r} "
+                    f"yields a {k_b_rc} bp overlap; "
+                    f"did you mean to flip {b['name']!r}?"
+                )
+            elif k_a_rc >= probe_min:
+                rc_hint = (
+                    f" — but reverse-complement of {a['name']!r} "
+                    f"yields a {k_a_rc} bp overlap; "
+                    f"did you mean to flip {a['name']!r}?"
+                )
+        overlaps.append({
+            "junction": i + 1,
+            "from":     a["name"],
+            "to":       b["name"],
+            "length":   k,
+            "seq":      a_seq[-k:] if k else "",
+            "ok":       ok,
+            "is_wrap":  (circular and i == n - 1),
+            "rc_hint":  rc_hint,
+        })
+        if not ok:
+            errors.append(
+                f"Junction {i+1} ({a['name']!r} → "
+                f"{b['name']!r}): no overlap ≥ "
+                f"{min_overlap} bp." + rc_hint
+            )
+        overlap_lens.append(k)
+
+    if errors:
+        return {
+            "success": False, "product_seq": "", "circular": circular,
+            "features": [], "overlaps": overlaps,
+            "errors": errors, "warnings": warnings,
+        }
+
+    # Sanity-check: every fragment after the first must have body
+    # length > 0 after its leading overlap is removed. Otherwise the
+    # fragment is biologically redundant — its body bases are entirely
+    # supplied by the preceding fragment's tail.
+    for i in range(1, n):
+        oh_lead = overlap_lens[i - 1]
+        frag_len = len(norm_fragments[i]["sequence"])
+        if oh_lead >= frag_len:
+            errors.append(
+                f"Fragment {norm_fragments[i]['name']!r} is consumed "
+                f"by its leading {oh_lead} bp overlap "
+                f"(fragment is {frag_len} bp). "
+                f"Use a longer fragment or shorter overlap."
+            )
+
+    # For circular: the wrap fragment must also have body left after
+    # BOTH its leading + trailing overlaps. n=1 self-circularisation
+    # is a special case — only the wrap overlap applies.
+    if circular and not errors:
+        if n == 1:
+            wrap_oh = overlap_lens[0]
+            frag_len = len(norm_fragments[0]["sequence"])
+            if wrap_oh >= frag_len:
+                errors.append(
+                    f"Fragment {norm_fragments[0]['name']!r} is fully "
+                    f"consumed by its self-circularisation overlap "
+                    f"({wrap_oh} ≥ {frag_len} bp)."
+                )
+        else:
+            last_lead  = overlap_lens[n - 2]
+            last_trail = overlap_lens[n - 1]
+            last_len = len(norm_fragments[-1]["sequence"])
+            if last_lead + last_trail >= last_len:
+                errors.append(
+                    f"Fragment {norm_fragments[-1]['name']!r} is fully "
+                    f"consumed by its homology arms ({last_lead} + "
+                    f"{last_trail} ≥ {last_len} bp). Pick a longer "
+                    f"fragment or shorter overlaps."
+                )
+    if errors:
+        return {
+            "success": False, "product_seq": "", "circular": circular,
+            "features": [], "overlaps": overlaps,
+            "errors": errors, "warnings": warnings,
+        }
+
+    # Soft warning: very short fragments (< 3 × min_overlap) are
+    # legal but unusual — flag for the user's awareness without
+    # blocking the save.
+    for f in norm_fragments:
+        if 0 < len(f["sequence"]) < 3 * min_overlap:
+            warnings.append(
+                f"Fragment {f['name']!r} is short "
+                f"({len(f['sequence'])} bp) relative to the "
+                f"{min_overlap} bp homology arms — assembly may "
+                f"be hard to confirm by gel."
+            )
+
+    # Build product sequence + track per-fragment offsets.
+    seq_parts: list[str] = []
+    offsets: list[int] = []
+    cursor = 0
+    first_seq = norm_fragments[0]["sequence"]
+    seq_parts.append(first_seq)
+    offsets.append(0)
+    cursor = len(first_seq)
+    for i in range(1, n):
+        oh_lead = overlap_lens[i - 1]
+        frag_seq = norm_fragments[i]["sequence"]
+        body = frag_seq[oh_lead:]
+        seq_parts.append(body)
+        # Fragment i's local-pos 0 maps to product pos (cursor - oh_lead)
+        # — the leading overlap bases already exist as the previous
+        # fragment's tail.
+        offsets.append(cursor - oh_lead)
+        cursor += len(body)
+
+    if circular:
+        if n == 1:
+            # Self-circularisation: drop the trailing wrap overlap from
+            # the only fragment. seq_parts has one entry == fragments[0].
+            wrap_oh = overlap_lens[0]
+            if wrap_oh > 0:
+                seq_parts[0] = seq_parts[0][:-wrap_oh]
+                cursor -= wrap_oh
+        else:
+            wrap_oh = overlap_lens[n - 1]
+            if wrap_oh > 0:
+                # Drop the last fragment's trailing-overlap bases —
+                # they equal the first fragment's leading bases, which
+                # are already at the start of the product.
+                seq_parts[-1] = seq_parts[-1][:-wrap_oh]
+                cursor -= wrap_oh
+
+    product_seq = "".join(seq_parts)
+    product_len = len(product_seq)
+
+    # Shift features into product coords. Skip features wholly inside
+    # a fragment's leading-overlap region (i > 0): they're already
+    # covered by the preceding fragment's trailing copy of the same
+    # bases. For circular, features that straddle the wrap junction
+    # become wrap features (end < start) so downstream code can use
+    # `_feat_len` / `_bp_in` to handle them correctly.
+    shifted: list[dict] = []
+    for i, f_dict in enumerate(norm_fragments):
+        offset = offsets[i]
+        oh_lead = overlap_lens[i - 1] if i > 0 else 0
+        for feat in (f_dict.get("features") or []):
+            if not isinstance(feat, dict):
+                continue
+            ftype = str(feat.get("type") or "")
+            if ftype == "source":
+                continue
+            try:
+                s = int(feat.get("start", 0))
+                e = int(feat.get("end",   0))
+            except (TypeError, ValueError):
+                continue
+            if e <= s:
+                continue
+            if i > 0 and e <= oh_lead:
+                # Feature lies entirely in the leading-overlap region
+                # — preceding fragment already supplies its annotation
+                # at the same product coords. Skip to avoid a duplicate.
+                continue
+            new_s = offset + s
+            new_e = offset + e
+            span = new_e - new_s
+            if circular and product_len > 0:
+                # Wrap math: modulo into product coords. The span
+                # (linear length) is invariant under shift, so we
+                # decide product topology from `span` not from the
+                # `ms <=> me` ordering — which is ambiguous when
+                # `ms == me` mod product_len.
+                ms = new_s % product_len
+                me_raw = new_e % product_len
+                # `me == 0` with span > 0 means the feature ends
+                # exactly at the product's wrap point — keep it as
+                # `product_len` so the linear-form expression matches.
+                me = product_len if (me_raw == 0 and span > 0) else me_raw
+                if span >= product_len:
+                    new_s, new_e = 0, product_len
+                elif ms < me:
+                    new_s, new_e = ms, me
+                else:
+                    # ms >= me — wrap feature in product coords.
+                    new_s, new_e = ms, me
+            else:
+                # Linear product. Negative `new_s` means the feature's
+                # 5' edge sits before the product start — the only way
+                # this happens is if a middle fragment is shorter than
+                # its lead+trail arms (a pathological design the
+                # simulator doesn't reject up front; see the body
+                # length check above which only catches single-arm
+                # exhaustion). Skip rather than clamp: clamping would
+                # silently shift the feature's biological coordinates,
+                # whereas skip is honest about the lost annotation.
+                if new_s < 0:
+                    continue
+                if new_e > product_len:
+                    new_e = product_len
+                if new_e <= new_s:
+                    continue
+            shifted.append({**feat, "start": new_s, "end": new_e})
+
+    # Re-merge wrap-source halves: when a circular source plasmid's
+    # wrap feature was split by `_record_features`, both halves carry
+    # the same ``_wrap_pair`` id. After shifting, if the two halves
+    # are still adjacent across the product's wrap (head.new_s == 0
+    # AND tail.new_e == product_len) we collapse them back into one
+    # wrap feature. For linear products or non-adjacent halves the
+    # split is preserved (the biological feature was severed by the
+    # assembly geometry — the user sees two pieces).
+    out_feats: list[dict] = []
+    handled_pairs: set[str] = set()
+    pair_index: dict[str, dict] = {}
+    if circular and product_len > 0:
+        for f in shifted:
+            pid = f.get("_wrap_pair")
+            if pid:
+                pair_index.setdefault(pid, {"halves": []})["halves"].append(f)
+    for f in shifted:
+        pid = f.get("_wrap_pair")
+        if pid and circular and product_len > 0:
+            if pid in handled_pairs:
+                continue
+            halves = pair_index.get(pid, {}).get("halves") or []
+            if len(halves) == 2:
+                head = next((h for h in halves
+                             if h.get("_wrap_role") == "head"), None)
+                tail = next((h for h in halves
+                             if h.get("_wrap_role") == "tail"), None)
+                if (head is not None and tail is not None
+                        and head["start"] == 0
+                        and tail["end"] == product_len):
+                    merged = {k: v for k, v in tail.items()
+                              if not k.startswith("_wrap_")}
+                    merged["start"] = tail["start"]
+                    merged["end"]   = head["end"]
+                    out_feats.append(merged)
+                    handled_pairs.add(pid)
+                    continue
+            # Halves not adjacent — preserve both as separate features,
+            # but strip the wrap-pair sentinels so downstream code
+            # doesn't see a half-merged shape.
+        cleaned = {k: v for k, v in f.items()
+                   if not k.startswith("_wrap_")}
+        out_feats.append(cleaned)
+
+    return {
+        "success":     True,
+        "product_seq": product_seq,
+        "circular":    circular,
+        "features":    out_feats,
+        "overlaps":    overlaps,
+        "errors":      [],
+        "warnings":    warnings,
+    }
+
+
+def _gibson_record_from_result(result: dict, *, name: str) -> "object | None":
+    """Build a SeqRecord from a successful ``_simulate_gibson_assembly``
+    result. Returns ``None`` when ``result["success"] is False``.
+
+    Wrap features (``end < start``) become ``CompoundLocation`` per the
+    GenBank wrap convention. Linear features land as ``FeatureLocation``.
+    Strand defaults to +1 when missing.
+    """
+    if not result or not result.get("success"):
+        return None
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import (
+        SeqFeature, FeatureLocation, CompoundLocation,
+    )
+    seq_str = str(result.get("product_seq") or "")
+    n = len(seq_str)
+    safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", name or "gibson") or "gibson"
+    topology = "circular" if result.get("circular") else "linear"
+    rec = SeqRecord(
+        Seq(seq_str),
+        id=safe_name[:16] or "gibson",
+        name=safe_name[:16] or "gibson",
+        description=name or "Gibson assembly",
+        annotations={
+            "molecule_type": "DNA",
+            "topology":      topology,
+        },
+    )
+    for f in (result.get("features") or []):
+        if not isinstance(f, dict):
+            continue
+        try:
+            s = int(f.get("start", 0))
+            e = int(f.get("end",   0))
+            strand = int(f.get("strand", 1) or 1)
+        except (TypeError, ValueError):
+            continue
+        if s == e or n == 0:
+            continue
+        ftype = str(f.get("type") or "misc_feature")
+        quals: dict = {}
+        label = f.get("label")
+        if label:
+            quals["label"] = [str(label)]
+        color = f.get("color")
+        if color:
+            quals["ApEinfo_fwdcolor"] = [str(color)]
+            quals["ApEinfo_revcolor"] = [str(color)]
+        note = f.get("note")
+        if note:
+            quals["note"] = [str(note)]
+        if e > s:
+            loc = FeatureLocation(s, e, strand=strand)
+        else:
+            # Wrap feature: (s, n) + (0, e)
+            loc = CompoundLocation([
+                FeatureLocation(s, n, strand=strand),
+                FeatureLocation(0, e, strand=strand),
+            ])
+        rec.features.append(SeqFeature(loc, type=ftype, qualifiers=quals))
+    return rec
+
+
 def _rc_fragment(frag: dict) -> dict:
     """Reverse-complement a Fragment, swapping its left/right ends and
     flipping its feature coordinates. The overhang sequences of the
@@ -36854,6 +37353,832 @@ class TraditionalCloningPane(Vertical):
         )
 
 
+class GibsonAssemblyPane(Vertical):
+    """Body of the Constructor's "Gibson Assembly" tab.
+
+    Workflow: stage N linear DNA fragments in an ordered lane, each
+    fragment ending with a 5' / 3' homology arm shared with its
+    neighbour. The simulator (`_simulate_gibson_assembly`) detects
+    the longest exact-match overlap at every junction (and the wrap
+    junction last → first when topology=Circular), validates that
+    each is ≥ `min_overlap`, and produces a single assembled product
+    where each overlap appears once. The product is saved to the
+    library as a new entry.
+
+    Fragment sources (analogous to `TraditionalCloningPane`):
+        plasmid — full library plasmid sequence linearised at base 0
+                  (user is responsible for designing primer tails
+                  that produce the desired overlap geometry).
+        feature — pick a plasmid + feature; the feature's bases form
+                  the fragment.
+        pcr     — pasted DNA, treated as a linear PCR product.
+
+    No restriction enzymes — Gibson chemistry is enzyme-free. The
+    overlap chain is recomputed on every lane mutation so the user
+    sees junction status (green ≥ min, red < min) in real time.
+    """
+
+    DEFAULT_CSS = ""
+
+    # Cap the number of fragments per Gibson reaction — bench Gibson
+    # tops out around 6–8 fragments per round; this is a soft UI cap
+    # to keep the lane sensible. The simulator itself has no fixed
+    # ceiling.
+    _GIB_MAX_FRAGMENTS = 12
+    # Cap pasted-sequence length. Bench Gibson products top out around
+    # 50 kb; 1 MB is a wide guardrail against an accidental whole-
+    # genome paste pegging the textarea (paste mode allows arbitrary
+    # IUPAC chars without an explicit length limit otherwise).
+    _GIB_MAX_PASTE_BP = 1_000_000
+    # Display-only cap on fragment names — keeps the lane table
+    # readable and avoids overflowing tooltips / log lines downstream.
+    _GIB_MAX_FRAGMENT_NAME = 80
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._mode: str = "plasmid"
+        # Ordered list of fragment dicts: {name, sequence, features, source}
+        self._lane: list[dict] = []
+        # Last computed simulation result; gates the Save button.
+        self._product: "dict | None" = None
+        # Cache parsed library entries so we don't re-parse on every
+        # dropdown rebuild. Mirror of TraditionalCloningPane's cache.
+        self._record_cache: "dict[str, object]" = {}
+
+    # ── Compose ───────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="gib-mode-row"):
+            yield Static("Fragment source:", id="gib-mode-label")
+            yield RadioSet(
+                RadioButton("From plasmid", value=True,
+                              id="gib-mode-plasmid"),
+                RadioButton("From feature", id="gib-mode-feature"),
+                RadioButton("Paste DNA",     id="gib-mode-pcr"),
+                id="gib-mode-set",
+            )
+        with Vertical(id="gib-source-host"):
+            yield Static(" Source plasmid (whole sequence, linearised) ",
+                          id="gib-source-hdr")
+            yield DataTable(id="gib-source-table",
+                              cursor_type="row", zebra_stripes=True)
+            with Horizontal(id="gib-feature-row"):
+                yield Static("Feature:", classes="gib-inline-label")
+                yield Select([("(pick a plasmid first)", "")],
+                              id="gib-feature-select",
+                              allow_blank=True, prompt="Feature")
+            with Vertical(id="gib-pcr-rows"):
+                yield Input(placeholder="Fragment name (e.g., insert1)",
+                              id="gib-pcr-name")
+                yield TextArea(id="gib-pcr-seq")
+        with Horizontal(id="gib-add-row"):
+            yield Button("→  Add Fragment", id="btn-gib-add",
+                          variant="primary")
+        # Lane.
+        with Vertical(id="gib-lane-host"):
+            yield Static(" Assembly Lane ", id="gib-lane-hdr")
+            yield DataTable(id="gib-lane-table",
+                              cursor_type="row", zebra_stripes=True)
+            with Horizontal(id="gib-lane-btns"):
+                yield Button("↑",        id="btn-gib-lane-up")
+                yield Button("↓",        id="btn-gib-lane-down")
+                yield Button("✕ Remove", id="btn-gib-lane-remove",
+                               variant="error")
+                yield Button("Clear",    id="btn-gib-lane-clear")
+        # Settings row — topology + min-overlap. Pre-2026-05-14 these
+        # were in the action row alongside Simulate; splitting them
+        # keeps the action row from wrapping at narrow widths.
+        with Horizontal(id="gib-settings-row"):
+            yield Static("Topology:", classes="gib-inline-label")
+            yield RadioSet(
+                RadioButton("Circular", value=True,
+                              id="gib-topo-circular"),
+                RadioButton("Linear",    id="gib-topo-linear"),
+                id="gib-topo-set",
+            )
+            yield Static("Min overlap:", classes="gib-inline-label")
+            yield Input(value=str(_GIBSON_MIN_OVERLAP_BP),
+                          id="gib-min-overlap",
+                          classes="gib-min-overlap")
+            yield Static("bp", classes="gib-inline-label")
+        # Validation + results panel. Always-on chain rendering on
+        # every lane mutation; Simulate triggers a fresh check + save
+        # enable.
+        with Vertical(id="gib-results"):
+            yield Static(
+                "[dim]Add fragments to begin. Overlaps appear here.[/]",
+                id="gib-results-text", markup=True,
+            )
+        with Horizontal(id="gib-action-row"):
+            yield Button("Simulate", id="btn-gib-simulate",
+                          variant="primary")
+            yield Button("Save to Library", id="btn-gib-save",
+                          variant="primary", disabled=True)
+
+    def on_mount(self) -> None:
+        self._populate_library_table()
+        self._apply_mode_visibility()
+        self._refresh_lane_table()
+        self._refresh_overlap_view()
+
+    # ── Library table ────────────────────────────────────────────────────────
+
+    def _populate_library_table(self) -> None:
+        entries = sorted(
+            (e for e in _load_library() if isinstance(e, dict)),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
+        try:
+            t = self.query_one("#gib-source-table", DataTable)
+        except NoMatches:
+            return
+        t.clear(columns=True)
+        t.add_columns("Name", "Size (bp)")
+        for e in entries:
+            name = str(e.get("name") or e.get("id") or "")[:60]
+            gb_text = e.get("gb_text") or ""
+            size = (e.get("size") or len(gb_text) or 0)
+            t.add_row(Text(name), str(size))
+
+    def _record_for_table_row(self, row_idx: int) -> "object | None":
+        if row_idx < 0:
+            return None
+        entries = sorted(
+            (e for e in _load_library() if isinstance(e, dict)),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
+        if row_idx >= len(entries):
+            return None
+        entry = entries[row_idx]
+        eid = str(entry.get("id") or entry.get("name") or "")
+        if eid in self._record_cache:
+            return self._record_cache[eid]
+        gb = entry.get("gb_text") or ""
+        if not gb:
+            return None
+        try:
+            rec = _gb_text_to_record(gb)
+        except Exception:
+            _log.exception("gibson: parse failed for entry %r", eid)
+            return None
+        self._record_cache[eid] = rec
+        return rec
+
+    # ── Mode visibility ──────────────────────────────────────────────────────
+
+    def _apply_mode_visibility(self) -> None:
+        try:
+            src_table = self.query_one("#gib-source-table", DataTable)
+            feat_row  = self.query_one("#gib-feature-row", Horizontal)
+            pcr_rows  = self.query_one("#gib-pcr-rows",   Vertical)
+        except NoMatches:
+            return
+        src_table.display = self._mode in ("plasmid", "feature")
+        feat_row.display  = (self._mode == "feature")
+        pcr_rows.display  = (self._mode == "pcr")
+
+    @on(RadioSet.Changed, "#gib-mode-set")
+    def _on_mode_changed(self, event: RadioSet.Changed) -> None:
+        rb = event.pressed
+        if rb is None:
+            return
+        rb_id = rb.id or ""
+        if rb_id.endswith("plasmid"):
+            self._mode = "plasmid"
+        elif rb_id.endswith("feature"):
+            self._mode = "feature"
+        elif rb_id.endswith("pcr"):
+            self._mode = "pcr"
+        self._apply_mode_visibility()
+
+    @on(RadioSet.Changed, "#gib-topo-set")
+    def _on_topo_changed(self, _: RadioSet.Changed) -> None:
+        # Topology change re-runs the overlap chain (the wrap junction
+        # appears/disappears).
+        self._invalidate_product()
+        self._refresh_overlap_view()
+
+    @on(Input.Changed, "#gib-min-overlap")
+    def _on_min_overlap_changed(self, _: Input.Changed) -> None:
+        self._invalidate_product()
+        self._refresh_overlap_view()
+
+    @on(DataTable.RowSelected, "#gib-source-table")
+    def _on_source_selected(self, event: DataTable.RowSelected) -> None:
+        if self._mode != "feature":
+            return
+        rec = self._record_for_table_row(event.cursor_row)
+        if rec is None:
+            return
+        feat_select = self.query_one("#gib-feature-select", Select)
+        opts: list[tuple[str, str]] = []
+        idx = 0
+        total = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+        for f in rec.features:
+            if f.type == "source":
+                continue
+            label = ((f.qualifiers.get("label") or [""])[0]
+                       or f.type or "(unnamed)")
+            bounds = _feat_bounds(f, total)
+            if bounds is None:
+                continue
+            s, e, _strand = bounds
+            opts.append((
+                f"{label}  ({f.type}, {_feat_span_label(s, e, total)})",
+                str(idx),
+            ))
+            idx += 1
+        if not opts:
+            opts = [("(no annotated features)", "")]
+        feat_select.set_options(opts)
+
+    # ── Add fragment ─────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-gib-add")
+    def _on_add(self, _: Button.Pressed) -> None:
+        if len(self._lane) >= self._GIB_MAX_FRAGMENTS:
+            self.app.notify(
+                f"Lane is full — Gibson reactions typically use "
+                f"≤{self._GIB_MAX_FRAGMENTS} fragments. Remove one "
+                f"to add another.",
+                severity="warning",
+            )
+            return
+        try:
+            frag = self._build_fragment_from_inputs()
+        except ValueError as exc:
+            self.app.notify(str(exc), severity="warning", markup=False)
+            return
+        if frag is None:
+            return
+        self._lane.append(frag)
+        self._invalidate_product()
+        self._refresh_lane_table(restore_cursor=len(self._lane) - 1)
+        self._refresh_overlap_view()
+
+    def _build_fragment_from_inputs(self) -> "dict | None":
+        """Read the source-picker inputs and return a fragment dict, or
+        raise ValueError with a user-facing message. Returns None if
+        the user hasn't supplied a valid source (silent — the Add
+        button is a no-op rather than an error)."""
+        if self._mode == "plasmid":
+            t = self.query_one("#gib-source-table", DataTable)
+            rec = self._record_for_table_row(t.cursor_row)
+            if rec is None:
+                raise ValueError(
+                    "Pick a source plasmid from the table first."
+                )
+            seq = str(rec.seq).upper()
+            if not seq:
+                raise ValueError("Source plasmid has no sequence.")
+            name = (str(rec.name or rec.id or "fragment")
+                    [:self._GIB_MAX_FRAGMENT_NAME])
+            return {
+                "name":     self._dedupe_fragment_name(name),
+                "sequence": seq,
+                "features": self._record_features(rec),
+                "source":   f"plasmid:{name}",
+            }
+        if self._mode == "feature":
+            t = self.query_one("#gib-source-table", DataTable)
+            sel = self.query_one("#gib-feature-select", Select)
+            rec = self._record_for_table_row(t.cursor_row)
+            if rec is None:
+                raise ValueError("Pick a source plasmid first.")
+            if sel.value is Select.BLANK or not sel.value:
+                raise ValueError("Pick a feature.")
+            try:
+                feat_idx = int(str(sel.value))
+            except ValueError as exc:
+                raise ValueError("Bad feature selection.") from exc
+            feats_iter = [f for f in rec.features if f.type != "source"]
+            if not (0 <= feat_idx < len(feats_iter)):
+                raise ValueError("Selected feature out of range.")
+            feat = feats_iter[feat_idx]
+            total = len(rec.seq)
+            bounds = _feat_bounds(feat, total)
+            if bounds is None:
+                raise ValueError("Feature has unparseable coordinates.")
+            s, e, strand = bounds
+            feat_seq = _slice_circular(str(rec.seq), s, e).upper()
+            if not feat_seq:
+                raise ValueError("Feature has zero length.")
+            label = (feat.qualifiers.get("label") or ["feature"])[0]
+            name = self._dedupe_fragment_name(
+                str(label)[:self._GIB_MAX_FRAGMENT_NAME]
+            )
+            # If the feature is on the reverse strand, reverse-complement
+            # so the fragment's 5' end is biologically the 5' end.
+            if strand == -1:
+                feat_seq = _rc(feat_seq)
+            return {
+                "name":     name,
+                "sequence": feat_seq,
+                "features": [{
+                    "start":  0,
+                    "end":    len(feat_seq),
+                    "strand": 1,
+                    "type":   feat.type or "misc_feature",
+                    "label":  str(label),
+                }],
+                "source":   f"feature:{rec.id or rec.name}:{label}",
+            }
+        if self._mode == "pcr":
+            name_in = self.query_one("#gib-pcr-name", Input).value.strip()
+            seq_ta = self.query_one("#gib-pcr-seq", TextArea)
+            cleaned = "".join(
+                ch for ch in (seq_ta.text or "").upper()
+                if ch in "ACGTRYWSMKBDHVN"
+            )
+            if not cleaned:
+                raise ValueError(
+                    "Paste DNA bases (ACGT / IUPAC) into the sequence box."
+                )
+            if len(cleaned) > self._GIB_MAX_PASTE_BP:
+                raise ValueError(
+                    f"Pasted sequence is {len(cleaned):,} bp — exceeds "
+                    f"the {self._GIB_MAX_PASTE_BP:,} bp cap for paste "
+                    f"mode. Trim it, or import via 'From plasmid'."
+                )
+            base_name = (name_in or "fragment")[:self._GIB_MAX_FRAGMENT_NAME]
+            name = self._dedupe_fragment_name(base_name)
+            return {
+                "name":     name,
+                "sequence": cleaned,
+                "features": [],
+                "source":   f"paste:{name}",
+            }
+        return None
+
+    def _dedupe_fragment_name(self, base: str) -> str:
+        """Disambiguate by suffixing -2, -3, … when the name is already
+        in the lane. Keeps the lane table readable without forcing the
+        user to type unique names every time."""
+        existing = {f.get("name") for f in self._lane}
+        if base not in existing:
+            return base
+        n = 2
+        while f"{base}-{n}" in existing:
+            n += 1
+        return f"{base}-{n}"
+
+    @staticmethod
+    def _record_features(rec) -> list[dict]:
+        """Convert a SeqRecord's features into the simple-dict shape
+        the simulator expects. Skips `source`. Wrap-aware via
+        `_feat_bounds`. Wrap features get split into a tail half
+        (`[s, total)`) and a head half (`[0, e)`), both tagged with
+        the same ``_wrap_pair`` id so the simulator can re-merge them
+        in the product when the product's topology still has them
+        spanning a junction."""
+        out: list[dict] = []
+        total = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+        wrap_counter = 0
+        for f in rec.features:
+            if f.type == "source":
+                continue
+            bounds = _feat_bounds(f, total)
+            if bounds is None:
+                continue
+            s, e, strand = bounds
+            label = (f.qualifiers.get("label")
+                      or f.qualifiers.get("product")
+                      or [f.type])[0]
+            color = ((f.qualifiers.get("ApEinfo_fwdcolor") or [""])[0]
+                       or "")
+            if e < s:
+                # Wrap feature on a circular source — split into two
+                # halves so each can shift into product coords. The
+                # ``_wrap_pair`` id lets the simulator detect both
+                # halves of the same biological feature and re-merge
+                # them when product topology still has them across a
+                # junction (e.g. the plasmid being used whole as one
+                # Gibson fragment with self-circularisation).
+                pair_id = f"wrap:{wrap_counter}"
+                wrap_counter += 1
+                out.append({
+                    "start":  s,
+                    "end":    total,
+                    "strand": strand,
+                    "type":   f.type,
+                    "label":  str(label)[:200],
+                    "color":  color,
+                    "_wrap_pair": pair_id,
+                    "_wrap_role": "tail",
+                    "_wrap_total": total,
+                })
+                out.append({
+                    "start":  0,
+                    "end":    e,
+                    "strand": strand,
+                    "type":   f.type,
+                    "label":  str(label)[:200],
+                    "color":  color,
+                    "_wrap_pair": pair_id,
+                    "_wrap_role": "head",
+                    "_wrap_total": total,
+                })
+                continue
+            out.append({
+                "start":  s,
+                "end":    e,
+                "strand": strand,
+                "type":   f.type,
+                "label":  str(label)[:200],
+                "color":  color,
+            })
+        return out
+
+    # ── Lane management ──────────────────────────────────────────────────────
+
+    def _refresh_lane_table(self, restore_cursor: int = -1) -> None:
+        try:
+            t = self.query_one("#gib-lane-table", DataTable)
+        except NoMatches:
+            return
+        t.clear(columns=True)
+        t.add_columns("#", "Name", "bp", "5' end", "3' end")
+        for i, f in enumerate(self._lane):
+            seq = str(f.get("sequence") or "")
+            head = seq[:10] + ("…" if len(seq) > 10 else "")
+            tail = ("…" if len(seq) > 10 else "") + seq[-10:]
+            t.add_row(
+                str(i + 1),
+                Text(str(f.get("name") or "?")),
+                str(len(seq)),
+                Text(head, style="cyan"),
+                Text(tail, style="cyan"),
+            )
+        if 0 <= restore_cursor < len(self._lane):
+            try:
+                t.move_cursor(row=restore_cursor)
+            except Exception:
+                pass
+
+    @on(Button.Pressed, "#btn-gib-lane-up")
+    def _on_lane_up(self, _: Button.Pressed) -> None:
+        self._lane_move(-1)
+
+    @on(Button.Pressed, "#btn-gib-lane-down")
+    def _on_lane_down(self, _: Button.Pressed) -> None:
+        self._lane_move(+1)
+
+    def _lane_move(self, delta: int) -> None:
+        try:
+            t = self.query_one("#gib-lane-table", DataTable)
+        except NoMatches:
+            return
+        idx = t.cursor_row
+        new_idx = idx + delta
+        if not (0 <= idx < len(self._lane)
+                and 0 <= new_idx < len(self._lane)):
+            return
+        self._lane[idx], self._lane[new_idx] = (
+            self._lane[new_idx], self._lane[idx]
+        )
+        self._invalidate_product()
+        self._refresh_lane_table(restore_cursor=new_idx)
+        self._refresh_overlap_view()
+
+    @on(Button.Pressed, "#btn-gib-lane-remove")
+    def _on_lane_remove(self, _: Button.Pressed) -> None:
+        try:
+            t = self.query_one("#gib-lane-table", DataTable)
+        except NoMatches:
+            return
+        idx = t.cursor_row
+        if not (0 <= idx < len(self._lane)):
+            return
+        del self._lane[idx]
+        self._invalidate_product()
+        self._refresh_lane_table(
+            restore_cursor=min(idx, len(self._lane) - 1)
+        )
+        self._refresh_overlap_view()
+
+    @on(Button.Pressed, "#btn-gib-lane-clear")
+    def _on_lane_clear(self, _: Button.Pressed) -> None:
+        self._lane = []
+        self._invalidate_product()
+        self._refresh_lane_table()
+        self._refresh_overlap_view()
+
+    # ── Simulation + overlap chain ──────────────────────────────────────────
+
+    def _is_circular(self) -> bool:
+        try:
+            rb = self.query_one("#gib-topo-circular", RadioButton)
+        except NoMatches:
+            return True
+        return bool(rb.value)
+
+    def _min_overlap(self) -> int:
+        try:
+            raw = self.query_one("#gib-min-overlap", Input).value.strip()
+            v = int(raw)
+        except (NoMatches, ValueError):
+            return _GIBSON_MIN_OVERLAP_BP
+        if v < 1:
+            return 1
+        if v > _GIBSON_MAX_OVERLAP_BP:
+            return _GIBSON_MAX_OVERLAP_BP
+        return v
+
+    def _invalidate_product(self) -> None:
+        self._product = None
+        try:
+            self.query_one("#btn-gib-save", Button).disabled = True
+        except NoMatches:
+            pass
+
+    def _refresh_overlap_view(self) -> None:
+        """Run a probe simulation on every lane mutation so the user
+        sees overlap status in real time. The result here is rendered
+        but NOT cached as a "saveable product" — the Simulate button
+        is the explicit commit step that enables Save."""
+        try:
+            results = self.query_one("#gib-results-text", Static)
+        except NoMatches:
+            return
+        if not self._lane:
+            results.update(
+                "[dim]Add fragments to begin. Overlaps appear here.[/]"
+            )
+            return
+        circ = self._is_circular()
+        min_oh = self._min_overlap()
+        r = _simulate_gibson_assembly(
+            self._lane, min_overlap=min_oh, circular=circ,
+        )
+        results.update(self._render_overlap_chain(r, min_oh, circ))
+
+    def _render_overlap_chain(self, result: dict, min_oh: int,
+                                circ: bool) -> Text:
+        t = Text()
+        n = len(self._lane)
+        if n == 0:
+            t.append("(empty)", style="dim")
+            return t
+        # Header: fragment count + topology + product length when valid.
+        topo = "circular" if circ else "linear"
+        if result.get("success"):
+            prod_len = len(result.get("product_seq") or "")
+            t.append(
+                f"{n} fragment(s), {topo} → "
+                f"product {prod_len:,} bp\n",
+                style="bold",
+            )
+        else:
+            t.append(
+                f"{n} fragment(s), {topo} → "
+                f"product invalid (see errors)\n",
+                style="bold",
+            )
+        # Chain rendering: F1 ─[20 bp]─ F2 ─[18 bp]─ F3 ─[wrap]─
+        for i, f in enumerate(self._lane):
+            name = str(f.get("name") or "?")
+            t.append(f"[{name}]", style="cyan")
+            if i < n - 1 or circ:
+                overlaps = result.get("overlaps") or []
+                oh = overlaps[i] if i < len(overlaps) else None
+                if oh is None:
+                    t.append(" — ", style="dim")
+                else:
+                    length = int(oh.get("length") or 0)
+                    ok = bool(oh.get("ok"))
+                    style = "bold green" if ok else "bold red"
+                    arrow = "─[wrap]─" if oh.get("is_wrap") else "─"
+                    t.append(arrow, style="dim")
+                    t.append(f" {length} bp ", style=style)
+                    t.append("─", style="dim")
+        t.append("\n")
+        # Validation messages.
+        for err in (result.get("errors") or []):
+            t.append(f"✗ {err}\n", style="bold red")
+        for w in (result.get("warnings") or []):
+            t.append(f"⚠ {w}\n", style="yellow")
+        if result.get("success") and not result.get("errors"):
+            t.append(
+                "✓ Click Simulate to commit, then Save to Library.\n",
+                style="green",
+            )
+        return t
+
+    @on(Button.Pressed, "#btn-gib-simulate")
+    def _on_simulate(self, _: Button.Pressed) -> None:
+        if not self._lane:
+            self.app.notify(
+                "Add fragments to the lane first.",
+                severity="warning",
+            )
+            return
+        circ = self._is_circular()
+        min_oh = self._min_overlap()
+        r = _simulate_gibson_assembly(
+            self._lane, min_overlap=min_oh, circular=circ,
+        )
+        try:
+            results = self.query_one("#gib-results-text", Static)
+        except NoMatches:
+            return
+        results.update(self._render_overlap_chain(r, min_oh, circ))
+        if r.get("success") and not r.get("errors"):
+            self._product = r
+            try:
+                self.query_one("#btn-gib-save", Button).disabled = False
+            except NoMatches:
+                pass
+        else:
+            self._invalidate_product()
+
+    # ── Save ─────────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-gib-save")
+    def _on_save(self, _: Button.Pressed) -> None:
+        product = self._product
+        if product is None or not product.get("success"):
+            self.app.notify(
+                "Simulate first — no committed product to save.",
+                severity="warning",
+            )
+            return
+        # Capture inputs on the UI thread, then dispatch to the worker.
+        # The lane is deepcopied so a concurrent lane mutation can't
+        # mutate the worker's view; product is already a fresh dict
+        # returned by `_simulate_gibson_assembly`.
+        import copy as _copy
+        lane_snapshot = _copy.deepcopy(self._lane)
+        product_snapshot = _copy.deepcopy(product)
+        circ = bool(product_snapshot.get("circular", True))
+        entry_counter = getattr(self.app, "_record_load_counter", 0)
+        # Disable Save immediately so a second click can't race the
+        # worker into a duplicate insert.
+        self._invalidate_product()
+        self._gibson_save_worker(
+            product=product_snapshot,
+            lane=lane_snapshot,
+            circular=circ,
+            entry_counter=entry_counter,
+        )
+
+    @work(thread=True, exclusive=True, group="gibson_save")
+    def _gibson_save_worker(self, *, product: dict, lane: list[dict],
+                              circular: bool,
+                              entry_counter: int) -> None:
+        """Worker: build the GenBank text + history XML and persist the
+        Gibson product to the library. Heavy serialisation runs
+        off-thread; UI updates (notify / panel reveal / re-populate)
+        bounce back via ``call_from_thread``.
+        """
+        try:
+            entries = _load_library()
+        except Exception as exc:
+            _log.exception("gibson: library load failed")
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Plasmid library", exc,
+            )
+            return
+        existing = {e.get("name") for e in entries
+                     if isinstance(e, dict)}
+        base = "gibson"
+        n = 1
+        name = base
+        while name in existing:
+            n += 1
+            name = f"{base}-{n}"
+        rec = _gibson_record_from_result(product, name=name)
+        if rec is None:
+            self.app.call_from_thread(
+                self._on_gibson_save_failed,
+                "Failed to build SeqRecord from product.",
+            )
+            return
+        try:
+            gb_text = _record_to_gb_text(rec)
+        except Exception as exc:
+            _log.exception("gibson: gb_text serialisation failed")
+            self.app.call_from_thread(
+                self._on_gibson_save_failed,
+                f"Failed to serialize product: {exc}",
+            )
+            return
+        from datetime import date as _date_mod
+        entry = {
+            "id":      name,
+            "name":    name,
+            "size":    len(rec.seq),
+            "n_feats": len(rec.features or []),
+            "source":  "constructor:gibson",
+            "added":   _date_mod.today().isoformat(),
+            "gb_text": gb_text,
+        }
+        try:
+            entry["history_xml"] = self._build_history_for_gibson(
+                name=name, product_seq_len=len(rec.seq),
+                lane=lane, circular=circular,
+                library_entries=entries,
+            )
+        except Exception:
+            _log.exception(
+                "gibson: history recording failed for %s", name,
+            )
+        # Stale-record guard (invariant #28). If the canvas record
+        # changed between Simulate and Save (e.g. the user opened a
+        # different plasmid mid-flight), the lane is still valid
+        # (lane fragments are self-contained, not pinned to the canvas)
+        # — so we proceed but bump the entry's `source` to flag it
+        # for diagnostic clarity.
+        if entry_counter != getattr(self.app, "_record_load_counter",
+                                       entry_counter):
+            entry["source"] = "constructor:gibson:stale-canvas"
+        entries.insert(0, entry)
+        try:
+            _save_library(entries)
+        except (OSError, RuntimeError) as exc:
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Plasmid library", exc,
+            )
+            return
+        self.app.call_from_thread(
+            self._on_gibson_save_success,
+            name, len(rec.seq), len(rec.features or []),
+        )
+
+    def _on_gibson_save_failed(self, msg: str) -> None:
+        self.app.notify(msg, severity="error", markup=False)
+
+    def _on_gibson_save_success(self, name: str, seq_len: int,
+                                  n_feats: int) -> None:
+        self.app.notify(
+            f"Saved {name} ({seq_len:,} bp, "
+            f"{n_feats} features) to library.",
+            timeout=6,
+        )
+        try:
+            lib = self.app.query_one("#library", LibraryPanel)
+            lib.reveal_entry_id(name)
+        except (NoMatches, AttributeError):
+            pass
+        # Re-populate so the new entry is immediately pickable as a
+        # source for the next Gibson lane.
+        self._populate_library_table()
+
+    def _build_history_for_gibson(self, *, name: str,
+                                       product_seq_len: int,
+                                       lane: list[dict],
+                                       circular: bool,
+                                       library_entries: "list | None" = None,
+                                       ) -> "str | None":
+        """Build a `<HistoryTree>` XML documenting the Gibson assembly.
+        Mirrors `TraditionalCloningPane._build_history_for_product`:
+        a root product node, one parent per lane fragment. Parents
+        that came from a library entry inherit their full nested
+        subtree so multi-step builds chain through the history viewer.
+
+        ``library_entries`` lets the caller pass the already-loaded
+        library so we don't re-read it from disk (the save worker
+        already loads it once). When None, falls back to
+        ``_load_library()``.
+        """
+        root = _CommercialSaaSHistoryNode.new(
+            name=name + ".dna",
+            seq_len=product_seq_len,
+            circular=circular,
+            operation="gibsonAssembly",
+            node_id=0,
+        )
+        # Build a name → entry index once so the per-fragment lookup is O(n).
+        if library_entries is None:
+            library_entries = _load_library()
+        lib_by_name: dict[str, dict] = {}
+        for e in library_entries:
+            if isinstance(e, dict):
+                nm = e.get("name")
+                if nm:
+                    lib_by_name[str(nm)] = e
+        for f in lane:
+            f_name = str(f.get("name") or "?")
+            entry = lib_by_name.get(f_name)
+            if entry is None:
+                # Synth a leaf node when the fragment didn't originate
+                # from a library entry (paste-DNA mode, feature mode
+                # with a renamed fragment, etc.).
+                entry = {
+                    "name": f_name,
+                    "size": len(str(f.get("sequence") or "")),
+                }
+            p_node = TraditionalCloningPane._parent_node_for_entry(entry)
+            if p_node is not None:
+                root.add_parent(p_node)
+        return _serialize_commercialsaas_history(root)
+
+
 def _palette_rows_for_grammar(
     grammar_id: str, *, filter_enabled: bool, source_level: int = 0,
 ) -> list[tuple]:
@@ -37094,6 +38419,9 @@ class ConstructorModal(ModalScreen):
                 with TabPane("Traditional  (Restriction digest + ligate)",
                               id="ctor-tab-traditional"):
                     yield TraditionalCloningPane(id="ctor-trad-pane")
+                with TabPane("Gibson  (Overlap homology assembly)",
+                              id="ctor-tab-gibson"):
+                    yield GibsonAssemblyPane(id="ctor-gib-pane")
                 for gid, label in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
                     with TabPane(label, id=f"ctor-tab-{gid}"):
                         yield from self._compose_modular_pane(gid)
@@ -47841,6 +49169,44 @@ TraditionalCloningPane    { height: auto; }
 #trad-results > Static    { padding: 0 1; }
 #trad-save-row            { height: 3; margin-top: 1; align: left middle; }
 #trad-save-row Button     { margin-right: 1; }
+
+/* ── Gibson assembly tab ────────────────────────────────── */
+GibsonAssemblyPane        { height: auto; }
+#gib-mode-row             { height: 3; align: left middle; margin-bottom: 1; }
+#gib-mode-label           { width: 18; color: $text-muted; }
+#gib-mode-row RadioSet    { layout: horizontal; height: 3; }
+#gib-mode-row RadioButton { margin-right: 2; }
+#gib-source-host          { height: auto; border: solid $primary-darken-2;
+                            padding: 0 1; margin-bottom: 1; }
+#gib-source-host > Static { color: $text-muted; padding: 0 1;
+                             background: $primary-darken-2; }
+#gib-source-table         { height: 4; }
+#gib-feature-row          { height: 3; align: left middle; }
+#gib-pcr-rows             { height: auto; }
+#gib-feature-select       { width: 1fr; }
+#gib-pcr-name             { width: 1fr; }
+#gib-pcr-seq              { height: 4; border: solid $primary-darken-3; }
+.gib-inline-label         { padding: 1 1 0 1; width: auto;
+                             color: $text-muted; }
+#gib-add-row              { height: 3; align: left middle; margin-bottom: 1; }
+#gib-lane-host            { height: auto; border: solid $primary-darken-2;
+                            padding: 0 1; margin-bottom: 1; }
+#gib-lane-host > Static   { color: $text-muted; padding: 0 1;
+                             background: $primary-darken-2; }
+#gib-lane-table           { height: 5; }
+#gib-lane-btns            { height: 3; align: left middle; }
+#gib-lane-btns Button     { margin-right: 1; }
+#gib-settings-row         { height: 3; align: left middle; margin-bottom: 1; }
+#gib-settings-row RadioSet { layout: horizontal; height: 3;
+                              margin-right: 2; }
+#gib-settings-row RadioButton { margin-right: 2; }
+.gib-min-overlap          { width: 8; }
+#gib-results              { height: 1fr; min-height: 6;
+                            border: solid $primary-darken-2;
+                            padding: 0 1; overflow-y: auto; }
+#gib-results > Static     { padding: 0 1; }
+#gib-action-row           { height: 3; margin-top: 1; align: left middle; }
+#gib-action-row Button    { margin-right: 1; }
 
 /* ── Grammar editor modal ────────────────────────────────── */
 GrammarEditorModal { align: center middle; }
