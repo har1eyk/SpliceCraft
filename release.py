@@ -2,20 +2,29 @@
 """release.py — cut a new SpliceCraft release.
 
 Usage:  ./release.py 0.8.7
+        ./release.py --bioconda-only           # re-submit current recipe
 
-Pure-Python replacement for the old release.sh. Same five steps, same
+Pure-Python replacement for the old release.sh. Same seven steps, same
 ordering, same abort-on-failure semantics:
 
   1. Bumps the version in BOTH pyproject.toml and splicecraft.py.
   2. Runs the test suite (aborts on any failure).
   3. Builds the package locally (aborts if twine check fails).
-  4. Commits the bump, tags v<version>, and pushes.
-  5. GitHub Actions (publish.yml) builds + uploads to PyPI from the tag.
+  4. Syncs `conda-recipe/meta.yaml` (version + sha256 + run-deps) from
+     the just-built sdist + pyproject — keeps the in-repo recipe in
+     lockstep with PyPI so a bioconda PR is one click away.
+  5. Commits the bump, tags v<version>, and pushes.
+  6. GitHub Actions (publish.yml) builds + uploads to PyPI from the tag.
+  7. Polls PyPI until the sdist is hosted, then forks
+     bioconda-recipes (if needed) and opens a PR with the recipe
+     update so end users can `conda install -c bioconda splicecraft`.
 
 Prereqs (one-time, see README):
 
   - Trusted Publishing configured at pypi.org for this project.
   - git clean working tree (commit everything else first).
+  - `gh` CLI authenticated (`gh auth status`) — needed for the
+    bioconda fork + PR step. Skipped with a note if missing.
 
 Aborts at the first error — every shelled-out step uses ``check=True`` so
 a failed test / build / push raises ``CalledProcessError`` and the script
@@ -27,16 +36,33 @@ The whole thing takes ~2 minutes from run to "live on PyPI".
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 REPO_ROOT = Path(__file__).resolve().parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 SPLICECRAFT = REPO_ROOT / "splicecraft.py"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
+CONDA_RECIPE = REPO_ROOT / "conda-recipe" / "meta.yaml"
+
+# Upstream bioconda repository — the canonical channel every
+# `conda install -c bioconda <pkg>` user pulls from. The release flow
+# forks this into the maintainer's account, pushes a branch with the
+# updated recipe, and opens a PR against this upstream repo. Once
+# merged by a bioconda maintainer, bioconda's CI builds the package
+# and uploads to anaconda.org/bioconda — that's how the recipe
+# actually reaches end users.
+BIOCONDA_UPSTREAM = "bioconda/bioconda-recipes"
+BIOCONDA_RECIPE_SUBPATH = "recipes/splicecraft/meta.yaml"
+PYPI_SDIST_URL_TPL = (
+    "https://pypi.io/packages/source/s/splicecraft/"
+    "splicecraft-{version}.tar.gz"
+)
 
 # Accept canonical X.Y.Z plus PEP-440 suffixes (rc1, post1, dev0, …).
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+([a-z0-9.-]*)?$")
@@ -51,12 +77,35 @@ _SPLICECRAFT_VERSION_RE = re.compile(
     r'^(__version__\s*=\s*)"[^"]+"', re.MULTILINE,
 )
 
+# conda-recipe/meta.yaml uses jinja2-style `{% set version = "..." %}`
+# at the top and a `sha256: <hex>` line under `source:`. The run-deps
+# block under `requirements:` is a YAML list we rewrite wholesale from
+# pyproject's `[project] dependencies` so the two never drift.
+_CONDA_VERSION_RE = re.compile(
+    r'(\{%\s*set\s+version\s*=\s*)"[^"]+"(\s*%\})'
+)
+_CONDA_SHA256_RE = re.compile(
+    r'^(\s*sha256:\s*)[0-9a-fA-F]{64}', re.MULTILINE,
+)
+# `  run:` followed by one or more `    - <name> ...` list items, up to
+# the next less-indented line. Captures the whole block for replacement.
+_CONDA_RUN_BLOCK_RE = re.compile(
+    r"^  run:\n(?:    -.*\n)+", re.MULTILINE,
+)
+# Match a single "package>=X.Y.Z" or "package" line inside pyproject's
+# `dependencies = [ ... ]` array (PEP 621).
+_PYPROJECT_DEPS_BLOCK_RE = re.compile(
+    r"^dependencies\s*=\s*\[\s*\n(.*?)^\]",
+    re.MULTILINE | re.DOTALL,
+)
+_PEP440_SPEC_RE = re.compile(r"^([A-Za-z0-9._-]+)\s*(.*)$")
+
 
 def _heading(msg: str) -> None:
     print(f"── {msg} ──", flush=True)
 
 
-def _die(msg: str, code: int = 1) -> None:
+def _die(msg: str, code: int = 1) -> NoReturn:
     print(f"Error: {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -159,15 +208,376 @@ def _clean_build_artifacts() -> None:
         shutil.rmtree(egg, ignore_errors=True)
 
 
+def _read_pyproject_runtime_deps() -> list[str]:
+    """Extract the [project] dependencies array from pyproject.toml in
+    declaration order. Returns the raw PEP-440 specifiers (e.g.
+    ``"textual>=8.2.6"``).
+
+    Regex-based to avoid a tomllib (3.11+) / tomli dependency — the
+    pyproject's dependency block uses one quoted string per line with
+    comments and blank lines interspersed, all of which we skip.
+    """
+    text = PYPROJECT.read_text(encoding="utf-8")
+    m = _PYPROJECT_DEPS_BLOCK_RE.search(text)
+    if m is None:
+        _die("could not find `dependencies = [...]` in pyproject.toml.")
+    deps: list[str] = []
+    for line in m.group(1).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Strip trailing comma + trailing inline comment.
+        no_comment = stripped.split("#", 1)[0].strip().rstrip(",").strip()
+        m2 = re.match(r'^"([^"]+)"$', no_comment)
+        if m2:
+            deps.append(m2.group(1))
+    if not deps:
+        _die("pyproject's dependencies array parsed empty — refusing "
+             "to wipe the conda recipe's run-deps.")
+    return deps
+
+
+def _pep440_to_conda(spec: str) -> str:
+    """Translate a single PEP-440 spec to conda's `pkg >=X.Y.Z` form.
+
+    Conda's recipe parser wants whitespace between the package name and
+    the version constraint; pyproject (PEP 508) accepts both styles but
+    we normalise here so the recipe stays consistent regardless of how
+    pyproject is written.
+    """
+    m = _PEP440_SPEC_RE.match(spec.strip())
+    if not m:
+        return spec
+    name, rest = m.group(1), m.group(2).strip()
+    return f"{name} {rest}".strip() if rest else name
+
+
+def _sha256_of(path: Path) -> str:
+    """SHA-256 hex digest of a file, streamed in 64 KB chunks so we
+    don't load multi-MB sdists fully into RAM."""
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(64 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sync_conda_recipe(new_version: str) -> None:
+    """Rewrite ``conda-recipe/meta.yaml`` to match the just-built
+    release: bump version, regenerate sha256 from the local sdist
+    (hatchling produces deterministic sdists, so this matches what
+    PyPI will host), and rewrite the ``run:`` block from
+    pyproject.toml's runtime deps.
+
+    The recipe is the reference copy that lives in-repo; the canonical
+    bioconda copy at ``bioconda-recipes/recipes/splicecraft/`` still
+    needs a PR with the same bump, but having the local recipe always
+    pre-bumped means the PR is a one-shot copy-paste.
+
+    No-op if the recipe file is missing (older checkouts predate it).
+    """
+    if not CONDA_RECIPE.is_file():
+        print(f"Note: {CONDA_RECIPE.relative_to(REPO_ROOT)} not present; "
+              "skipping conda recipe sync.")
+        return
+
+    sdists = sorted((REPO_ROOT / "dist").glob("*.tar.gz"))
+    if not sdists:
+        _die("no sdist found in dist/ — conda sha256 cannot be computed.")
+    if len(sdists) > 1:
+        _die(f"expected exactly one sdist in dist/, found {len(sdists)}.")
+    sdist = sdists[0]
+    sha256 = _sha256_of(sdist)
+
+    text = CONDA_RECIPE.read_text(encoding="utf-8")
+
+    text, n = _CONDA_VERSION_RE.subn(rf'\1"{new_version}"\2', text)
+    if n != 1:
+        _die(f"conda recipe: expected 1 `{{% set version = ... %}}` "
+             f"line, got {n}.")
+
+    text, n = _CONDA_SHA256_RE.subn(rf"\g<1>{sha256}", text)
+    if n != 1:
+        _die(f"conda recipe: expected 1 sha256 line, got {n}.")
+
+    pep_deps = _read_pyproject_runtime_deps()
+    # `python >=3.10` is always the first run-dep — keep it pinned to
+    # the value in pyproject.toml's `requires-python` rather than
+    # hard-coding so a future Python-floor bump stays in sync. Parsing
+    # the floor again here avoids a separate constant.
+    py_floor_m = re.search(
+        r'^requires-python\s*=\s*"\s*([^"]+?)\s*"',
+        PYPROJECT.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    py_floor = (
+        py_floor_m.group(1).strip() if py_floor_m is not None else ">=3.10"
+    )
+    run_lines = [f"    - python {py_floor}"]
+    run_lines.extend(f"    - {_pep440_to_conda(d)}" for d in pep_deps)
+    new_run_block = "  run:\n" + "\n".join(run_lines) + "\n"
+
+    text, n = _CONDA_RUN_BLOCK_RE.subn(new_run_block, text, count=1)
+    if n != 1:
+        _die("conda recipe: failed to rewrite the `run:` deps block "
+             "(expected `  run:` followed by `    - …` lines).")
+
+    CONDA_RECIPE.write_text(text, encoding="utf-8")
+    print(f"  conda recipe → version {new_version}, sha256 {sha256[:16]}…, "
+          f"{len(pep_deps)} runtime deps from pyproject")
+
+
+def _wait_for_pypi(new_version: str, timeout_s: int = 360) -> bool:
+    """Poll PyPI until the new sdist is downloadable. Bioconda's bot
+    tries to fetch the sdist immediately when the PR opens; if PyPI's
+    Trusted Publishing pipeline hasn't finished yet, the first CI run
+    fails and the user has to re-trigger it manually. Polling here is
+    a 1-3 minute wait that avoids the dance entirely.
+
+    Returns True on success, False on timeout (in which case the
+    caller opens the PR anyway and the bot's automatic retry will
+    eventually pick up the sdist).
+    """
+    import time
+    url = PYPI_SDIST_URL_TPL.format(version=new_version)
+    deadline = time.time() + timeout_s
+    print(f"  Polling {url}")
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["curl", "-sIfL", "-o", "/dev/null", url],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            print("  sdist live on PyPI.")
+            return True
+        time.sleep(10)
+    print(f"  Timed out after {timeout_s}s. Bioconda PR will open "
+          "anyway; their bot retries until the sdist is reachable.")
+    return False
+
+
+def _gh_logged_in_user() -> "str | None":
+    """Return the GitHub username the local `gh` CLI is authenticated
+    as, or None if `gh` isn't installed / authed (caller skips PR)."""
+    if not shutil.which("gh"):
+        return None
+    result = subprocess.run(
+        ["gh", "api", "user", "--jq", ".login"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    name = result.stdout.strip()
+    return name or None
+
+
+def _ensure_bioconda_fork(owner: str) -> None:
+    """Ensure `<owner>/bioconda-recipes` exists. Forks the upstream if
+    it doesn't. Idempotent — `gh repo fork` is a no-op when the fork
+    already exists."""
+    result = subprocess.run(
+        ["gh", "repo", "view", f"{owner}/bioconda-recipes"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        return
+    print(f"  Forking {BIOCONDA_UPSTREAM} → {owner}/bioconda-recipes")
+    _run(["gh", "repo", "fork", BIOCONDA_UPSTREAM,
+          "--clone=false", "--default-branch-only"])
+
+
+def _submit_bioconda_pr(new_version: str) -> None:
+    """Open (or update) a bioconda PR with the current recipe.
+
+    Steps:
+      1. Verify `gh` is authed; skip with a note if not.
+      2. Fork bioconda/bioconda-recipes if the maintainer's account
+         doesn't already host a fork.
+      3. Shallow-clone the fork to a temp dir, fast-forward its
+         master to upstream (so our branch is fresh).
+      4. Drop in `recipes/splicecraft/meta.yaml` from our in-repo
+         recipe (which `_sync_conda_recipe` just refreshed).
+      5. Branch, commit, force-push to the fork (force-with-lease so
+         a stale branch from a previous failed attempt doesn't block
+         us; per-version branches make collisions impossible across
+         releases).
+      6. Open the PR against the upstream master. If one for this
+         version already exists (re-run), print the URL and skip.
+
+    First-time submissions (no `recipes/splicecraft/` directory in
+    bioconda yet) and updates use the same flow; bioconda's bot
+    handles both transparently.
+    """
+    if not CONDA_RECIPE.is_file():
+        print(f"Note: {CONDA_RECIPE.relative_to(REPO_ROOT)} not present; "
+              "skipping bioconda PR.")
+        return
+
+    owner = _gh_logged_in_user()
+    if owner is None:
+        print("Note: `gh` CLI not installed or not authenticated; "
+              "skipping bioconda PR. Run `gh auth login` and rerun "
+              "with --bioconda-only to publish to bioconda.")
+        return
+
+    print(f"  gh authenticated as {owner}")
+    _ensure_bioconda_fork(owner)
+
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="bioconda-pr-") as tmp:
+        clone = Path(tmp) / "bioconda-recipes"
+        # Shallow clone keeps the bioconda-recipes mega-repo manageable
+        # (it has 10K+ recipes and a multi-GB history).
+        _run([
+            "git", "clone", "--depth=1", "--single-branch",
+            "--branch=master",
+            f"https://github.com/{owner}/bioconda-recipes.git",
+            str(clone),
+        ])
+        # Pull the latest upstream master into the shallow clone so
+        # our branch starts from current head, not the fork's
+        # potentially-stale snapshot.
+        _run(["git", "-C", str(clone), "remote", "add",
+              "upstream", f"https://github.com/{BIOCONDA_UPSTREAM}.git"])
+        _run(["git", "-C", str(clone), "fetch", "--depth=1",
+              "upstream", "master"])
+        _run(["git", "-C", str(clone), "reset", "--hard",
+              "upstream/master"])
+
+        recipe_dir = clone / "recipes" / "splicecraft"
+        is_first_submission = not recipe_dir.exists()
+        recipe_dir.mkdir(parents=True, exist_ok=True)
+        target_meta = recipe_dir / "meta.yaml"
+        shutil.copy2(CONDA_RECIPE, target_meta)
+
+        branch = f"splicecraft-{new_version}"
+        _run(["git", "-C", str(clone), "checkout", "-b", branch])
+        _run(["git", "-C", str(clone), "add",
+              "recipes/splicecraft/meta.yaml"])
+
+        commit_msg = (
+            f"splicecraft: add v{new_version} (first submission)"
+            if is_first_submission
+            else f"splicecraft: bump to v{new_version}"
+        )
+        # Configure git identity for the commit in the temp clone so
+        # the commit doesn't fail on a clean machine without a global
+        # gitconfig. Use the same identity gh is authed as.
+        _run(["git", "-C", str(clone), "config", "user.name",  owner])
+        _run(["git", "-C", str(clone), "config", "user.email",
+              f"{owner}@users.noreply.github.com"])
+        _run(["git", "-C", str(clone), "commit", "-m", commit_msg])
+        # `--force-with-lease` rather than `--force`: safer if someone
+        # else is collaborating on the same branch (won't happen for
+        # auto-named per-version branches, but the habit is cheap).
+        _run(["git", "-C", str(clone), "push",
+              "--force-with-lease", "origin", branch])
+
+        # Check whether a PR for this version already exists. If yes,
+        # skip the create call and just print the URL — a re-run
+        # shouldn't open duplicate PRs.
+        pr_check = subprocess.run(
+            ["gh", "pr", "list",
+             "--repo", BIOCONDA_UPSTREAM,
+             "--head", f"{owner}:{branch}",
+             "--state", "open",
+             "--json", "url,number",
+             "--limit", "1"],
+            capture_output=True, text=True, check=False,
+        )
+        if pr_check.returncode == 0 and pr_check.stdout.strip() not in (
+            "", "[]"
+        ):
+            # A PR already exists for this branch — surface it.
+            import json as _json
+            try:
+                existing = _json.loads(pr_check.stdout)
+                if existing:
+                    print(f"  Existing PR: {existing[0]['url']}")
+                    return
+            except _json.JSONDecodeError:
+                pass
+
+        pr_title = commit_msg
+        pr_body = (
+            f"Updates the SpliceCraft recipe to v{new_version}.\n\n"
+            f"- PyPI: https://pypi.org/project/splicecraft/{new_version}/\n"
+            f"- Upstream: https://github.com/Binomica-Labs/SpliceCraft\n"
+            f"- Tag: https://github.com/Binomica-Labs/SpliceCraft/"
+            f"releases/tag/v{new_version}\n\n"
+            "Recipe synced from the in-repo `conda-recipe/meta.yaml` "
+            "via `release.py`: version + sha256 (regenerated from the "
+            "live sdist) + runtime deps (rewritten from `pyproject.toml`'s "
+            "`[project] dependencies`).\n"
+        )
+        if is_first_submission:
+            pr_body += (
+                "\n_This is the first bioconda submission for "
+                "splicecraft._ Recipe maintainer: @"
+                + owner
+                + ". Happy to address any bot feedback."
+            )
+
+        create_result = subprocess.run(
+            ["gh", "pr", "create",
+             "--repo", BIOCONDA_UPSTREAM,
+             "--head", f"{owner}:{branch}",
+             "--base", "master",
+             "--title", pr_title,
+             "--body", pr_body],
+            check=False,
+        )
+        if create_result.returncode != 0:
+            print("  Note: `gh pr create` exited non-zero. The fork "
+                  "branch is pushed; open the PR manually at "
+                  f"https://github.com/{BIOCONDA_UPSTREAM}/compare/"
+                  f"master...{owner}:bioconda-recipes:{branch}")
+
+
+def _current_version() -> str:
+    """Read the canonical version from pyproject.toml. Used by the
+    `--bioconda-only` re-submit path which skips the bump step."""
+    text = PYPROJECT.read_text(encoding="utf-8")
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if m is None:
+        _die("could not read current version from pyproject.toml.")
+    return m.group(1)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Cut a new SpliceCraft release.",
     )
     parser.add_argument(
         "version",
-        help="New version (X.Y.Z, optionally with PEP-440 suffix).",
+        nargs="?",
+        help="New version (X.Y.Z, optionally with PEP-440 suffix). "
+             "Omit when using --bioconda-only.",
+    )
+    parser.add_argument(
+        "--bioconda-only",
+        action="store_true",
+        help="Skip every PyPI step and just open / refresh the "
+             "bioconda PR against the upstream `bioconda-recipes` "
+             "repo using the current `conda-recipe/meta.yaml`. Use "
+             "after a PyPI release that pre-dated this automation, "
+             "or to retry the PR after addressing bot feedback.",
     )
     args = parser.parse_args(argv)
+
+    if args.bioconda_only:
+        if args.version is not None:
+            _die("--bioconda-only does not accept a version argument; "
+                 "it operates on the recipe currently in the tree.")
+        new_version = _current_version()
+        _heading(f"Bioconda-only re-submit for v{new_version}")
+        _wait_for_pypi(new_version)
+        _heading("Opening / refreshing bioconda PR")
+        _submit_bioconda_pr(new_version)
+        return 0
+
+    if args.version is None:
+        _die("version argument required (or pass --bioconda-only).")
     new_version = args.version
 
     if not _VERSION_RE.match(new_version):
@@ -207,8 +617,14 @@ def main(argv: list[str] | None = None) -> int:
         _die("no build artifacts found in dist/.")
     _run([sys.executable, "-m", "twine", "check", *dist_files])
 
+    _heading("Syncing conda recipe")
+    _sync_conda_recipe(new_version)
+
     _heading("Committing + tagging + pushing")
-    _run(["git", "add", "pyproject.toml", "splicecraft.py"])
+    add_targets = ["pyproject.toml", "splicecraft.py"]
+    if CONDA_RECIPE.is_file():
+        add_targets.append(str(CONDA_RECIPE.relative_to(REPO_ROOT)))
+    _run(["git", "add", *add_targets])
     _run(["git", "commit", "-m", f"Release v{new_version}"])
     _run(["git", "tag", f"v{new_version}"])
     _run(["git", "push", "origin", "master"])
@@ -220,6 +636,22 @@ def main(argv: list[str] | None = None) -> int:
     print(" GitHub Actions will publish to PyPI in ~2 minutes.")
     print(" Watch:  https://github.com/Binomica-Labs/SpliceCraft/actions")
     print(" Verify: https://pypi.org/project/splicecraft/")
+    print("═" * 61)
+
+    _heading("Waiting for PyPI before opening bioconda PR")
+    _wait_for_pypi(new_version)
+
+    _heading("Opening bioconda PR")
+    _submit_bioconda_pr(new_version)
+
+    print()
+    print("═" * 61)
+    print(f" Bioconda PR step complete for v{new_version}.")
+    print(" Watch:  "
+          f"https://github.com/{BIOCONDA_UPSTREAM}/pulls?q=splicecraft")
+    print(" End users will get the package via:")
+    print("   conda install -c bioconda splicecraft")
+    print(" once the PR is reviewed and merged.")
     print("═" * 61)
     return 0
 
