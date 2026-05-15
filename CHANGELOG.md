@@ -2,6 +2,177 @@
 
 ---
 
+## [0.8.9] — 2026-05-15 — adversarial audit sweep #5 · data integrity first
+
+Seven-surface parallel audit on top of sweep #4, with **data integrity
+elevated to top priority by the user**. Every corruption-class and
+silent-mutation finding lands first; defence-in-depth follows. All
+2,436 tests still pass; CLAUDE.md invariant #45 has the full ledger.
+
+### Data-integrity HIGHs
+
+* **Sidecar case-collision (corruption).** `_dna_sidecar_path` now
+  case-folds the basename AND appends an 8-char SHA-1 prefix of the
+  raw `entry_id`. Pre-fix, on case-insensitive filesystems (macOS
+  APFS default, NTFS) two library entries `pUC19` and `puc19`
+  collided on the same on-disk `.dna` sidecar path — silently
+  overwriting each other's round-trip bytes, so exporting the older
+  entry emitted the wrong molecule. Legacy path fallback at load
+  time migrates existing sidecars on first access. Basename capped
+  at 200 chars to keep the full path under NTFS's 260-char default.
+* **`.bak` recovery atomicity (corruption).** `_safe_load_json`'s
+  recovery branch routes through `_atomic_write_bytes` instead of
+  `shutil.copy2`. Pre-fix, a power loss mid-recovery left the main
+  file truncated — paradoxically *less* recoverable than the corrupt
+  state we were rescuing from.
+* **`_migrate_legacy_data` atomicity (corruption).** The one-shot
+  legacy-data-dir → `_DATA_DIR` copy now uses an inline atomic-copy
+  helper (tempfile + fsync + `os.replace`). Pre-fix, a crash
+  mid-launch left a permanently-corrupt copy that the `not
+  dst.exists()` idempotency check would skip on every subsequent
+  launch — silent lock-in of the corruption.
+* **Pre-update SHA-256 mandatory.** `_restore_pre_update_snapshot`
+  refuses restore when the manifest entry's `sha256` field is
+  missing or empty (was: silently skipped verify). This was one of
+  invariant #39's "sacred-four" checks; the backup directory is
+  user-writable, so a tampered manifest with `sha256` stripped used
+  to bypass the check entirely.
+* **Pre-update manifest size cap.** New
+  `_PRE_UPDATE_MANIFEST_MAX_BYTES = 4 MB` applied at both
+  `_list_pre_update_snapshots` and `_restore_pre_update_snapshot`.
+  Pre-fix a planted multi-GB manifest would OOM the launch path.
+
+### Durability + symlink hardening
+
+* `_save_dna_original`, `_export_commercialsaas_dna`,
+  `_create_diagnostic_bundle`, and the `_AGENT_TOKEN_FILE` writer
+  all now call `_fsync_parent_dir` after `os.replace`. POSIX rename
+  is atomic at the inode level but the directory entry update is
+  journalled separately — without the parent-dir fsync, a power
+  loss between rename and the next directory sync can leave the
+  directory entry pointing at the OLD inode after fsck.
+* `_safe_save_json` refuses to save through a symlinked target.
+  Pre-fix, a symlinked `_LIBRARY_FILE` pointing at `/etc/passwd`
+  would let the backup-read step copy the link target into a
+  user-readable `.bak`. Belt-and-braces with the existing agent-side
+  `_check_agent_write_path` symlink walk.
+* New `_check_agent_read_dir` rejects symlinked folder args on
+  `bulk-import-folder` and `create-collection` endpoints —
+  `Path.is_dir` follows symlinks, so a pre-placed symlink could
+  let an agent caller scan `/etc` etc.
+
+### Operational hygiene
+
+* `_sweep_orphan_tmp_files` collects leftover `.tmp` / `.migrating`
+  / `.restoring` files in `_DATA_DIR` from SIGKILL'd / OOM-killed
+  previous runs. Called from `main()` only when the data-dir lock
+  was acquired AND only for files older than 1 h, so legitimate
+  in-flight writes are never collected.
+* `_backup_filename_patterns` returns `(base, base + ".*")` so
+  collision-bumped `.bak.<ts>.<N>` files (slow-burn disk fill on
+  rapid Ctrl+S in the same wall-second) are pruned alongside the
+  base.
+* Lockfile creation uses `O_EXCL` first so a contention failure
+  can clean up only the lockfile we just created — no race-removing
+  another process's lockfile.
+* `_restore_from_backup` staging tmp switched from deterministic
+  `<target>.restoring` to `tempfile.mkstemp` so concurrent UI +
+  agent restores can't truncate each other mid-copy.
+* `_load_dna_original` now size-capped via `_safe_file_size_check`
+  (matching the 50 MB write cap).
+* `_sync_active_collection_plasmids` + `_sync_active_parts_bin_parts`
+  switched from shallow `dict(e)` to `_typed_clone` (invariant #17
+  requires deep on both read AND save sides).
+
+### Concurrency
+
+* `_settings_flush_worker` wrapped in `try/finally` so an
+  unforeseen exception (e.g., a non-JSON-serialisable value
+  sneaking past `_validate_settings`) cannot wedge
+  `_settings_flush_running = True` forever, silently disabling all
+  subsequent setting saves. Broadened except envelope catches the
+  unexpected case + logs.
+* `SPLICECRAFT_SKIP_SETTINGS_FLUSH=1` test bypass mirrors the
+  existing `_skip_*` flag pattern (deterministic disk state in
+  tests without a trailing daemon thread).
+* `_h_set_entry_vector` wrapped in `_agent_save_or_500` (8th
+  endpoint); pre-fix, a disk failure here silently returned 200 OK.
+* `_h_replace_sequence._apply` catches `NoMatches` / `AttributeError`
+  from screen unmount during the big-rebuild apply window.
+* `_AgentRequestHandler._read_body` catches socket `OSError` on
+  broken connections (cleaner 400 than the dispatch wrapper's
+  generic 500).
+* `PlasmidsaurusAlignModal._show` adds `is_mounted` guard before
+  `self.dismiss(result)` (mirror of the export modals' pattern).
+* `_blocks_undo: bool = True` added to `PrimerDesignScreen`,
+  `PartsBinModal`, `FeatureLibraryScreen` so Ctrl+Z under those
+  screens can't pop the canvas undo stack mid-save.
+* Three `@work(group="blast_run")` decorators (HMMscan / BLAST run
+  / BLAST build) split into distinct groups so a build no longer
+  cancels an in-flight search via shared-group `exclusive=True`.
+
+### Attack surface
+
+* `_h_diff_plasmid` pre-caps both seqs at `_PAIRWISE_MAX_LEN`
+  before `_find_circular_alignment_offset` doubles the target — a
+  50 MB library entry used to allocate 100 MB before
+  `_pairwise_align`'s own cap kicked in.
+* Export endpoints (`export-genbank` / `export-gff` / `export-fasta`)
+  enforce extension whitelists via `_check_export_extension`.
+  Pre-fix an agent could write `~/.bashrc` as GenBank text.
+* `_sanitize_path` refuses `~user` syntax (bare `~` for the running
+  user is still fine) — pre-fix a user-enumeration oracle via
+  agent-side `_h_load_file`'s 404 vs 400 distinction.
+* `splicecraft_cli.py` caps both the agent response body (50 MB,
+  symmetric with server cap) and the token file (1 KB) at read time.
+
+### Performance
+
+* `_repopulate_plasmids` no longer calls `_load_library()` twice
+  per filter keystroke — the caller already loaded into
+  `lib_entries`; the redundant second call was a full `_typed_clone`
+  of the cached library (hundreds of ms on a 1000-row library with
+  `gb_text` blobs).
+* Two seq-panel O(N) feature scans (the Enter key handler and
+  `_seq_lane_clicked`'s bp-fallback branch) migrated to
+  `pm._smallest_enclosing_feature(bp)`. Sweep #4 introduced the
+  helper but missed these callers.
+
+### Observability
+
+* `_notify_save_failure` (the central choke point through which
+  `_bg_notify_save_failure` and 30+ direct save sites route on
+  failure) now emits a structured `save.failed` event with `target`,
+  `exc_type`, and `exc_msg` — every disk-full / RO-mount / EACCES is
+  now AI-parseable from log dumps.
+* `_apply_record` emits `record.loaded` at every canvas swap (rec,
+  bp, n_features, topology, clear_undo) so post-load events
+  (restriction scan, sidebar populate, overlay paint) correlate
+  against a single boundary.
+* `_log_event(event, *, _stacklevel: int = 2, **fields)` —
+  decorators `@_action_log` and `@_timed` now pass `_stacklevel=3`
+  so the logger's `funcName:lineno` prefix lands on the wrapped
+  action method, not on the wrapper closure. Restores invariant
+  #43's documented contract.
+* `lock.acquired` / `lock.contended` / `lock.stale` events route
+  the lockfile path through `_scrub_path` so a shared log doesn't
+  leak `/home/<user>/`.
+* `SPLICECRAFT_DEBUG=1` env var bumps `_log` to DEBUG level —
+  surfaces network-retry events and other diagnostic-only signals
+  that normally stay below INFO.
+
+### Deferred to sweep #6
+
+Cross-thread cache-reassignment races on
+`_parts_bin_collections_cache` / `_grammars_cache` /
+`_entry_vectors_cache` / etc.; stale-collection guard on
+`_index_usage_worker` (primer-usage scan landing in the wrong
+collection's index after a switch); `MultiAlignPickerModal._on_picked`
+UI-thread GenBank parse. All three require structural refactors with
+dedicated test scaffolding that sweep #5's scope didn't budget.
+
+---
+
 ## [0.8.8] — 2026-05-15 — dep bumps · Python 3.13 in CI · primer3 error logging
 
 ### Dependency floors bumped to latest
