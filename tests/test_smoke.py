@@ -2620,6 +2620,14 @@ class TestSearchInputWidget:
         `pytest -n auto` heat — the inter-assignment scheduling
         gap could stretch past 50 ms when 8 workers were CPU-bound,
         firing the callback per-keystroke instead of once.
+
+        Mount-time `Input.Changed` race (Python 3.11 CI flake,
+        2026-05-14): when the widget mounts with the PREFILL value,
+        the resulting Changed event schedules a debounce timer. On
+        a slow runner that mount-tick can fire BEFORE the test's
+        first assignment, producing a spurious empty-string call.
+        Drain the mount-time debounce by sleeping past the window
+        and clearing `calls` before the keystroke burst.
         """
         import asyncio
         from textual.app import App
@@ -2637,6 +2645,11 @@ class TestSearchInputWidget:
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             inp = app.query_one("#harness-search", sc._SearchInput)
+            # Drain any mount-time debounce before exercising the
+            # cancel-and-reschedule path the test is actually about.
+            await asyncio.sleep(0.4)
+            await pilot.pause()
+            calls.clear()
             # Type three chars in rapid succession.
             inp.value = "p"
             inp.value = "pU"

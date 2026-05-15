@@ -2,6 +2,142 @@
 
 ---
 
+## [0.8.8] — 2026-05-15 — dep bumps · Python 3.13 in CI · primer3 error logging
+
+### Dependency floors bumped to latest
+
+Test suite re-verified against every bumped version (2,436 tests
+passing, ~5 min on 8 cores). Pins tightened from `>=` to the floor
+we tested at so end-user `pipx install splicecraft` pulls the same
+minimum we shipped against.
+
+| Package | Old floor | New floor | Notes |
+| --- | --- | --- | --- |
+| `textual` | 8.2.5 | **8.2.6** | text-selection UX patch; no API changes |
+| `pyhmmer` | 0.12 | **0.12.1** | `Profile.transition_scores` removed (we didn't use it); `Sequence.L`, `HMM.emit_sequence`, `Profile.emit_sequence` added |
+| `platformdirs` | 4.9 | **4.9.6** | patch-stream |
+| `pytest` | 9.0 | **9.0.3** | patch-stream |
+| `pytest-asyncio` | 1.3 | **1.3.0** | unchanged effective floor |
+| `pytest-xdist` | 3.8 | **3.8.0** | unchanged effective floor |
+| `hypothesis` | 6.152 | **6.152.7** | shrinker / explain polish |
+| `build` (dev) | unpinned | **1.5.0** | drops Python 3.9 (we already required 3.10+) |
+| `twine` (dev) | unpinned | **6.2.0** | first explicit floor |
+
+No breaking changes affecting any SpliceCraft call site. Verified
+via `python -m build && twine check dist/*` end-to-end.
+
+### Python 3.13 added to CI matrix
+
+`.github/workflows/test.yml` and `pyproject.toml` classifiers extended
+to include Python **3.13** alongside 3.10 / 3.11 / 3.12. Verified that
+none of the Python 3.13 stdlib removals (`imp`, `crypt`, `imghdr`,
+`distutils`, `telnetlib`, etc.) are used in SpliceCraft or its test
+harness.
+
+### Edge-case + error-logging audit (CLAUDE.md known pitfall #1)
+
+Four `except Exception:` blocks around primer3 calls (`_mut_tm`,
+`_mut_hairpin_dg`, `_mut_homodimer_dg`, and the bulk-import `_calc_tm`
+fallback) were silently swallowing exceptions. Per the convention that
+bare `except Exception` always pairs with `_log.exception`, each now
+emits a diagnostic log line before falling back to the GC approximation
+(or returning 0.0 for the secondary-structure helpers). A wave of
+degenerate-sequence primers will now show up as a diagnosable bundle
+entry instead of silent mis-Tm on every primer.
+
+### Adversarial audit sweep #4 (CLAUDE.md invariant #44)
+
+Six-surface parallel audit (exception handling, attack surface,
+concurrency, data safety, performance, observability) consolidated
+150+ raw findings into the patches below. All 2,436 tests still pass.
+
+**Privacy invariants restored** — `seq.chunk_dump` no longer routes
+raw DNA bases through `_log.info`; `seq.hover_copy` logs `text_len`
+not the DNA letter under cursor; `_format_ui_snapshot._kv_block`
+scrubs settings values through `_scrub_path` (so `hmm_db_path` etc.
+don't leak the username when a raw `.md` snapshot is shared without
+bundling); stale clipboard-helper docstring corrected.
+
+**Atomic backup writes** — new `_atomic_write_bytes` byte-mode
+counterpart to `_atomic_write_text`. Legacy `.bak`, timestamped
+`.bak.<ts>` rotation, and daily-snapshot copies all route through
+it; a mid-write crash can no longer truncate the recovery files that
+the four-layer safety net depends on. Collision protectors on the
+rotating-backup + lost-entries spill paths so two saves in the same
+wall-second don't silently overwrite each other.
+
+**Agent-API save contract uniform** — new `_LIVE_APP_REF` +
+`_agent_save_or_500` + `_bg_notify_save_failure` helpers. 7 agent
+write endpoints (`delete-from-library`, `create-collection`,
+`delete-collection`, `rename-collection`, `set-active-collection`,
+`bulk-import-folder`, `set-plasmid-status`) now return explicit
+`500 {"error": "save failed for X: ..."}` AND notify the UI user
+on disk failure (was: opaque generic 500 with the cache desynced
+from disk). `set-active-collection` rolls back the active pointer
+when the library save fails. 4 daemon-thread save sites
+(`_drain_collection_sync_loop`, `_settings_flush_worker`,
+`_sync_active_parts_bin_parts`, delete-bin re-seed) now route
+through `_bg_notify_save_failure`.
+
+**Stale-canvas guards extended** — `_h_transfer_annotations` now
+captures `_record_load_counter` at handler entry and returns `409`
+on concurrent canvas swap (mirrors `_h_replace_sequence`).
+`ConstructorModal._save_to_library_worker` wraps
+`_clone_assembly_into_entry_vector` in try/except (silent worker
+death is gone). `_persist_assembly` splits the library + parts-bin
+saves into per-call try blocks so partial commits surface a
+`library saved as X but parts-bin write failed` toast instead of a
+misleading "Save failed".
+
+**Attack surface tightening** — `_check_agent_write_path` walks the
+FULL ancestor chain via `resolve()` divergence + per-segment
+`is_symlink()` check (was: immediate parent only); `_h_hmmscan`
+routes `hmm_path` through `_safe_file_size_check` with a 2 GB cap
+(was just `exists()` — `/dev/zero` would DoS via `pyhmmer.HMMFile`);
+`_backup_info` / `_restore_from_backup` / `_safe_load_json` `.bak`
+fallback now apply the 1 GB cap symmetrically (recovery paths
+used to bypass the cap the main load enforces).
+
+**Performance** — new `_smallest_enclosing_feature(bp)` helper uses
+the existing `_feats_starts_sorted` bisect index + wrap second pass;
+replaces the O(N) `enumerate(self._feats)` scan in `_feat_at` /
+`_feat_at_linear` (UI hang on 1000+ feature WGS contigs). Settings
+load/save/set swapped from `deepcopy` to `_typed_clone` (pure win
+on every persistable-toggle keystroke). Startup banner reuses
+cached `_RUNTIME_PLATFORM` instead of re-shelling `platform.platform()`.
+
+**Observability** — 6 user-facing actions decorated with
+`@_action_log` (`app.save.trigger`, `app.library.add`,
+`app.feature.add`, `app.diff_plasmid.trigger`,
+`app.export.commercialsaas`, `app.whats_new.show`); 3 heavy ops
+decorated with `@_timed` (`op.blast_search`, `op.hmmscan`,
+`op.annotation_transfer`); `action_undo` / `action_redo` wrappers
+emit structured `undo.trigger` / `undo.refused` / `redo.trigger` /
+`redo.refused` (were unstructured `_log.info`); lock + drain
+lifecycle now emits `lock.acquired` / `lock.contended` /
+`lock.stale` / `lock.released` + `shutdown.drain.ok` /
+`shutdown.drain.timeout`; `app.click_debug_toggle` renamed to
+`app.click_debug.toggle` to match the `<area>.<verb>` convention.
+
+### Pyright config
+
+Added `[tool.pyright]` to `pyproject.toml`:
+
+```toml
+[tool.pyright]
+include = ["splicecraft.py", "splicecraft_cli.py"]
+exclude = ["tests/**", "build/**", "dist/**", ...]
+```
+
+Tests duck-type heavily on Textual's `App.push_screen()` return
+(typed as `Screen[object]`) and the BioPython `Position |
+ExactPosition` stubs — the resulting hundreds of diagnostics
+drowned out genuine errors on the application surface. Real test
+breakage is still caught by `pytest -n auto -q` which already runs
+against the same files.
+
+---
+
 ## [0.8.7] — 2026-05-15 — argparse migration · pyright sweep #2 · comment hygiene
 
 ### CLI (issue #11, Psy-Fer)

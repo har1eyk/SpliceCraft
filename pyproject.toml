@@ -26,30 +26,34 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Topic :: Terminals",
 ]
 dependencies = [
-    "textual>=8.2.5",
+    # Pin floors track the versions the test suite is verified
+    # against (bumped in v0.8.8). End-user `pipx install splicecraft`
+    # pulls the matching minimum so behaviour matches what shipped.
+    "textual>=8.2.6",
     "biopython>=1.87",
     "primer3-py>=2.3.0",
-    "platformdirs>=4.9",
+    "platformdirs>=4.9.6",
     # pyhmmer powers the BLAST modal's BLASTN (nhmmer), BLASTP (phmmer),
     # and HMMscan tiers — pure-Python bindings to HMMER 3 with no
     # external C-library install required (the wheels ship the HMMER
     # source compiled in). The pure-Python BLAST fallback also runs
     # without pyhmmer for very short queries.
-    "pyhmmer>=0.12",
+    "pyhmmer>=0.12.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.0",
-    "pytest-asyncio>=1.3",
-    "pytest-xdist>=3.8",
-    "hypothesis>=6.152",
-    "build",
-    "twine",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-xdist>=3.8.0",
+    "hypothesis>=6.152.7",
+    "build>=1.5.0",
+    "twine>=6.2.0",
 ]
 
 [project.urls]
@@ -89,6 +93,27 @@ include = [
 exclude = [
     "tests/*.dna",
 ]
+
+[tool.pyright]
+# Pyright runs strict on the shipped application code only. Tests
+# duck-type heavily on Textual's `App.push_screen()` return (which
+# is typed as `Screen[object]`), assert non-None after explicit
+# guards pyright can't narrow, and call BioPython APIs whose stubs
+# don't model `Position | ExactPosition` precisely. The resulting
+# noise drowns out genuine errors on the application surface, so
+# the test tree is excluded from analysis. Real test breakage is
+# caught by `pytest -n auto -q` which already runs against the
+# same files.
+include = ["splicecraft.py", "splicecraft_cli.py"]
+exclude = [
+    "tests/**",
+    "build/**",
+    "dist/**",
+    "**/__pycache__/**",
+    ".venv/**",
+    "venv/**",
+]
+
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

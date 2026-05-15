@@ -4,8 +4,11 @@
 
 [![PyPI](https://img.shields.io/pypi/v/splicecraft.svg)](https://pypi.org/project/splicecraft/)
 [![Python](https://img.shields.io/pypi/pyversions/splicecraft.svg)](https://pypi.org/project/splicecraft/)
+[![100% Python](https://img.shields.io/badge/100%25-Python-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![TUI: Textual](https://img.shields.io/badge/TUI-Textual-5A45FF?logo=python&logoColor=white)](https://textual.textualize.io/)
+[![Tests](https://github.com/Binomica-Labs/SpliceCraft/actions/workflows/test.yml/badge.svg)](https://github.com/Binomica-Labs/SpliceCraft/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Status: Beta](https://img.shields.io/badge/status-beta-orange.svg)](https://github.com/Binomica-Labs/SpliceCraft)
+[![Status: Pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)](https://github.com/Binomica-Labs/SpliceCraft)
 
 **A plasmid workbench you live in.** SpliceCraft is a terminal-native
 viewer, sequence editor, primer + mutagenesis designer, Golden Braid /
@@ -52,8 +55,8 @@ constraints:
 - **Crash-recovery autosave.** Dirty edits debounce a 3-second write
   to a per-record `.gb` snapshot. Power-cut your laptop mid-edit; the
   next launch surfaces the survivors.
-- **2,250+ tests** (`pytest -n auto -q`, ~5 min on 8 cores) anchored on
-  42 **sacred invariants** for biology correctness AND data integrity:
+- **2,400+ tests** (`pytest -n auto -q`, ~5 min on 8 cores) anchored on
+  43 **sacred invariants** for biology correctness AND data integrity:
   palindromic-enzyme scanning, reverse-strand coordinate handling,
   IUPAC reverse-complement including ambiguity codes, wrap-around
   feature math, atomic-save contract, undo deepcopy, cache-deepcopy on
@@ -108,13 +111,31 @@ constraints:
   rewrite on the next save. Migration code runs idempotently in
   `App.compose()` before any child mounts so the panel always sees a
   consistent state.
+- **AI-parseable diagnostic logging.** Every user action (key binding,
+  menu pick, button press, modal open, save / load / export) emits a
+  single JSON-payload line at INFO level with ms-precision timestamp,
+  8-char session id, originating `funcName:lineno`, and a structured
+  payload:
+  ```
+  12:45:08.399 INFO splicecraft.action_fetch:53483 event app.fetch {"accession":"L09137","rec":"pUC19"}
+  12:45:08.733 INFO splicecraft.fetch_genbank:6852 event op.timed {"path":"op.fetch_genbank","elapsed_ms":334.5}
+  ```
+  Heavy operations (NCBI fetch, primer3, Gibson simulate, restriction
+  scan, pairwise align, fragment excise) self-tag with `op.timed` so
+  bottlenecks surface immediately. `Alt+D` captures a UI snapshot;
+  `splicecraft logs --bundle` packages logs + last 5 snapshots +
+  scrubbed settings into a single ZIP for emailing. Sequence content
+  is never logged — `SeqRecord` / `Seq` / `bytes` render as opaque
+  size tags. The whole pipeline is level-gated for < 400 ns per call
+  when INFO is suppressed.
 
-> ⚠️ **Beta software.** SpliceCraft is under active development; the
-> UI, on-disk file formats, and agent-API surface may evolve between
-> releases. Your data files are auto-backed up to `*.bak` on every
-> save, but please keep your own off-disk copies of anything critical.
-> The maintainer treats it as their primary workbench — but it should
-> not yet be a project's sole system of record.
+> ⚠️ **Pre-release software.** SpliceCraft is under active
+> development; the UI, on-disk file formats, and agent-API surface may
+> evolve between releases. Your data files are auto-backed up to
+> `*.bak` on every save, but please keep your own off-disk copies of
+> anything critical. The maintainer treats it as their primary
+> workbench — but it should not yet be a project's sole system of
+> record.
 
 ---
 
@@ -489,7 +510,7 @@ than crashing.
 ## Tests
 
 ```bash
-python3 -m pytest -n auto -q                  # full suite (2,250+ tests, ~5–6 min on 8 cores)
+python3 -m pytest -n auto -q                  # full suite (2,400+ tests, ~5–6 min on 8 cores)
 python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 2 s)
 python3 -m pytest tests/test_invariants_hypothesis.py  # property-based fuzzing
 ```
@@ -511,7 +532,7 @@ place.
 map. Test files are 1:1 named after the subsystem they cover.
 
 `CLAUDE.md` at the repo root is the **agent + contributor handover
-document**: 42 sacred invariants, error-handling convention, known
+document**: 43 sacred invariants, error-handling convention, known
 pitfalls, persistence + cache discipline, natural-sort row-mapping
 symmetry, the `.dna` writer's expected packet inventory. Read it before
 touching the rendering layer, record pipeline, primer design, or any

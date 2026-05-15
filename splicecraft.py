@@ -22,6 +22,7 @@ Run standalone:
 """
 
 import argparse
+import functools
 import json
 import logging
 import math
@@ -300,7 +301,12 @@ def _log_startup_banner() -> None:
     _log.info("=" * 60)
     _log.info("SpliceCraft session %s starting", _SESSION_ID)
     _log.info("python    : %s", sys.version.split()[0])
-    _log.info("platform  : %s", platform.platform())
+    # Reuse the import-time cached platform string. Calling
+    # `platform.platform()` here would re-shell-out via subprocess on
+    # some OSes and conflict with tests that monkeypatch subprocess.run
+    # (the whole reason `_RUNTIME_PLATFORM` exists per CLAUDE.md
+    # invariant #36).
+    _log.info("platform  : %s", _RUNTIME_PLATFORM)
     _log.info("textual   : %s", _ver("textual"))
     _log.info("biopython : %s", _ver("Bio"))
     _log.info("log path  : %s", _LOG_PATH)
@@ -313,40 +319,164 @@ def _log_startup_banner() -> None:
 
 
 def _log_event(event: str, **fields) -> None:
-    """One-line structured log entry for user-facing events.
+    """One-line AI-parseable structured event for diagnostic logs.
 
-    Use this at click handlers, key actions, save / load / annotate
+    Output line shape (JSON payload after the prefix):
+
+        2026-05-15 12:34:56,789 [a3f2c1d8] INFO  splicecraft.action_save:53321 event save.ok {"rec":"pUC19","path":"/tmp/x.gb"}
+
+    The event payload is JSON so any downstream parser (jq, Python
+    json.loads, an LLM scanning the log on the user's behalf) can
+    extract every field unambiguously without regex tricks against
+    embedded whitespace or quotes. `stacklevel=2` makes the
+    `funcName:lineno` prefix point at the originating caller, not at
+    `_log_event` itself — so even an empty-field event names the
+    method that emitted it.
+
+    Sacred invariant: every string value over 200 chars is truncated
+    before encoding, so a caller that accidentally passes raw
+    sequence content can't leak bases into the log file. Non-scalar
+    values pass through `_repr_for_log` which truncates and adds a
+    size hint.
+
+    Use this at click handlers, key actions, save/load/annotate
     boundaries — anywhere a user-visible state change happens. The
     output goes to the rotating log file at INFO level so a user
-    pasting their log into a bug report shows what they were doing
-    when the symptom appeared:
+    pasting their log into a bug report tells the reader (or an
+    AI assistant) exactly what was being done when the symptom hit.
 
-        12:34:56 [a3f2c1d8] INFO  splicecraft.on_click:4243
-            event seq.click bp=120 lane=True feat=lacZ
-
-    Keep the field list short — long values blow up the log line.
-    Strings get repr'd to show whitespace / control chars (helpful
-    when a label contains odd characters that break rendering).
+    Event-name conventions (see also CLAUDE.md invariant #43):
+      * `app.<area>.<verb>`  — user actions
+            e.g. `app.save.trigger`, `app.library.add`,
+            `app.feature.add`, `app.click_debug.toggle`.
+      * `op.<area>.<verb>`   — heavy ops emitted by `@_timed`
+            e.g. `op.fetch_genbank`, `op.gibson_simulate`,
+            `op.pairwise_align`, `op.blast_search`, `op.hmmscan`,
+            `op.annotation_transfer`.
+      * `<noun>.<verb>`      — state changes
+            e.g. `save.ok` / `save.failed`, `record.loaded`,
+            `undo.trigger` / `undo.refused` / `undo.empty`,
+            `redo.trigger` / `redo.refused` / `redo.empty`,
+            `lock.acquired` / `lock.contended` / `lock.stale` /
+            `lock.released`, `shutdown.drain.ok` /
+            `shutdown.drain.timeout`, `agent.write.ok` /
+            `agent.write.failed`, `agent.error`.
 
     Performance: short-circuits to a no-op when the logger isn't
-    INFO-enabled, so the field-formatting cost only happens when the
-    message would actually be written. Per-call overhead in the
-    happy path is one method call + an `isEnabledFor` check (~100 ns).
-    Even at 100 events per second the framework throughput is well
-    below 0.01 % CPU.
+    INFO-enabled, so every callsite pays one `isEnabledFor` check
+    (~100 ns) in the happy path. The `logging` machinery is
+    thread-safe, so this is safe to call from `@work` workers.
     """
     if not _log.isEnabledFor(logging.INFO):
         return
     if not fields:
-        _log.info("event %s", event)
+        _log.info("event %s", event, stacklevel=2)
         return
-    parts = []
+    safe: dict = {}
     for k, v in fields.items():
-        if isinstance(v, str) and any(c in v for c in "\n\r\t"):
-            parts.append(f"{k}={v!r}")
+        if isinstance(v, str):
+            safe[k] = v if len(v) <= 200 else (
+                v[:100] + f"…[+{len(v) - 100}]"
+            )
+        elif isinstance(v, (int, float, bool)) or v is None:
+            safe[k] = v
+        elif isinstance(v, (list, tuple, dict)):
+            # Lists / tuples / dicts of primitives JSON-encode as
+            # arrays / objects (better for downstream parsers than
+            # a stringified repr). Bail to bounded repr only when
+            # the structure is too big to fit on one log line OR
+            # carries un-JSON-encodable values.
+            try:
+                encoded = json.dumps(v, default=str,
+                                      ensure_ascii=False)
+                if len(encoded) <= 300:
+                    safe[k] = list(v) if isinstance(v, tuple) else v
+                else:
+                    safe[k] = _repr_for_log(v, max_len=200)
+            except (TypeError, ValueError):
+                safe[k] = _repr_for_log(v, max_len=200)
+        elif isinstance(v, (bytes, bytearray)):
+            # Raw byte blobs (e.g. a .dna file body) are NEVER
+            # rendered — only a size tag.
+            safe[k] = f"<{type(v).__name__} len={len(v)}>"
         else:
-            parts.append(f"{k}={v}")
-    _log.info("event %s %s", event, " ".join(parts))
+            # Catch BioPython sequence-bearing classes by name
+            # (avoids importing BioPython here, which would
+            # already be in sys.modules anyway). `repr(Seq)` /
+            # `repr(SeqRecord)` embed the first ~55 bases — the
+            # sacred invariant says we must never log sequence
+            # content, so render an opaque tag instead.
+            cls_name = type(v).__name__
+            if cls_name in ("SeqRecord", "Seq", "MutableSeq"):
+                rid = getattr(v, "id", None)
+                try:
+                    sz = len(v)
+                except (TypeError, ValueError):
+                    sz = None
+                parts = [f"<{cls_name}"]
+                if rid:
+                    parts.append(f"id={rid}")
+                if sz is not None:
+                    parts.append(f"len={sz}")
+                safe[k] = " ".join(parts) + ">"
+            else:
+                # Path, datetime, arbitrary objects — bounded
+                # repr. Final defence against an unexpected type
+                # that happens to embed sequence in its repr.
+                safe[k] = _repr_for_log(v, max_len=200)
+    try:
+        payload = json.dumps(safe, default=str,
+                              separators=(",", ":"),
+                              ensure_ascii=False)
+    except (TypeError, ValueError):
+        # Final-resort fallback for non-JSON-encodable values that
+        # also slip past `_repr_for_log`. Should be unreachable.
+        payload = repr(safe)[:500]
+    _log.info("event %s %s", event, payload, stacklevel=2)
+
+
+def _action_log(event_name: str):
+    """Decorator that emits an INFO event at action-method entry
+    plus the active record id (when present) so the log line tells
+    the reader what the user was looking at, not just what they
+    pressed.
+
+    Applied to ``action_*`` methods on `PlasmidApp` so the per-action
+    boilerplate stays a one-line decorator instead of an explicit
+    `_log_event` call at the head of every body. Any exception in
+    the logging path is swallowed — logging must never break the
+    underlying action.
+
+    Use as::
+
+        @_action_log("app.fetch")
+        def action_fetch(self):
+            ...
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            # Level-gate FIRST so an INFO-suppressed run pays one
+            # attribute lookup per action invocation (no getattr chain,
+            # no dict build, no JSON encode). The same guard inside
+            # `_log_event` covers the explicit-call path; this one
+            # short-circuits the decorator wrapper too.
+            if _log.isEnabledFor(logging.INFO):
+                try:
+                    ctx: dict = {}
+                    rec = getattr(self, "_current_record", None)
+                    if rec is not None:
+                        rid = getattr(rec, "id", None) or getattr(
+                            rec, "name", None
+                        )
+                        if rid:
+                            ctx["rec"] = rid
+                    _log_event(event_name, **ctx)
+                except Exception:  # noqa: BLE001 — logging must never raise
+                    pass
+            return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 import time as _time
@@ -358,6 +488,42 @@ from contextlib import contextmanager
 # (NCBI fetch, pytest-driven cosmid renders) by passing an explicit
 # `threshold_ms`.
 _SLOW_THRESHOLD_MS = 50.0
+
+
+def _timed(path: str, threshold_ms: float = 0.0):
+    """Decorator counterpart to `_log_timing` — wraps a whole function
+    body in the same start/elapsed harness. Use on top-level heavy
+    operations (NCBI fetch, primer3, BLAST, Gibson simulate) where
+    every call is potentially diagnostic-worthy.
+
+    Default `threshold_ms=0` means every call emits an event — useful
+    for known-heavy paths where you always want a timestamp + duration
+    in the log. Bump to a non-zero value to silence fast cases on
+    paths that mostly return quickly.
+
+    Naming: pass a `path` like ``"op.fetch_genbank"`` or
+    ``"op.gibson_simulate"`` so the AI-parser can group all slow
+    events by operation type.
+
+    Performance: same level-gate short-circuit as `_log_event` — when
+    INFO is suppressed the wrapper still measures (`perf_counter` is
+    sub-microsecond) but `_log_event` early-returns before any JSON
+    encode. Net cost per call when INFO is off: ~300 ns.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            t0 = _time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                dt_ms = (_time.perf_counter() - t0) * 1000
+                if dt_ms >= threshold_ms:
+                    _log_event("op.timed",
+                                path=path,
+                                elapsed_ms=round(dt_ms, 1))
+        return wrapper
+    return decorator
 
 
 @contextmanager
@@ -724,6 +890,36 @@ def _notify_save_failure(app, label: str, exc: BaseException,
         pass
 
 
+def _bg_notify_save_failure(label: str, exc: BaseException) -> None:
+    """Notify the live app of a daemon-thread save failure.
+
+    Daemon-thread save workers (collection sync, parts-bin sync,
+    settings flush) can't take an `app` parameter without threading
+    it through every queue + closure; this helper fetches the live
+    app via `_LIVE_APP_REF` and marshals back to the UI thread via
+    `call_from_thread`. Safe to call from any thread; no-op if no
+    app is mounted (test contexts, post-shutdown).
+
+    The corresponding caller pattern is::
+
+        try:
+            _save_X(...)
+        except (OSError, RuntimeError) as exc:
+            _bg_notify_save_failure("...", exc)
+    """
+    app = _LIVE_APP_REF.get()
+    if app is None:
+        _log.exception("background save failed for %s", label)
+        return
+    try:
+        app.call_from_thread(_notify_save_failure, app, label, exc)
+    except Exception:
+        # `call_from_thread` raises if the app loop has stopped (e.g.
+        # mid-shutdown). The save failure has already been recorded
+        # via `_log.exception` inside `_notify_save_failure`.
+        _log.exception("background save failed for %s", label)
+
+
 def _fsync_parent_dir(path: Path) -> None:
     """Fsync `path.parent` so the rename's directory entry update is
     journalled. `os.replace` is atomic for the *inode* on POSIX, but
@@ -770,6 +966,40 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     try:
         with os.fdopen(fd, "w", encoding=encoding) as fh:
             fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, str(path))
+        _fsync_parent_dir(path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Atomically write *data* to *path* via ``tempfile`` + ``os.replace``.
+
+    Byte-mode counterpart to :func:`_atomic_write_text`. Used by the
+    `_safe_save_json` backup rotation (legacy `.bak` + timestamped
+    `.bak.<ts>`) and the daily-snapshot copy so a mid-write crash
+    cannot truncate the recovery files that invariant #31's four-layer
+    safety net depends on. Raises ``OSError`` on disk failure so
+    callers can decide to surface or log.
+    """
+    import os
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
             fh.flush()
             try:
                 os.fsync(fh.fileno())
@@ -843,6 +1073,14 @@ def _spill_lost_entries(path: Path, lost: list, label: str) -> "Path | None":
         lost_dir.mkdir(parents=True, exist_ok=True)
         ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
         out = lost_dir / f"{path.stem}-{ts}.json"
+        # Bump on collision — two saves in the same wall-second both
+        # tripping the shrink guard would otherwise have the second
+        # spill silently overwrite the first. Spillover is the
+        # last-ditch recovery; losing it is a hard regression.
+        bump = 0
+        while out.exists():
+            bump += 1
+            out = lost_dir / f"{path.stem}-{ts}.{bump}.json"
         # Route through `_atomic_write_text` so a mid-write crash
         # (disk full, RO mount, power loss) leaves either nothing or
         # a complete recovery dump — never a half-written file that
@@ -976,18 +1214,23 @@ def _safe_save_json(path: Path, entries: list, label: str,
                 # tests depend on it. Keep it overwriting per save.
                 bak_legacy = path.with_suffix(path.suffix + ".bak")
                 try:
-                    bak_legacy.write_bytes(existing)
+                    _atomic_write_bytes(bak_legacy, existing)
                 except OSError:
                     _log.warning(
                         "Could not write legacy .bak for %s", path,
                     )
-                # Timestamped multi-generation backup.
+                # Timestamped multi-generation backup. Bump on
+                # collision so two saves in the same wall-second don't
+                # have the second silently overwrite the first's
+                # rotating generation.
                 ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
-                bak_ts = path.with_name(
-                    f"{path.name}.bak.{ts}",
-                )
+                bak_ts = path.with_name(f"{path.name}.bak.{ts}")
+                bump = 0
+                while bak_ts.exists():
+                    bump += 1
+                    bak_ts = path.with_name(f"{path.name}.bak.{ts}.{bump}")
                 try:
-                    bak_ts.write_bytes(existing)
+                    _atomic_write_bytes(bak_ts, existing)
                 except OSError:
                     _log.warning(
                         "Could not write timestamped backup for %s", path,
@@ -1165,7 +1408,7 @@ def _snapshot_data_files(data_dir: Path,
         if dest.exists():
             continue
         try:
-            dest.write_bytes(src.read_bytes())
+            _atomic_write_bytes(dest, src.read_bytes())
             written.append(dest)
             _log.info(
                 "Snapshotted %s → %s (%d bytes)",
@@ -1275,7 +1518,17 @@ def _backup_info(path: Path) -> "dict | None":
     """Parse `path` as a SpliceCraft persistence file (envelope or
     legacy bare-list) and return ``{n_entries, mtime_str}`` or None
     if unreadable. The mtime is used as the user-visible timestamp
-    so even an undated `.bak` shows when it was written."""
+    so even an undated `.bak` shows when it was written.
+
+    Size-capped at `_SAFE_LOAD_JSON_MAX_BYTES` (mirrors `_safe_load_json`'s
+    1 GB cap) — a corrupted/oversized legacy `.bak` could otherwise OOM
+    the Restore modal on open. Symlink-rejected via the same lstat path.
+    """
+    ok, _reason = _safe_file_size_check(
+        path, _SAFE_LOAD_JSON_MAX_BYTES, "backup",
+    )
+    if not ok:
+        return None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -1360,8 +1613,19 @@ def _restore_from_backup(target_path: Path, source_path: Path,
     `target_path` via `_safe_save_json` so the current state is
     automatically backed up under the new rotating-backup discipline
     before being overwritten. Returns the number of entries
-    restored. Raises ValueError on unparseable source, OSError on
-    write failure."""
+    restored. Raises ValueError on unparseable / oversized source,
+    OSError on write failure.
+
+    Size-capped at `_SAFE_LOAD_JSON_MAX_BYTES` to match
+    `_safe_load_json` — a co-resident attacker who planted a 50 GB
+    file under `<DATA_DIR>/` would otherwise OOM the restore worker.
+    Symlink-rejected via lstat.
+    """
+    ok, reason = _safe_file_size_check(
+        source_path, _SAFE_LOAD_JSON_MAX_BYTES, "backup",
+    )
+    if not ok:
+        raise ValueError(reason or "backup file rejected")
     try:
         raw = json.loads(source_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1454,9 +1718,22 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     except Exception:
         _log.exception("Corrupt %s file: %s", label, path)
 
-    # Main file is corrupt — try the .bak
+    # Main file is corrupt — try the .bak. Apply the same size cap
+    # + symlink rejection here: if the main file was small/corrupt
+    # but the `.bak` happens to be oversized, the recovery path
+    # would otherwise OOM while the main load was safely refused.
     bak = path.with_suffix(path.suffix + ".bak")
     if bak.exists():
+        ok_bak, _reason = _safe_file_size_check(
+            bak, _SAFE_LOAD_JSON_MAX_BYTES, label,
+        )
+        if not ok_bak:
+            _log.warning("Backup %s rejected: oversized/symlink", bak)
+            return [], (
+                main_warning
+                or f"{label} is corrupt and the backup was rejected. "
+                "Starting empty."
+            )
         try:
             raw = json.loads(bak.read_text(encoding="utf-8"))
             entries, _ = _extract_entries(raw, label)
@@ -1723,6 +2000,8 @@ def _acquire_data_dir_lock(
                     "retaking the lock.",
                     lockfile, held_by_pid,
                 )
+                _log_event("lock.stale", path=str(lockfile),
+                            stale_pid=held_by_pid)
                 try:
                     if sys.platform != "win32":
                         import fcntl  # type: ignore[import-not-found]
@@ -1735,6 +2014,8 @@ def _acquire_data_dir_lock(
                     os.close(fd)
                 except OSError:
                     pass
+                _log_event("lock.contended", path=str(lockfile),
+                            held_by=held_by or "unknown")
                 hint = f" (held by PID {held_by})" if held_by else ""
                 raise DataDirLockError(
                     f"Another splicecraft instance is already running"
@@ -1760,6 +2041,7 @@ def _acquire_data_dir_lock(
                 pass
         except OSError as exc:
             _log.warning("Could not write lockfile metadata: %s", exc)
+        _log_event("lock.acquired", path=str(lockfile), pid=os.getpid())
         return fd, lockfile
     except DataDirLockError:
         raise
@@ -1796,6 +2078,7 @@ def _release_data_dir_lock(fd: "int | None") -> None:
             os.close(fd)
         except OSError:
             pass
+        _log_event("lock.released")
 
 
 def _drain_in_flight_workers(timeout_s: float = 2.0) -> "list[str]":
@@ -1838,6 +2121,11 @@ def _drain_in_flight_workers(timeout_s: float = 2.0) -> "list[str]":
             "Workers still in flight at exit (timeout=%.1fs): %s",
             timeout_s, leftover,
         )
+        _log_event("shutdown.drain.timeout",
+                    timeout_s=timeout_s,
+                    leftover=leftover)
+    else:
+        _log_event("shutdown.drain.ok", timeout_s=timeout_s)
     return leftover
 
 
@@ -2050,6 +2338,11 @@ def _format_ui_snapshot(snap: dict) -> str:
                 v_repr = _repr_for_log(v, max_len=200)
             else:
                 v_repr = str(v) if v is not None else "(none)"
+            # Scrub /home/<user>/, /Users/<user>/, C:\Users\<user>\
+            # from values — settings keys like `hmm_db_path` carry
+            # absolute paths that would otherwise leak the username
+            # when the raw .md snapshot is shared without bundling.
+            v_repr = _scrub_path(v_repr)
             out.append(f"{indent}- **{k}**: {v_repr}")
         return "\n".join(out) + "\n"
 
@@ -2897,9 +3190,9 @@ def _drain_collection_sync_loop() -> None:
                     c["plasmids"] = snapshot
                     _save_collections(colls)
                     break
-        except Exception:
-            _log.exception(
-                "collection sync worker: save failed for %r", name,
+        except (OSError, RuntimeError) as exc:
+            _bg_notify_save_failure(
+                f"Active-collection mirror ({name})", exc,
             )
         if _collection_sync_shutdown.is_set():
             # Refuse NEW work; any pending mutations queued during
@@ -3487,6 +3780,7 @@ _RESTR_SCAN_CACHE: "_OD[tuple, list]" = _OD()
 _RESTR_SCAN_CACHE_MAX = 4
 
 
+@_timed("op.scan_restriction", threshold_ms=25)
 def _scan_restriction_sites(
     seq: str,
     min_recognition_len: int = 6,
@@ -4244,6 +4538,7 @@ def _make_synthetic_fragment(seq: str, *, enz_left: str, enz_right: str,
     }
 
 
+@_timed("op.excise_fragment_pair", threshold_ms=25)
 def _excise_fragment_pair(seq: str, enzyme_names: list[str], *,
                            circular: bool = True,
                            features: "list[dict] | None" = None,
@@ -4436,6 +4731,7 @@ def _gibson_overlap_len(a_seq: str, b_seq: str, *,
     return 0
 
 
+@_timed("op.gibson_simulate")
 def _simulate_gibson_assembly(fragments: list[dict], *,
                                 min_overlap: int = _GIBSON_MIN_OVERLAP_BP,
                                 circular: bool = True,
@@ -6269,8 +6565,11 @@ def _copy_to_clipboard_with_fallback(
       mode    — `"clipboard"` | `"osc52"` | `"file"` | `"log_only"`
       detail  — Path to the temp file (when mode == "file"); else None
 
-    The full text is also logged at INFO level so a diagnostic
-    bundle preserves it regardless of which tier succeeded.
+    Privacy invariant (CLAUDE.md #38): the copied text is NEVER
+    logged — only its length + caller-supplied label. Clipboard
+    content is the user's data; bundling a sequence selection into
+    the diagnostic log would defeat the same invariant that
+    `seq.chunk_dump` had to walk back.
     """
     _log.info("clipboard copy %r (%d chars)", label, len(text))
     if app is not None:
@@ -6743,6 +7042,7 @@ _NCBI_TIMEOUT_S = 30   # cap long NCBI hangs; the UI worker can't otherwise canc
 _NCBI_GB_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
+@_timed("op.fetch_genbank")
 def fetch_genbank(accession: str, email: str = "splicecraft@local"):
     """Fetch a GenBank record by accession from NCBI Entrez. Returns SeqRecord.
 
@@ -7635,6 +7935,12 @@ def _augment_dna_record_from_packets(
             except Exception:
                 # primer3 occasionally barfs on weird sequences (very
                 # short, contains N, etc.); fall back to the 2+4 rule.
+                # Log so a wave of import-time degenerate primers
+                # surfaces as a diagnosable bundle entry instead of
+                # silent mis-Tm on every imported primer.
+                _log.exception(
+                    "import _calc_tm: primer3.calc_tm fell back to "
+                    "GC approximation for %d-mer", len(s))
                 gc = sum(1 for c in s.upper() if c in "GC")
                 at = sum(1 for c in s.upper() if c in "AT")
                 return float(2 * at + 4 * gc)
@@ -8415,6 +8721,7 @@ def _feature_bases(rec_seq: str, feat: dict, n: int) -> str:
     return bases.upper()
 
 
+@_timed("op.annotation_transfer")
 def _find_annotation_transfers(source_rec, target_rec, *,
                                   min_len: int = _ANNOT_TRANSFER_MIN_LEN
                                   ) -> list[dict]:
@@ -8696,6 +9003,7 @@ def _rotate_seq_record(record, offset: int):
     return new_rec
 
 
+@_timed("op.pairwise_align")
 def _pairwise_align(query_seq: str, target_seq: str,
                      *, mode: str = "global",
                      match: float = 2.0,
@@ -10129,16 +10437,79 @@ class PlasmidMap(Widget):
         angle = math.atan2(dr_n, dc_n)
         angle_norm = (angle + math.pi / 2) % (2 * math.pi)
         bp = int(self.origin_bp + self._total * angle_norm / (2 * math.pi)) % self._total
+        best_idx = self._smallest_enclosing_feature(bp)
+        return (best_idx, bp) if best_idx >= 0 else (-1, -1)
+
+    def _smallest_enclosing_feature(self, bp: int) -> int:
+        """Return the index of the smallest-span feature whose span
+        contains `bp`, or -1 if none. Used by both `_feat_at` (circular)
+        and `_feat_at_linear` to resolve nested-feature clicks to the
+        inner annotation.
+
+        Perf: uses the bisect index `_feats_starts_sorted` to narrow
+        non-wrap candidates from O(N) to O(log N + matches), which is
+        the hover-frame budget on WGS contigs with 1000+ features.
+        Wrap features (`end < start`) are checked in a second pass —
+        there are usually 0–2 per record so the cost is bounded.
+        """
+        feats = self._feats
+        if not feats:
+            return -1
+        starts = getattr(self, "_feats_starts_sorted", None)
+        sorted_idx = getattr(self, "_feats_by_start", None)
         best_idx = -1
         best_span = float("inf")
-        for i, f in enumerate(self._feats):
+        # Fast path: bisect over sorted starts to find features with
+        # start <= bp, then iterate backwards while end > bp.
+        if starts is not None and sorted_idx is not None:
+            import bisect as _bs
+            upper = _bs.bisect_right(starts, bp)
+            for k in range(upper - 1, -1, -1):
+                i = sorted_idx[k]
+                f = feats[i]
+                sb = f["start"]
+                eb = f["end"]
+                # Linear (non-wrap) features: bp must be in [sb, eb).
+                if eb >= sb:
+                    if bp < sb:
+                        # bisect should have prevented this, but
+                        # belt-and-braces — and an early break
+                        # would be wrong because the sort is by
+                        # start, not end, so we just continue.
+                        continue
+                    if eb <= bp:
+                        continue
+                    span = eb - sb
+                    if span < best_span:
+                        best_span = span
+                        best_idx = i
+                # Wrap features handled in the second pass below.
+            # Second pass: wrap features (`end < start`). Caller's
+            # `_bp_in` knows how to test these; iterate only wrap
+            # features by scanning the full list once. On a typical
+            # plasmid this is 0 or 1 features.
+            for i, f in enumerate(feats):
+                sb = f["start"]
+                eb = f["end"]
+                if eb >= sb:
+                    continue  # not a wrap
+                if not self._bp_in(bp, f):
+                    continue
+                span = _feat_len(sb, eb, self._total) or 0
+                if span < best_span:
+                    best_span = span
+                    best_idx = i
+            return best_idx
+        # Fallback: index not built (early in load_record before
+        # `_feats_by_start` populates). Linear scan.
+        for i, f in enumerate(feats):
             if not self._bp_in(bp, f):
                 continue
             span = _feat_len(f["start"], f["end"], self._total) or 0
             if span < best_span:
                 best_span = span
-                best_idx  = i
-        return (best_idx, bp) if best_idx >= 0 else (-1, -1)
+                best_idx = i
+        return best_idx
 
     def _align_at_click(self, x: int, y: int) -> int:
         """Linear-view alignment hit-test. Returns the alignment index
@@ -10636,16 +11007,9 @@ class PlasmidMap(Widget):
         # Smallest-enclosing wins on nested features (matches the
         # circular path + sequence-panel fallback). No strand gating
         # here because the new layout puts both strands on the same
-        # row pair.
-        best_idx  = -1
-        best_span = float("inf")
-        for i, f in enumerate(self._feats):
-            if not self._bp_in(bp, f):
-                continue
-            span = _feat_len(f["start"], f["end"], self._total) or 0
-            if span < best_span:
-                best_span = span
-                best_idx  = i
+        # row pair. Routed through the bisect-indexed helper so
+        # hover-frame budgets hold on WGS contigs with 1000+ feats.
+        best_idx = self._smallest_enclosing_feature(bp)
         return (best_idx, bp) if best_idx >= 0 else (-1, -1)
 
     def _draw_linear(self, w: int, h: int) -> Text:
@@ -13500,14 +13864,15 @@ class SequencePanel(Widget):
                 out_lines.append(f"{pad}^ ← hover (seq_col={hover_seq_col})")
         dump = "\n".join(out_lines)
         _log_event("seq.chunk_dump", chunk=chunk_idx, lines=len(out_lines))
-        _log.info("seq.chunk_dump:\n%s", dump)
+        # Privacy invariant (CLAUDE.md #38): never log sequence content.
+        # The dump embeds rendered DNA bases; clipboard is the only sink.
         try:
             self.app.copy_to_clipboard(dump)
         except Exception:
             if not _copy_to_clipboard_osc52(dump):
                 self.app.notify(
-                    "Clipboard unavailable — see splicecraft.log "
-                    "(seq.chunk_dump entry) for the full dump",
+                    "Clipboard unavailable — dump discarded "
+                    "(seq.chunk_dump event logged without content)",
                     severity="warning",
                 )
                 return
@@ -13541,8 +13906,10 @@ class SequencePanel(Widget):
             self.app.notify("Nothing under cursor to copy",
                             severity="information")
             return
+        # Privacy invariant (CLAUDE.md #38): `plain` can contain the
+        # DNA letter under cursor — log its length, not its content.
         _log_event("seq.hover_copy",
-                   screen_x=mx, screen_y=my, text=plain, **{
+                   screen_x=mx, screen_y=my, text_len=len(plain), **{
                        k: (v.get("label") if isinstance(v, dict) else v)
                        for k, v in info.items()
                    })
@@ -22880,7 +23247,7 @@ def _load_settings() -> dict:
     """
     global _settings_cache
     if _settings_cache is not None:
-        return deepcopy(_settings_cache)
+        return _typed_clone(_settings_cache)
     entries, warning = _safe_load_json(_SETTINGS_FILE, "Settings")
     if warning:
         _log.warning(warning)
@@ -22895,7 +23262,7 @@ def _load_settings() -> dict:
     for w in warns:
         _log.warning(w)
     _settings_cache = cleaned
-    return deepcopy(_settings_cache)
+    return _typed_clone(_settings_cache)
 
 
 def _save_settings(settings: dict) -> None:
@@ -22906,7 +23273,7 @@ def _save_settings(settings: dict) -> None:
     global _settings_cache
     entries = [{"key": k, "value": v} for k, v in settings.items()]
     _safe_save_json(_SETTINGS_FILE, entries, "Settings")
-    _settings_cache = deepcopy(settings)
+    _settings_cache = _typed_clone(settings)
 
 
 def _get_setting(key: str, default: "_Any" = None) -> "_Any":
@@ -22937,11 +23304,14 @@ def _settings_flush_worker() -> None:
         entries = [{"key": k, "value": v} for k, v in payload.items()]
         try:
             _safe_save_json(_SETTINGS_FILE, entries, "Settings")
-        except Exception:
+        except (OSError, RuntimeError) as exc:
             # The cache was already updated synchronously, so the
             # in-process state stays consistent; only the on-disk
             # mirror is stale until the next successful flush.
-            _log.exception("Settings disk flush failed")
+            # Surface to the UI so a persistable-toggle keystroke
+            # that the user thinks "took" can't silently revert
+            # at next launch.
+            _bg_notify_save_failure("Settings", exc)
 
 
 def _set_setting(key: str, value) -> None:
@@ -23081,6 +23451,7 @@ def _gb_binding_region_advisory(
     return out
 
 
+@_timed("op.primer3.gb_design")
 def _design_gb_primers(
     template_seq: str,
     start: int,
@@ -23468,9 +23839,9 @@ def _sync_active_parts_bin_parts(entries: list[dict]) -> None:
             b["parts"] = snapshot
             try:
                 _save_parts_bin_collections(bins)
-            except (OSError, RuntimeError):
-                _log.exception(
-                    "parts-bin sync: save failed for %r", name,
+            except (OSError, RuntimeError) as exc:
+                _bg_notify_save_failure(
+                    f"Active-parts-bin mirror ({name})", exc,
                 )
             return
 
@@ -25030,6 +25401,7 @@ _CLONING_RE_OPTIONS: list[tuple[str, str]] = sorted([
 ], key=lambda t: t[0])
 
 
+@_timed("op.primer3.detection_design")
 def _design_detection_primers(
     template_seq: str,
     target_start: int,
@@ -25146,6 +25518,7 @@ def _design_detection_primers(
     }
 
 
+@_timed("op.primer3.cloning_design")
 def _design_cloning_primers_raw(
     template_seq: str,
     start: int,
@@ -25237,6 +25610,7 @@ def _design_cloning_primers(
     )
 
 
+@_timed("op.primer3.generic_design")
 def _design_generic_primers(
     template_seq: str,
     start: int,
@@ -25389,6 +25763,14 @@ def _mut_tm(seq: str) -> float:
         import primer3
         return primer3.calc_tm(seq, **_MUT_P3)  # type: ignore[arg-type]
     except Exception:
+        # Fall back to the crude 2×AT + 4×GC approximation when
+        # primer3 is missing or raises (degenerate input, NaN config).
+        # Log so a wave of failures shows up as one diagnosable
+        # symptom in the bug-report bundle instead of silent
+        # mis-temperature on every primer.
+        _log.exception(
+            "_mut_tm: primer3.calc_tm fell back to GC approximation "
+            "for %d-mer", len(seq))
         gc = sum(1 for c in seq.upper() if c in "GC")
         at = sum(1 for c in seq.upper() if c in "AT")
         return 2 * at + 4 * gc
@@ -25399,6 +25781,9 @@ def _mut_hairpin_dg(seq: str) -> float:
         import primer3
         return primer3.calc_hairpin(seq, **_MUT_P3).dg  # type: ignore[arg-type]
     except Exception:
+        _log.exception(
+            "_mut_hairpin_dg: primer3.calc_hairpin raised on %d-mer; "
+            "returning 0.0 (no secondary-structure penalty)", len(seq))
         return 0.0
 
 
@@ -25407,6 +25792,9 @@ def _mut_homodimer_dg(seq: str) -> float:
         import primer3
         return primer3.calc_homodimer(seq, **_MUT_P3).dg  # type: ignore[arg-type]
     except Exception:
+        _log.exception(
+            "_mut_homodimer_dg: primer3.calc_homodimer raised on "
+            "%d-mer; returning 0.0", len(seq))
         return 0.0
 
 
@@ -28884,6 +29272,7 @@ def _blast_search_pyhmmer(query: str, db: dict, *,
     return hits_out[:max_hits]
 
 
+@_timed("op.blast_search")
 def _blast_search(query: str, db: dict, *, max_hits: int = 25,
                    backend: str = "auto") -> list[dict]:
     """Top-level BLAST dispatcher. ``backend``:
@@ -29022,6 +29411,7 @@ _HMMSCAN_MIN_QUERY_LEN = 5     # too-short queries are pure noise hits
 _HMMSCAN_MAX_HITS      = 25    # match the BLAST default for consistency
 
 
+@_timed("op.hmmscan")
 def _hmmscan_run(query_protein: str,
                  hmm_path: str,
                  *, max_hits: int = _HMMSCAN_MAX_HITS,
@@ -32707,10 +33097,17 @@ class PartsBinPickerModal(ModalScreen):
                     )
                     globals()["_parts_bin_cache"] = None
                     _clear_assembly_fragment_cache()
-                except (OSError, RuntimeError):
-                    _log.exception(
-                        "delete-bin: re-seed parts_bin.json failed",
+                except (OSError, RuntimeError) as exc:
+                    # Surface so the user knows the success toast
+                    # below is misleading: cache is invalidated but
+                    # disk wasn't re-seeded → next launch reads
+                    # stale data from the deleted bin.
+                    _notify_save_failure(
+                        self.app,
+                        f"Re-seed Parts bin after delete '{name}'",
+                        exc,
                     )
+                    return
         self._set_status(f"[dim]Deleted bin '{name}'.[/dim]")
         self._repopulate()
 
@@ -39744,10 +40141,23 @@ class ConstructorModal(ModalScreen):
         itself still completes — the assembly is library-bound, not
         canvas-bound — but the UI follows the user's attention.
         """
-        new_rec = _clone_assembly_into_entry_vector(
-            parts, entry_vector, grammar,
-            source_level=source_level, name=name,
-        )
+        # Wrap the clone in the same try/except envelope as the
+        # persist step below — a raised exception (malformed grammar,
+        # extra IIS sites, ValueError from a part with bad overhangs)
+        # used to kill the worker silently, leaving the user staring
+        # at the "Assembling and saving…" toast forever.
+        try:
+            new_rec = _clone_assembly_into_entry_vector(
+                parts, entry_vector, grammar,
+                source_level=source_level, name=name,
+            )
+        except Exception as exc:
+            _log.exception("Save To Library: clone failed")
+            self.app.call_from_thread(
+                self._on_constructor_save_failed,
+                f"Assembly simulation crashed: {exc}",
+            )
+            return
         if new_rec is None:
             self.app.call_from_thread(
                 self._on_constructor_save_failed,
@@ -40048,7 +40458,15 @@ class ConstructorModal(ModalScreen):
                             "for %s", unique_id)
         lib_entries = _load_library()
         lib_entries.insert(0, lib_entry)
-        _save_library(lib_entries)
+        try:
+            _save_library(lib_entries)
+        except (OSError, RuntimeError) as exc:
+            # Library save is the first commit. Re-raise — nothing
+            # has landed on disk yet, so the outer worker's failure
+            # toast is honest.
+            raise RuntimeError(
+                f"library save failed: {exc}"
+            ) from exc
         # Parts-bin entry — tagged with level so the new TU/MOD shows
         # up in the right Parts Bin tab AND can be selected as a
         # source for the next assembly cycle.
@@ -40126,7 +40544,25 @@ class ConstructorModal(ModalScreen):
         }
         bin_entries = _load_parts_bin()
         bin_entries.insert(0, deepcopy(bin_entry))
-        _save_parts_bin(bin_entries)
+        try:
+            _save_parts_bin(bin_entries)
+        except (OSError, RuntimeError) as exc:
+            # Partial commit: the library write at line ~40319 already
+            # succeeded, so the new plasmid IS in the library — only
+            # the parts-bin row that the next-cycle palette depends
+            # on is missing. Surface this distinct state so the user
+            # doesn't see a misleading "Save failed" toast and
+            # re-trigger the whole assembly (which would create a
+            # duplicate library row). The unique_id below lets the
+            # user find the partially-saved entry; they can then
+            # manually re-add it to the parts bin via the New Part
+            # flow.
+            raise RuntimeError(
+                f"library saved as {unique_id!r} but parts-bin "
+                f"write failed: {exc}. The assembled plasmid is in "
+                f"your library; re-add it to the parts bin manually "
+                f"via the New Part button."
+            ) from exc
         _log.info(
             "constructor: saved assembly %r (level %d, gid %s) — "
             "%d bp, %d parts, vector %r",
@@ -46789,22 +47225,73 @@ def _check_agent_write_path(path: Path) -> "str | None":
     Rejects:
     * Symlinks at the destination — an agent shouldn't get to write
       through a pre-placed symlink to `/etc/passwd` or similar.
-    * Existing symlinks in any parent component (TOCTOU defense — a
-      racing process can't redirect the write via a parent symlink).
+    * Existing symlinks in ANY parent component up to root (TOCTOU
+      defense — a racing process can't redirect the write via a
+      grandparent symlink either).
     * Paths whose parent doesn't exist (forces the user to mkdir
       first rather than us auto-creating arbitrary directories).
 
     Audit hardening 2026-05-14: previously the agent's export
     endpoints used `_sanitize_path` only, which expands `~` and does
     nothing else — symlink-as-destination was unprotected.
+
+    Audit sweep #4 2026-05-15: previously this only checked the
+    immediate parent. A symlink at any deeper ancestor (e.g.
+    `/home/<user>/Documents` → `/etc`) could redirect every write
+    under it. Walk the full chain via `resolve()` so the canonical
+    absolute path is what we compare; an ancestor symlink would
+    yield a `resolve()` result differing from the lexical path,
+    flagging the redirect.
     """
     if path.is_symlink():
         return f"refusing to write through symlink at {path!s}"
     parent = path.parent
     if not parent.exists():
         return f"parent directory does not exist: {parent!s}"
-    if parent.is_symlink():
-        return f"parent directory is a symlink: {parent!s}"
+    # Resolve the parent through every symlink hop. If the result
+    # differs from the lexical absolute path (modulo `..` / `.`
+    # collapsing), some ancestor is a symlink.
+    try:
+        resolved_parent = parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return f"could not resolve parent directory: {exc}"
+    # Walk every ancestor segment under the parent and lstat
+    # each. `parent.resolve()` follows symlinks, so if any
+    # intermediate component IS a symlink, `lexical_parent` and
+    # `resolved_parent` diverge. Refuse the divergence outright —
+    # the user can re-target through the resolved path if they
+    # actually meant to write there.
+    try:
+        lexical_parent = parent.absolute()
+    except OSError as exc:
+        return f"could not normalise parent directory: {exc}"
+    if str(resolved_parent) != str(lexical_parent):
+        return (
+            f"parent path resolves through a symlink: "
+            f"{lexical_parent!s} → {resolved_parent!s}"
+        )
+    # Per-segment lstat as defense in depth — `resolve()` already
+    # catches symlinks via the divergence check above, but an
+    # attacker swapping a regular dir for a symlink between the
+    # resolve() and the open() (TOCTOU race) would slip through.
+    # Walking each ancestor with lstat at least narrows the race
+    # window to the open() itself.
+    cur = parent
+    seen: set = set()
+    while True:
+        try:
+            if cur.is_symlink():
+                return (
+                    f"ancestor directory is a symlink: {cur!s}"
+                )
+        except OSError:
+            # A permission error mid-walk is a refusal — we can't
+            # tell whether an ancestor is safe.
+            return f"could not stat ancestor: {cur!s}"
+        if cur.parent == cur or str(cur) in seen:
+            break
+        seen.add(str(cur))
+        cur = cur.parent
     return None
 
 
@@ -46934,6 +47421,54 @@ def _agent_endpoint(name: str, *, write: bool = False):
 _AGENT_RESPONSE_MAX_BYTES = 50 * 1024 * 1024
 
 
+def _agent_save_or_500(save_fn, label: str = "library"):
+    """Run `save_fn()`; on OSError/RuntimeError, return
+    ``({"error": "save failed: ..."}, 500)`` so the handler can
+    propagate. Returns None on success — caller pattern is
+    ``err = _agent_save_or_500(...); if err: return err``.
+
+    Per sacred invariant #7, `_safe_save_json` re-raises on disk
+    failure so callers can surface; agent endpoints used to let those
+    exceptions bubble up as generic 500s with no actionable detail.
+    Routes through `_notify_save_failure` so the in-process UI user
+    also sees the failure toast (the agent path and the GUI share an
+    `app` object).
+    """
+    try:
+        save_fn()
+    except (OSError, RuntimeError) as exc:
+        _notify_save_failure(_LIVE_APP_REF.get(), label, exc)
+        return ({"error": f"save failed for {label}: {exc}"}, 500)
+    return None
+
+
+# Soft reference to the currently-running PlasmidApp so daemon-thread
+# save workers (collection sync, parts-bin sync, settings flush) and
+# the agent API can surface failures through `_notify_save_failure`.
+# Set in `PlasmidApp.on_mount` and `_agent_dispatch`; cleared in
+# `PlasmidApp.on_unmount` and `_agent_dispatch`'s `finally`. None
+# when no app is mounted (test contexts that don't run an App).
+class _LiveAppRef:
+    """Single-slot soft pointer to the live PlasmidApp instance.
+
+    Daemon-thread save workers can't take an `app` parameter without
+    threading it through every queue + closure; instead they fetch
+    via `.get()` at the point of failure. `None` is always a valid
+    return (test contexts, pre-mount, post-unmount) and the only
+    caller `_notify_save_failure` already handles `None` gracefully.
+    """
+    _app = None
+
+    def set(self, app): self._app = app
+
+    def get(self): return self._app
+
+    def clear(self): self._app = None
+
+
+_LIVE_APP_REF = _LiveAppRef()
+
+
 def _agent_dirty_guard(app, payload):
     """Return None if writes may proceed, else (error_dict, 409). The
     `force` field in the payload (or `?force=1` in the query, applied
@@ -46989,7 +47524,35 @@ def _h_status(app, payload):
 
 @_agent_endpoint("tools")
 def _h_tools(app, payload):
-    """Self-describe: list of available endpoints + their write/read mode."""
+    """Self-describe: list of available endpoints + their write/read mode.
+
+    Global error-shape contract every endpoint follows:
+      * Success     → ``200`` with handler-specific JSON.
+      * Bad input   → ``400`` with ``{"error": "..."}`` describing the
+                       field that failed validation.
+      * Auth        → ``401`` for write endpoints called without the
+                       bearer token.
+      * Missing     → ``404`` when the requested object (library entry,
+                       collection, hmm file) doesn't exist.
+      * Stale ref   → ``409`` when the request was valid at receive time
+                       but the canvas record / library state moved on
+                       before apply (audit sweep #4 added this to
+                       `transfer-annotations`; mirrors
+                       `replace-sequence`). Retry against current state.
+      * Loaded?     → ``422`` for endpoints that need a record loaded
+                       but `_current_record is None`.
+      * Save fail   → ``500`` with ``{"error": "save failed for X: ..."}``
+                       when the disk write raised (disk-full, RO mount,
+                       EACCES). The in-process UI user ALSO sees a
+                       failure toast via `_notify_save_failure`. Agent
+                       endpoints route through `_agent_save_or_500` so
+                       the shape is uniform across 7 write paths
+                       (delete-from-library, create/delete/rename-
+                       collection, set-active-collection,
+                       bulk-import-folder, set-plasmid-status).
+      * Crash       → ``500`` with ``{"error": "...", "type": "..."}``
+                       (the dispatcher's catch-all).
+    """
     return {"endpoints": [
         {
             "name":   name,
@@ -47709,6 +48272,12 @@ def _h_delete_from_library(app, payload):
     canvas pointing at the now-deleted entry; a subsequent Ctrl+S
     would re-create the row from the stale in-memory record.
     Mirrors `LibraryPanel._on_delete`'s cleanup at splicecraft.py:~12504.
+
+    Save-failure contract (audit sweep #4 2026-05-15): the underlying
+    `_save_library` call is wrapped via `_agent_save_or_500`, so
+    disk-full / RO-mount / EACCES surfaces as ``500 {"error": "save
+    failed for library: ..."}`` instead of a generic 500 with an
+    opaque exception. The in-process UI user also sees a toast.
     """
     name = _sanitize_label(payload.get("name"), max_len=200)
     if not name:
@@ -47726,7 +48295,9 @@ def _h_delete_from_library(app, payload):
         kept = [e for e in entries if e.get("name") != name]
         if len(kept) == len(entries):
             return ({"error": f"no entry named {name!r}"}, 404)
-        _save_library(kept)
+        if (err := _agent_save_or_500(
+                lambda: _save_library(kept), "library")) is not None:
+            return err
         # If the deleted entry is the loaded record, clear the canvas
         # + drop the panel's active pointer so subsequent saves can't
         # re-resurrect it from the stale in-memory state.
@@ -47804,10 +48375,26 @@ def _h_transfer_annotations(app, payload):
     mutating the record — useful for showing the agent a preview
     before committing. Set `dry_run=false` to actually append the
     matched features. Returns
-    ``{transfers: [...], applied: bool, count: int}``."""
+    ``{transfers: [...], applied: bool, count: int}``.
+
+    Stale-canvas guard (audit sweep #4 2026-05-15): captures
+    `_record_load_counter` at handler entry and returns ``409`` if
+    the canvas swapped (concurrent `load-file`, GUI navigation,
+    primer-add reload) before the apply step. Agents should re-
+    resolve `source_id` and retry against the current target.
+    Mirrors `_h_replace_sequence`'s symmetric guard."""
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
+    # Capture the record-load counter at handler entry so the
+    # apply-back guard can detect a concurrent canvas swap. Without
+    # this, an agent transfer-annotations + a concurrent agent
+    # load-file (or GUI navigation) races: the transfer
+    # `_apply_annotation_transfers` deep-copies the stale `rec`,
+    # appends features, and assigns `_current_record = new_record`
+    # — silently clobbering the freshly-loaded plasmid. Mirrors
+    # `_h_replace_sequence`'s symmetric guard.
+    entry_counter = getattr(app, "_record_load_counter", 0)
     source_id = _sanitize_label(payload.get("source_id"), max_len=200)
     if not source_id:
         return ({"error": "missing 'source_id'"}, 400)
@@ -47846,6 +48433,13 @@ def _h_transfer_annotations(app, payload):
         guard = _agent_dirty_guard(app, payload)
         if guard is not None:
             return guard
+        # Stale-canvas check: refuse to apply if the record has
+        # moved on between handler entry and now (concurrent
+        # load-file, GUI navigation, primer-add reload). Returning
+        # 409 lets the agent re-query, re-resolve `source_id`, and
+        # re-issue the transfer against the current target.
+        if getattr(app, "_record_load_counter", 0) != entry_counter:
+            return ({"error": "record changed mid-flight; retry"}, 409)
         try:
             app._apply_annotation_transfers(transfers, rec)
         except Exception as exc:
@@ -48257,7 +48851,12 @@ def _h_create_collection(app, payload):
     If ``folder`` is supplied, every importable file in that directory
     is bulk-imported into the new collection (same path as the GUI
     NewCollectionModal). Returns counts; the full plasmid list is
-    available via ``list-library`` after switching active collection."""
+    available via ``list-library`` after switching active collection.
+
+    Save-failure contract (audit sweep #4): the `_save_collections`
+    write is wrapped via `_agent_save_or_500`, returning ``500
+    {"error": "save failed for collections: ..."}`` on disk failure.
+    The UI user also sees a toast via `_notify_save_failure`."""
     guard = _agent_dirty_guard(app, payload)
     if guard is not None:
         return guard
@@ -48293,7 +48892,9 @@ def _h_create_collection(app, payload):
         "plasmids":    plasmids,
         "saved":       _date.today().isoformat(),
     })
-    _save_collections(colls)
+    if (err := _agent_save_or_500(
+            lambda: _save_collections(colls), "collections")) is not None:
+        return err
     app.call_from_thread(_agent_refresh_library_panel, app)
     return {
         "ok":          True,
@@ -48309,7 +48910,11 @@ def _h_delete_collection(app, payload):
     """Delete a collection by exact name. Body: ``{name}``. If the
     deleted collection is the active one, the active pointer is
     cleared and the panel returns to the collections-list view on
-    next render."""
+    next render.
+
+    Save-failure contract (audit sweep #4): wraps `_save_collections`
+    via `_agent_save_or_500` — ``500`` with explicit ``"save failed
+    for collections: ..."`` instead of generic exception bubble."""
     guard = _agent_dirty_guard(app, payload)
     if guard is not None:
         return guard
@@ -48320,7 +48925,9 @@ def _h_delete_collection(app, payload):
     remaining = [c for c in colls if c.get("name") != name]
     if len(remaining) == len(colls):
         return ({"error": f"no collection named {name!r}"}, 404)
-    _save_collections(remaining)
+    if (err := _agent_save_or_500(
+            lambda: _save_collections(remaining), "collections")) is not None:
+        return err
     if _get_active_collection_name() == name:
         _set_active_collection_name(None)
     app.call_from_thread(_agent_refresh_library_panel, app)
@@ -48329,7 +48936,12 @@ def _h_delete_collection(app, payload):
 
 @_agent_endpoint("rename-collection", write=True)
 def _h_rename_collection(app, payload):
-    """Rename a collection. Body: ``{old, new}``."""
+    """Rename a collection. Body: ``{old, new}``.
+
+    Save-failure contract (audit sweep #4): wraps `_save_collections`
+    via `_agent_save_or_500` — ``500`` with explicit ``"save failed
+    for collections: ..."`` so an in-memory rename never gets
+    committed to disk silently."""
     guard = _agent_dirty_guard(app, payload)
     if guard is not None:
         return guard
@@ -48350,7 +48962,9 @@ def _h_rename_collection(app, payload):
             break
     if not found:
         return ({"error": f"no collection named {old!r}"}, 404)
-    _save_collections(colls)
+    if (err := _agent_save_or_500(
+            lambda: _save_collections(colls), "collections")) is not None:
+        return err
     if _get_active_collection_name() == old:
         _set_active_collection_name(new)
     app.call_from_thread(_agent_refresh_library_panel, app)
@@ -48361,7 +48975,14 @@ def _h_rename_collection(app, payload):
 def _h_set_active_collection(app, payload):
     """Switch the active collection. Body: ``{name}``. Mirrors the
     panel's Click-to-enter flow (writes the active pointer to
-    settings.json + refreshes the in-memory library)."""
+    settings.json + refreshes the in-memory library).
+
+    Save-failure contract (audit sweep #4 2026-05-15): the
+    `_save_library` write is wrapped via `_agent_save_or_500`. On
+    disk-write failure the active-collection pointer is ROLLED BACK
+    to the prior value, so the next launch loads the collection
+    whose content is actually on disk. Returns ``500 {"error":
+    "save failed for library: ..."}`` in this case."""
     guard = _agent_dirty_guard(app, payload)
     if guard is not None:
         return guard
@@ -48371,10 +48992,19 @@ def _h_set_active_collection(app, payload):
     coll = _find_collection(name)
     if coll is None:
         return ({"error": f"no collection named {name!r}"}, 404)
-    _set_active_collection_name(name)
     plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                  if isinstance(p, dict)]
-    _save_library(plasmids)
+    # Set the active pointer FIRST in memory only; commit it after
+    # the library write succeeds so a save failure doesn't leave the
+    # active-collection setting pointing at content that isn't there.
+    prev_active = _get_active_collection_name()
+    _set_active_collection_name(name)
+    err = _agent_save_or_500(lambda: _save_library(plasmids), "library")
+    if err is not None:
+        # Roll back the active pointer so the next launch loads the
+        # collection whose content is actually on disk.
+        _set_active_collection_name(prev_active)
+        return err
     app.call_from_thread(_agent_refresh_library_panel, app)
     return {"ok": True, "active": name, "n_plasmids": len(plasmids)}
 
@@ -48386,7 +49016,14 @@ def _h_bulk_import_folder(app, payload):
     The collection is created if missing, refused if it exists (use
     a second call to ``create-collection`` with the same name first to
     pre-create, or pick a unique target). Per-file failures are
-    isolated; the response carries a per-file summary."""
+    isolated; the response carries a per-file summary.
+
+    Save-failure contract (audit sweep #4): wraps `_save_collections`
+    via `_agent_save_or_500` — a bulk import of 1000 plasmids that
+    parsed successfully but failed to commit now returns ``500
+    {"error": "save failed for collections: ..."}`` instead of the
+    pre-sweep "imported 1000" lie followed by "where did they go?"
+    on next launch."""
     guard = _agent_dirty_guard(app, payload)
     if guard is not None:
         return guard
@@ -48410,7 +49047,9 @@ def _h_bulk_import_folder(app, payload):
         "plasmids":    entries,
         "saved":       _date.today().isoformat(),
     })
-    _save_collections(colls)
+    if (err := _agent_save_or_500(
+            lambda: _save_collections(colls), "collections")) is not None:
+        return err
     app.call_from_thread(_agent_refresh_library_panel, app)
     return {
         "ok":         True,
@@ -48502,7 +49141,13 @@ def _h_hmmscan(app, payload):
     ``{query, hmm_path, max_hits?}``. ``hmm_path`` must point at a
     readable .hmm / .h3m / .h3p file on the server filesystem; the
     file is read lazily so Pfam-scale DBs don't pre-fetch into RAM.
-    Returns hits in the same shape as ``blast``."""
+    Returns hits in the same shape as ``blast``.
+
+    Path safety (audit sweep #4 2026-05-15): `hmm_path` is routed
+    through `_safe_file_size_check` (2 GB cap, symlink rejection,
+    `S_ISREG` check) before opening — without this an agent caller
+    could pass `/dev/zero` or a symlink to it and DoS the worker
+    via `pyhmmer.HMMFile`'s streaming read."""
     raw_query = payload.get("query")
     if not raw_query or not isinstance(raw_query, str):
         return ({"error": "missing or non-string 'query'"}, 400)
@@ -48511,6 +49156,17 @@ def _h_hmmscan(app, payload):
         return ({"error": "missing 'hmm_path'"}, 400)
     if not hmm_path.exists():
         return ({"error": f"hmm file not found: {hmm_path}"}, 404)
+    # Symlink + size + regular-file check. Asymmetric vs
+    # `_h_load_file` which already routes through `_safe_file_size_check`;
+    # without this, `pyhmmer.HMMFile(/dev/zero)` streams forever and an
+    # agent caller can DoS the worker. Cap at 2 GB — real Pfam-A.hmm
+    # bundles weigh in around 1.3 GB so this is generous but bounded.
+    _HMMSCAN_HMM_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+    ok, reason = _safe_file_size_check(
+        hmm_path, _HMMSCAN_HMM_MAX_BYTES, "hmm file",
+    )
+    if not ok:
+        return ({"error": reason or "hmm file rejected"}, 400)
     max_hits = _coerce_int(payload.get("max_hits", 25),
                              name="max_hits")
     if isinstance(max_hits, str):
@@ -48551,7 +49207,12 @@ def _h_set_plasmid_status(app, payload):
     `list-plasmid-statuses`, or empty string / null to clear. Anything
     else is treated as "clear" (matches `_sanitize_plasmid_status`'s
     documented strict-canonical-or-empty behaviour). Persists via
-    `_save_library`, which mirrors into the active collection."""
+    `_save_library`, which mirrors into the active collection.
+
+    Save-failure contract (audit sweep #4): wraps `_save_library`
+    via `_agent_save_or_500` so disk-write failures surface as
+    ``500 {"error": "save failed for library: ..."}`` with the UI
+    user also notified — the in-memory cache stays consistent."""
     key = _sanitize_label(payload.get("name") or payload.get("id"),
                            max_len=200)
     if not key:
@@ -48572,7 +49233,10 @@ def _h_set_plasmid_status(app, payload):
         for e in entries:
             if e.get("name") == key or e.get("id") == key:
                 e["status"] = new_status
-                _save_library(entries)
+                if (err := _agent_save_or_500(
+                        lambda: _save_library(entries),
+                        "library")) is not None:
+                    return err
                 _agent_refresh_library_panel(app)
                 return new_status
         return None
@@ -49936,8 +50600,16 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         # would AttributeError on the very first field access.
         if not isinstance(body, dict):
             body = {}
+        srv_app = getattr(self.server, "_app", None)
+        # The agent handler may run while the app is alive (the
+        # decorator sets `_LIVE_APP_REF` in `PlasmidApp.on_mount`).
+        # Re-assert here for test contexts that exercise agent
+        # endpoints directly without spinning up PlasmidApp.
+        prev_live = _LIVE_APP_REF.get()
+        if prev_live is None and srv_app is not None:
+            _LIVE_APP_REF.set(srv_app)
         try:
-            result = fn(getattr(self.server, "_app"), body)
+            result = fn(srv_app, body)
         except Exception as exc:
             _log.exception("agent-api %s failed", path_part)
             _log_event(
@@ -49947,6 +50619,9 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             return self._send(
                 {"error": str(exc), "type": type(exc).__name__}, 500,
             )
+        finally:
+            if prev_live is None:
+                _LIVE_APP_REF.clear()
         if isinstance(result, tuple):
             payload, status = result
         else:
@@ -51534,6 +52209,7 @@ SpeciesPickerModal { align: center middle; }
         sp._refresh_view()
         return True
 
+    @_action_log("app.map.reset_origin")
     def action_reset_origin(self):
         """Home is context-aware: when no focus-stealing widget owns
         the keystroke (typical seq-cursor case), jump the seq cursor
@@ -51547,12 +52223,14 @@ SpeciesPickerModal { align: center middle; }
             return
         self.query_one("#plasmid-map", PlasmidMap).action_reset_origin()
 
+    @_action_log("app.cursor.end_of_row")
     def action_end_of_row(self):
         """End: jump the seq cursor to the end of its current display
         row. No-op when focus is on the map / a DataTable / an Input
         (those widgets keep their native End semantics)."""
         self._seq_jump_row_edge(end=True)
 
+    @_action_log("app.toggle.map_view")
     def action_toggle_map_view(self):
         # Map mode (circular ↔ linear) is intentionally NOT persisted:
         # circular is the canonical default and the per-record
@@ -51562,6 +52240,7 @@ SpeciesPickerModal { align: center middle; }
         pm = self.query_one("#plasmid-map", PlasmidMap)
         pm.action_toggle_map_view()
 
+    @_action_log("app.toggle.connectors")
     def action_toggle_connectors(self):
         sp = self.query_one("#seq-panel", SequencePanel)
         pm = self.query_one("#plasmid-map", PlasmidMap)
@@ -51594,6 +52273,7 @@ SpeciesPickerModal { align: center middle; }
             callback(result)
         return _wrapped
 
+    @_action_log("app.seq.edit")
     def action_edit_seq(self) -> None:
         sp = self.query_one("#seq-panel", SequencePanel)
         if not sp._seq:
@@ -51897,6 +52577,7 @@ SpeciesPickerModal { align: center middle; }
             node = getattr(node, "parent", None)
         return False
 
+    @_action_log("app.feature.delete")
     def action_delete_feature(self):
         # Focus-aware routing: when the keyboard focus is inside the
         # library, Delete targets whatever's under the cursor in the
@@ -51926,6 +52607,7 @@ SpeciesPickerModal { align: center middle; }
         self._apply_snapshot(str(new_record.seq), sp._cursor_pos, new_record)
         self.notify(f"Deleted '{label}'  (Ctrl+Z to undo)", markup=False)
 
+    @_action_log("app.library.add")
     def action_add_to_library(self):
         if self._current_record is None:
             self.notify("No record loaded to add.", severity="warning")
@@ -51938,6 +52620,11 @@ SpeciesPickerModal { align: center middle; }
     # ── Mount: auto-load preloaded record ──────────────────────────────────────
 
     def on_mount(self) -> None:
+        # Register this app as the live instance so daemon-thread
+        # save workers (collection sync, parts-bin sync, settings
+        # flush, agent endpoints) can surface failures through
+        # `_notify_save_failure`. Cleared in `on_unmount`.
+        _LIVE_APP_REF.set(self)
         # Pin every panel/screen background to true black to match the
         # logo. textual-dark's defaults are near-black greys; we
         # register a fork that pins `background` / `panel` to
@@ -52530,6 +53217,7 @@ SpeciesPickerModal { align: center middle; }
 
     # ── Keyboard: cursor movement, copy, undo/redo ─────────────────────────────
 
+    @_action_log("app.copy.selection")
     def action_copy_selection(self) -> None:
         """Ctrl+C — copy the top strand (5'→3') of the selection."""
         self._copy_strand(bottom=False)
@@ -53254,6 +53942,7 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_choice,
         )
 
+    @_action_log("app.whats_new.show")
     def action_show_whats_new(self) -> None:
         """File → What's New… — manual reopen of the per-version
         dialog, regardless of `last_seen_version`. Doesn't touch the
@@ -53325,6 +54014,7 @@ SpeciesPickerModal { align: center middle; }
             self._notify_success(f"Saved {self._current_record.name} to library")
         return True
 
+    @_action_log("app.save.trigger")
     def action_save(self) -> None:
         # Async path for the user-facing Ctrl+S keystroke. The synchronous
         # `_do_save` is preserved for the quit flow + agent API, where
@@ -53441,6 +54131,7 @@ SpeciesPickerModal { align: center middle; }
 
         self.call_from_thread(_finish)
 
+    @_action_log("app.quit")
     def action_quit(self) -> None:  # type: ignore[override]
         # Sync override of Textual's `App.action_quit` (which is async).
         # Textual's action dispatcher accepts both sync and async
@@ -53476,11 +54167,13 @@ SpeciesPickerModal { align: center middle; }
 
     # ── Fetch / open ───────────────────────────────────────────────────────────
 
+    @_action_log("app.fetch")
     def action_fetch(self):
         # Auto-persist: fetched records go straight into the library so the
         # user never has to remember to press `a`. See _import_and_persist.
         self.push_screen(FetchModal(), callback=self._import_and_persist)
 
+    @_action_log("app.open_file")
     def action_open_file(self):
         # Same auto-persist policy as fetch; _import_and_persist preserves
         # the record's _tui_source path for later "Save" operations.
@@ -53537,11 +54230,13 @@ SpeciesPickerModal { align: center middle; }
         # Single-record path: same as before.
         self._import_and_persist(result)
 
+    @_action_log("app.show_help")
     def action_show_help(self) -> None:
         """`?` — open the keyboard-shortcut reference modal. Bound at
         the App level (priority) so it's accessible from any context."""
         self.push_screen(HelpModal())
 
+    @_action_log("app.select_all")
     def action_select_all(self) -> None:
         """Ctrl+A — select the entire plasmid sequence so Ctrl+C copies
         the whole top strand to clipboard. Sets `_user_sel = (0, n)` on
@@ -53563,6 +54258,7 @@ SpeciesPickerModal { align: center middle; }
         self.notify(f"Selected all {n:,} bp — Ctrl+C to copy",
                     severity="information")
 
+    @_action_log("app.new_plasmid")
     def action_new_plasmid(self) -> None:
         """Ctrl+N — open the New Plasmid modal: paste a sequence,
         optionally auto-annotate via BLAST against the plasmid library
@@ -53577,6 +54273,7 @@ SpeciesPickerModal { align: center middle; }
             return
         self._import_and_persist(record)
 
+    @_action_log("app.open.blast")
     def action_open_blast(self) -> None:
         """Ctrl+B — open the BLAST modal: query an arbitrary AA / DNA
         sequence against a plasmid-library or collections database,
@@ -53584,6 +54281,7 @@ SpeciesPickerModal { align: center middle; }
         the user's collections."""
         self.push_screen(BlastModal())
 
+    @_action_log("app.export.genbank")
     def action_export_genbank(self) -> None:
         """Prompt for a path and write the current record as GenBank.
 
@@ -53674,6 +54372,7 @@ SpeciesPickerModal { align: center middle; }
         )
         self.push_screen(HistoryScreen(title, root))
 
+    @_action_log("app.restore_from_backup")
     def action_restore_from_backup(self) -> None:
         """Open the multi-tier backup-restore modal. On commit, the
         chosen target file is overwritten with the picked source —
@@ -53706,6 +54405,7 @@ SpeciesPickerModal { align: center middle; }
 
         self.push_screen(RestoreFromBackupModal(), callback=_on_done)
 
+    @_action_log("app.export.gff")
     def action_export_gff(self) -> None:
         """Prompt for a path and write the loaded record as GFF3.
 
@@ -53735,6 +54435,7 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_done,
         )
 
+    @_action_log("app.export.fasta")
     def action_export_fasta(self) -> None:
         """Prompt for a path and write the current record as FASTA.
 
@@ -53767,6 +54468,7 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_done,
         )
 
+    @_action_log("app.transfer.annotations")
     def action_transfer_annotations(self) -> None:
         """Transfer annotations from a library plasmid onto the loaded
         record by sequence-identity matching.
@@ -53900,6 +54602,7 @@ SpeciesPickerModal { align: center middle; }
             timeout=6,
         )
 
+    @_action_log("app.diff_plasmid.trigger")
     def action_diff_plasmid(self) -> None:
         """Compare the loaded plasmid against another from the library.
 
@@ -54164,6 +54867,7 @@ SpeciesPickerModal { align: center middle; }
             return
         pm.set_alignments([])
 
+    @_action_log("app.open.align_picker")
     def action_open_align_picker(self) -> None:
         """Open the multi-target alignment picker (Alt+A).
 
@@ -54342,6 +55046,7 @@ SpeciesPickerModal { align: center middle; }
             )
         self.call_from_thread(_summary)
 
+    @_action_log("app.clear.alignments")
     def action_clear_alignments(self) -> None:
         """User-triggered: clear every alignment row from the linear map.
 
@@ -54361,6 +55066,7 @@ SpeciesPickerModal { align: center middle; }
             severity="information", timeout=3,
         )
 
+    @_action_log("app.find.plasmid")
     def action_find_plasmid(self) -> None:
         """Open the cross-collection plasmid search modal. Pre-fix the
         library panel's search input only filtered within the active
@@ -54432,6 +55138,7 @@ SpeciesPickerModal { align: center middle; }
 
         self.push_screen(LibrarySearchModal(), callback=_on_done)
 
+    @_action_log("app.find.orfs")
     def action_find_orfs(self) -> None:
         """Open the ORF finder modal. On row pick, highlight the
         chosen ORF in the sequence panel (sel range + cursor) and on
@@ -54485,6 +55192,7 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_done,
         )
 
+    @_action_log("app.export.commercialsaas")
     def action_export_commercialsaas(self) -> None:
         """Prompt for a path and write the current record as CommercialSaaS
         `.dna`. Only available for plasmids that have a sidecar from
@@ -54856,7 +55564,7 @@ SpeciesPickerModal { align: center middle; }
             self._click_debug_total = 0
             self._click_debug_extends = 0
             self._click_debug_hinted = False
-        _log_event("app.click_debug_toggle", on=self._click_debug)
+        _log_event("app.click_debug.toggle", on=self._click_debug)
         self.notify(
             f"Click debug {'ON' if self._click_debug else 'OFF'} — "
             f"each click echoes the modifier state in a toast so you "
@@ -56362,6 +57070,7 @@ SpeciesPickerModal { align: center middle; }
         else:
             getattr(self, f"action_{action}")()
 
+    @_action_log("app.toggle.restr")
     def action_toggle_restr(self) -> None:
         self._show_restr = not self._show_restr
         _set_setting("show_restr", self._show_restr)
@@ -56369,6 +57078,7 @@ SpeciesPickerModal { align: center middle; }
         state = "shown" if self._show_restr else "hidden"
         self.notify(f"Restriction enzymes {state}")
 
+    @_action_log("app.toggle.check_updates")
     def action_toggle_check_updates(self) -> None:
         """Settings → Check for updates on launch.
 
@@ -56381,6 +57091,7 @@ SpeciesPickerModal { align: center middle; }
         state = "enabled" if self._check_updates else "disabled"
         self.notify(f"Update check on launch: {state}")
 
+    @_action_log("app.set.min_primer_binding")
     def action_set_min_primer_binding(self) -> None:
         """Settings → Min primer binding: open `MinPrimerBindingModal`
         to type a new threshold (1–60 bp). Replaces the old
@@ -56437,6 +57148,7 @@ SpeciesPickerModal { align: center middle; }
             pm.refresh()
         self.notify(f"Min primer binding: {nxt} bp")
 
+    @_action_log("app.open.align_zip")
     def action_open_align_zip(self) -> None:
         """File → Align sequencing run (Plasmidsaurus .zip)…
         Opens the alignment ingestion modal. The modal handles the zip
@@ -56556,21 +57268,27 @@ SpeciesPickerModal { align: center middle; }
 
         self.notify(f"Layout: {label} only  [F5 = restore]", timeout=2)
 
+    @_action_log("app.focus.library")
     def action_focus_panel_library(self) -> None:
         self._focus_panel("library")
 
+    @_action_log("app.focus.map")
     def action_focus_panel_map(self) -> None:
         self._focus_panel("plasmid-map")
 
+    @_action_log("app.focus.sidebar")
     def action_focus_panel_sidebar(self) -> None:
         self._focus_panel("sidebar")
 
+    @_action_log("app.focus.seq")
     def action_focus_panel_seq(self) -> None:
         self._focus_panel("seq-panel")
 
+    @_action_log("app.focus.all")
     def action_focus_panel_all(self) -> None:
         self._focus_panel(None)
 
+    @_action_log("app.toggle.feature_tooltips")
     def action_toggle_feature_tooltips(self) -> None:
         """Settings → 'Show feature hover tooltips'. Persists the
         preference to settings.json so it survives across sessions.
@@ -56592,6 +57310,7 @@ SpeciesPickerModal { align: center middle; }
             severity="information",
         )
 
+    @_action_log("app.toggle.constructor_filter")
     def action_toggle_constructor_filter(self) -> None:
         """Settings → 'Filter Constructor parts by grammar'. When ON
         (default), each modular Constructor tab's parts palette
@@ -56631,6 +57350,7 @@ SpeciesPickerModal { align: center middle; }
     # `linear_layout` resolve to "flag" via the `_get_setting`
     # validator clamp.
 
+    @_action_log("app.toggle.restr_unique")
     def action_toggle_restr_unique(self) -> None:
         self._restr_unique_only = not self._restr_unique_only
         _set_setting("restr_unique_only", self._restr_unique_only)
@@ -56638,24 +57358,28 @@ SpeciesPickerModal { align: center middle; }
         state = "on" if self._restr_unique_only else "off"
         self.notify(f"Unique cutters {state}")
 
+    @_action_log("app.toggle.restr_min6")
     def action_toggle_restr_min6(self) -> None:
         self._restr_min_len = 6
         _set_setting("restr_min_len", 6)
         self._rescan_restrictions()
         self.notify("Showing 6+ bp recognition sites")
 
+    @_action_log("app.toggle.restr_min4")
     def action_toggle_restr_min4(self) -> None:
         self._restr_min_len = 4
         _set_setting("restr_min_len", 4)
         self._rescan_restrictions()
         self.notify("Showing 4+ bp recognition sites")
 
+    @_action_log("app.edit.custom_enzyme_list")
     def action_edit_custom_enzyme_list(self) -> None:
         """Open the custom-enzyme-list modal (GH #13). Save commits
         the parsed CSV + active toggle to settings and re-scans the
         restriction overlay so the change is visible immediately."""
         self.push_screen(CustomEnzymeListModal())
 
+    @_action_log("app.toggle.custom_enzyme_list")
     def action_toggle_custom_enzyme_list(self) -> None:
         """Flip `restr_use_custom_list`. If the list is empty, the
         toggle still saves but the scan falls back to the default
@@ -56672,6 +57396,7 @@ SpeciesPickerModal { align: center middle; }
             markup=False,
         )
 
+    @_action_log("app.capture.to_features")
     def action_capture_to_features(self) -> None:
         """Ctrl+Shift+F: grab the drag-selected DNA *or* the highlighted feature
         from the main view, open the AddFeatureModal prefilled, and after
@@ -56808,6 +57533,7 @@ SpeciesPickerModal { align: center middle; }
             self._notify_success(f"Added '{entry.get('name')}' to feature library.")
             self.push_screen(FeatureLibraryScreen())
 
+    @_action_log("app.feature.add")
     def action_add_feature(self) -> None:
         """Open the AddFeatureModal.
 
@@ -57043,6 +57769,7 @@ SpeciesPickerModal { align: center middle; }
             f"'{label or '(unlabeled)'}' at {coord_str} ({span} bp)."
         )
 
+    @_action_log("app.open.parts_bin")
     def action_open_parts_bin(self) -> None:
         """Open the parts toolbar tab.
 
@@ -57063,6 +57790,7 @@ SpeciesPickerModal { align: center middle; }
             self.push_screen(PartsBinModal())
         self.push_screen(PartsBinPickerModal(), callback=_on_picked)
 
+    @_action_log("app.open.collections")
     def action_open_collections(self) -> None:
         """Open the plasmid-collections manager."""
         self.push_screen(CollectionsModal(),
@@ -57089,9 +57817,11 @@ SpeciesPickerModal { align: center middle; }
             timeout=10,
         )
 
+    @_action_log("app.open.constructor")
     def action_open_constructor(self) -> None:
         self.push_screen(ConstructorModal())
 
+    @_action_log("app.open.grammars")
     def action_open_grammars(self) -> None:
         """Settings → Cloning grammars… opens the grammar manager so
         the user can create / edit / delete custom grammars without
@@ -57100,6 +57830,7 @@ SpeciesPickerModal { align: center middle; }
         (`_grammar_dropdown_options`) once saved."""
         self.push_screen(GrammarManagerModal())
 
+    @_action_log("app.find.annotation")
     def action_find_annotation(self) -> None:
         """Open the feature-search modal (issue #6 from Anirudh). On
         dismiss, jump the seq-panel cursor and select the chosen
@@ -57169,6 +57900,7 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_pick,
         )
 
+    @_action_log("app.open.primer_design")
     def action_open_primer_design(self) -> None:
         """Open the full-screen Primer Design workbench. Passes the current
         plasmid's sequence and features so the user can select regions."""
@@ -57182,6 +57914,7 @@ SpeciesPickerModal { align: center middle; }
             pass
         self.push_screen(PrimerDesignScreen(seq, feats, name))
 
+    @_action_log("app.open.mutagenize")
     def action_open_mutagenize(self) -> None:
         """Open the SOE-PCR site-directed mutagenesis primer designer.
 
@@ -57336,8 +58069,9 @@ SpeciesPickerModal { align: center middle; }
         return bool(getattr(top, "_blocks_undo", False))
 
     def action_undo(self) -> None:
-        # Log every undo so a diagnostic bundle can replay the user's
-        # sequence of edits. Cheap (one line per keystroke).
+        # Structured event per undo so a diagnostic bundle can replay
+        # the user's sequence of edits — AI-parseable counterpart to
+        # the inner `_action_undo`'s `undo` / `undo.empty` events.
         if self._undo_blocked_by_modal():
             try:
                 self.notify(
@@ -57346,13 +58080,13 @@ SpeciesPickerModal { align: center middle; }
                 )
             except Exception:
                 pass
-            _log.info("user action: undo refused — modal blocks_undo")
+            _log_event("undo.refused", reason="modal_blocks_undo")
             return
         try:
             n = len(self._undo_stack) if hasattr(self, "_undo_stack") else 0
         except Exception:
             n = -1
-        _log.info("user action: undo (stack depth before=%d)", n)
+        _log_event("undo.trigger", stack_depth=n)
         self._action_undo()
 
     def action_redo(self) -> None:
@@ -57364,12 +58098,13 @@ SpeciesPickerModal { align: center middle; }
                 )
             except Exception:
                 pass
-            _log.info("user action: redo refused — modal blocks_undo")
+            _log_event("redo.refused", reason="modal_blocks_undo")
             return
         try:
             n = len(self._redo_stack) if hasattr(self, "_redo_stack") else 0
         except Exception:
             n = -1
+        _log_event("redo.trigger", stack_depth=n)
         _log.info("user action: redo (redo stack before=%d)", n)
         self._action_redo()
 

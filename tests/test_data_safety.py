@@ -280,11 +280,28 @@ class TestListAndRestoreBackups:
         # state ("current") must land in a fresh rotating backup.
         legacy = tmp_path / "lib.json.bak"
         sc._restore_from_backup(p, legacy, "library")
-        # Find the rotating backup that holds "current".
-        rotating = sorted(tmp_path.glob("lib.json.bak.????????-??????"))
+        # Find the rotating backup that holds "current". Match both
+        # bare-second `lib.json.bak.YYYYMMDD-HHMMSS` and the bumped
+        # `....YYYYMMDD-HHMMSS.N` collision-protector variants — two
+        # `_safe_save_json` calls in the same wall-second would
+        # otherwise have the second silently overwrite the first.
+        rotating = sorted(p for p in (
+            list(tmp_path.glob("lib.json.bak.????????-??????"))
+            + list(tmp_path.glob("lib.json.bak.????????-??????.*"))
+        ))
         assert rotating, "restore must create a rotating backup"
-        latest = rotating[-1]
-        assert json.loads(latest.read_text())["entries"] == [{"id": "current"}]
+        # Among the rotating backups, exactly one should contain
+        # "current" (the pre-restore state); the rest carry "good"
+        # from the earlier saves. Locate it explicitly rather than
+        # relying on lexical sort order, which depends on whether
+        # the collision-bump suffix landed on this run.
+        found = [r for r in rotating
+                  if json.loads(r.read_text())["entries"]
+                     == [{"id": "current"}]]
+        assert found, (
+            "no rotating backup holds the pre-restore state; "
+            "found: " + ", ".join(r.name for r in rotating)
+        )
 
     def test_restore_unparseable_source_raises(self, tmp_path):
         p = tmp_path / "lib.json"
