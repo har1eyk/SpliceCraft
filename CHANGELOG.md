@@ -2,6 +2,79 @@
 
 ---
 
+## [0.9.1] — 2026-05-17 — Friendlier agent launch · downgrade-recovery via `splicecraft update VERSION`
+
+Two ergonomic improvements layered on the existing data-safety net.
+
+### New: `--agent` / `--agent-port` aliases
+
+Launching the side-door for an external AI agent (Claude Code, Cursor,
+aider) is now a single short flag:
+
+* `splicecraft --agent` — alias for `--agent-api`. The original
+  surface is preserved (stable contract per invariant in CLAUDE.md);
+  the alias is purely additive.
+* `splicecraft --agent-port=PORT` — alias for `--agent-api-port`.
+
+Discoverable in `splicecraft --help` and in the "no SpliceCraft
+session found" error message from `splicecraft-cli`.
+
+### New: `splicecraft update VERSION` (downgrade / version pin)
+
+If a release ships broken code, you can roll the install itself back
+to the previous working version without remembering the
+pip/pipx/uv/pixi incantation:
+
+```
+splicecraft update 0.9.0          # positional (most ergonomic)
+splicecraft update --pin 0.9.0    # explicit flag form
+```
+
+Implementation:
+
+* PEP 440-lite validator (`_validate_pin_version`) accepts canonical
+  PyPI version strings — including `vX.Y.Z` from a git tag — and
+  rejects shell-injection, extras syntax, environment markers, and
+  comparison operators at the input boundary. An unvalidated string
+  would land in the install subprocess argv as `splicecraft==<raw>`.
+* `_build_upgrade_command(..., pin_version=...)` produces the correct
+  `--force`-style command for every supported install method
+  (`pipx install --force`, `uv tool install --force`,
+  `uv pip install --reinstall`, `pixi global install --force`,
+  `pip install --force-reinstall …`). Required because every front
+  end refuses to "upgrade" to an older version; pinning needs an
+  explicit reinstall.
+* Refusal methods (editable / source / pixi-project) remain refused —
+  the user's working tree / project manifest is still the source of
+  truth.
+* **Pre-update snapshot still runs first.** The sacred invariant from
+  the 0.7.x data-safety pass holds: the pinned install is itself
+  reversible via `splicecraft update --restore-pre-update latest`.
+  Tested by `test_update_pin_snapshot_still_taken`.
+* Same-as-current pin without `--force` is a no-op.
+* Confirm prompt explicitly flags **DOWNGRADE** direction and points
+  at the restore command for an extra layer of safety net.
+
+### Discoverability
+
+Main `splicecraft --help` now surfaces the recovery escape hatches so
+a panicking user under stress can find them:
+
+* `splicecraft update 0.8.10` (downgrade / pin)
+* `splicecraft update --restore-pre-update latest` (roll back the
+  library / collections / parts / primers to the snapshot taken
+  before the last `splicecraft update` run).
+
+README documents the future-proof-updates guarantee end-to-end.
+
+### Tests
+
+21 new regression tests (`TestUpdateVersionPin` × 17 + `TestAgentFlagAlias` × 3 +
+the new positional + flag conflict guards). Full smoke + agent_api
+suite (694 tests) green.
+
+---
+
 ## [0.9.0] — 2026-05-17 — Simulator workbench (PCR + agarose gel)
 
 A new menu-bar workbench — `Simulator` — that pairs in-silico PCR with
