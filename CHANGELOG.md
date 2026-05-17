@@ -2,6 +2,14 @@
 
 ---
 
+## [0.9.2] — 2026-05-17
+
+_(auto-generated from commits since v0.9.1)_
+
+* Launch-time update prompt modal · never-stale CHANGELOG auto-gen · structured update.* events
+
+---
+
 ## [0.9.1] — 2026-05-17 — Friendlier agent launch · downgrade-recovery via `splicecraft update VERSION`
 
 Two ergonomic improvements layered on the existing data-safety net.
