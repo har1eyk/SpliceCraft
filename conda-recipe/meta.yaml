@@ -1,5 +1,5 @@
 {% set name = "splicecraft" %}
-{% set version = "0.9.2" %}
+{% set version = "0.9.3" %}
 
 # Bioconda recipe for SpliceCraft.
 #
@@ -27,7 +27,7 @@ package:
 source:
   url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
   # Regenerate this on every version bump (see comment above).
-  sha256: 89fe1b53713e67b52fe3615c85321ff2ec74c576171f911000c395c72a434e6d
+  sha256: 1649bc542a900f6829f5d49ef8e463ea98e18ea36c78058867e14ff6e59c339f
 
 build:
   noarch: python
