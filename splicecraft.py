@@ -17671,7 +17671,8 @@ def _detect_install_method() -> dict:
     return info
 
 
-def _build_upgrade_command(method: str, *, force: bool, pre: bool = False) -> "list[str] | None":
+def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
+                            pin_version: "str | None" = None) -> "list[str] | None":
     """Translate a detected install method into the argv list for the
     upgrade command. Returns None for methods that we refuse to upgrade
     automatically (`editable`, `source`, `pixi-project` — for the last,
@@ -17680,38 +17681,62 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False) -> "l
     For `pip-system` we DO return a command list — but the caller is
     expected to print it for the user to run with sudo rather than
     invoking it directly.
+
+    When ``pin_version`` is supplied (a validated version string like
+    ``"0.8.10"``), the returned command installs that exact version
+    instead of the PyPI latest. This is the downgrade-recovery path:
+    if a release ships broken code, the user can roll the install
+    itself back to the prior working version. Pinning implies
+    ``--force`` semantics everywhere because every front-end refuses to
+    "upgrade" to an older version — we have to ask for an explicit
+    reinstall. ``pre`` is silently ignored when pinning because the
+    user has already chosen the exact version they want.
     """
     if method in ("editable", "source", "pixi-project"):
         return None
+    pkg_spec = f"splicecraft=={pin_version}" if pin_version else "splicecraft"
+    pinned = pin_version is not None
     if method == "pipx":
-        if force:
+        if force or pinned:
             # `pipx upgrade` is a no-op when versions match; `install
-            # --force` re-runs the install end-to-end.
-            return ["pipx", "install", "--force", "splicecraft"]
+            # --force` re-runs the install end-to-end. Also the only
+            # way to install a specific version (incl. older).
+            return ["pipx", "install", "--force", pkg_spec]
         return ["pipx", "upgrade", "splicecraft"]
     if method == "uv-tool":
-        if force:
+        if force or pinned:
             # `uv tool upgrade` is also a no-op when versions match;
             # `install --force` is the canonical re-run for uv tools.
-            return ["uv", "tool", "install", "--force", "splicecraft"]
+            return ["uv", "tool", "install", "--force", pkg_spec]
         return ["uv", "tool", "upgrade", "splicecraft"]
     if method == "uv-venv":
         # uv-managed venv: prefer the uv front-end over plain pip so
         # the user's lockfile / cache stay consistent with how the
-        # venv was built.
-        cmd = ["uv", "pip", "install", "--upgrade", "splicecraft"]
-        if force:
-            cmd.append("--force-reinstall")
-        if pre:
-            cmd.insert(3, "--prerelease=allow")
+        # venv was built. When pinning, drop --upgrade (uv refuses to
+        # "upgrade" to an older version) and add --reinstall so the
+        # pinned spec wins over whatever is already installed.
+        if pinned:
+            cmd = ["uv", "pip", "install", "--reinstall", pkg_spec]
+        else:
+            cmd = ["uv", "pip", "install", "--upgrade", "splicecraft"]
+            if force:
+                cmd.append("--force-reinstall")
+            if pre:
+                cmd.insert(3, "--prerelease=allow")
         return cmd
     if method == "pixi-global":
-        if force:
+        if force or pinned:
             # pixi global has no `--force` on update; the canonical
             # force-reinstall is `install --force`.
-            return ["pixi", "global", "install", "--force", "splicecraft"]
+            return ["pixi", "global", "install", "--force", pkg_spec]
         return ["pixi", "global", "update", "splicecraft"]
     if method == "pip-user":
+        if pinned:
+            # Drop --upgrade (pip refuses to downgrade with --upgrade)
+            # and use --force-reinstall so the pinned spec replaces the
+            # installed package regardless of direction.
+            return [sys.executable, "-m", "pip", "install", "--user",
+                    "--force-reinstall", pkg_spec]
         cmd = [sys.executable, "-m", "pip", "install", "--user",
                "--upgrade", "splicecraft"]
         if force:
@@ -17721,12 +17746,50 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False) -> "l
         return cmd
     # pip-venv, pip-system, unknown — same baseline command. Caller
     # decides whether to run it or just print it.
+    if pinned:
+        return [sys.executable, "-m", "pip", "install",
+                "--force-reinstall", pkg_spec]
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "splicecraft"]
     if force:
         cmd.append("--force-reinstall")
     if pre:
         cmd.insert(3, "--pre")
     return cmd
+
+
+# PEP 440-lite: digits dot-separated, with optional pre-release / dev
+# suffix. Matches the shapes SpliceCraft itself publishes and the
+# common patterns on PyPI. Anchored so the entire string is the
+# version — we never accept "0.8.10 ; os_name=='posix'" or any other
+# environment-marker / extras / URL syntax through the pin flag. If a
+# future SpliceCraft starts publishing post-release tags, extend this
+# regex (and the corresponding test).
+_PINNED_VERSION_RE = re.compile(
+    r"^\d+(?:\.\d+){0,3}(?:(?:a|b|rc|\.dev|\.post)\d+)?$"
+)
+
+
+def _validate_pin_version(raw: str) -> "str | None":
+    """Return the normalised version string if ``raw`` looks like a
+    PyPI version SpliceCraft would publish, else ``None``. The caller
+    is expected to surface a user-facing error on ``None``. Defence-in-
+    depth before constructing the install command: an unvalidated
+    string would land verbatim in the subprocess argv as
+    ``splicecraft==<raw>``."""
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    # Be permissive about a leading 'v' (`v0.8.10` from a git tag) but
+    # strip it before validating — pip et al. expect bare digits.
+    if stripped.lower().startswith("v"):
+        stripped = stripped[1:]
+    if len(stripped) > 64:
+        return None
+    if not _PINNED_VERSION_RE.match(stripped):
+        return None
+    return stripped
 
 
 # ── Pre-update user-data snapshot (SACRED INVARIANT) ──────────────────────────
@@ -18550,6 +18613,8 @@ _UPDATE_HELP_TEXT = (
     "\n"
     "Usage:\n"
     "  splicecraft update [--check|--dry-run] [--force] [--yes|-y] [--help|-h]\n"
+    "  splicecraft update VERSION                    # downgrade / pin\n"
+    "  splicecraft update --pin VERSION              # explicit form\n"
     "  splicecraft update --list-snapshots\n"
     "  splicecraft update --restore-pre-update [ID|latest]\n"
     "\n"
@@ -18559,6 +18624,12 @@ _UPDATE_HELP_TEXT = (
     "                         pip/pipx/uv/pixi. Useful for CI verification.\n"
     "  --force                Reinstall even if the local version matches PyPI.\n"
     "  --yes,-y               Skip the confirmation prompt before installing.\n"
+    "  --pin VERSION          Install splicecraft==VERSION instead of latest.\n"
+    "                         Use this to roll back a broken release without\n"
+    "                         remembering the pip/pipx/uv incantation —\n"
+    "                         e.g. `splicecraft update 0.8.10`. The pre-\n"
+    "                         update snapshot is still taken so the pinned\n"
+    "                         install is itself reversible.\n"
     "  --list-snapshots       List recoverable pre-update snapshots and exit.\n"
     "  --restore-pre-update   Restore the user library/collections/parts/primers\n"
     "                         from a pre-update snapshot. With no ID, lists\n"
@@ -18654,6 +18725,21 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     parser.add_argument("--list-snapshots", action="store_true",
                           dest="list_snapshots")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run")
+    # Pin a specific PyPI version instead of installing latest. Supports
+    # downgrade-recovery: if a release ships broken code, the user can
+    # roll back to the previous working version without remembering the
+    # exact pip incantation. Cannot reuse the flag name `--version`
+    # because the outer parser eats it before subcommand dispatch.
+    parser.add_argument("--pin", dest="pin_version", default=None,
+                          metavar="VERSION",
+                          help="install splicecraft==VERSION (downgrade-safe)")
+    # Positional alias for `--pin`. The shorter form (`splicecraft
+    # update 0.8.10`) is what a panicking user under stress is most
+    # likely to type. Validated against `_PINNED_VERSION_RE` below so
+    # an accidental file path can't slip into the install command.
+    parser.add_argument("version_pos", nargs="?", default=None,
+                          metavar="VERSION",
+                          help="positional alias for --pin")
     # `--restore-pre-update` accepts an optional ID. argparse's nargs="?"
     # with const=<sentinel> models the trio of historical shapes:
     #   --restore-pre-update            → const sentinel → restore mode, no id
@@ -18692,6 +18778,35 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     else:
         restore_id = None
 
+    # Reconcile the two pin sources: `--pin X.Y.Z` (explicit flag) and
+    # `splicecraft update X.Y.Z` (positional). If both are given they
+    # must agree; otherwise the user has typoed and the safe call is
+    # to refuse rather than silently pick one. The raw value is
+    # validated via `_validate_pin_version` so an accidental file path
+    # / shell-expansion token / extras spec can't reach the install
+    # command's argv.
+    raw_pin = args.pin_version
+    if args.version_pos is not None:
+        if raw_pin is not None and raw_pin.strip() != args.version_pos.strip():
+            print(
+                f"splicecraft update: --pin {raw_pin!r} conflicts with "
+                f"positional {args.version_pos!r}. Pass one or the other.",
+                file=sys.stderr,
+            )
+            return 2
+        raw_pin = args.version_pos
+    pin_version: "str | None" = None
+    if raw_pin is not None:
+        pin_version = _validate_pin_version(raw_pin)
+        if pin_version is None:
+            print(
+                f"splicecraft update: {raw_pin!r} is not a recognisable "
+                "version string (expected something like 0.8.10, "
+                "1.2.3rc1, or v0.9.0).",
+                file=sys.stderr,
+            )
+            return 2
+
     # `--check` and `--dry-run` are mutually exclusive: `--check` skips
     # the snapshot (read-only); `--dry-run` exercises everything up to
     # but not including the install. Allowing both would be ambiguous.
@@ -18700,6 +18815,19 @@ def _run_update_subcommand(argv: "list[str]") -> int:
             "splicecraft update: --check and --dry-run are mutually "
             "exclusive. --check is read-only; --dry-run exercises the "
             "snapshot pipeline without installing.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # A pin is incompatible with the listing/restore modes — those
+    # don't touch the install at all. Refuse the ambiguous combo so
+    # the user isn't surprised by which one wins.
+    if pin_version is not None and (list_snapshots or restore_mode):
+        print(
+            "splicecraft update: --pin / positional version cannot be "
+            "combined with --list-snapshots or --restore-pre-update. "
+            "Those flags inspect / roll back local snapshots; they "
+            "don't install anything.",
             file=sys.stderr,
         )
         return 2
@@ -18794,15 +18922,24 @@ def _run_update_subcommand(argv: "list[str]") -> int:
             return 1
         return 0
 
-    print(f"SpliceCraft {__version__} — checking for updates…", flush=True)
+    if pin_version is not None:
+        print(
+            f"SpliceCraft {__version__} — pinning install to "
+            f"{pin_version}…", flush=True
+        )
+    else:
+        print(f"SpliceCraft {__version__} — checking for updates…", flush=True)
     info = _detect_install_method()
     method = info["method"]
 
     # Hit PyPI for the latest released version. `_fetch_latest_pypi_version`
     # is already timeout-bounded (3 s) and size-capped, so this can't hang
     # the terminal. Returns None on any failure (network, parse, cap).
+    # When pinning, the user has already chosen the exact version, so a
+    # PyPI failure here is informational only (we still proceed). When
+    # NOT pinning, we need a latest to compare against — abort on failure.
     latest = _fetch_latest_pypi_version()
-    if latest is None:
+    if latest is None and pin_version is None:
         print(
             "Could not reach PyPI to check the latest version.\n"
             "  • Check your network connection.\n"
@@ -18815,14 +18952,19 @@ def _run_update_subcommand(argv: "list[str]") -> int:
             print(f"Install method: {method} ({info['details']})", file=sys.stderr)
         return 1
 
-    is_newer = _is_newer_pypi_version(latest, __version__)
-    same_version = (latest.strip() == __version__.strip())
+    is_newer = (latest is not None) and _is_newer_pypi_version(latest, __version__)
+    same_version = (latest is not None and latest.strip() == __version__.strip())
     print(f"  Local : {__version__}")
-    print(f"  PyPI  : {latest}")
+    if pin_version is not None:
+        print(f"  Pin   : {pin_version}")
+        if latest is not None:
+            print(f"  PyPI  : {latest}")
+    else:
+        print(f"  PyPI  : {latest}")
     print(f"  Method: {method}  ({info['details']})")
 
     # No upgrade needed and not forcing.
-    if not is_newer and not force:
+    if pin_version is None and not is_newer and not force:
         if same_version:
             print("You're on the latest released version. Nothing to do.")
         else:
@@ -18834,6 +18976,16 @@ def _run_update_subcommand(argv: "list[str]") -> int:
                 "Nothing to do.\n"
                 "Pass --force to reinstall anyway."
             )
+        return 0
+
+    # Pinning to the currently-installed version is a no-op unless
+    # --force is also set (then it re-runs the install end-to-end,
+    # useful for fixing a corrupted site-packages).
+    if pin_version is not None and pin_version == __version__ and not force:
+        print(
+            f"\nYou're already on splicecraft {pin_version}. Nothing to "
+            "do.\nPass --force to reinstall anyway."
+        )
         return 0
 
     # Editable / source-clone refusal — respect the user's working tree.
@@ -18865,7 +19017,8 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         )
         return 1
 
-    cmd = _build_upgrade_command(method, force=force)
+    cmd = _build_upgrade_command(method, force=force,
+                                  pin_version=pin_version)
     if cmd is None:
         # _build_upgrade_command only returns None for editable/source,
         # which we already handled above; this branch is defensive.
@@ -18938,6 +19091,29 @@ def _run_update_subcommand(argv: "list[str]") -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Pinning-direction banner: if the pin is older than the running
+    # version, surface that explicitly so the user doesn't get
+    # surprised. A downgrade is the recovery path after a bad release;
+    # it's a feature, but it deserves a clear callout.
+    if pin_version is not None:
+        try:
+            is_downgrade = _is_newer_pypi_version(__version__, pin_version)
+        except Exception:
+            is_downgrade = False
+        if is_downgrade:
+            print(
+                f"\nThis is a DOWNGRADE: splicecraft {__version__} → "
+                f"{pin_version}.\n"
+                "Your data is snapshotted before the install runs, so "
+                "the rollback itself is reversible (see "
+                "`splicecraft update --restore-pre-update latest`)."
+            )
+        elif pin_version != __version__:
+            print(
+                f"\nInstalling splicecraft {pin_version} (currently "
+                f"on {__version__})."
+            )
 
     print(f"\nWill run:  {' '.join(cmd)}")
     if not assume_yes:
@@ -60487,7 +60663,10 @@ def main():
     # `--agent-api-port=PORT`. Both also accept the env-var
     # alternative SPLICECRAFT_AGENT_API=1 / =PORT for shell pipelines.
     # The agent side-door is a stable contract for `splicecraft-cli`
-    # and external agents; do NOT alter this flag surface.
+    # and external agents; do NOT alter this flag surface. `--agent` /
+    # `--agent-port` are friendly aliases added 2026-05-17 so casual
+    # users don't have to remember the `-api` suffix — they map to the
+    # same dest so the downstream code is unchanged.
     main_parser = argparse.ArgumentParser(
         prog="splicecraft",
         add_help=False,
@@ -60499,10 +60678,11 @@ def main():
                               dest="want_help")
     main_parser.add_argument("--no-splash", "-Q", action="store_true",
                               dest="skip_splash")
-    main_parser.add_argument("--agent-api", action="store_true",
+    main_parser.add_argument("--agent-api", "--agent", action="store_true",
                               dest="agent_api")
-    main_parser.add_argument("--agent-api-port", type=int, default=None,
-                              metavar="PORT", dest="agent_api_port")
+    main_parser.add_argument("--agent-api-port", "--agent-port", type=int,
+                              default=None, metavar="PORT",
+                              dest="agent_api_port")
 
     try:
         parsed, rest = main_parser.parse_known_args(sys.argv[1:])
@@ -60531,19 +60711,26 @@ def main():
         print(
             f"splicecraft {__version__}\n"
             "Usage: splicecraft [ACCESSION | FILE.gb | update | logs] [--no-splash] "
-            "[--agent-api[-port=PORT]]\n\n"
+            "[--agent[-port=PORT]]\n\n"
             "  splicecraft               # load 1 kb synthetic demo plasmid\n"
             "  splicecraft L09137        # fetch pUC19 from NCBI\n"
             "  splicecraft my.gb         # open a local GenBank file\n"
             "  splicecraft update        # upgrade to the latest PyPI release\n"
             "                            # (run `splicecraft update --help` for flags)\n"
+            "  splicecraft update 0.8.10 # downgrade / pin to a specific version\n"
+            "                            # (recovery path if a release ships broken)\n"
+            "  splicecraft update --restore-pre-update latest\n"
+            "                            # roll your library/collections/parts back\n"
+            "                            # to the pre-update snapshot from the last\n"
+            "                            # `splicecraft update` run\n"
             "  splicecraft logs --bundle # pack logs + UI snapshots into a ZIP\n"
             "                            # for emailing in a bug report\n"
             "  splicecraft --no-splash   # skip the launcher splash\n"
-            "  splicecraft --agent-api   # expose JSON API on "
-            f"127.0.0.1:{_AGENT_API_PORT_DEFAULT}\n"
-            "                            # (use `splicecraft-cli`"
-            " from another shell)\n\n"
+            "  splicecraft --agent       # AI-agent mode: expose JSON API on\n"
+            f"                            # 127.0.0.1:{_AGENT_API_PORT_DEFAULT} so Claude Code /\n"
+            "                            # another agent can drive this session\n"
+            "                            # (alias for --agent-api; pair with\n"
+            "                            #  --agent-port=PORT to override port)\n\n"
             "Data files (library, parts, primers) live in:\n"
             f"  {_DATA_DIR}\n"
             "Override with $SPLICECRAFT_DATA_DIR.\n"

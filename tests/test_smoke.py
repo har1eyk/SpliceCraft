@@ -10643,3 +10643,332 @@ class TestUpdateSubcommandMainDispatch:
         assert excinfo.value.code == 0
         err = capsys.readouterr().err
         assert "ignored in favour of the update subcommand" in err
+
+
+class TestAgentFlagAlias:
+    """Regression guard for 2026-05-17: `--agent` and `--agent-port`
+    are friendly aliases for `--agent-api` / `--agent-api-port`. The
+    test exercises argparse via `main()` with `--help` so the parser
+    has to accept the alias to reach the early-exit help branch."""
+
+    def test_agent_alias_accepted_by_parser(self, monkeypatch, capsys):
+        # `--agent` paired with `--help` proves argparse accepted the
+        # alias (otherwise parse_known_args raises SystemExit(2) before
+        # the want_help branch fires).
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "--agent", "--help"])
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        sc.main()
+        out = capsys.readouterr().out
+        # Help text now advertises `--agent` as the friendly form.
+        assert "--agent" in out
+
+    def test_agent_port_alias_accepted_by_parser(self, monkeypatch,
+                                                   capsys):
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "--agent-port=7777",
+                               "--help"])
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        sc.main()
+        # Reaching here without SystemExit(2) proves argparse parsed
+        # the alias. The help branch returns normally.
+
+    def test_legacy_agent_api_flag_still_accepted(self, monkeypatch,
+                                                    capsys):
+        # The original `--agent-api` is a stable contract (CLAUDE.md
+        # invariant) — assert it still parses after the alias rewrite.
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "--agent-api", "--help"])
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        sc.main()
+        out = capsys.readouterr().out
+        assert "splicecraft" in out
+
+
+class TestUpdateVersionPin:
+    """Regression guard for 2026-05-17: `splicecraft update 0.8.10` and
+    `--pin 0.8.10` install a specific PyPI version instead of latest,
+    providing a one-shot rollback path when a release ships broken
+    code. The pre-update snapshot still runs so the pinned install is
+    itself reversible."""
+
+    # ── Version-string validator ──────────────────────────────────
+
+    def test_validate_pin_version_accepts_canonical(self):
+        for raw, expected in [
+            ("0.8.10", "0.8.10"),
+            ("1.0.0", "1.0.0"),
+            ("0.9", "0.9"),
+            ("v0.8.10", "0.8.10"),        # leading 'v' tolerated
+            ("V0.8.10", "0.8.10"),        # case-insensitive
+            ("1.2.3rc1", "1.2.3rc1"),
+            ("1.2.3a1", "1.2.3a1"),
+            ("1.2.3b1", "1.2.3b1"),
+            ("1.2.3.dev4", "1.2.3.dev4"),
+            ("1.2.3.post1", "1.2.3.post1"),
+            ("  0.8.10  ", "0.8.10"),     # whitespace stripped
+        ]:
+            assert sc._validate_pin_version(raw) == expected, raw
+
+    def test_validate_pin_version_rejects_garbage(self):
+        # An unvalidated string would land in the subprocess argv as
+        # `splicecraft==<raw>`. These must NEVER pass.
+        for raw in [
+            "",
+            "   ",
+            "not-a-version",
+            "0.8.10; rm -rf",
+            "../../etc/passwd",
+            "0.8.10[extras]",
+            "0.8.10>=0.9.0",
+            ">=0.8.10",
+            "0.8.10 0.9.0",
+            "0.8.10\n0.9.0",
+            "0.8.10 ; os_name=='posix'",
+            "a" * 100,
+            None,
+            42,
+            ["0.8.10"],
+        ]:
+            assert sc._validate_pin_version(raw) is None, raw
+
+    # ── _build_upgrade_command with pin_version ───────────────────
+
+    def test_build_upgrade_command_pip_venv_pin(self):
+        cmd = sc._build_upgrade_command("pip-venv", force=False,
+                                          pin_version="0.8.10")
+        assert cmd is not None
+        # Drop --upgrade, use --force-reinstall, include spec.
+        assert "--upgrade" not in cmd
+        assert "--force-reinstall" in cmd
+        assert "splicecraft==0.8.10" in cmd
+
+    def test_build_upgrade_command_pipx_pin(self):
+        cmd = sc._build_upgrade_command("pipx", force=False,
+                                          pin_version="0.8.10")
+        assert cmd == ["pipx", "install", "--force",
+                       "splicecraft==0.8.10"]
+
+    def test_build_upgrade_command_uv_tool_pin(self):
+        cmd = sc._build_upgrade_command("uv-tool", force=False,
+                                          pin_version="0.8.10")
+        assert cmd == ["uv", "tool", "install", "--force",
+                       "splicecraft==0.8.10"]
+
+    def test_build_upgrade_command_uv_venv_pin(self):
+        cmd = sc._build_upgrade_command("uv-venv", force=False,
+                                          pin_version="0.8.10")
+        assert cmd is not None
+        assert "--upgrade" not in cmd
+        # uv pip uses --reinstall, not --force-reinstall.
+        assert "--reinstall" in cmd
+        assert "splicecraft==0.8.10" in cmd
+
+    def test_build_upgrade_command_pixi_global_pin(self):
+        cmd = sc._build_upgrade_command("pixi-global", force=False,
+                                          pin_version="0.8.10")
+        assert cmd == ["pixi", "global", "install", "--force",
+                       "splicecraft==0.8.10"]
+
+    def test_build_upgrade_command_pip_user_pin(self):
+        cmd = sc._build_upgrade_command("pip-user", force=False,
+                                          pin_version="0.8.10")
+        assert cmd is not None
+        assert "--user" in cmd
+        assert "--upgrade" not in cmd
+        assert "--force-reinstall" in cmd
+        assert "splicecraft==0.8.10" in cmd
+
+    def test_build_upgrade_command_refusal_methods_unchanged(self):
+        # Editable / source / pixi-project remain refused even when a
+        # pin is requested — the user's working tree / project manifest
+        # is still the source of truth.
+        for method in ("editable", "source", "pixi-project"):
+            assert sc._build_upgrade_command(method, force=False,
+                                              pin_version="0.8.10") is None
+
+    def test_build_upgrade_command_without_pin_unchanged(self):
+        # Regression: the no-pin path must produce the historical
+        # commands (already covered by other tests, but assert one
+        # explicitly here so a future pin refactor can't drift).
+        cmd = sc._build_upgrade_command("pipx", force=False,
+                                          pin_version=None)
+        assert cmd == ["pipx", "upgrade", "splicecraft"]
+
+    # ── CLI dispatch ──────────────────────────────────────────────
+
+    def test_update_positional_version_accepted(self, monkeypatch,
+                                                  capsys):
+        # `splicecraft update 0.8.10` must reach the subcommand and
+        # produce a confirmation prompt about the pinned install.
+        # We short-circuit at the subprocess boundary so no network
+        # / install runs.
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "0.8.10",
+                               "--yes", "--dry-run"])
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "0.9.0")
+        monkeypatch.setattr(sc, "_detect_install_method",
+                              lambda: {"method": "pipx",
+                                       "details": "pipx test"})
+        monkeypatch.setattr(sc, "_data_dir_inside_install_path",
+                              lambda: False)
+        monkeypatch.setattr(sc, "_create_pre_update_snapshot",
+                              lambda *a, **k: "/tmp/fake-snapshot")
+        monkeypatch.setattr(sc.shutil, "which", lambda *a, **k: "/usr/bin/pipx")
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        # Confirm-prompt surfaces the pinned version and the install
+        # command name.
+        assert "0.8.10" in out
+        assert "splicecraft==0.8.10" in out
+
+    def test_update_pin_flag_accepted(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "--pin",
+                               "0.8.10", "--yes", "--dry-run"])
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "0.9.0")
+        monkeypatch.setattr(sc, "_detect_install_method",
+                              lambda: {"method": "pipx",
+                                       "details": "pipx test"})
+        monkeypatch.setattr(sc, "_data_dir_inside_install_path",
+                              lambda: False)
+        monkeypatch.setattr(sc, "_create_pre_update_snapshot",
+                              lambda *a, **k: "/tmp/fake-snapshot")
+        monkeypatch.setattr(sc.shutil, "which", lambda *a, **k: "/usr/bin/pipx")
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 0
+
+    def test_update_bad_version_rejected(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "totally-bogus",
+                               "--yes"])
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "not a recognisable" in err
+
+    def test_update_pin_conflict_with_list_snapshots(
+            self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "0.8.10",
+                               "--list-snapshots"])
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 2
+
+    def test_update_pin_conflict_positional_vs_flag(
+            self, monkeypatch, capsys):
+        # Disagreeing values → refuse rather than silently picking one.
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "0.8.10",
+                               "--pin", "0.9.0"])
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "conflicts" in err.lower()
+
+    def test_update_pin_same_value_positional_and_flag_ok(
+            self, monkeypatch, capsys):
+        # Same value passed twice — should be tolerated (idempotent).
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "0.8.10",
+                               "--pin", "0.8.10",
+                               "--yes", "--dry-run"])
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "0.9.0")
+        monkeypatch.setattr(sc, "_detect_install_method",
+                              lambda: {"method": "pipx",
+                                       "details": "pipx test"})
+        monkeypatch.setattr(sc, "_data_dir_inside_install_path",
+                              lambda: False)
+        monkeypatch.setattr(sc, "_create_pre_update_snapshot",
+                              lambda *a, **k: "/tmp/fake-snapshot")
+        monkeypatch.setattr(sc.shutil, "which",
+                              lambda *a, **k: "/usr/bin/pipx")
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 0
+
+    def test_update_pin_same_as_current_is_noop(self, monkeypatch,
+                                                  capsys):
+        # Pinning to the running version without --force is a no-op.
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", sc.__version__,
+                               "--yes"])
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "0.9.0")
+        monkeypatch.setattr(sc, "_detect_install_method",
+                              lambda: {"method": "pipx",
+                                       "details": "pipx test"})
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "Nothing to do" in out
+
+    def test_update_pin_snapshot_still_taken(self, monkeypatch,
+                                               capsys):
+        # SACRED INVARIANT: pre-update snapshot runs BEFORE the install
+        # subprocess. The pin path must honor this — otherwise the
+        # rollback escape hatch isn't itself reversible.
+        snapshot_calls: list = []
+        def _record_snapshot(*args, **kwargs):
+            snapshot_calls.append((args, kwargs))
+            return "/tmp/fake-snapshot"
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "0.8.10",
+                               "--yes", "--dry-run"])
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "0.9.0")
+        monkeypatch.setattr(sc, "_detect_install_method",
+                              lambda: {"method": "pipx",
+                                       "details": "pipx test"})
+        monkeypatch.setattr(sc, "_data_dir_inside_install_path",
+                              lambda: False)
+        monkeypatch.setattr(sc, "_create_pre_update_snapshot",
+                              _record_snapshot)
+        monkeypatch.setattr(sc.shutil, "which",
+                              lambda *a, **k: "/usr/bin/pipx")
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 0
+        assert len(snapshot_calls) == 1, (
+            "pre-update snapshot must be taken before the pinned install"
+        )

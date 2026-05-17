@@ -52,6 +52,16 @@ constraints:
     across all four tiers; pick a row, get a one-click restore (the
     pre-restore state goes through the same backup chain, so even an
     accidental restore is reversible).
+- **Future-proof updates.** Every `splicecraft update` snapshots your
+  full library, collections, parts bin, primers, feature library,
+  grammars, codon tables, settings, crash-recovery autosaves, and
+  `.dna` sidecars **before** invoking pip/pipx/uv/pixi. If the
+  snapshot can't be taken (disk full, permissions), the upgrade
+  aborts. Snapshots live in a sibling directory of the data dir, so a
+  hypothetical recursive-wipe bug in a new version cannot touch them.
+  - Roll back from a bad release with `splicecraft update --restore-pre-update latest` (or pick a specific snapshot id from `--list-snapshots`).
+  - Pin to a specific working version with `splicecraft update 0.8.10` — the recovery escape hatch when a fresh release ships broken code.
+  - The pre-update snapshot is itself reversible (a pre-restore snapshot is taken before any restore), so even an accidental rollback can be undone.
 - **Crash-recovery autosave.** Dirty edits debounce a 3-second write
   to a per-record `.gb` snapshot. Power-cut your laptop mid-edit; the
   next launch surfaces the survivors.
@@ -315,9 +325,13 @@ Press `?` once running for the full keyboard-shortcut reference.
   re-sort so dirty-edit markers don't desync.
 
 ### Drive it from outside the GUI
-- **Agent API** (`splicecraft --agent-api`) exposes a localhost JSON
-  API with bearer-token auth, covering every GUI action external AI
-  agents need. Sixty-plus endpoints across:
+- **Agent API** (`splicecraft --agent`, alias `--agent-api`) exposes a
+  localhost JSON API with bearer-token auth, covering every GUI action
+  external AI agents need. Launch SpliceCraft with `--agent` (override
+  the default port via `--agent-port=PORT`) and any local AI coding
+  agent — Claude Code, Cursor, aider, hand-rolled scripts — can drive
+  the running session through the side-door without leaving its
+  terminal. Sixty-plus endpoints across:
   - **Records** — get / set sequence, add / update / delete features,
     list features, find ORFs, transfer annotations.
   - **Files** — load (chromosome-scale safe via the path-based

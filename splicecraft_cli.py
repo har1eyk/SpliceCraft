@@ -2,8 +2,9 @@
 """splicecraft-cli — drive a running SpliceCraft GUI session from any
 external CLI agent (Claude Code, Cursor, aider, hand-rolled scripts).
 
-Connects to the localhost JSON API exposed by `splicecraft --agent-api`.
-Reads connection details (port + bearer token) from
+Connects to the localhost JSON API exposed by `splicecraft --agent`
+(alias of the original `--agent-api`). Reads connection details
+(port + bearer token) from
 ``~/.local/share/splicecraft/agent_token`` (or
 ``$SPLICECRAFT_DATA_DIR/agent_token`` when overridden), so the running
 GUI is always the destination — no flag-fiddling required.
@@ -74,7 +75,7 @@ def _read_session() -> tuple[str, int, str]:
         sys.exit(
             f"No SpliceCraft session found.\n"
             f"  Expected token file: {f}\n"
-            f"  Start the GUI with: splicecraft --agent-api"
+            f"  Start the GUI with: splicecraft --agent"
         )
     try:
         size = f.stat().st_size
