@@ -54,6 +54,17 @@ dev = [
     "hypothesis>=6.152.7",
     "build>=1.5.0",
     "twine>=6.2.0",
+    # Linters / type-checkers / coverage — mirror what CI runs
+    # so local + CI behaviour stays in step (see test.yml).
+    "ruff>=0.15.0",
+    # `pyright` is intentionally floor-pinned at 1.1.408 (when strict
+    # mode first surfaced a regression we care about) but the dev /
+    # CI install ALWAYS pulls latest via PYRIGHT_PYTHON_FORCE_VERSION
+    # (set in test.yml + recommended for local). The pip-resolved
+    # version is only the bootstrap; the launcher then downloads the
+    # current latest into a managed cache and runs it.
+    "pyright>=1.1.408",
+    "coverage>=7.0",
 ]
 
 [project.urls]
@@ -73,11 +84,24 @@ splicecraft-cli = "splicecraft_cli:main"
 # CHANGELOG.md is bundled so the in-app "What's New" modal works for
 # every install path (pipx, pip, conda) — without it `_load_whats_new_body`
 # falls back to the GitHub-link placeholder.
-only-include = ["splicecraft.py", "splicecraft_cli.py", "CHANGELOG.md"]
+only-include = [
+    "splicecraft.py",
+    "splicecraft_cli.py",
+    # First deliberate extraction from the single-file rule —
+    # pure biology primitives (`_rc`, `_iupac_pattern`,
+    # `_feat_len`, etc.) live here and are re-imported by
+    # splicecraft.py. See its module docstring + the
+    # CONTRIBUTING three-test rule for the extraction
+    # criteria. Must ship in the wheel or `import splicecraft`
+    # fails at the import-back step.
+    "splicecraft_biology.py",
+    "CHANGELOG.md",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "splicecraft.py",
+    "splicecraft_biology.py",
     "splicecraft_cli.py",
     "README.md",
     "CHANGELOG.md",
@@ -94,6 +118,39 @@ exclude = [
     "tests/*.dna",
 ]
 
+[tool.ruff]
+# Ruff is the lightweight bug-finding / lint gate. The strict
+# correctness gate is pyright (see `[tool.pyright]` below) + the full
+# pytest suite. Ruff sits in front of both to catch the cheap stuff
+# fast.
+#
+# We pick a TIGHT ruleset on purpose:
+#   * F — all of pyflakes (real bugs: undefined names, unused vars,
+#         f-string-without-placeholder, etc.)
+#   * E9 — syntax errors only (the rest of E is style, and conflicts
+#         with intentional codebase choices like mid-file lazy imports
+#         and one-line `if x: do()` for tight conditionals).
+#
+# `B` (bugbear) and `UP` (pyupgrade) are deliberately NOT enabled
+# today: bugbear flags several intentional patterns (synchronous
+# closure capture, `zip()` without `strict=`) as smells. They're
+# tracked as a follow-up sweep, after which they'll be enabled here.
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E9"]
+# tests/ runs duck-typed against Textual / BioPython internals and
+# uses fixtures whose names look unused to the linter; skip the
+# noise. Production code is what ruff guards.
+exclude = ["tests/**", ".hypothesis/**", "build/**", "dist/**"]
+
+[tool.ruff.format]
+# Hands off. Formatting the whole 61k-LoC file would produce a churn
+# diff that destroys git blame for no behavioural gain. Re-enable
+# once a dedicated formatting sweep is scheduled.
+exclude = ["*"]
+
 [tool.pyright]
 # Pyright runs strict on the shipped application code only. Tests
 # duck-type heavily on Textual's `App.push_screen()` return (which
@@ -104,7 +161,7 @@ exclude = [
 # the test tree is excluded from analysis. Real test breakage is
 # caught by `pytest -n auto -q` which already runs against the
 # same files.
-include = ["splicecraft.py", "splicecraft_cli.py"]
+include = ["splicecraft.py", "splicecraft_biology.py", "splicecraft_cli.py"]
 exclude = [
     "tests/**",
     "build/**",

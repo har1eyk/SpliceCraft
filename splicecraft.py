@@ -2869,7 +2869,6 @@ def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
         has no rotated backups).
     """
     import datetime as _dt
-    import io as _io
     import tempfile
     import zipfile
 
@@ -3939,83 +3938,34 @@ _RESTR_COLOR: dict[str, str] = {
 }
 
 
-_IUPAC_RE: dict[str, str] = {
-    "A": "A", "C": "C", "G": "G", "T": "T",
-    "R": "[AG]", "Y": "[CT]", "W": "[AT]", "S": "[CG]",
-    "M": "[AC]", "K": "[GT]", "B": "[CGT]", "D": "[AGT]",
-    "H": "[ACT]", "V": "[ACG]", "N": "[ACGT]",
-}
-
-
-# Pattern cache (sacred invariant #4). Bounded LRU so a long-lived
-# process scanning many recognition sites can't grow the cache
-# indefinitely; the catalog is ~120 enzymes (palindromic + RC variants
-# < 256), so 256 is comfortably above steady state. Public dict so
-# tests can `.clear()` and inspect membership.
-_PATTERN_CACHE: "_OD[str, re.Pattern[str]]" = _OD()
-_PATTERN_CACHE_MAX = 256
-
-def _iupac_pattern(site: str) -> "re.Pattern[str]":
-    pat = _PATTERN_CACHE.get(site)
-    if pat is not None:
-        _PATTERN_CACHE.move_to_end(site)
-        return pat
-    pat = re.compile("".join(_IUPAC_RE.get(c, c) for c in site.upper()))
-    _PATTERN_CACHE[site] = pat
-    if len(_PATTERN_CACHE) > _PATTERN_CACHE_MAX:
-        _PATTERN_CACHE.popitem(last=False)
-    return pat
-
-
-_IUPAC_COMP = str.maketrans(
-    "ACGTRYWSMKBDHVN",
-    "TGCAYRWSKMVHDBN",
+# ── Biology primitives ─ extracted to splicecraft_biology.py ──────────────
+#
+# Pure functions / constants live in `splicecraft_biology.py` (see the
+# module docstring + docs/architecture.md for the rationale). We re-
+# bind them into the splicecraft.* namespace so external callers
+# (`import splicecraft as sc; sc._rc(...)`) and every existing call
+# site inside this file continue to work unchanged.
+#
+# Sacred invariants #3, #4, #8 are owned by splicecraft_biology — see
+# its module docstring.
+# Three of these symbols (`_IUPAC_RE`, `_PATTERN_CACHE`,
+# `_PATTERN_CACHE_MAX`) are referenced only by tests via `sc.<name>`,
+# not inside splicecraft.py itself — they're public-API re-exports,
+# not dead imports, and the `from foo import bar as bar` alias is the
+# idiomatic way to tell ruff that. The E402 ignore covers the
+# deliberate mid-file location of the extraction.
+from splicecraft_biology import (  # noqa: E402
+    _IUPAC_RE         as _IUPAC_RE,
+    _IUPAC_COMP       as _IUPAC_COMP,
+    _DNA_COMP_PRESERVE_CASE as _DNA_COMP_PRESERVE_CASE,
+    _PATTERN_CACHE    as _PATTERN_CACHE,
+    _PATTERN_CACHE_MAX as _PATTERN_CACHE_MAX,
+    _iupac_pattern    as _iupac_pattern,
+    _rc               as _rc,
+    _feat_len         as _feat_len,
+    _seq_len          as _seq_len,
+    _slice_circular   as _slice_circular,
 )
-
-# Case-preserving ACGT complement used by the sequence-panel renderer.
-_DNA_COMP_PRESERVE_CASE = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
-
-
-# Tiny LRU on `_rc` — the cached value of a 200 kb plasmid's RC is
-# itself ~200 kb, so a 4-entry cap is enough to cover the working set
-# (current sequence + a couple of recent rotations / undo snapshots)
-# without ballooning RAM. Benches show 35–113× speedup on cache hit
-# for cosmid-size sequences (scripts/perf_probe.py).
-@_functools.lru_cache(maxsize=4)
-def _rc(seq: str) -> str:
-    return seq.upper().translate(_IUPAC_COMP)[::-1]
-
-
-def _feat_len(start: int, end: int, total: int) -> int:
-    """Circular-aware feature length. A wrap feature (end < start) is
-    (total - start) + end bp long; a linear feature is end - start."""
-    return (total - start) + end if end < start else end - start
-
-
-def _seq_len(record) -> int:
-    """Length of ``record.seq`` in bp, or 0 if the record has no
-    sequence attached. BioPython's ``SeqRecord.seq`` is typed as
-    ``Seq | MutableSeq | None`` because the dataclass allows records
-    without sequences (rare — e.g. annotation-only GenBank views).
-    SpliceCraft always loads records with sequence content, but
-    routing length lookups through this helper sidesteps the
-    ``"None" is not assignable to "Sized"`` pyright noise at every
-    ``len(rec.seq)`` call site without an inline None guard."""
-    seq = getattr(record, "seq", None)
-    return len(seq) if seq is not None else 0
-
-
-def _slice_circular(seq: str, start: int, end: int) -> str:
-    """Circular-aware slice. If end > start this is a normal slice; if
-    end < start the slice wraps the origin and returns seq[start:] + seq[:end].
-    end == start is treated as empty (not "wrap whole plasmid") — callers
-    that want the latter should pass explicit boundaries. Used by the
-    primer-design helpers so a region straddling the origin can be
-    primer-designed without special casing at every call site.
-    """
-    if end >= start:
-        return seq[start:end]
-    return seq[start:] + seq[:end]
 
 
 def _feat_bounds(feat, total: int) -> "tuple[int, int, int] | None":
@@ -5086,6 +5036,17 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
                               ) -> dict:
     """Simulate a Gibson assembly of N linear top-strand fragments.
 
+    .. note::
+       **DEFERRED REFACTOR** (370 lines). Splitting this is on the V1.0.0
+       soft-gate list (see V1_GATE.md S3) but the math is biology-critical
+       (overlap detection at every junction incl. the wrap junction;
+       feature-coord shifting with single-source-of-truth offset
+       arithmetic). Safe refactor needs a dedicated regression scaffold
+       — a per-junction property test on `tests/test_gibson.py` that
+       fuzzes `(n_fragments, overlap_len, feature_density, wrap_yes_no)`
+       and asserts product invariants before any extraction. Not done
+       in 0.9.x to avoid silent biology drift.
+
     Each ``fragments[i]`` dict shape:
         {
           "name":     str,
@@ -5591,8 +5552,6 @@ def _paint_feature_label(arr: list[tuple[str, str]], f: dict,
         return
     color = f.get("color", "white")
     feat_type = f.get("type", "")
-    starts_here = s >= chunk_start
-    ends_here   = e <= chunk_end
     content_w = chunk_end - chunk_start
 
     if feat_type == "resite":
@@ -6473,7 +6432,6 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                    if re_highlight else -1)
     reh_rec_e   = (re_highlight.get("rec_end",   -1)
                    if re_highlight else -1)
-    reh_color   = re_highlight["color"]         if re_highlight else ""
 
     seq_upper = seq.upper()
     result    = Text(no_wrap=True, overflow="crop")
@@ -9751,8 +9709,10 @@ def _record_to_gff3(record) -> str:
             strand_int = int(feat.location.strand or 0)
         except (AttributeError, TypeError, ValueError):
             strand_int = 0
-        gff_strand = ("+" if strand_int == 1
-                      else "-" if strand_int == -1 else ".")
+        # NOTE: per-part strand is computed below in the parts loop
+        # (see `part_gff_strand`); the feature-level strand glyph was
+        # an earlier-revision artefact and is unused after the
+        # mixed-strand `CompoundLocation` fix.
         # Pull a display name + extra qualifiers. Same precedence other
         # parts of the codebase use.
         name = ""
@@ -14228,7 +14188,6 @@ class SequencePanel(Widget):
         hover_seq_col = info.get("seq_col")
         hover_kind = info.get("kind")
         hover_packed = info.get("packed_row")
-        hover_dna = hover_kind == "dna"
         out_lines = [f"chunk={chunk_idx} bp=[{chunk_start},{chunk_end}) "
                      f"above_rows={above_rows} below_rows={below_rows} "
                      f"line_width={line_width}  "
@@ -18708,16 +18667,25 @@ def _format_pre_update_snapshot_table(snaps: "list[dict]") -> str:
 _RESTORE_LIST_SENTINEL = "\x00splicecraft-restore-list-only\x00"
 
 
-def _run_update_subcommand(argv: "list[str]") -> int:
-    """Entry point for `splicecraft update`. Returns a shell exit
-    code. Never raises — every failure path is converted to a printed
-    message + numeric exit code.
+# ── _run_update_subcommand helpers ────────────────────────────────────────
+#
+# `_run_update_subcommand` was 532 lines in 0.9.2 — too big to hold in one
+# review frame. Pre-refactor every branch (parse, list, restore, refuse,
+# snapshot, install) lived in one function, so a bug in one branch lived
+# inside 500 lines of unrelated code. Splitting each branch into a named
+# helper does NOT change behaviour — the helpers exist purely to give the
+# dispatcher a flat, scannable shape.
+#
+# Sacred invariant #39 (pre-update snapshot before any install
+# subprocess) still applies; only its location has moved into
+# `_update_take_snapshot`.
 
-    Emits ``update.subcommand.*`` structured events at every decision
-    point so a malfunctioning updater can be diagnosed from a single
-    log paste (see invariant #42 in CLAUDE.md).
-    """
-    _log_event("update.subcommand.start", argv=list(argv))
+
+def _update_build_parser() -> "_SubcommandParser":
+    """Construct the argparse parser for `splicecraft update`.
+
+    Kept as a separate function so tests can introspect the parser
+    without having to monkeypatch the install subprocess."""
     parser = _SubcommandParser(
         prog="splicecraft update",
         add_help=False,
@@ -18751,10 +18719,7 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     #   --restore-pre-update            → const sentinel → restore mode, no id
     #   --restore-pre-update foo        → "foo"           → restore mode, id="foo"
     #   --restore-pre-update --flag     → const sentinel → restore mode, no id
-    #     (argparse refuses to swallow a token starting with `-` as a value
-    #     for an optional positional, mirroring the historical guard)
-    # `--restore-pre-update=` (empty after =) is normalised to None below
-    # to match the legacy `a.split("=", 1)[1] or None` behaviour.
+    # `--restore-pre-update=` (empty after =) is normalised to None below.
     parser.add_argument(
         "--restore-pre-update",
         nargs="?",
@@ -18763,6 +18728,353 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         metavar="ID",
         dest="restore_raw",
     )
+    return parser
+
+
+def _update_reconcile_pin(args) -> "tuple[str | None, int | None]":
+    """Reconcile `--pin X.Y.Z` (flag) vs `splicecraft update X.Y.Z`
+    (positional). Returns ``(pin_version, error_code)``:
+
+      * Both `pin_version` and `error_code` are None when no pin was
+        requested (normal upgrade path).
+      * `pin_version` is the validated string + `error_code` is None
+        on a clean pin.
+      * `pin_version` is None + `error_code` is an int when validation
+        failed; the caller should return that exit code immediately.
+
+    If both flag + positional are given, they must agree — a typo is
+    a refusal rather than a silent pick to avoid surprising the user.
+    """
+    raw_pin = args.pin_version
+    if args.version_pos is not None:
+        if raw_pin is not None and raw_pin.strip() != args.version_pos.strip():
+            print(
+                f"splicecraft update: --pin {raw_pin!r} conflicts with "
+                f"positional {args.version_pos!r}. Pass one or the other.",
+                file=sys.stderr,
+            )
+            return None, 2
+        raw_pin = args.version_pos
+    if raw_pin is None:
+        return None, None
+    pin_version = _validate_pin_version(raw_pin)
+    if pin_version is None:
+        print(
+            f"splicecraft update: {raw_pin!r} is not a recognisable "
+            "version string (expected something like 0.8.10, "
+            "1.2.3rc1, or v0.9.0).",
+            file=sys.stderr,
+        )
+        return None, 2
+    return pin_version, None
+
+
+def _update_handle_list_snapshots() -> int:
+    """Handle `splicecraft update --list-snapshots`: dump the
+    pre-update snapshot directory contents and exit. Read-only —
+    never touches a snapshot."""
+    try:
+        backup_dir = _resolve_pre_update_backup_dir()
+    except OSError as exc:
+        print(f"Could not resolve backup directory: {exc}",
+              file=sys.stderr)
+        return 1
+    snaps = _list_pre_update_snapshots(backup_dir)
+    if not snaps:
+        print(
+            f"No pre-update snapshots in {backup_dir}.\n"
+            "Snapshots are taken automatically before each "
+            "`splicecraft update` install.")
+        return 0
+    print(f"Pre-update snapshots in {backup_dir}:")
+    print(_format_pre_update_snapshot_table(snaps))
+    return 0
+
+
+def _update_handle_restore(restore_id: "str | None",
+                              assume_yes: bool) -> int:
+    """Handle `splicecraft update --restore-pre-update [ID]`.
+
+    `restore_id=None` lists the available snapshots and exits 0
+    (forces the user to pick explicitly). `"latest"` resolves to the
+    most-recent. Any other value is looked up against the backup
+    dir; missing → exit 1.
+
+    A pre-restore snapshot is taken first so the restore itself is
+    reversible — that's part of the four-restore-checks contract in
+    `CLAUDE.md` invariant #39.
+    """
+    try:
+        backup_dir = _resolve_pre_update_backup_dir()
+    except OSError as exc:
+        print(f"Could not resolve backup directory: {exc}",
+              file=sys.stderr)
+        return 1
+    snaps = _list_pre_update_snapshots(backup_dir)
+    if not snaps:
+        print(
+            f"No pre-update snapshots in {backup_dir}.\n"
+            "Nothing to restore.",
+            file=sys.stderr)
+        return 1
+    if restore_id is None:
+        print(
+            "No snapshot id given. Pick one and re-run with\n"
+            "  splicecraft update --restore-pre-update <id>\n"
+            "(or pass `latest` to restore the most recent):\n")
+        print(_format_pre_update_snapshot_table(snaps))
+        return 0
+    if restore_id.lower() == "latest":
+        chosen = snaps[0]["path"]
+    else:
+        chosen_path = backup_dir / restore_id
+        if not chosen_path.is_dir():
+            print(
+                f"Snapshot not found: {restore_id!r}\n"
+                f"Searched: {backup_dir}\n"
+                "Run `splicecraft update --list-snapshots` "
+                "to see available ids.",
+                file=sys.stderr)
+            return 1
+        chosen = chosen_path
+    print(
+        f"About to restore snapshot:\n"
+        f"  {chosen.name}\n"
+        f"This will OVERWRITE the current contents of:\n"
+        f"  library, collections, parts bin, primers, features,\n"
+        f"  feature colors, grammars, entry vectors, codon tables,\n"
+        f"  settings, crash-recovery autosaves, .dna sidecars\n"
+        "A pre-restore snapshot will be taken first so the restore "
+        "is reversible."
+    )
+    if not assume_yes and not _confirm_proceed("Proceed with restore? [y/N] "):
+        print("Cancelled.", file=sys.stderr)
+        return 130
+    _log_event("update.restore.start", snapshot_id=chosen.name)
+    try:
+        summary = _restore_pre_update_snapshot(
+            chosen, backup_dir=backup_dir
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        _log.exception("restore-pre-update: failed")
+        _log_event("update.restore.failed", error=repr(exc),
+                   snapshot_id=chosen.name)
+        print(f"Restore failed: {exc}", file=sys.stderr)
+        return 1
+    _log_event(
+        "update.restore.ok",
+        snapshot_id=chosen.name,
+        n_files=len(summary["restored_files"]),
+        n_dirs=len(summary["restored_dirs"]),
+        n_failed=len(summary["failed"]),
+    )
+    print("\nRestore complete.")
+    print(f"  Pre-restore snapshot: {summary['pre_restore_snapshot']}")
+    print(f"  Files restored:  {len(summary['restored_files'])}  "
+          f"({', '.join(summary['restored_files']) or '(none)'})")
+    print(f"  Dirs restored:   {len(summary['restored_dirs'])}  "
+          f"({', '.join(summary['restored_dirs']) or '(none)'})")
+    if summary["failed"]:
+        print(f"  Failed entries: {len(summary['failed'])}",
+              file=sys.stderr)
+        for name, reason in summary["failed"]:
+            print(f"    - {name}: {reason}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _update_refuse_unsupported_install(method: str, info: dict,
+                                          cmd: "list[str] | None"
+                                          ) -> "int | None":
+    """Check whether the detected install method is one we refuse to
+    auto-upgrade (editable / source / pixi-project / pip-system) or
+    whether the upgrade front-end isn't on PATH.
+
+    Returns:
+      * an exit code if the upgrade should be refused (caller exits)
+      * `None` if the upgrade can proceed.
+
+    These are split out from `_run_update_subcommand` because the
+    refusal messages are long enough to crowd the dispatcher and the
+    refusal logic is testable in isolation without monkeypatching
+    `subprocess.run`.
+    """
+    if method in ("editable", "source"):
+        target = info.get("git_clone") or info.get("module") or "(unknown)"
+        print(
+            f"\nThis SpliceCraft is a {method} install at {target}.\n"
+            "Refusing to overwrite a developer install with a PyPI build.\n"
+            "Update it from the source tree instead:\n"
+            f"  cd {target}\n"
+            "  git pull",
+            file=sys.stderr,
+        )
+        return 1
+    if method == "pixi-project":
+        target = info.get("git_clone") or info.get("module") or "(unknown)"
+        print(
+            f"\nThis SpliceCraft is in a pixi-managed project env at {target}.\n"
+            "Refusing to bypass the project manifest with a direct PyPI install.\n"
+            "Update the project's pinned version instead:\n"
+            f"  cd {target}\n"
+            "  pixi update splicecraft",
+            file=sys.stderr,
+        )
+        return 1
+    if cmd is None:
+        print(
+            f"Don't know how to upgrade a {method!r} install automatically.",
+            file=sys.stderr,
+        )
+        return 1
+    if method == "pip-system":
+        print(
+            "\nThis is a system-wide install. Run the upgrade yourself:\n"
+            f"  sudo {' '.join(cmd)}\n"
+            "Or migrate to an isolated user-level install via:\n"
+            "  python3 -m pip install --user pipx && pipx install splicecraft\n"
+            "  uv tool install splicecraft     "
+            "(https://docs.astral.sh/uv/)\n"
+            "  pixi global install splicecraft "
+            "(https://pixi.sh)",
+            file=sys.stderr,
+        )
+        return 1
+    front_end = cmd[0]
+    needs_external = method in (
+        "pipx", "uv-tool", "uv-venv", "pixi-global"
+    )
+    if needs_external and shutil.which(front_end) is None:
+        homepage = _MANAGER_HOMEPAGES.get(front_end, "")
+        suffix = f"\nOr reinstall {front_end} ({homepage})." if homepage else ""
+        print(
+            f"\nDetected a {method} install, but `{front_end}` isn't on PATH.\n"
+            f"Open a shell where {front_end} is available and run:\n"
+            f"  {' '.join(cmd)}"
+            f"{suffix}",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _update_take_snapshot(pin_version: "str | None"
+                            ) -> "tuple[Path | None, int | None]":
+    """Take the pre-install snapshot (sacred invariant #39).
+
+    Returns ``(snap_path, None)`` on success or ``(None, exit_code)``
+    on failure. The caller MUST exit immediately on a failed snapshot
+    — running the install without one violates invariant #39.
+    """
+    print("Snapshotting user data before update…", flush=True)
+    _log_event("update.snapshot.start", from_version=__version__,
+               pin=pin_version or "")
+    try:
+        snap_path = _create_pre_update_snapshot(__version__)
+    except (OSError, shutil.Error) as exc:
+        _log.exception("pre-update snapshot failed")
+        _log_event("update.snapshot.failed", error=repr(exc))
+        print(
+            f"\nABORTING: could not snapshot user data before the upgrade.\n"
+            f"  Reason: {exc}\n"
+            "Refusing to proceed without a recoverable copy of your "
+            "library, collections, parts bin, and primers. Free up disk "
+            "space, fix permissions on the backup directory, and retry. "
+            "(Override the location with $SPLICECRAFT_UPDATE_BACKUP_DIR.)",
+            file=sys.stderr,
+        )
+        return None, 1
+    _log_event("update.snapshot.ok", path=str(snap_path))
+    print(f"  ✓ Snapshot saved: {snap_path}")
+    return snap_path, None
+
+
+def _update_run_install(cmd: "list[str]", snap_path: Path,
+                          method: str,
+                          pin_version: "str | None") -> int:
+    """Actually run the install subprocess + report the result.
+
+    Pre-condition: the snapshot at `snap_path` was successfully
+    created (sacred invariant #39). The exit code reflects pip /
+    pipx / uv's return code, with snapshot location surfaced in
+    every error message so the user can always reverse the change.
+    """
+    _log_event("update.install.start", method=method,
+               pin=pin_version or "", front_end=cmd[0])
+    try:
+        result = subprocess.run(cmd, check=False)
+    except FileNotFoundError:
+        _log_event("update.install.front_end_missing", front_end=cmd[0])
+        print(
+            f"Command not found: {cmd[0]!r}.  "
+            "Install the matching package manager and retry.\n"
+            f"(Pre-update snapshot is intact at {snap_path}.)",
+            file=sys.stderr,
+        )
+        return 127
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.exception("splicecraft update: subprocess failed")
+        _log_event("update.install.subprocess_error", error=repr(exc))
+        print(
+            f"Update failed to launch: {exc}\n"
+            f"(Pre-update snapshot is intact at {snap_path}.)",
+            file=sys.stderr,
+        )
+        return 1
+    rc = int(result.returncode or 0)
+    _log_event("update.install.end", returncode=rc, method=method,
+               pin=pin_version or "")
+    if rc == 0:
+        print("\nUpgrade complete.")
+        # Best-effort: try to read the freshly installed version so the
+        # user sees the new number without restarting.
+        try:
+            import importlib.metadata as ilm
+            try:
+                installed = ilm.version("splicecraft")
+                if installed and installed != __version__:
+                    print(f"  splicecraft {__version__} → {installed}")
+            except ilm.PackageNotFoundError:
+                pass
+        except ImportError:
+            pass
+        print(f"  Pre-update snapshot: {snap_path}")
+        print(
+            "  If anything looks wrong on the new version, restore with:\n"
+            f"    splicecraft update --restore-pre-update {snap_path.name}"
+        )
+    else:
+        print(
+            f"\nUpgrade command exited with status {rc}. "
+            "See output above for details.\n"
+            f"Your pre-update snapshot is intact at:\n"
+            f"  {snap_path}\n"
+            "If your data ended up corrupted, run:\n"
+            f"  splicecraft update --restore-pre-update {snap_path.name}",
+            file=sys.stderr,
+        )
+    return rc
+
+
+def _run_update_subcommand(argv: "list[str]") -> int:
+    """Entry point for `splicecraft update`. Returns a shell exit
+    code. Never raises — every failure path is converted to a printed
+    message + numeric exit code.
+
+    Emits ``update.subcommand.*`` structured events at every decision
+    point so a malfunctioning updater can be diagnosed from a single
+    log paste (see invariant #42 in CLAUDE.md).
+
+    Pre-refactor this was a 532-line behemoth; the per-branch work
+    has been split into the `_update_*` helpers above. The dispatcher
+    here is the only place where the order of operations is
+    visible — sacred invariant #39 (snapshot ALWAYS happens before
+    `subprocess.run(install_cmd)`) is enforced by the fact that
+    `_update_take_snapshot` is called BEFORE `_update_run_install`,
+    with an early-exit on snapshot failure.
+    """
+    _log_event("update.subcommand.start", argv=list(argv))
+    parser = _update_build_parser()
 
     try:
         args = parser.parse_args(list(argv))
@@ -18773,50 +19085,20 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         print(_UPDATE_HELP_TEXT)
         return 0
 
-    check_only = args.check
-    force = args.force
-    assume_yes = args.assume_yes
-    list_snapshots = args.list_snapshots
-    dry_run = args.dry_run
     restore_mode = args.restore_raw is not None
     if restore_mode and args.restore_raw not in (_RESTORE_LIST_SENTINEL, ""):
         restore_id: str | None = args.restore_raw
     else:
         restore_id = None
 
-    # Reconcile the two pin sources: `--pin X.Y.Z` (explicit flag) and
-    # `splicecraft update X.Y.Z` (positional). If both are given they
-    # must agree; otherwise the user has typoed and the safe call is
-    # to refuse rather than silently pick one. The raw value is
-    # validated via `_validate_pin_version` so an accidental file path
-    # / shell-expansion token / extras spec can't reach the install
-    # command's argv.
-    raw_pin = args.pin_version
-    if args.version_pos is not None:
-        if raw_pin is not None and raw_pin.strip() != args.version_pos.strip():
-            print(
-                f"splicecraft update: --pin {raw_pin!r} conflicts with "
-                f"positional {args.version_pos!r}. Pass one or the other.",
-                file=sys.stderr,
-            )
-            return 2
-        raw_pin = args.version_pos
-    pin_version: "str | None" = None
-    if raw_pin is not None:
-        pin_version = _validate_pin_version(raw_pin)
-        if pin_version is None:
-            print(
-                f"splicecraft update: {raw_pin!r} is not a recognisable "
-                "version string (expected something like 0.8.10, "
-                "1.2.3rc1, or v0.9.0).",
-                file=sys.stderr,
-            )
-            return 2
+    pin_version, pin_err = _update_reconcile_pin(args)
+    if pin_err is not None:
+        return pin_err
 
     # `--check` and `--dry-run` are mutually exclusive: `--check` skips
     # the snapshot (read-only); `--dry-run` exercises everything up to
     # but not including the install. Allowing both would be ambiguous.
-    if check_only and dry_run:
+    if args.check and args.dry_run:
         print(
             "splicecraft update: --check and --dry-run are mutually "
             "exclusive. --check is read-only; --dry-run exercises the "
@@ -18828,7 +19110,7 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     # A pin is incompatible with the listing/restore modes — those
     # don't touch the install at all. Refuse the ambiguous combo so
     # the user isn't surprised by which one wins.
-    if pin_version is not None and (list_snapshots or restore_mode):
+    if pin_version is not None and (args.list_snapshots or restore_mode):
         print(
             "splicecraft update: --pin / positional version cannot be "
             "combined with --list-snapshots or --restore-pre-update. "
@@ -18839,105 +19121,13 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         return 2
 
     # ── Listing / restore early-exit branches (no PyPI fetch needed) ──
-    if list_snapshots:
-        try:
-            backup_dir = _resolve_pre_update_backup_dir()
-        except OSError as exc:
-            print(f"Could not resolve backup directory: {exc}",
-                  file=sys.stderr)
-            return 1
-        snaps = _list_pre_update_snapshots(backup_dir)
-        if not snaps:
-            print(
-                f"No pre-update snapshots in {backup_dir}.\n"
-                "Snapshots are taken automatically before each "
-                "`splicecraft update` install.")
-            return 0
-        print(f"Pre-update snapshots in {backup_dir}:")
-        print(_format_pre_update_snapshot_table(snaps))
-        return 0
+    if args.list_snapshots:
+        return _update_handle_list_snapshots()
 
     if restore_mode:
-        try:
-            backup_dir = _resolve_pre_update_backup_dir()
-        except OSError as exc:
-            print(f"Could not resolve backup directory: {exc}",
-                  file=sys.stderr)
-            return 1
-        snaps = _list_pre_update_snapshots(backup_dir)
-        if not snaps:
-            print(
-                f"No pre-update snapshots in {backup_dir}.\n"
-                "Nothing to restore.",
-                file=sys.stderr)
-            return 1
-        if restore_id is None:
-            # No ID — print the listing so the user can copy-paste one.
-            print(
-                "No snapshot id given. Pick one and re-run with\n"
-                "  splicecraft update --restore-pre-update <id>\n"
-                "(or pass `latest` to restore the most recent):\n")
-            print(_format_pre_update_snapshot_table(snaps))
-            return 0
-        # Resolve "latest" or the literal id.
-        if restore_id.lower() == "latest":
-            chosen = snaps[0]["path"]
-        else:
-            chosen_path = backup_dir / restore_id
-            if not chosen_path.is_dir():
-                print(
-                    f"Snapshot not found: {restore_id!r}\n"
-                    f"Searched: {backup_dir}\n"
-                    "Run `splicecraft update --list-snapshots` "
-                    "to see available ids.",
-                    file=sys.stderr)
-                return 1
-            chosen = chosen_path
-        print(
-            f"About to restore snapshot:\n"
-            f"  {chosen.name}\n"
-            f"This will OVERWRITE the current contents of:\n"
-            f"  library, collections, parts bin, primers, features,\n"
-            f"  feature colors, grammars, entry vectors, codon tables,\n"
-            f"  settings, crash-recovery autosaves, .dna sidecars\n"
-            "A pre-restore snapshot will be taken first so the restore "
-            "is reversible."
-        )
-        if not assume_yes and not _confirm_proceed("Proceed with restore? [y/N] "):
-            print("Cancelled.", file=sys.stderr)
-            return 130
-        _log_event("update.restore.start", snapshot_id=chosen.name)
-        try:
-            summary = _restore_pre_update_snapshot(
-                chosen, backup_dir=backup_dir
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            _log.exception("restore-pre-update: failed")
-            _log_event("update.restore.failed", error=repr(exc),
-                       snapshot_id=chosen.name)
-            print(f"Restore failed: {exc}", file=sys.stderr)
-            return 1
-        _log_event(
-            "update.restore.ok",
-            snapshot_id=chosen.name,
-            n_files=len(summary["restored_files"]),
-            n_dirs=len(summary["restored_dirs"]),
-            n_failed=len(summary["failed"]),
-        )
-        print(f"\nRestore complete.")
-        print(f"  Pre-restore snapshot: {summary['pre_restore_snapshot']}")
-        print(f"  Files restored:  {len(summary['restored_files'])}  "
-              f"({', '.join(summary['restored_files']) or '(none)'})")
-        print(f"  Dirs restored:   {len(summary['restored_dirs'])}  "
-              f"({', '.join(summary['restored_dirs']) or '(none)'})")
-        if summary["failed"]:
-            print(f"  Failed entries: {len(summary['failed'])}",
-                  file=sys.stderr)
-            for name, reason in summary["failed"]:
-                print(f"    - {name}: {reason}", file=sys.stderr)
-            return 1
-        return 0
+        return _update_handle_restore(restore_id, args.assume_yes)
 
+    # ── Upgrade path: detect install method, hit PyPI, compare ────────
     if pin_version is not None:
         print(
             f"SpliceCraft {__version__} — pinning install to "
@@ -18980,7 +19170,7 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     print(f"  Method: {method}  ({info['details']})")
 
     # No upgrade needed and not forcing.
-    if pin_version is None and not is_newer and not force:
+    if pin_version is None and not is_newer and not args.force:
         if same_version:
             print("You're on the latest released version. Nothing to do.")
         else:
@@ -18997,91 +19187,24 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     # Pinning to the currently-installed version is a no-op unless
     # --force is also set (then it re-runs the install end-to-end,
     # useful for fixing a corrupted site-packages).
-    if pin_version is not None and pin_version == __version__ and not force:
+    if pin_version is not None and pin_version == __version__ and not args.force:
         print(
             f"\nYou're already on splicecraft {pin_version}. Nothing to "
             "do.\nPass --force to reinstall anyway."
         )
         return 0
 
-    # Editable / source-clone refusal — respect the user's working tree.
-    if method in ("editable", "source"):
-        target = info.get("git_clone") or info.get("module") or "(unknown)"
-        print(
-            f"\nThis SpliceCraft is a {method} install at {target}.\n"
-            "Refusing to overwrite a developer install with a PyPI build.\n"
-            "Update it from the source tree instead:\n"
-            f"  cd {target}\n"
-            "  git pull",
-            file=sys.stderr,
-        )
-        return 1
+    cmd = _build_upgrade_command(method, force=args.force,
+                                   pin_version=pin_version)
+    # Refuse upgrades for install methods we don't auto-handle
+    # (editable / source / pixi-project / pip-system) or where the
+    # upgrade front-end isn't on PATH.
+    refused = _update_refuse_unsupported_install(method, info, cmd)
+    if refused is not None:
+        return refused
 
-    # pixi-project refusal — the project's pixi manifest is the source
-    # of truth for which version is pinned, so a PyPI build would
-    # silently desynchronise the lockfile. Tell the user to run pixi's
-    # own update from the project root instead.
-    if method == "pixi-project":
-        target = info.get("git_clone") or info.get("module") or "(unknown)"
-        print(
-            f"\nThis SpliceCraft is in a pixi-managed project env at {target}.\n"
-            "Refusing to bypass the project manifest with a direct PyPI install.\n"
-            "Update the project's pinned version instead:\n"
-            f"  cd {target}\n"
-            "  pixi update splicecraft",
-            file=sys.stderr,
-        )
-        return 1
-
-    cmd = _build_upgrade_command(method, force=force,
-                                  pin_version=pin_version)
-    if cmd is None:
-        # _build_upgrade_command only returns None for editable/source,
-        # which we already handled above; this branch is defensive.
-        print(
-            f"Don't know how to upgrade a {method!r} install automatically.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # System-wide pip — print, don't run. sudo from inside an app is a
-    # support nightmare (TTY state, password caching, $PATH for sudo).
-    if method == "pip-system":
-        print(
-            "\nThis is a system-wide install. Run the upgrade yourself:\n"
-            f"  sudo {' '.join(cmd)}\n"
-            "Or migrate to an isolated user-level install via:\n"
-            "  python3 -m pip install --user pipx && pipx install splicecraft\n"
-            "  uv tool install splicecraft     "
-            "(https://docs.astral.sh/uv/)\n"
-            "  pixi global install splicecraft "
-            "(https://pixi.sh)",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Front-end binary not on PATH — common when the user installed
-    # the package manager (pipx / uv / pixi) into a different shell or
-    # forgot to source their shell rc. Refuse to run, but print the
-    # exact command they'd need to execute themselves. Homepage table
-    # lives at module level so it's a single source of truth.
-    front_end = cmd[0]
-    needs_external = method in (
-        "pipx", "uv-tool", "uv-venv", "pixi-global"
-    )
-    if needs_external and shutil.which(front_end) is None:
-        homepage = _MANAGER_HOMEPAGES.get(front_end, "")
-        suffix = f"\nOr reinstall {front_end} ({homepage})." if homepage else ""
-        print(
-            f"\nDetected a {method} install, but `{front_end}` isn't on PATH.\n"
-            f"Open a shell where {front_end} is available and run:\n"
-            f"  {' '.join(cmd)}"
-            f"{suffix}",
-            file=sys.stderr,
-        )
-        return 1
-
-    if check_only:
+    if args.check:
+        assert cmd is not None  # refused-path returned above (assert narrows for pyright)
         print("\nUpdate available." if is_newer else "\nForce flag set.")
         print("To upgrade, run:")
         print(f"  {' '.join(cmd)}")
@@ -19131,13 +19254,14 @@ def _run_update_subcommand(argv: "list[str]") -> int:
                 f"on {__version__})."
             )
 
+    assert cmd is not None  # refused-path returned above (assert narrows for pyright)
     print(f"\nWill run:  {' '.join(cmd)}")
-    if not assume_yes:
+    if not args.assume_yes:
         if not _confirm_proceed():
             print("Cancelled.", file=sys.stderr)
             return 130
 
-    # ── SACRED INVARIANT ──────────────────────────────────────────
+    # ── SACRED INVARIANT #39 ──────────────────────────────────────
     # Snapshot the user's library, collections, parts bin, primers,
     # feature library, custom grammars, codon tables, settings,
     # crash-recovery autosaves, and .dna sidecars BEFORE invoking
@@ -19146,33 +19270,17 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     # the upgrade — it is NEVER acceptable to risk destroying user
     # data without a recoverable copy first. Tested by
     # `test_update_snapshot_taken_before_subprocess` in tests/test_smoke.py.
-    print("Snapshotting user data before update…", flush=True)
-    _log_event("update.snapshot.start", from_version=__version__,
-               pin=pin_version or "")
-    try:
-        snap_path = _create_pre_update_snapshot(__version__)
-    except (OSError, shutil.Error) as exc:
-        _log.exception("pre-update snapshot failed")
-        _log_event("update.snapshot.failed", error=repr(exc))
-        print(
-            f"\nABORTING: could not snapshot user data before the upgrade.\n"
-            f"  Reason: {exc}\n"
-            "Refusing to proceed without a recoverable copy of your "
-            "library, collections, parts bin, and primers. Free up disk "
-            "space, fix permissions on the backup directory, and retry. "
-            "(Override the location with $SPLICECRAFT_UPDATE_BACKUP_DIR.)",
-            file=sys.stderr,
-        )
-        return 1
-    _log_event("update.snapshot.ok", path=str(snap_path))
-    print(f"  ✓ Snapshot saved: {snap_path}")
+    snap_path, snap_err = _update_take_snapshot(pin_version)
+    if snap_err is not None:
+        return snap_err
+    assert snap_path is not None  # snap_err None ⇒ path present
 
     # `--dry-run` short-circuits HERE: we've gone all the way through
     # detection + PyPI fetch + snapshot, but we don't actually run the
     # install. Useful for verifying the snapshot pipeline works on a
     # given machine, for CI smoke-checks, and for documenting the
     # exact command an automated workflow would run.
-    if dry_run:
+    if args.dry_run:
         print(
             "\n[dry-run] No install was run. Snapshot is intact at:\n"
             f"  {snap_path}\n"
@@ -19181,66 +19289,7 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         )
         return 0
 
-    # Inherit stdout/stderr so the user sees pip/pipx progress live.
-    # `check=False` because we report the return code ourselves; let
-    # the user see whatever pip wrote on failure.
-    _log_event("update.install.start", method=method,
-               pin=pin_version or "", front_end=cmd[0])
-    try:
-        result = subprocess.run(cmd, check=False)
-    except FileNotFoundError:
-        _log_event("update.install.front_end_missing", front_end=cmd[0])
-        print(
-            f"Command not found: {cmd[0]!r}.  "
-            "Install the matching package manager and retry.\n"
-            f"(Pre-update snapshot is intact at {snap_path}.)",
-            file=sys.stderr,
-        )
-        return 127
-    except (OSError, subprocess.SubprocessError) as exc:
-        _log.exception("splicecraft update: subprocess failed")
-        _log_event("update.install.subprocess_error", error=repr(exc))
-        print(
-            f"Update failed to launch: {exc}\n"
-            f"(Pre-update snapshot is intact at {snap_path}.)",
-            file=sys.stderr,
-        )
-        return 1
-
-    rc = int(result.returncode or 0)
-    _log_event("update.install.end", returncode=rc, method=method,
-               pin=pin_version or "")
-    if rc == 0:
-        print("\nUpgrade complete.")
-        # Best-effort: try to read the freshly installed version so the
-        # user sees the new number without restarting. Ignore any failure
-        # — the success message above already covered the happy path.
-        try:
-            import importlib.metadata as ilm
-            try:
-                installed = ilm.version("splicecraft")
-                if installed and installed != __version__:
-                    print(f"  splicecraft {__version__} → {installed}")
-            except ilm.PackageNotFoundError:
-                pass
-        except ImportError:
-            pass
-        print(f"  Pre-update snapshot: {snap_path}")
-        print(
-            "  If anything looks wrong on the new version, restore with:\n"
-            f"    splicecraft update --restore-pre-update {snap_path.name}"
-        )
-    else:
-        print(
-            f"\nUpgrade command exited with status {rc}. "
-            "See output above for details.\n"
-            f"Your pre-update snapshot is intact at:\n"
-            f"  {snap_path}\n"
-            "If your data ended up corrupted, run:\n"
-            f"  splicecraft update --restore-pre-update {snap_path.name}",
-            file=sys.stderr,
-        )
-    return rc
+    return _update_run_install(cmd, snap_path, method, pin_version)
 
 
 # ── Fetch modal ────────────────────────────────────────────────────────────────
@@ -19548,13 +19597,20 @@ class OpenFileModal(ModalScreen):
                 record = load_genbank(path)
         except Exception as exc:
             _log.exception("OpenFileModal load failed for %s", path)
+            # PEP 3110 clears `exc` once the except block exits, and
+            # the `_err` closure runs later on the UI thread via
+            # `call_from_thread` — by then the closure cell is unbound
+            # and the `f"{exc}"` formats would raise NameError on a
+            # path that's already in the error handler. Snapshot the
+            # message into a plain local that survives the scope tear.
+            err_msg = str(exc)
             def _err():
                 # Modal may have been dismissed mid-parse via Esc; in
                 # that case fall back to a toast so the user still
                 # sees what failed.
                 if not self.is_mounted:
                     try:
-                        self.app.notify(f"Open failed: {exc}",
+                        self.app.notify(f"Open failed: {err_msg}",
                                           severity="error", timeout=8,
                                           markup=False)
                     except Exception:
@@ -19562,7 +19618,7 @@ class OpenFileModal(ModalScreen):
                     return
                 try:
                     self.query_one("#open-status", Static).update(
-                        f"[red]{exc}[/red]"
+                        f"[red]{err_msg}[/red]"
                     )
                     self.query_one("#btn-open",        Button).disabled = False
                     self.query_one("#btn-cancel-open", Button).disabled = False
@@ -21222,6 +21278,17 @@ def _clone_part_into_entry_vector(
     ligate the insert fragment into the vector backbone, return a
     circular `SeqRecord` of the cloned plasmid.
 
+    .. note::
+       **DEFERRED REFACTOR** (355 lines). Splitting needed a dedicated
+       regression scaffold first — feature carry-through math has
+       wrap-aware edge cases that aren't fully covered by the existing
+       test surface (single-source-of-truth offset deltas, dropout
+       boundary feature handling, multi-cut vector simplification).
+       V1.0.0 soft-gate S3. Not refactored in 0.9.x — the risk of a
+       subtle off-by-one in overhang-matching code propagating to a
+       wrong-orientation plasmid is unacceptable without a property-
+       based regression test against `_excise_fragment_pair`.
+
     Mirrors what happens in real-life Golden Braid / MoClo cloning:
       1. The entry vector carries a dropout cassette flanked by two
          enzyme sites (Esp3I for L0, BsaI for L1, etc.).
@@ -21851,6 +21918,14 @@ def _assembly_fragment_from_source(
     suitable for chaining in a multi-part Golden Braid (or any other
     modular) assembly.
 
+    .. note::
+       **DEFERRED REFACTOR** (346 lines). Same reasoning as
+       `_clone_part_into_entry_vector`: feature-carry through across
+       a Type IIS digest has subtle wrap-aware corner cases, and the
+       L0/L1+ branch divergence makes any "extract into per-level
+       helper" simplification a real biology-correctness review.
+       V1.0.0 soft-gate S3.
+
     L0 sources read fields directly. L1+ sources are digested with the
     grammar's level-up enzyme; if that yields no clean 2-fragment
     circular digest the helper falls back to grammar.enzyme (and
@@ -22267,7 +22342,6 @@ def _clone_assembly_into_entry_vector(
     seq_parts: list[str] = []
     chained_features: list[dict] = []
     cursor = 0
-    grammar_id_for_color = grammar.get("id") or ""
     for i, f in enumerate(fragments):
         if i > 0:
             cursor += len(f["oh5"])
@@ -22545,9 +22619,9 @@ def _splice_part_into_vector_by_overhang(
     # fell entirely within the dropped region. Features outside the
     # dropped region get shifted by `delta = len(insert) -
     # len(dropout)` if they sat AFTER the dropout in linear order.
-    dropout_start = i if not (j >= n) else (i % n)
-    dropout_end = (j + len(oh3)) if not (j >= n) else \
-        ((j + len(oh3)) % n)
+    # (Dropout bounds were tracked explicitly in an earlier revision;
+    # the current shift math uses overhang5_end / overhang3_start /
+    # delta directly, so the explicit bounds were dropped.)
     new_feats: list[dict] = []
     if not (j >= n):
         # Linear, non-wrap dropout: simple shift bookkeeping.
@@ -29902,7 +29976,6 @@ def _blast_search_pyhmmer(query: str, db: dict, *,
         _log.exception("pyhmmer search dispatch failed")
         return []
 
-    import math
     for top_hits in top_hits_iter:
         for h in top_hits:
             if h.score is None:
@@ -36536,10 +36609,14 @@ class PlasmidsaurusAlignModal(ModalScreen):
             )
             result["target_rotation"] = rotation
         except ValueError as exc:
+            # PEP 3110 clears `exc` once the except scope exits, and
+            # `_err` runs later on the UI thread via call_from_thread.
+            # Snapshot the message into a closure-safe local.
+            err_msg = _esc_md(str(exc))
             def _err():
                 try:
                     self.query_one("#align-status", Static).update(
-                        f"[red]Alignment failed: {_esc_md(str(exc))}[/red]"
+                        f"[red]Alignment failed: {err_msg}[/red]"
                     )
                 except NoMatches:
                     pass
@@ -36547,10 +36624,11 @@ class PlasmidsaurusAlignModal(ModalScreen):
             return
         except Exception as exc:
             _log.exception("PlasmidsaurusAlignModal worker failed")
+            err_msg = _esc_md(str(exc))
             def _err():
                 try:
                     self.query_one("#align-status", Static).update(
-                        f"[red]Alignment failed: {_esc_md(str(exc))}[/red]"
+                        f"[red]Alignment failed: {err_msg}[/red]"
                     )
                 except NoMatches:
                     pass
@@ -36729,7 +36807,6 @@ class AlignmentScreen(Screen):
         """Render the alignment body as Rich Text. Three rows per
         chunk: target features lane, target bases, match track,
         query bases. Mismatches red, gaps dim."""
-        from rich.markup import escape as _esc
         r       = self._result
         aq      = r["aligned_q"]
         at      = r["aligned_t"]
@@ -37185,7 +37262,6 @@ class DomesticatorModal(ModalScreen):
         Wrap features render as ``S+1..0..E`` via `_feat_span_label` so the
         user can spot origin-spanning features in the dropdown."""
         opts: list[tuple[str, str]] = []
-        total = len(self._plasmid_pick_seq)
         for i, f in enumerate(self._plasmid_pick_feats):
             label = f.get("label") or f.get("type", "?")
             s, e  = f.get("start", 0), f.get("end", 0)
@@ -38252,7 +38328,7 @@ class TraditionalCloningPane(Vertical):
         """Look up the SeqRecord for the entry at row `row_idx` of
         the named DataTable. Returns None on lookup failure."""
         try:
-            t = self.query_one(table_id, DataTable)
+            self.query_one(table_id, DataTable)
         except NoMatches:
             return None
         if row_idx < 0:
@@ -40781,22 +40857,22 @@ class ConstructorModal(ModalScreen):
             return
         # Add Lane-button stems with their suffix-stripped names.
         stem = bid[:len(bid) - len(gid) - 1]
-        if stem == f"btn-ctor-add":
+        if stem == "btn-ctor-add":
             event.stop()
             self._add_selected_part(gid)
-        elif stem == f"btn-lane-up":
+        elif stem == "btn-lane-up":
             event.stop()
             self._lane_move(gid, -1)
-        elif stem == f"btn-lane-down":
+        elif stem == "btn-lane-down":
             event.stop()
             self._lane_move(gid, +1)
-        elif stem == f"btn-lane-remove":
+        elif stem == "btn-lane-remove":
             event.stop()
             self._lane_remove(gid)
-        elif stem == f"btn-ctor-simulate":
+        elif stem == "btn-ctor-simulate":
             event.stop()
             self._save_to_library(gid)
-        elif stem == f"btn-ctor-clear":
+        elif stem == "btn-ctor-clear":
             event.stop()
             self._lanes[gid] = []
             self._refresh_lane(gid)
@@ -53337,6 +53413,43 @@ def _stop_agent_api(srv) -> None:
 # ── Main app ───────────────────────────────────────────────────────────────────
 
 class PlasmidApp(App):
+    """The Textual application — owns global keyboard state, undo
+    stashes, autosave, agent-API dispatch, modal stack management.
+
+    .. note::
+       **DEFERRED REFACTOR — controller split** (156 methods,
+       ~7,600 lines). The audit (see V1_GATE.md soft-gate S6) flagged
+       this class as the largest single legibility cost in the
+       codebase. Cleanest split candidates:
+
+       * ``_UndoController``: ``action_undo``, ``action_redo``,
+         ``_push_undo``, per-plasmid undo stashes, deepcopy hygiene
+         (sacred invariant #10).
+       * ``_AutosaveController``: crash-recovery autosave debounce,
+         ``_mark_dirty`` / ``_mark_clean`` propagation, dirty-state
+         lifecycle (single `_active_dirty` source of truth).
+       * ``_SettingsController``: ``_get_setting`` / ``_set_setting``
+         hydration in ``compose``, ``_settings_flush_worker`` background
+         thread, ``_SETTINGS_SCHEMA`` validation.
+       * ``_RestrictionScanController``: ``_dispatch_restr_scan``,
+         worker pre-capture of (topology, min-length, unique-only),
+         stale-record-counter guard.
+
+       Extraction shape (chosen so external behaviour is bit-identical):
+       mixin classes, NOT composed objects. Mixins keep the existing
+       `self._foo` attribute discipline intact across all methods;
+       composed objects would force every method to pierce
+       `self.undo._foo` and that's the diff that loses the
+       behaviour-preservation property. Mixin order MUST be documented
+       (App stays last) so the MRO is deterministic.
+
+       Not done in 0.9.x: each candidate set needs an isolated test
+       file BEFORE the extraction, then the extraction, then verify
+       the test file still passes against the mixin'd version. Doing
+       all four in one go gambles 2,600 tests on a deep refactor with
+       no incremental safety net. **V1.0.0 soft-gate item — pre-RC
+       sweep, not in the 0.9.x line.**
+    """
     TITLE       = "SpliceCraft"
     TRANSITIONS = {}          # instant screen open/close — no slide animations
     # Auto-focus the plasmid library table on startup, NOT the search
@@ -55606,7 +55719,7 @@ SpeciesPickerModal { align: center middle; }
         total = len(leftovers)
         prefix = (f"{len(new_stems)} new of {total} unsaved recovery "
                   f"file(s)" if total > len(new_stems)
-                  else f"Unsaved recovery file(s) from a prior session")
+                  else "Unsaved recovery file(s) from a prior session")
         self.notify(
             f"{prefix}: {names}. "
             f"Open via File > Open from {_CRASH_RECOVERY_DIR}",
@@ -59122,7 +59235,7 @@ SpeciesPickerModal { align: center middle; }
     def _library_load(self, event: LibraryPanel.PlasmidLoad):
         gb_text = event.entry.get("gb_text", "")
         if not gb_text:
-            self.notify(f"Library entry has no stored sequence.", severity="warning")
+            self.notify("Library entry has no stored sequence.", severity="warning")
             return
         # If this entry is already loaded (matched on record.id), skip the
         # reload — it would clobber undo/redo and any unsaved edits for no

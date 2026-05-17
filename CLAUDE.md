@@ -2,7 +2,7 @@
 
 Agent handoff. Read before touching the codebase.
 
-Developed by a human bioinformatician + Claude. **Single-file architecture** — entire app is `splicecraft.py` (~39,000 lines). Intentional: keeps the codebase greppable.
+Developed by a human bioinformatician + Claude. **Near-single-file architecture** — the application lives in `splicecraft.py` (~61,000 lines) plus a small extracted biology module `splicecraft_biology.py` and the stdlib-only sidecar `splicecraft_cli.py`. The single-file constraint is intentional (keeps the codebase greppable); the biology extraction is the first deliberate exception, scoped to pure functions / constants with no `PlasmidApp` coupling. See the three-test rule in `CONTRIBUTING.md` for the criteria any future extraction must satisfy.
 
 ## What is SpliceCraft?
 

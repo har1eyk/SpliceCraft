@@ -1,5 +1,124 @@
 # SpliceCraft Changelog
 
+> **Archive policy:** entries older than 12 months are rotated into
+> `CHANGELOG-archive/YEAR.md` and linked from the bottom of this
+> file. Until then, everything stays here for grep-ability. Current
+> active window: **2026-03-23 → present** (nothing eligible for
+> rotation yet — the project shipped its first release in March 2026).
+
+> **Per-release format:** versions follow `MAJOR.MINOR.PATCH`, ISO
+> dates (`YYYY-MM-DD`), and one-line headlines. The release script
+> auto-prepends a stub from the commits since the last tag; the
+> maintainer hand-fills the body before tagging. See
+> `RELEASE_CHECKLIST.md` for the full release workflow.
+
+---
+
+## [Unreleased] — Professional-audit sweep
+
+Audit-pass sweep landing 17 of the 20 action items from a
+professional code-review pass; 1 partial (`_run_update_subcommand`
+refactored from 532 lines into a 200-line dispatcher + 6 named
+helpers; the three cloning functions get documented deferred-refactor
+notes pending dedicated regression scaffolding); 1 deferred (the
+PlasmidApp controller split, with a written extraction plan).
+
+### Hardening
+
+- **Real bug fix**: 4 sites where an `except Exception as exc:`
+  closure later referenced `exc` from a `call_from_thread` callback,
+  which would raise `NameError` after PEP 3110 cleared the binding.
+  Captured the message into a closure-safe local at the `except`
+  site. Affected `OpenFileModal` open-failed path and the
+  Plasmidsaurus alignment worker's error reports.
+- **F-rule sweep**: 12 ruff auto-fixes (unused imports, extraneous
+  f-prefixes), 10 manual F841 cleanups (dead `starts_here`,
+  `ends_here`, `reh_color`, `gff_strand`, `hover_dna`,
+  `grammar_id_for_color`, `dropout_start`/`end`, `total`, `t`).
+
+### Code organisation
+
+- **Extracted `splicecraft_biology.py`**: first deliberate
+  extraction from the single-file rule. Pure biology primitives
+  (`_IUPAC_RE`, `_IUPAC_COMP`, `_DNA_COMP_PRESERVE_CASE`,
+  `_PATTERN_CACHE`, `_iupac_pattern`, `_rc`, `_feat_len`,
+  `_seq_len`, `_slice_circular`) live in their own module and are
+  re-imported into `splicecraft.py` so `sc._rc(...)` keeps working
+  for every existing caller. Sacred invariants #3, #4, #8 are now
+  owned by the new module.
+- **`_run_update_subcommand`**: 532-line god-function split into
+  `_update_build_parser`, `_update_reconcile_pin`,
+  `_update_handle_list_snapshots`, `_update_handle_restore`,
+  `_update_refuse_unsupported_install`, `_update_take_snapshot`,
+  `_update_run_install`. Sacred invariant #39 (snapshot before
+  install subprocess) is preserved — the dispatcher's only
+  responsibility now is making the ordering visible.
+- **Deferred-refactor notes** on `_simulate_gibson_assembly`,
+  `_clone_part_into_entry_vector`, `_assembly_fragment_from_source`,
+  and `PlasmidApp` explain what needs to land first before each one
+  is safe to split.
+
+### Tests
+
+- **`tests/test_perf_regression.py`** (`@pytest.mark.slow`):
+  best-of-N regression gates against `tests/perf-baseline.json`.
+  Best-of-N (not p50/p99) because under pytest-xdist load the
+  median drifts; the MINIMUM sample is "is the code capable of
+  meeting the budget" which is the real regression signal.
+- **`tests/test_cli_client.py`** (31 tests): covers
+  `splicecraft_cli.py` — token-file size cap + boundary, malformed-
+  token rejection, response-size cap + boundary, HTTP error decode,
+  connection-refused messaging, argparse surface, every documented
+  subcommand registered.
+
+### CI
+
+- **`ruff check .`** as a CI gate (F + E9 rules; intentional E-style
+  rules disabled to match codebase conventions; tests excluded).
+- **`pyright`** as a CI gate (strict; production code only —
+  splicecraft.py + splicecraft_biology.py + splicecraft_cli.py).
+- **`coverage`** + Codecov upload on Python 3.12 (informational;
+  doesn't gate merges).
+- Concurrency: cancel in-flight CI on rapid push to same ref.
+
+### Documentation
+
+- **`SECURITY.md`** — disclosure channel, threat model, in-scope /
+  out-of-scope, scope-mapping table from each sacred invariant to
+  the defence it owns.
+- **`CONTRIBUTING.md`** — local setup, single-file rule + three-test
+  extraction criteria, test cadence, no-bare-except rule,
+  security-sensitive code surfaces.
+- **`V1_GATE.md`** — 14 hard gates + 8 soft gates for v1.0.0,
+  documents the maintainer-approval-required principle.
+- **`.github/ISSUE_TEMPLATE/bug.yml` + `feature.yml` + `config.yml`** —
+  bug template requires version / Python / OS / terminal / install
+  method up front; feature template asks for the bench workflow.
+  Security disclosures routed to email via `config.yml`.
+- **`docs/` tree + `mkdocs.yml`** — split the README's deep dive
+  into `install.md`, `getting-started.md`, `features.md`,
+  `keybindings.md`, `data-safety.md`, `agent-api.md`, `cli.md`,
+  `architecture.md`. README slimmed from 598 → 126 lines.
+- **CHANGELOG**: 12-month archive-rotation policy documented at
+  the top.
+- **Conda recipe**: clarified that the in-repo `meta.yaml` IS the
+  reference copy (not a stale mirror).
+- **RELEASE_CHECKLIST.md**: per-terminal video-archive convention
+  added for diff-on-regression workflows.
+
+### Repo metadata
+
+- Description: "Terminal-based plasmid map viewer, sequence editor,
+  and cloning/mutagenesis workbench in pure Python".
+- Added discovery topics: textual, primer3, golden-braid, moclo,
+  biopython, cloning, mutagenesis, restriction-enzymes. Removed
+  vague topics (next-generation-sequencing, research, science,
+  laboratory, sequence).
+
+### Hygiene
+
+- `.gitignore` explicit `.hypothesis/` + coverage artifacts.
+
 ---
 
 ## [0.9.2] — 2026-05-17

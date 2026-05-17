@@ -43,6 +43,33 @@ keystroke that arrived via `Alt+M` click-debug and either rebind to a
 non-conflicting key (precedent: 0.5.5.x → F1-F5) or document the
 limitation in `?` Help.
 
+### Per-release video archive (recommended)
+
+Recording the matrix run on each terminal makes it trivial to diff
+visual behaviour between releases — much faster than re-running the
+matrix from scratch on a regression hunt.
+
+Convention:
+
+1. For each terminal: record the whole walkthrough as a short screen
+   capture (`asciinema` for terminal-only, `obs` / `Cmd+Shift+5` /
+   Windows `Win+G` for one with mouse interactions). Aim for ~90
+   seconds; speed-run the matrix.
+2. Save to a private archive directory not committed to the repo
+   (e.g. `~/splicecraft-release-videos/<X.Y.Z>/<terminal>.mp4` or
+   `.cast`). Naming: `<X.Y.Z>__<terminal>__<host-os>.<ext>`.
+3. Keep at least the last 3 releases' archive. Bisect-on-regression:
+   diff `<old>__iterm2__macos.mp4` against `<new>__iterm2__macos.mp4`
+   side-by-side.
+4. Note in the release's CHANGELOG entry whether the videos surfaced
+   any new behaviour even if the matrix passed — a Ctrl/Shift/Alt
+   interception that *worked* but now opens a different modifier
+   path is a soft regression worth flagging.
+
+The archive is private because some plasmids in the test workflow
+are real lab molecules; the recording is purely a diff aid, not a
+publishable artefact.
+
 ## Chromosome-scale eyeball
 
 A 5 MB record is in `tests/test_smoke.py::TestLazyChunkRender` but only

@@ -1,0 +1,77 @@
+name: Feature request
+description: Suggest a new workflow, command, or quality-of-life improvement.
+title: "[feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        SpliceCraft is built for daily lab work. Feature requests that
+        come with a "here's the bench workflow this would unlock"
+        story land better than abstract polish.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The bench workflow today, and where it breaks down.
+      placeholder: |
+        "When I'm planning a 6-fragment Golden Gate assembly, I have
+        to manually check overhang compatibility for each pair. The
+        current Constructor lets me bind parts but doesn't surface
+        an at-a-glance compatibility matrix."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would the feature do?
+      description: Concrete behaviour — what does the user see, what do they press, what changes.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface?
+      multiple: true
+      options:
+        - "Map view (circular / linear)"
+        - "Sequence panel"
+        - "Feature sidebar"
+        - "Library panel"
+        - "Modal (Constructor / Domesticator / Mutagenize / Primer / ...)"
+        - "Agent API (HTTP endpoints)"
+        - "CLI (splicecraft / splicecraft-cli)"
+        - "File I/O (.gb / .gbk / .dna / .fasta / .zip)"
+        - "Backup / restore / autosave"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've tried
+      description: External tools, manual processes, scripts. Helps gauge how acute the gap is.
+    validations:
+      required: false
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope / non-goals
+      description: What's explicitly out of scope for this request? Helps keep the PR focused.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: prior-art
+    attributes:
+      label: Prior art
+      description: |
+        Does any other tool (the popular commercial plasmid editor, Benchling, ApE, A Plasmid Editor, SnapGene, Geneious) already do this? If yes, link or describe — concrete prior art shortens the design conversation.
+      options:
+        - label: I've checked existing issues and this isn't a duplicate
+          required: true

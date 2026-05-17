@@ -1,0 +1,58 @@
+{
+  "_schema_version": 1,
+  "_notes": [
+    "Per-operation perf budgets, used by tests/test_perf_regression.py.",
+    "Each entry pairs a description with a budget_ms ceiling.",
+    "The test takes BEST-OF-N (default 5) samples and asserts the best",
+    "sample beats the budget. Best-of-N is intentional: under parallel",
+    "test-suite load + GC noise, p50/p99 are unreliable, but 'is the",
+    "code CAPABLE of meeting the budget' is a real regression signal.",
+    "",
+    "Decrease (tighten) a budget when code legitimately gets faster.",
+    "Increase (loosen) ONLY with a written justification in the same PR",
+    "(e.g. 'BioPython 1.92 changed CompoundLocation evaluation cost').",
+    "",
+    "Baselines were measured 2026-05-17 on WSL2 Ubuntu 24.04 / Python 3.12",
+    "with the suite already warm. Ceilings carry 3-5x headroom over the",
+    "measured best-of-5 so machine-to-machine variance doesn't trip the",
+    "gate."
+  ],
+  "operations": {
+    "scan_restriction_sites_puc19": {
+      "description": "_scan_restriction_sites on a pUC19-size (2686 bp) random sequence",
+      "budget_ms": 30,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "scan_restriction_sites_10kb": {
+      "description": "_scan_restriction_sites on a 10 kb random sequence",
+      "budget_ms": 150,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "rc_10kb": {
+      "description": "_rc reverse-complement of a 10 kb sequence",
+      "budget_ms": 2,
+      "samples": 20,
+      "warmup_iterations": 3
+    },
+    "iupac_pattern_warm_200": {
+      "description": "_iupac_pattern lookup × 200 with a warm cache",
+      "budget_ms": 5,
+      "samples": 10,
+      "warmup_iterations": 3
+    },
+    "build_seq_text_puc19": {
+      "description": "_build_seq_text on pUC19-size (2686 bp) with 10 features, cold cache per call",
+      "budget_ms": 25,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "build_seq_text_20kb": {
+      "description": "_build_seq_text on 20 kb with 80 features, cold cache per call",
+      "budget_ms": 200,
+      "samples": 3,
+      "warmup_iterations": 1
+    }
+  }
+}

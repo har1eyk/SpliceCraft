@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability (private)
+    url: https://github.com/Binomica-Labs/SpliceCraft/blob/master/SECURITY.md
+    about: Email scocioba@gmail.com with [splicecraft-security] in the subject. Do not file a public issue.
+  - name: How-to / usage question
+    url: https://github.com/Binomica-Labs/SpliceCraft/blob/master/README.md
+    about: The README + the in-app `?` help cover most workflows. If those don't, open a feature request describing the missing affordance.

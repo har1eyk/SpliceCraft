@@ -6,6 +6,18 @@ __pycache__/
 # pytest
 .pytest_cache/
 
+# Hypothesis writes its own .hypothesis/.gitignore on first run, but
+# that's regenerated only when the directory is missing — so a stale
+# checkout that pre-dates the auto-ignore could still see contents
+# show up under `git status`. Belt + suspenders.
+.hypothesis/
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # Build artifacts
 dist/
 build/

@@ -1,0 +1,121 @@
+# Agent API
+
+`splicecraft --agent` (alias `--agent-api`) exposes a localhost JSON
+HTTP API with bearer-token auth, covering every GUI action external
+AI agents need.
+
+## Why it exists
+
+Local AI coding agents (Claude Code, Cursor, aider, hand-rolled
+scripts) work best when they can *do* things in the user's existing
+environment, not just generate text. SpliceCraft's agent API lets an
+agent drive the running GUI session through the side-door without
+leaving its terminal.
+
+## Quick start
+
+```bash
+splicecraft --agent                  # default port 6701
+splicecraft --agent --agent-port 6800  # alternative port
+```
+
+The server writes a token file at
+`<DATA_DIR>/agent_token` containing the port + bearer token on the
+first two lines. Hand the token to any client that needs to call the
+API; the [CLI sidecar](cli.md) reads this file automatically.
+
+```bash
+# manual cURL
+TOKEN=$(tail -1 ~/.local/share/splicecraft/agent_token)
+PORT=$(head -1 ~/.local/share/splicecraft/agent_token)
+curl -s -H "Authorization: Bearer $TOKEN" \
+     -X POST -H "Content-Type: application/json" \
+     -d '{"accession":"L09137"}' \
+     http://127.0.0.1:$PORT/fetch
+```
+
+## Endpoint inventory
+
+60+ endpoints across:
+
+- **Records** — get / set sequence, add / update / delete features,
+  list features, find ORFs, transfer annotations.
+- **Files** — load (chromosome-scale safe via the path-based
+  loader), export GenBank / GFF3 / FASTA (symlink-guarded), bulk
+  import a folder.
+- **Library + collections** — list, search across collections,
+  delete entries, create / rename / delete collections, set the
+  active collection, list / set plasmid statuses.
+- **Parts** — list-parts, get-part, delete-part, classify-part
+  (overhang-pair lookup against every grammar).
+- **Design** — gibson-assemble, simulate-gibson, design-mutagenesis,
+  design-gb-part (Golden Braid / MoClo), design-primers (generic
+  Primer3 detection or restriction cloning).
+- **Simulate** — simulate-pcr (exact-match in-silico amplification,
+  wrap-aware on circular templates) and simulate-gel (per-lane band
+  positions + optional rendered ASCII gel image; ladder / plasmid /
+  digest / PCR-amplicon sources).
+- **Alignment** — diff-plasmid (circular rotation auto-detected),
+  list-plasmidsaurus-members, align-plasmidsaurus-zip.
+- **History** — get-history returns the parsed `<HistoryTree>`
+  lineage as nested JSON.
+- **Codon tables** — list, add (Kazusa fetch or raw dict), delete.
+- **Search** — blast, hmmscan.
+- **Data safety** — list-backups, restore-backup,
+  list-pre-update-snapshots, restore-pre-update-snapshot.
+- **Settings** — get-settings, set-setting (allowlisted toggles).
+- **Utility** — check-primer-duplicates, capture-snapshot,
+  entry-vector CRUD.
+
+Call `/tools` for the live discovery endpoint that emits the current
+inventory with one-line docs per endpoint.
+
+## Security posture
+
+- **Bearer-token auth** on every write endpoint; reads are
+  unauthenticated to keep scripted introspection ergonomic.
+- **Localhost only** (`127.0.0.1`) — single-tenant by design. Do not
+  expose on a LAN.
+- **Inputs are length-, range-, and shape-validated at the boundary.**
+- **Symlink refusal**: write paths go through
+  `_check_agent_write_path` which walks the full ancestor chain via
+  `resolve()` divergence + per-segment `is_symlink()`. Pre-fix this
+  only checked the immediate parent — see `CLAUDE.md` invariant #41
+  for the regression.
+- **Read-dir traversal** uses `lstat` + `S_ISDIR` to refuse
+  directory-symlink escapes.
+- **Per-handler size caps** — `_h_load_file` 50 MB
+  (`force=true` override), agent paths capped via
+  `_safe_file_size_check`, manifest reads capped at
+  `_PRE_UPDATE_MANIFEST_MAX_BYTES`.
+
+## Cross-collection lookups
+
+The `transfer-annotations` and `diff-plasmid` endpoints look up
+plasmids in the **active library only** (via `_load_library()`), not
+across collections. To target a plasmid in another collection: call
+`search-library` to locate it, then `set-active-collection`, then the
+endpoint you actually want. Documented in each handler's docstring;
+see [`CLAUDE.md`](
+https://github.com/Binomica-Labs/SpliceCraft/blob/master/CLAUDE.md)
+invariant #30.
+
+## Concurrency
+
+- Heavy ops (BLAST build, BLAST search, HMMscan, alignment) run in
+  `@work(thread=True)` workers; the API returns immediately with a
+  status the client can poll, OR blocks the request until the worker
+  completes — endpoint-specific.
+- The agent server uses `_agent_save_or_500(save_fn, label)` for
+  every `_save_*` call so an OSError / RuntimeError becomes a 500 +
+  in-app notify, not a silent in-memory / disk desync.
+
+## Discovery + introspection
+
+```bash
+splicecraft-cli tools             # list every endpoint + one-line doc
+splicecraft-cli status            # current record snapshot
+splicecraft-cli features          # features on the loaded record
+```
+
+See the [CLI sidecar](cli.md) for the full convenience wrapper.

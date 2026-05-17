@@ -1,0 +1,65 @@
+site_name: SpliceCraft
+site_description: Terminal-based plasmid map viewer, sequence editor, and cloning/mutagenesis workbench in pure Python.
+site_url: https://binomica-labs.github.io/SpliceCraft/
+repo_url: https://github.com/Binomica-Labs/SpliceCraft
+repo_name: Binomica-Labs/SpliceCraft
+edit_uri: edit/master/docs/
+
+# Material theme is the most-deployed mkdocs theme and ships every
+# component a project this scope needs out of the box (navigation
+# tree, search, copy-code button, tabbed code blocks). Pin to a
+# major version so a breaking release doesn't break the doc build.
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  font: false   # don't pull in Google Fonts — privacy + offline
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Getting started: getting-started.md
+  - Features:
+    - Overview: features.md
+    - Keybindings + menus: keybindings.md
+  - Data safety + backups: data-safety.md
+  - Agent + scripting:
+    - Agent API: agent-api.md
+    - CLI sidecar: cli.md
+  - Architecture: architecture.md
+  - Project:
+    - Contributing: ../CONTRIBUTING.md
+    - Security policy: ../SECURITY.md
+    - v1.0.0 acceptance gate: ../V1_GATE.md
+    - Changelog: ../CHANGELOG.md
