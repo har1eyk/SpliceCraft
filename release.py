@@ -141,32 +141,150 @@ def _ensure_tag_unused(version: str) -> None:
         _die(f"tag v{version} already exists.")
 
 
-def _ensure_changelog_entry(version: str) -> None:
-    """Refuse to proceed if `CHANGELOG.md` doesn't carry a heading for
-    the new version.
+def _previous_release_ref() -> str | None:
+    """Return the most recent SpliceCraft release tag (``vX.Y.Z``) for
+    bounding ``git log`` when drafting a changelog section. Falls back
+    to ``None`` if no such tag exists (first-ever release on a fresh
+    clone), in which case the caller emits a placeholder rather than
+    dumping the whole history.
+    """
+    result = subprocess.run(
+        ["git", "tag", "--list", "v*", "--sort=-v:refname"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        tag = line.strip()
+        if tag:
+            return tag
+    return None
 
-    The What's New modal in-app reads `CHANGELOG.md` to render the per-
-    release brief; without an entry, users upgrading to this version
-    open the modal and see stale older releases at the top. We caught
-    this 2026-05-12 only after five sequential releases (0.7.11.0
-    through 0.7.14.0) shipped without entries — this gate prevents the
-    same lapse going forward.
+
+def _commits_since(ref: "str | None") -> list[str]:
+    """Return the subject line of every non-merge commit since *ref*
+    (or every commit on the branch if *ref* is None / unknown).
+    Strips out the bookkeeping commits ("Release v…", standalone
+    "Changelog: …") that would clutter a user-facing summary.
+    """
+    if ref is None:
+        rng = ["HEAD"]
+    else:
+        rng = [f"{ref}..HEAD"]
+    result = subprocess.run(
+        ["git", "log", "--no-merges", "--pretty=format:%s", *rng],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return []
+    out: list[str] = []
+    for ln in result.stdout.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low.startswith("release v"):
+            continue
+        if low.startswith("changelog:"):
+            continue
+        out.append(s)
+    return out
+
+
+def _draft_changelog_section(version: str) -> str:
+    """Build a fresh ``## [<version>]`` section from the commits landed
+    since the previous release tag. Used by `_ensure_changelog_entry`
+    when no entry has been hand-written yet — guarantees the What's
+    New modal renders an up-to-date brief on every release, never a
+    stale one.
+
+    Commit subjects in this repo are descriptive enough to make a
+    reasonable user-facing summary; the maintainer is free to write a
+    richer entry by hand before running release.py and the auto-draft
+    will not overwrite it.
+    """
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    prev = _previous_release_ref()
+    commits = _commits_since(prev)
+    if commits:
+        bullets = "\n".join(f"* {c}" for c in commits)
+        provenance = (
+            f"_(auto-generated from commits since {prev})_"
+            if prev is not None else
+            "_(auto-generated changelog)_"
+        )
+        body = f"{provenance}\n\n{bullets}\n"
+    else:
+        # No commits since the last tag (e.g. a re-release of the same
+        # tree, or release.py is invoked twice). Still emit a heading
+        # so the modal has something to display rather than rendering
+        # the previous version as if it were current.
+        body = (
+            "_(auto-generated changelog — no notable commits found "
+            "since the previous release)_\n"
+        )
+    return (
+        f"## [{version}] — {today}\n\n"
+        f"{body}\n---\n\n"
+    )
+
+
+def _insert_changelog_section(section: str) -> None:
+    """Insert *section* at the top of ``CHANGELOG.md``, just below the
+    file's header + first ``---`` separator. Preserves all existing
+    entries verbatim. Caller has already confirmed the new version's
+    heading is absent.
+    """
+    text = CHANGELOG.read_text(encoding="utf-8")
+    # Canonical file shape:
+    #   # SpliceCraft Changelog
+    #   <blank>
+    #   ---
+    #   <blank>
+    #   ## [X.Y.Z] — …
+    # New sections insert between the leading `---` and the most
+    # recent `## [` heading. If the anchor is missing (mangled file),
+    # fall back to prepending immediately after the H1.
+    marker = "\n---\n\n"
+    idx = text.find(marker)
+    if idx == -1:
+        prefix, _, rest = text.partition("\n")
+        new_text = f"{prefix}\n\n{section}{rest}"
+    else:
+        split_at = idx + len(marker)
+        new_text = text[:split_at] + section + text[split_at:]
+    CHANGELOG.write_text(new_text, encoding="utf-8")
+
+
+def _ensure_changelog_entry(version: str) -> None:
+    """Make sure `CHANGELOG.md` carries a heading for the new version.
+    If the maintainer has hand-written one, leave it alone. Otherwise
+    auto-generate a section from `git log <previous tag>..HEAD` so the
+    in-app What's New modal renders the current release on every
+    install — no stale section, no missed update.
 
     Looks for an exact `## [<version>]` heading (matches the format
     used everywhere else in the file). Missing CHANGELOG.md falls
     through with a friendlier message than ``FileNotFoundError``.
+
+    The auto-written CHANGELOG.md is added to the release commit
+    downstream (see `add_targets` in `main()`), so the file on disk
+    and the modal stay in lockstep.
     """
     if not CHANGELOG.is_file():
         _die(f"{CHANGELOG.name} not found at {CHANGELOG}. "
              "Add it before releasing.")
     text = CHANGELOG.read_text(encoding="utf-8")
     needle = f"## [{version}]"
-    if needle not in text:
-        _die(
-            f"{CHANGELOG.name} has no `{needle}` heading. The What's "
-            "New modal reads this file to render the per-release brief; "
-            "add a section for the new version before releasing."
-        )
+    if needle in text:
+        return
+    section = _draft_changelog_section(version)
+    _insert_changelog_section(section)
+    print(
+        f"  ↳ auto-generated `{needle}` section in {CHANGELOG.name} "
+        "(no hand-written entry was present)"
+    )
 
 
 def _bump_version_in_file(path: Path, pattern: re.Pattern[str],
@@ -621,7 +739,14 @@ def main(argv: list[str] | None = None) -> int:
     _sync_conda_recipe(new_version)
 
     _heading("Committing + tagging + pushing")
-    add_targets = ["pyproject.toml", "splicecraft.py"]
+    # CHANGELOG.md is always added — `_ensure_changelog_entry` either
+    # confirmed a hand-written entry was already in the tree (a no-op
+    # `git add` then) or auto-wrote a fresh section that needs to land
+    # in the same release commit as the version bump. Without picking
+    # it up here, the auto-generated entry would sit dirty in the
+    # working tree and the next `_ensure_clean_tree` call would
+    # refuse the following release.
+    add_targets = ["pyproject.toml", "splicecraft.py", "CHANGELOG.md"]
     if CONDA_RECIPE.is_file():
         add_targets.append(str(CONDA_RECIPE.relative_to(REPO_ROOT)))
     _run(["git", "add", *add_targets])

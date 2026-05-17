@@ -10940,6 +10940,48 @@ class TestUpdateVersionPin:
         out = capsys.readouterr().out
         assert "Nothing to do" in out
 
+    def test_post_exit_dispatch_runs_update(self, monkeypatch,
+                                              capsys):
+        """`_launch_update_after_exit` on the app instance must cause
+        `main()` to dispatch to `_run_update_subcommand([])` after the
+        TUI tears down. Regression guard for the launch-modal Yes
+        path."""
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "--no-splash"])
+        # pytest-xdist workers don't carry a real TTY; without a stub
+        # `main()` aborts at the 100x30 terminal-size gate before
+        # reaching `app.run()`. Pass a generous size so we land in the
+        # actual dispatch path. argparse pulls width from the same
+        # function via `.columns`, so the stub returns a real
+        # `os.terminal_size` namedtuple — not a bare tuple.
+        import shutil as _sh, os as _os
+        _fake_size = _os.terminal_size((200, 60))
+        monkeypatch.setattr(_sh, "get_terminal_size",
+                              lambda fallback=(0, 0): _fake_size)
+        called: dict = {}
+
+        def _fake_run(self_app, *a, **k):
+            # Simulate the user clicking Yes on the launch modal.
+            self_app._launch_update_after_exit = True
+
+        def _fake_update(argv):
+            called["argv"] = list(argv)
+            return 0
+
+        monkeypatch.setattr(sc.PlasmidApp, "run", _fake_run)
+        monkeypatch.setattr(sc, "_run_update_subcommand", _fake_update)
+        # Stub heavy initialisation so we reach app.run() cleanly.
+        monkeypatch.setattr(sc, "_acquire_data_dir_lock",
+                              lambda: (None, None))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 0
+        assert called.get("argv") == [], (
+            "post-exit dispatch must call _run_update_subcommand([]) "
+            "verbatim — the install path mirrors a hand-typed "
+            "`splicecraft update`"
+        )
+
     def test_update_pin_snapshot_still_taken(self, monkeypatch,
                                                capsys):
         # SACRED INVARIANT: pre-update snapshot runs BEFORE the install
@@ -10972,3 +11014,225 @@ class TestUpdateVersionPin:
         assert len(snapshot_calls) == 1, (
             "pre-update snapshot must be taken before the pinned install"
         )
+
+
+class TestUpdateAvailableModal:
+    """Launch-time update prompt: `UpdateAvailableModal` plus the
+    `_notify_update_available` controller. Attack-surface hardening
+    (2026-05-17): every input that lands in the modal is validated +
+    Rich-markup-escaped + length-capped; the modal cannot fire in
+    agent-API mode, cannot fire twice in a session, and cannot be
+    injected by a hostile cache value."""
+
+    def test_modal_constructable(self):
+        # Boundary test covers fit; just confirm no constructor crashes.
+        m = sc.UpdateAvailableModal("0.9.1", "0.9.0")
+        assert m.latest_raw == "0.9.1"
+        assert m.current_raw == "0.9.0"
+
+    def test_modal_truncates_huge_input(self):
+        m = sc.UpdateAvailableModal("0.9.1" + "x" * 1000,
+                                      "0.9.0" + "y" * 1000)
+        assert len(m.latest_raw) <= 64
+        assert len(m.current_raw) <= 64
+
+    def test_modal_blocks_undo(self):
+        # `_blocks_undo = True` keeps app-level Ctrl+Z from firing on
+        # the canvas underneath the modal (CLAUDE.md sweep #2-6).
+        assert sc.UpdateAvailableModal._blocks_undo is True
+
+    def test_modal_handles_none_strings(self):
+        # Defensive: None or empty must not crash the constructor.
+        m = sc.UpdateAvailableModal("", "")
+        assert m.latest_raw == ""
+        assert m.current_raw == ""
+
+    def test_validator_rejects_hostile_version_strings(self):
+        # Defence-in-depth for the modal — `_validate_pin_version` runs
+        # on both worker-side and call-site. Hostile cache values
+        # (markup injection, command substitution) get rejected before
+        # the prompt is shown.
+        for hostile in [
+            "0.9.1[red]EVIL[/red]",
+            "0.9.1; rm -rf /",
+            "$(echo pwned)",
+            "../../etc/passwd",
+            "0.9.1\nrm -rf",
+        ]:
+            assert sc._validate_pin_version(hostile) is None, hostile
+
+    def test_notify_suppressed_in_agent_mode(self, monkeypatch):
+        # In agent-API mode there's no interactive human; the modal
+        # must NOT fire (the side-door is for automated callers).
+        events: list = []
+        monkeypatch.setattr(sc, "_log_event",
+                              lambda e, **k: events.append((e, k)))
+
+        class _StubApp:
+            _agent_api_port = 6701
+            _update_modal_shown = False
+            _skip_launch_update_modal = False
+            screen_stack = ["base"]
+            def notify(self, *a, **k): pass
+            def push_screen(self, *a, **k):
+                raise AssertionError("modal must not be pushed in "
+                                       "agent-API mode")
+            _show_update_toast = sc.PlasmidApp._show_update_toast
+            screen = None  # accessed by splash isinstance check
+
+        sc.PlasmidApp._notify_update_available(_StubApp(),  # type: ignore[arg-type]
+                                                  "0.9.1")
+        # Suppressed-event with agent_mode reason must be present.
+        suppressed = [e for e, k in events
+                      if e == "update.notify.suppressed"
+                      and k.get("reason") == "agent_mode"]
+        assert suppressed, (
+            "expected update.notify.suppressed{reason=agent_mode} "
+            f"event; got {events}"
+        )
+
+    def test_notify_suppressed_when_modal_busy(self, monkeypatch):
+        events: list = []
+        monkeypatch.setattr(sc, "_log_event",
+                              lambda e, **k: events.append((e, k)))
+
+        class _StubApp:
+            _agent_api_port = None
+            _update_modal_shown = False
+            _skip_launch_update_modal = False
+            # Stack length > 1 means a modal is on top of the base
+            # screen — we defer the update prompt to next launch.
+            screen_stack = ["base", "modal-on-top"]
+            screen = None
+            def notify(self, *a, **k): pass
+            def push_screen(self, *a, **k):
+                raise AssertionError("modal must not stack on top of "
+                                       "an existing modal")
+            _show_update_toast = sc.PlasmidApp._show_update_toast
+
+        sc.PlasmidApp._notify_update_available(_StubApp(),  # type: ignore[arg-type]
+                                                  "0.9.1")
+        suppressed = [e for e, k in events
+                      if e == "update.notify.suppressed"
+                      and k.get("reason") == "modal_busy"]
+        assert suppressed, (
+            f"expected modal_busy suppression event; got {events}"
+        )
+
+    def test_notify_rejects_invalid_latest(self, monkeypatch):
+        events: list = []
+        monkeypatch.setattr(sc, "_log_event",
+                              lambda e, **k: events.append((e, k)))
+
+        class _StubApp:
+            _agent_api_port = None
+            _update_modal_shown = False
+            _skip_launch_update_modal = False
+            screen_stack = ["base"]
+            screen = None
+            def notify(self, *a, **k): pass
+            def push_screen(self, *a, **k):
+                raise AssertionError("modal must not fire on invalid "
+                                       "version")
+            _show_update_toast = sc.PlasmidApp._show_update_toast
+
+        # A hostile latest must abort the notify path before any
+        # modal/toast renders.
+        sc.PlasmidApp._notify_update_available(_StubApp(),  # type: ignore[arg-type]
+                                                  "0.9.1[red]INJ[/red]")
+        rejected = [e for e, k in events
+                    if e == "update.notify.rejected_invalid_version"]
+        assert rejected, (
+            f"hostile version must hit rejected_invalid_version; got {events}"
+        )
+
+    def test_notify_only_once_per_session(self, monkeypatch):
+        events: list = []
+        monkeypatch.setattr(sc, "_log_event",
+                              lambda e, **k: events.append((e, k)))
+
+        class _StubApp:
+            _agent_api_port = None
+            _update_modal_shown = True   # already shown
+            _skip_launch_update_modal = False
+            screen_stack = ["base"]
+            screen = None
+            def notify(self, *a, **k): pass
+            def push_screen(self, *a, **k):
+                raise AssertionError("modal must not re-fire in same "
+                                       "session")
+            _show_update_toast = sc.PlasmidApp._show_update_toast
+
+        sc.PlasmidApp._notify_update_available(_StubApp(),  # type: ignore[arg-type]
+                                                  "0.9.1")
+        suppressed = [e for e, k in events
+                      if e == "update.notify.suppressed"
+                      and k.get("reason") == "already_shown_this_session"]
+        assert suppressed, (
+            f"expected already_shown_this_session suppression; got {events}"
+        )
+
+    def test_notify_deferred_when_splash_active(self, monkeypatch):
+        """The update prompt MUST stay silent while the splash is up.
+        Verifies the stash-and-replay path: `_pending_update_latest`
+        gets set, no toast, no modal."""
+        events: list = []
+        monkeypatch.setattr(sc, "_log_event",
+                              lambda e, **k: events.append((e, k)))
+
+        class _StubSplash(sc.SplashScreen):
+            pass
+
+        class _StubApp:
+            _agent_api_port = None
+            _update_modal_shown = False
+            _skip_launch_update_modal = False
+            _pending_update_latest = ""
+            screen_stack = ["base", "splash"]
+            def notify(self, *a, **k):
+                raise AssertionError("no toast during splash")
+            def push_screen(self, *a, **k):
+                raise AssertionError("no modal during splash")
+            _show_update_toast = sc.PlasmidApp._show_update_toast
+
+        stub = _StubApp()
+        stub.screen = _StubSplash.__new__(_StubSplash)  # type: ignore[attr-defined]
+        sc.PlasmidApp._notify_update_available(stub,  # type: ignore[arg-type]
+                                                  "0.9.1")
+        assert stub._pending_update_latest == "0.9.1"
+        deferred = [e for e, k in events
+                    if e == "update.notify.deferred"
+                    and k.get("reason") == "splash_active"]
+        assert deferred, (
+            f"expected splash-deferred event; got {events}"
+        )
+
+    def test_notify_test_flag_routes_to_toast(self, monkeypatch):
+        """`_skip_launch_update_modal=True` (the test default) routes
+        the notify to the toast fallback so pilots never race a modal
+        push. Production launch flips the flag False."""
+        events: list = []
+        monkeypatch.setattr(sc, "_log_event",
+                              lambda e, **k: events.append((e, k)))
+        toast_calls: list = []
+
+        class _StubApp:
+            _agent_api_port = None
+            _update_modal_shown = False
+            _skip_launch_update_modal = True
+            screen_stack = ["base"]
+            screen = None
+            def notify(self, *a, **k):
+                toast_calls.append((a, k))
+            def push_screen(self, *a, **k):
+                raise AssertionError("modal must not fire when "
+                                       "_skip_launch_update_modal is set")
+            _show_update_toast = sc.PlasmidApp._show_update_toast
+
+        sc.PlasmidApp._notify_update_available(_StubApp(),  # type: ignore[arg-type]
+                                                  "0.9.1")
+        assert len(toast_calls) == 1
+        suppressed = [e for e, k in events
+                      if e == "update.notify.suppressed"
+                      and k.get("reason") == "test_flag"]
+        assert suppressed

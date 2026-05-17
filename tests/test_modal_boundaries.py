@@ -152,6 +152,8 @@ _MODAL_CASES = [
                                                 ["a", "b", "c", "d", "e"])),
     ("LibraryDeleteConfirmModal",  lambda: sc.LibraryDeleteConfirmModal(
                                                "test", 3000, "abc123")),
+    ("UpdateAvailableModal",       lambda: sc.UpdateAvailableModal(
+                                               "0.9.1", "0.9.0")),
     ("PlasmidPickerModal",         lambda: sc.PlasmidPickerModal(None)),
     ("PlasmidFeaturePickerModal",  lambda: sc.PlasmidFeaturePickerModal(
                                                [{"name": "lacZ", "feature_type": "CDS",

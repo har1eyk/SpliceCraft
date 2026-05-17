@@ -62,6 +62,14 @@ constraints:
   - Roll back from a bad release with `splicecraft update --restore-pre-update latest` (or pick a specific snapshot id from `--list-snapshots`).
   - Pin to a specific working version with `splicecraft update 0.8.10` — the recovery escape hatch when a fresh release ships broken code.
   - The pre-update snapshot is itself reversible (a pre-restore snapshot is taken before any restore), so even an accidental rollback can be undone.
+  - Launch-time update prompt: if the PyPI probe finds a newer
+    version, SpliceCraft surfaces an "Install now? Yes / No"
+    modal (default **No**) AFTER the splash screen dismisses — never
+    during the splash, never in agent-API mode, never twice in the
+    same session. The Yes path exits the TUI cleanly and runs the
+    same `splicecraft update` flow (with the mandatory pre-update
+    snapshot) in the same terminal. Every step of the updater path
+    emits a structured `update.*` event for log-based diagnosis.
 - **Crash-recovery autosave.** Dirty edits debounce a 3-second write
   to a per-record `.gb` snapshot. Power-cut your laptop mid-edit; the
   next launch surfaces the survivors.

@@ -18711,7 +18711,13 @@ _RESTORE_LIST_SENTINEL = "\x00splicecraft-restore-list-only\x00"
 def _run_update_subcommand(argv: "list[str]") -> int:
     """Entry point for `splicecraft update`. Returns a shell exit
     code. Never raises — every failure path is converted to a printed
-    message + numeric exit code."""
+    message + numeric exit code.
+
+    Emits ``update.subcommand.*`` structured events at every decision
+    point so a malfunctioning updater can be diagnosed from a single
+    log paste (see invariant #42 in CLAUDE.md).
+    """
+    _log_event("update.subcommand.start", argv=list(argv))
     parser = _SubcommandParser(
         prog="splicecraft update",
         add_help=False,
@@ -18900,14 +18906,24 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         if not assume_yes and not _confirm_proceed("Proceed with restore? [y/N] "):
             print("Cancelled.", file=sys.stderr)
             return 130
+        _log_event("update.restore.start", snapshot_id=chosen.name)
         try:
             summary = _restore_pre_update_snapshot(
                 chosen, backup_dir=backup_dir
             )
         except (OSError, json.JSONDecodeError) as exc:
             _log.exception("restore-pre-update: failed")
+            _log_event("update.restore.failed", error=repr(exc),
+                       snapshot_id=chosen.name)
             print(f"Restore failed: {exc}", file=sys.stderr)
             return 1
+        _log_event(
+            "update.restore.ok",
+            snapshot_id=chosen.name,
+            n_files=len(summary["restored_files"]),
+            n_dirs=len(summary["restored_dirs"]),
+            n_failed=len(summary["failed"]),
+        )
         print(f"\nRestore complete.")
         print(f"  Pre-restore snapshot: {summary['pre_restore_snapshot']}")
         print(f"  Files restored:  {len(summary['restored_files'])}  "
@@ -19131,10 +19147,13 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     # data without a recoverable copy first. Tested by
     # `test_update_snapshot_taken_before_subprocess` in tests/test_smoke.py.
     print("Snapshotting user data before update…", flush=True)
+    _log_event("update.snapshot.start", from_version=__version__,
+               pin=pin_version or "")
     try:
         snap_path = _create_pre_update_snapshot(__version__)
     except (OSError, shutil.Error) as exc:
         _log.exception("pre-update snapshot failed")
+        _log_event("update.snapshot.failed", error=repr(exc))
         print(
             f"\nABORTING: could not snapshot user data before the upgrade.\n"
             f"  Reason: {exc}\n"
@@ -19145,6 +19164,7 @@ def _run_update_subcommand(argv: "list[str]") -> int:
             file=sys.stderr,
         )
         return 1
+    _log_event("update.snapshot.ok", path=str(snap_path))
     print(f"  ✓ Snapshot saved: {snap_path}")
 
     # `--dry-run` short-circuits HERE: we've gone all the way through
@@ -19164,9 +19184,12 @@ def _run_update_subcommand(argv: "list[str]") -> int:
     # Inherit stdout/stderr so the user sees pip/pipx progress live.
     # `check=False` because we report the return code ourselves; let
     # the user see whatever pip wrote on failure.
+    _log_event("update.install.start", method=method,
+               pin=pin_version or "", front_end=cmd[0])
     try:
         result = subprocess.run(cmd, check=False)
     except FileNotFoundError:
+        _log_event("update.install.front_end_missing", front_end=cmd[0])
         print(
             f"Command not found: {cmd[0]!r}.  "
             "Install the matching package manager and retry.\n"
@@ -19176,6 +19199,7 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         return 127
     except (OSError, subprocess.SubprocessError) as exc:
         _log.exception("splicecraft update: subprocess failed")
+        _log_event("update.install.subprocess_error", error=repr(exc))
         print(
             f"Update failed to launch: {exc}\n"
             f"(Pre-update snapshot is intact at {snap_path}.)",
@@ -19184,6 +19208,8 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         return 1
 
     rc = int(result.returncode or 0)
+    _log_event("update.install.end", returncode=rc, method=method,
+               pin=pin_version or "")
     if rc == 0:
         print("\nUpgrade complete.")
         # Best-effort: try to read the freshly installed version so the
@@ -48293,6 +48319,110 @@ _LARGE_LOAD_DISK_BYTES = 5 * 1024 * 1024     # 5 MB on disk
 _LARGE_LOAD_SEQ_BP     = 200_000              # 200 kb parsed
 
 
+class UpdateAvailableModal(ModalScreen):
+    """Launch-time prompt: "SpliceCraft vX.Y.Z is available. Install
+    now?" Default focus = No so a stray Enter / Esc dismisses safely.
+    Yes path signals the controller to exit the TUI cleanly so
+    `_run_update_subcommand` can run in the same terminal at the next
+    tick.
+
+    Attack-surface hardening (2026-05-17):
+      * The displayed `latest` is re-validated against
+        `_PINNED_VERSION_RE` (the same regex used for the install
+        subcommand). A hostile PyPI metadata server / hand-edited
+        `last_known_latest` cache cannot inject Rich markup or shell
+        metacharacters through the modal copy.
+      * Both versions are length-capped at 64 chars before display.
+      * `rich.markup.escape` runs on the strings even after the regex
+        check (defence-in-depth: belt and suspenders for any future
+        regex relaxation).
+      * `_blocks_undo = True` so app-level Ctrl+Z under the modal
+        doesn't fire on the canvas underneath.
+      * The modal never decides to install — it only returns a bool.
+        The caller is responsible for routing Yes through the same
+        `_run_update_subcommand` flow a hand-typed `splicecraft
+        update` would hit, including the sacred pre-update snapshot.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "No"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    UpdateAvailableModal { align: center middle; }
+    #upd-dlg {
+        width: 60; height: auto; max-height: 60%;
+        background: #1c1c1c; border: solid $accent; padding: 1 2;
+    }
+    #upd-title { background: $accent-darken-2; color: $text;
+                  padding: 0 1; margin-bottom: 1; }
+    #upd-msg   { margin-bottom: 1; }
+    #upd-btns  { height: 3; margin-top: 1; }
+    #upd-btns Button { margin-right: 1; min-width: 18; }
+    """
+
+    def __init__(self, latest: str, current: str) -> None:
+        super().__init__()
+        # Defensive copy + cap so a caller passing a giant blob can't
+        # land in the modal compose pass. The version validator below
+        # may still reject the value; that's surfaced as "unknown".
+        self.latest_raw = (latest or "")[:64].strip()
+        self.current_raw = (current or "")[:64].strip()
+
+    def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
+        # Defence-in-depth: re-validate the version string here, not
+        # just at the call site. If `_validate_pin_version` exists in
+        # this module use it; otherwise apply the canonical regex.
+        try:
+            validator = _validate_pin_version
+        except NameError:
+            validator = None
+        latest_safe = (validator(self.latest_raw) if validator
+                        else None) or "(unknown)"
+        current_safe = (validator(self.current_raw) if validator
+                         else None) or self.current_raw or "(unknown)"
+        with Vertical(id="upd-dlg"):
+            yield Static(" Update available ", id="upd-title")
+            yield Static(
+                f"  SpliceCraft [bold]v{_esc(latest_safe)}[/] is "
+                "available on PyPI.\n"
+                f"  You're on [dim]v{_esc(current_safe)}[/].\n\n"
+                "  Install now? The TUI will exit and the upgrade\n"
+                "  will run in this terminal. Your library /\n"
+                "  collections / parts are snapshotted before the\n"
+                "  install runs, so the upgrade is reversible.",
+                id="upd-msg", markup=True,
+            )
+            with Horizontal(id="upd-btns"):
+                yield Button("No (default)", id="btn-upd-no",
+                              variant="default")
+                yield Button("Yes, install", id="btn-upd-yes",
+                              variant="success")
+
+    def on_mount(self) -> None:
+        # Default focus on No — a stray Enter / Esc bails out without
+        # committing to an install + restart cycle.
+        self.query_one("#btn-upd-no", Button).focus()
+
+    @on(Button.Pressed, "#btn-upd-no")
+    def _no(self, _) -> None:
+        _log_event("update.modal.dismissed", choice="no")
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-upd-yes")
+    def _yes(self, _) -> None:
+        _log_event("update.modal.dismissed", choice="yes")
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        _log_event("update.modal.dismissed", choice="escape")
+        self.dismiss(False)
+
+
 class CollectionDeleteConfirmModal(ModalScreen):
     """Confirm-on-delete modal for collections — different copy from
     LibraryDeleteConfirmModal (which talks about library entries).
@@ -53320,6 +53450,27 @@ class PlasmidApp(App):
     # Hydrated from the persisted `check_updates` setting in compose();
     # the in-memory mirror is read by the worker and the menu toggle.
     _check_updates: bool          = True
+    # Single-shot guard for `UpdateAvailableModal` — flipped True the
+    # first time the modal is pushed in a session so a re-fire of the
+    # background worker can't queue a second prompt. Reset to False at
+    # session start (class default).
+    _update_modal_shown: bool     = False
+    # Signal from `UpdateAvailableModal` Yes-path back to `main()`.
+    # When True, `main()` re-enters `_run_update_subcommand([])` after
+    # the TUI exits so the install runs in the same terminal at the
+    # same prompt the user already had open.
+    _launch_update_after_exit: bool = False
+    # Test flag: suppress the launch-time update modal during async
+    # pilot tests. Matches the established pattern of `_skip_seed` /
+    # `_skip_snapshot` / `_skip_primer_dedupe_check`. `main()` flips
+    # this False for production.
+    _skip_launch_update_modal: bool = True
+    # Stash for an `update.available` event that lands while the
+    # splash is still up. `_notify_update_available` writes the
+    # validated version string here and returns; `_on_splash_dismissed`
+    # picks it up after the user acknowledges the splash (and after
+    # any What's New modal) so the prompt never overlays the helix.
+    _pending_update_latest: str    = ""
 
     CSS = """
 Screen { background: $background; }
@@ -55481,8 +55632,13 @@ SpeciesPickerModal { align: center middle; }
 
         Errors are logged at DEBUG only; the user never sees a
         crash from this path. Best-effort by design.
+
+        Structured events emitted (`update.probe.*`) feed bug-report
+        parsing — every probe outcome lands in the rotating log so a
+        misbehaving updater can be diagnosed from a single log paste.
         """
         try:
+            _log_event("update.probe.started", current=__version__)
             now = _time.time()
             try:
                 last_check = float(_get_setting("last_update_check_ts", 0)
@@ -55501,40 +55657,171 @@ SpeciesPickerModal { align: center middle; }
             # PyPI recently. Still fall through to the comparator
             # below using the cached value.
             latest = cached_str
+            fetched_from_network = False
             if (not cached_str
                     or (now - last_check) > _UPDATE_CHECK_INTERVAL_S):
                 fetched = _fetch_latest_pypi_version()
                 if fetched is not None:
                     latest = fetched
+                    fetched_from_network = True
                     try:
                         _set_setting("last_known_latest", latest)
                         _set_setting("last_update_check_ts", now)
                     except OSError as exc:
                         _log.debug("update-check cache write failed: %s",
                                     exc)
+                else:
+                    _log_event("update.probe.failed",
+                               reason="pypi_fetch_returned_none")
             if not latest:
+                _log_event("update.probe.no_data")
+                return
+            # Defence-in-depth: a hostile cache / mid-flight settings
+            # corruption could push a bogus string here. Re-validate
+            # before flagging an update — the validator rejects anything
+            # that isn't a recognisable PyPI version.
+            if _validate_pin_version(latest) is None:
+                _log_event("update.probe.rejected_version_string",
+                           length=len(latest))
                 return
             if _is_newer_pypi_version(latest, __version__):
+                _log_event("update.available", latest=latest,
+                           current=__version__,
+                           source="network" if fetched_from_network
+                                                else "cache")
                 self.call_from_thread(self._notify_update_available,
                                        latest)
+            else:
+                _log_event("update.probe.up_to_date",
+                           latest=latest, current=__version__)
         except Exception:
             # Best-effort: any unexpected failure is logged but
             # never bubbles to the user. The check fires on every
             # launch and a crash here would create a startup
             # regression with no recovery path.
             _log.exception("Update check worker hit unexpected error")
+            _log_event("update.probe.exception")
 
     def _notify_update_available(self, latest: str) -> None:
-        """Show a non-modal toast that a newer SpliceCraft is on
+        """Surface an update prompt when a newer SpliceCraft is on
         PyPI. Called from the update-check worker via
-        `call_from_thread`. The toast auto-dismisses; users who
-        want to silence it can flip the `Settings → Check for
-        updates on launch` toggle off.
+        `call_from_thread`.
+
+        Behaviour layers:
+          * Interactive session, first time this launch → push
+            `UpdateAvailableModal`. Yes flips
+            `_launch_update_after_exit` and exits the TUI so
+            `main()` re-enters `_run_update_subcommand`.
+          * Already shown this session → no-op (don't pester).
+          * Agent-API mode (no interactive human) → fall back to
+            the auto-dismissing toast so the running agent's
+            terminal log still records the available update.
+          * A modal is already on the stack (e.g. crash recovery,
+            startup wizard) → fall back to the toast and defer the
+            prompt until next launch.
+
+        Users who don't want any update prompts can disable the
+        `Settings → Check for updates on launch` toggle.
         """
+        # Validate one more time at the call site so an attacker who
+        # bypasses the worker (e.g. a future agent endpoint that
+        # forwards the latest string) still hits a validator before
+        # the modal renders.
+        safe_latest = _validate_pin_version(latest) if isinstance(latest, str) else None
+        if not safe_latest:
+            _log_event("update.notify.rejected_invalid_version")
+            return
+
+        # While the splash is up the user is in the loading-narrative
+        # frame of mind — popping a prompt or even a toast on top of
+        # the helix breaks that. Stash the latest version and let
+        # `_on_splash_dismissed` replay it after the user acknowledges
+        # the splash. Mirrors the same queue/replay pattern that
+        # `notify()` uses for toasts.
+        try:
+            splash_active = isinstance(self.screen, SplashScreen)
+        except Exception:
+            splash_active = False
+        if splash_active:
+            _log_event("update.notify.deferred", reason="splash_active")
+            self._pending_update_latest = safe_latest
+            return
+
+        # Avoid pestering: once per session is enough. The user can
+        # always pick a future launch to act on it.
+        if getattr(self, "_update_modal_shown", False):
+            _log_event("update.notify.suppressed",
+                       reason="already_shown_this_session")
+            return
+
+        agent_mode = bool(getattr(self, "_agent_api_port", None))
+        # If another screen is already on the stack we don't want to
+        # interrupt — push the toast instead and try again next launch.
+        # `len(screen_stack) > 1` means a modal is up; we always have at
+        # least the base screen on the stack.
+        modal_busy = False
+        try:
+            modal_busy = len(self.screen_stack) > 1
+        except Exception:
+            modal_busy = False
+        # Test gate — `main()` flips this False at production launch.
+        # When True, tests that DO exercise the worker still see the
+        # toast fallback rather than a modal push that would race
+        # `async with app.run_test` pilots.
+        skip_modal = bool(getattr(self, "_skip_launch_update_modal", False))
+
+        if agent_mode or modal_busy or skip_modal:
+            _log_event(
+                "update.notify.suppressed",
+                reason=("agent_mode" if agent_mode else
+                        "modal_busy" if modal_busy else
+                        "test_flag"),
+            )
+            self._show_update_toast(safe_latest)
+            return
+
+        # Mark before push so a worker re-fire during the same
+        # session can't queue a second modal.
+        self._update_modal_shown = True
+
+        def _on_dismissed(answer: "bool | None") -> None:
+            # Modal can dismiss with None on screen-cap overflow; treat
+            # as a No.
+            if not answer:
+                _log_event("update.modal.closed", outcome="no")
+                return
+            _log_event("update.modal.closed", outcome="yes",
+                       latest=safe_latest, current=__version__)
+            # Hand off to the post-exit dispatch in main(). Doing the
+            # actual install from inside the TUI would race the
+            # subprocess with the running process holding the venv.
+            self._launch_update_after_exit = True
+            try:
+                self.exit()
+            except Exception:
+                # Worst case the user can quit manually; the flag is
+                # already set so main() will pick it up regardless.
+                _log.exception("Failed to exit TUI for update launch")
+
+        try:
+            _log_event("update.modal.shown", latest=safe_latest,
+                       current=__version__)
+            self.push_screen(UpdateAvailableModal(safe_latest,
+                                                    __version__),
+                              callback=_on_dismissed)
+        except Exception:
+            _log.exception("Could not push UpdateAvailableModal; "
+                            "falling back to toast")
+            self._update_modal_shown = False  # let next launch retry
+            self._show_update_toast(safe_latest)
+
+    def _show_update_toast(self, latest: str) -> None:
+        """Auto-dismissing toast used when the modal path isn't
+        appropriate (agent-API mode, modal-busy state, push failure)."""
         self.notify(
             f"SpliceCraft v{latest} is available "
             f"(you're on v{__version__}).  "
-            f"Upgrade with:  pipx upgrade splicecraft",
+            f"Upgrade with:  splicecraft update",
             title="Update available",
             severity="information",
             timeout=10,
@@ -56348,10 +56635,31 @@ SpeciesPickerModal { align: center middle; }
             seen = str(_get_setting("last_seen_version", "") or "")
         except Exception:
             seen = ""
+        # Take ownership of the pending update (if any) right here so a
+        # race between the worker completing and the splash dismissal
+        # can't double-fire. Cleared before we hand it off so a second
+        # dismissal cycle (shouldn't happen but defensive) starts
+        # clean.
+        pending_update = getattr(self, "_pending_update_latest", "") or ""
+        self._pending_update_latest = ""
+
+        def _fire_pending_update() -> None:
+            if pending_update:
+                _log_event("update.notify.replay_after_splash",
+                           latest=pending_update)
+                self._notify_update_available(pending_update)
+
         if seen != __version__:
             def _on_seen(_dismiss_result) -> None:
                 _set_setting("last_seen_version", __version__)
+                # Chain: WhatsNew finishes, THEN the update prompt fires
+                # (otherwise the two modals would stack on top of each
+                # other and the user would see the prompt before they
+                # could read the per-release brief).
+                _fire_pending_update()
             self.push_screen(WhatsNewModal(__version__), _on_seen)
+        else:
+            _fire_pending_update()
 
     def _check_primer_duplicates(self) -> None:
         """Scan `primers.json` for duplicate-sequence entries AND for
@@ -60880,6 +61188,11 @@ def main():
     # duplicate scan. Tests leave this True (class default) so
     # `PrimerDuplicatesModal` doesn't pop during async pilots.
     app._skip_primer_dedupe_check = False
+    # Production launch also opts in to the launch-time update prompt
+    # modal. Tests leave this True so the modal never races async
+    # pilots; `_check_for_updates_worker` falls back to the historical
+    # auto-dismissing toast when the modal is suppressed.
+    app._skip_launch_update_modal = False
     if enable_agent_api:
         app._agent_api_port = agent_port  # type: ignore[attr-defined]
 
@@ -60988,6 +61301,24 @@ def main():
         # under most Python builds, but explicit shutdown is cheap
         # insurance against truncated logs on hard exits.
         logging.shutdown()
+
+    # Post-exit dispatch for the launch-time update prompt. The Yes
+    # path of `UpdateAvailableModal` set `_launch_update_after_exit`
+    # and called `app.exit()`; now that the TUI has fully torn down,
+    # hand control to `_run_update_subcommand` so the install runs in
+    # the same terminal where the user already typed `splicecraft`.
+    # Snapshot + confirm + manager-detection still happen inside the
+    # update subcommand — we never bypass the data-safety net.
+    if getattr(app, "_launch_update_after_exit", False):
+        _log_event("update.launch_dispatch.start")
+        try:
+            code = _run_update_subcommand([])
+        except Exception as exc:
+            _log_event("update.launch_dispatch.failed", error=repr(exc))
+            _log.exception("Post-exit update dispatch crashed")
+            sys.exit(1)
+        _log_event("update.launch_dispatch.end", exit_code=code)
+        sys.exit(code)
 
 
 if __name__ == "__main__":
