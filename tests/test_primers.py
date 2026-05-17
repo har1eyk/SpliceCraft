@@ -722,8 +722,9 @@ class TestWrapRegionUI:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Primer library — `.dna` imports show up + scroll-through behaviour.
 # Regression guards for 2026-05-10 user report: "make sure primers
-# added from snapgene collection import shows up in the primer library
-# section of the Primers tab, and that the primer library is scrollable"
+# added from commercial SaaS collection import shows up in the primer
+# library section of the Primers tab, and that the primer library is
+# scrollable"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 

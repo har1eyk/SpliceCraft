@@ -1895,10 +1895,11 @@ multi-step builds (matches the TraditionalCloningPane pattern).
 ## [0.7.10.1] — 2026-05-11 — `.dna` import recovers colours, primers, and feeds the primer library
 
 The 0.7.10.0 release shipped the `.dna` augmentation path that recovers
-per-feature colours and primer information BioPython's `snapgene` parser
-silently drops, but two follow-up issues surfaced once it landed in real
-use: bulk-folder imports never reached the primer library, and legacy
-duplicate sequences accumulated in `primers.json` without a cleanup path.
+per-feature colours and primer information BioPython's commercial-SaaS-
+format parser silently drops, but two follow-up issues surfaced once it
+landed in real use: bulk-folder imports never reached the primer library,
+and legacy duplicate sequences accumulated in `primers.json` without a
+cleanup path.
 
 ### Fixed: bulk-folder `.dna` imports now seed the primer library
 
@@ -2219,7 +2220,7 @@ not pytest targets — kept for future regression detection).
 > cross-package-manager `splicecraft update` subcommand, a diagnostic
 > bundle workflow for bug reports, and a 10-item robustness pass —
 > plus six future-proofing scaffolds for the upcoming 1.0 freeze.
-> NOT v1.0.0; the 1.0 tag remains gated on the SnapGene round-trip
+> NOT v1.0.0; the 1.0 tag remains gated on the commercial SaaS round-trip
 > work + explicit user sign-off.
 
 ### New: `splicecraft update` subcommand
@@ -2362,7 +2363,7 @@ not pytest targets — kept for future regression detection).
 
 > Pre-1.0 readiness sweep — bug fixes, cache discipline, worker
 > safety, doc refresh. NOT v1.0.0; the 1.0 tag is gated on the
-> SnapGene round-trip work landing in full and explicit user
+> commercial SaaS round-trip work landing in full and explicit user
 > sign-off, neither of which is in this sweep.
 
 ### Bug fixes
@@ -2923,7 +2924,7 @@ existing library + collections file keeps loading without migration.
 
 - v1.0.0.0 scope status: 6/6 v1.0 features done; the data-safety
   hardening backfills a "STABLE" requirement from before features.
-  SnapGene .dna round-trip remains the long-pole.
+  commercial SaaS .dna round-trip remains the long-pole.
 
 ---
 
@@ -2961,7 +2962,7 @@ existing library + collections file keeps loading without migration.
 
 ### Roadmap
 
-- v1.0.0.0 scope status: FASTA export ✓, GFF export ✓, diff view ✓, ORF finder ✓, annotation transfer ✓, cross-collection search ✓, SnapGene .dna round-trip (in flight), stability gate (next).
+- v1.0.0.0 scope status: FASTA export ✓, GFF export ✓, diff view ✓, ORF finder ✓, annotation transfer ✓, cross-collection search ✓, commercial SaaS .dna round-trip (in flight), stability gate (next).
 
 ---
 
@@ -2979,7 +2980,7 @@ existing library + collections file keeps loading without migration.
 
 ### Roadmap
 
-- v1.0.0.0 scope locked: FASTA export ✓, GFF export, diff view, ORF finder ✓, annotation transfer, cross-collection search ✓, SnapGene .dna round-trip (in flight), stability gate. No CLI — every new feature ships an agent-API endpoint instead.
+- v1.0.0.0 scope locked: FASTA export ✓, GFF export, diff view, ORF finder ✓, annotation transfer, cross-collection search ✓, commercial SaaS .dna round-trip (in flight), stability gate. No CLI — every new feature ships an agent-API endpoint instead.
 
 ---
 

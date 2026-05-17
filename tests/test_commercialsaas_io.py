@@ -1,3 +1,11 @@
+# pyright: reportArgumentType=false, reportCallIssue=false, reportAttributeAccessIssue=false, reportOptionalMemberAccess=false, reportPossiblyUnboundVariable=false
+#
+# Tests pass `None`-returning helpers through downstream calls
+# (`_parse_commercialsaas_history` returning None for malformed XML;
+# `_CommercialSaaSHistoryNode.walk` on optional nodes) to verify the
+# defensive paths. The project's `pyproject.toml` already excludes
+# `tests/**` from pyright; this file-scope pragma keeps the editor /
+# harness diagnostics aligned with that policy.
 """
 test_commercialsaas_io — low-level .dna packet I/O.
 
@@ -1810,8 +1818,8 @@ class TestRealCommercialSaaSFiles:
 # `.dna` import augmentation (regression guard for 2026-05-10 user report).
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# `_augment_dna_record_from_packets` recovers info BioPython's snapgene
-# parser drops:
+# `_augment_dna_record_from_packets` recovers info BioPython's
+# commercial-SaaS-format parser drops:
 #   1. per-feature colours from the 0x0A features packet — without
 #      this, every imported .dna feature gets a deterministic-but-
 #      unrelated colour from `_FEATURE_PALETTE` rotation.
@@ -1833,8 +1841,8 @@ def _fixture_available() -> bool:
 @pytest.mark.skipif(not _fixture_available(), reason="FFE fixture not present")
 class TestDnaImportAugmentation:
     """End-to-end via `load_genbank` against the real FFE_1 fixture.
-    Verifies the augmentation actually fires on the snapgene parse
-    path and stamps the qualifiers / primer entries we expect."""
+    Verifies the augmentation actually fires on the commercial SaaS
+    parse path and stamps the qualifiers / primer entries we expect."""
 
     def test_per_feature_colors_recovered(self):
         rec = sc.load_genbank(str(_FFE_FIXTURE))
@@ -2275,8 +2283,8 @@ class TestGH17LabelOverride:
     """Regression guard for GH #17 (Cory Tobin, 2026-05-13): feature
     names containing whitespace landed as `lac\\operator` instead of
     `lac operator` after .dna import. Root cause was BioPython's
-    SnapGeneIO parser mangling whitespace on some payloads; the fix in
-    v0.8.0 (`_augment_dna_record_from_packets`) re-pins
+    commercial SaaS format parser mangling whitespace on some payloads;
+    the fix in v0.8.0 (`_augment_dna_record_from_packets`) re-pins
     `qualifiers["label"]` to the verbatim `<Feature name=...>` XML
     attribute. This test simulates the mangle by handing the augment
     helper a SeqRecord whose label is already corrupted and asserts
