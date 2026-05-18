@@ -9064,7 +9064,7 @@ def _list_gbk_members_in_zip(zip_path: Path) -> "list[dict]":
             })
     finally:
         zf.close()
-    members.sort(key=lambda m: m["name"].lower())
+    members.sort(key=lambda m: _natural_sort_key(m["name"]))
     return members
 
 
@@ -13432,6 +13432,14 @@ class LibraryPanel(Widget):
         def _on_confirm(yes: "bool | None") -> None:
             if not yes:
                 return
+            # Capture the deleted row's index in the current sorted +
+            # filtered display BEFORE any mutation, so we can park the
+            # cursor on the row directly above it after repopulate.
+            # `LibraryDeleteConfirmModal` captures focus, so the user
+            # cannot move the cursor between modal-open and confirm —
+            # `cursor_row` is still on the row that prompted delete.
+            t_lib = self.query_one("#lib-table", DataTable)
+            deleted_row_idx = t_lib.cursor_row
             entries = [e for e in _load_library() if e.get("id") != entry_id]
             # Update the in-memory cache + invalidate dependent caches
             # synchronously so the panel repopulate below sees the
@@ -13509,6 +13517,29 @@ class LibraryPanel(Widget):
                     severity="warning",
                 )
             self._repopulate_plasmids()
+            # Park the cursor on the row directly above the one we
+            # just deleted. Rows above the deleted index keep their
+            # positions; rows below shift up by one. So `deleted - 1`
+            # in the new display is the same plasmid the user was
+            # looking at just above the deletion — the scroll
+            # neighbourhood stays put instead of snapping to row 0.
+            # Edge cases handled: deleted-row-was-top (clamp to 0,
+            # which is now the next-down plasmid), filter-empty /
+            # library-empty (row_count == 0, skip), deleted_row_idx
+            # is None (no row was selected — shouldn't happen because
+            # delete is gated on a cursor key, but defensively skip).
+            try:
+                row_count = t_lib.row_count
+            except Exception:
+                row_count = 0
+            if row_count > 0 and deleted_row_idx is not None:
+                target = max(0, min(deleted_row_idx - 1, row_count - 1))
+                try:
+                    t_lib.move_cursor(row=target)
+                except Exception:
+                    _log.exception(
+                        "Plasmid delete: cursor restore failed",
+                    )
             # If we just deleted the loaded record's library entry,
             # drop the panel's active-row binding AND clear the
             # canvas so the plasmid map / sidebar / seq panel don't
@@ -36611,10 +36642,14 @@ class PlasmidsaurusAlignModal(ModalScreen):
         `id` (LOCUS-safe), label is the display name + size."""
         opts: list[tuple[str, str]] = []
         try:
-            for e in _load_library():
+            entries = sorted(
+                (e for e in _load_library() if e.get("id")),
+                key=lambda e: _natural_sort_key(
+                    e.get("name") or e.get("id") or ""
+                ),
+            )
+            for e in entries:
                 eid = e.get("id") or ""
-                if not eid:
-                    continue
                 name = e.get("name") or eid
                 size = e.get("size", 0)
                 opts.append((f"{name}  ({size:,} bp)", eid))
@@ -37434,8 +37469,12 @@ class DomesticatorModal(ModalScreen):
         """Build Select options for the Feature Library source. Value is the
         integer index into ``_load_features()`` (as a str, since Select values
         must be strings) so the design step can look the entry back up."""
+        indexed = list(enumerate(_load_features()))
+        indexed.sort(key=lambda ie: _natural_sort_key(
+            ie[1].get("name") or ""
+        ))
         opts: list[tuple[str, str]] = []
-        for i, e in enumerate(_load_features()):
+        for i, e in indexed:
             name = e.get("name", "?") or "?"
             ft   = e.get("feature_type", "misc")
             blen = len(e.get("sequence", "") or "")
@@ -45693,44 +45732,83 @@ class SimulatorScreen(Screen):
     #sim-tabs { width: 100%; height: 1fr; }
     #sim-tabs TabPane { padding: 0 1; }
 
-    /* ── PCR pane ───────────────────────────────────────────── */
+    /* ── PCR pane ───────────────────────────────────────────────
+       Wrapped in a VerticalScroll so the pane adapts to narrow /
+       short terminals (Input widgets need height 3 each for borders;
+       below ~36 rows the stack overflows otherwise). Row heights
+       follow PrimerDesignScreen's convention: rows with Inputs /
+       Selects use height: 3; pure-Label / Static rows stay at 1. */
     #sim-pcr-pane { width: 100%; height: 1fr; }
-    #sim-pcr-template-row { height: 1; margin: 0 0 1 0; }
-    #sim-pcr-template-row Label { width: auto; padding: 0 1 0 0; }
+    #sim-pcr-scroll {
+        width: 100%; height: 1fr;
+        overflow-y: auto; overflow-x: hidden;
+    }
+    #sim-pcr-template-row {
+        height: 1; margin: 0 0 1 0;
+        align: left middle;
+    }
+    #sim-pcr-template-row Label {
+        width: auto; padding: 0 1 0 0;
+        content-align: left middle;
+    }
     #sim-pcr-template-name {
         width: auto; max-width: 40;
         color: $accent; padding: 0 1 0 0;
+        content-align: left middle;
     }
     #sim-pcr-template-meta {
-        width: auto; color: $text-muted; padding: 0 1;
+        width: 1fr; color: $text-muted; padding: 0 1;
+        content-align: left middle;
     }
 
-    .sim-pcr-primer-row { height: 1; margin: 0 0 1 0; }
-    .sim-pcr-primer-row Label { width: 9; padding: 0 1 0 0; content-align: right middle; }
-    .sim-pcr-primer-row Input { width: 1fr; }
+    /* Primer rows: Inputs need height 3 to render their borders
+       (Textual's Input clips at heights < 3). Label is right-aligned
+       in a fixed 10-col gutter so Forward:/Reverse: stack tidily;
+       the Tm read-out gets 14 cols to fit "Tm 72.5 °C" without
+       truncation. Inputs flex into the remaining row width. */
+    .sim-pcr-primer-row {
+        height: 3; margin: 0 0 1 0;
+        align: left middle;
+    }
+    .sim-pcr-primer-row Label {
+        width: 10; padding: 0 1 0 0;
+        content-align: right middle;
+    }
+    .sim-pcr-primer-row Input { width: 1fr; min-width: 24; }
     .sim-pcr-primer-row .sim-tm {
-        width: 12; padding: 0 1;
+        width: 14; padding: 0 1;
         content-align: center middle; color: $text-muted;
     }
 
-    #sim-pcr-params-row { height: 1; margin: 0 0 1 0; }
+    /* Params row: same height: 3 treatment so the Max-amplicon Input
+       renders fully. Hint Static gets the residual width so it never
+       clips when other widgets settle. */
+    #sim-pcr-params-row {
+        height: 3; margin: 0 0 1 0;
+        align: left middle;
+    }
     #sim-pcr-params-row Label {
         width: auto; padding: 0 1 0 0;
         content-align: right middle;
     }
-    #sim-pcr-params-row Input { width: 10; }
+    #sim-pcr-params-row Input { width: 12; }
     #sim-pcr-params-row Static {
-        width: auto; color: $text-muted; padding: 0 1;
+        width: 1fr; color: $text-muted; padding: 0 1;
+        content-align: left middle;
     }
     #sim-pcr-hint { width: 1fr; }
 
-    #sim-pcr-btns { height: 3; margin: 0 0 1 0; }
+    #sim-pcr-btns { height: 3; margin: 0 0 1 0; align: left middle; }
     #sim-pcr-btns Button { margin-right: 1; }
 
     #sim-pcr-status { height: 1; color: $text-muted; margin: 0 0 1 0; }
-    #sim-pcr-table { height: 10; border: solid $primary-darken-2; }
+    #sim-pcr-table {
+        height: 10; min-height: 6;
+        border: solid $primary-darken-2;
+    }
     #sim-pcr-preview {
-        height: 5; border: solid $primary-darken-2;
+        height: 5; min-height: 3;
+        border: solid $primary-darken-2;
         padding: 0 1; margin-top: 1; color: $accent;
     }
 
@@ -45740,21 +45818,40 @@ class SimulatorScreen(Screen):
        cramped at heights < 3. Lane container scrolls vertically when
        lanes exceed the available height. ─────────────────────────── */
     #sim-gel-pane { width: 100%; height: 1fr; }
-    #sim-gel-top-row { height: 3; margin: 0 0 1 0; }
-    #sim-gel-top-row Label {
-        width: auto; padding: 0 1 0 0; content-align: right middle;
+    /* Agarose-% row: Label + Select packed flush left.
+       `align: left middle` keeps the Label butted up against the
+       Select instead of the children each grabbing a 1fr share of
+       the row. Explicit Label width (11 fits "Agarose %:") prevents
+       Textual from stretching it when the row has spare cols. */
+    #sim-gel-top-row {
+        height: 3; margin: 0 0 1 0;
+        align: left middle;
     }
-    #sim-gel-top-row Select { width: 16; }
-    #sim-gel-top-row Static {
-        width: 1fr; color: $text-muted; padding: 0 1;
-        content-align: left middle;
+    #sim-gel-top-row Label {
+        width: 11; padding: 0 1 0 0;
+        content-align: right middle;
+    }
+    #sim-gel-top-row Select { width: 14; }
+    /* Hint sentence lives on its own line below the row so the dot
+       separator doesn't wrap awkwardly when the Select takes its
+       fixed slice of the top row. */
+    #sim-gel-hint {
+        height: 1; margin: 0 0 1 0;
+        color: $text-muted; padding: 0 1;
     }
 
     #sim-gel-split { width: 100%; height: 1fr; }
+    /* Flex the left (lane-config) column so it adapts to terminal
+       width — fixed 64 was wide on 80-col terminals and tight on
+       wider ones once the source Select needed room for the
+       "Plasmid (uncut)" label. min-width keeps the labels readable
+       on narrow terminals; max-width prevents the lane config from
+       eating the gel image on very wide terminals. */
     #sim-gel-left {
-        width: 64; height: 1fr; padding-right: 1;
+        width: 1fr; min-width: 56; max-width: 72;
+        height: 1fr; padding-right: 1;
     }
-    #sim-gel-right { width: 1fr; height: 1fr; }
+    #sim-gel-right { width: 2fr; min-width: 32; height: 1fr; }
 
     #sim-gel-lanes {
         height: 1fr; min-height: 12;
@@ -45764,13 +45861,16 @@ class SimulatorScreen(Screen):
     }
     .sim-gel-lane-row {
         height: 3; width: 100%; margin: 0 0 0 0;
+        align: left middle;
     }
     .sim-gel-lane-num {
         width: 3; padding: 0 1 0 0;
         color: $text-muted; content-align: center middle;
     }
-    .sim-gel-lane-name   { width: 14; }
-    .sim-gel-lane-source { width: 22; }
+    .sim-gel-lane-name   { width: 14; min-width: 10; }
+    /* 24 cols fits "Plasmid (uncut)" (15) + dropdown chrome (5)
+       with a touch of breathing room. */
+    .sim-gel-lane-source { width: 24; min-width: 20; }
     .sim-gel-lane-detail { width: 1fr; min-width: 10; }
     .sim-gel-lane-del    { width: 5;  min-width: 5; }
 
@@ -45856,45 +45956,46 @@ class SimulatorScreen(Screen):
 
     def _compose_pcr_pane(self):
         with Vertical(id="sim-pcr-pane"):
-            with Horizontal(id="sim-pcr-template-row"):
-                yield Label("Template:")
-                yield Static(self._plasmid_name, id="sim-pcr-template-name")
-                meta = (f"{len(self._template):,} bp · "
-                         f"{'circular' if self._template_circular else 'linear'}"
-                        if self._template
-                        else "(no plasmid loaded)")
-                yield Static(meta, id="sim-pcr-template-meta")
-            with Horizontal(classes="sim-pcr-primer-row"):
-                yield Label("Forward:")
-                yield Input(placeholder="5' → 3' (ACGT only, 10–80 bp)",
-                              id="sim-pcr-fwd")
-                yield Static("Tm —", classes="sim-tm", id="sim-pcr-fwd-tm")
-            with Horizontal(classes="sim-pcr-primer-row"):
-                yield Label("Reverse:")
-                yield Input(placeholder="5' → 3' (ACGT only, 10–80 bp)",
-                              id="sim-pcr-rev")
-                yield Static("Tm —", classes="sim-tm", id="sim-pcr-rev-tm")
-            with Horizontal(id="sim-pcr-params-row"):
-                yield Label("Max amplicon (bp):")
-                yield Input(str(_PCR_DEFAULT_MAX_AMPLICON),
-                              id="sim-pcr-maxamp")
-                yield Static("· primers must match template exactly",
-                              id="sim-pcr-hint")
-            with Horizontal(id="sim-pcr-btns"):
-                yield Button("Run PCR", id="btn-sim-pcr-run",
-                              variant="primary")
-                yield Button("Save amplicon to library",
-                              id="btn-sim-pcr-save")
-                yield Button("Send to Gel lane",
-                              id="btn-sim-pcr-togel")
-            yield Static("Enter forward + reverse primers, then click Run.",
-                          id="sim-pcr-status")
-            table = DataTable(id="sim-pcr-table", cursor_type="row",
-                               zebra_stripes=True)
-            table.add_columns("#", "Start", "End", "Length", "Wrap",
-                               "GC%", "Fwd Tm", "Rev Tm")
-            yield table
-            yield Static("(no amplicon selected)", id="sim-pcr-preview")
+            with VerticalScroll(id="sim-pcr-scroll"):
+                with Horizontal(id="sim-pcr-template-row"):
+                    yield Label("Template:")
+                    yield Static(self._plasmid_name, id="sim-pcr-template-name")
+                    meta = (f"{len(self._template):,} bp · "
+                             f"{'circular' if self._template_circular else 'linear'}"
+                            if self._template
+                            else "(no plasmid loaded)")
+                    yield Static(meta, id="sim-pcr-template-meta")
+                with Horizontal(classes="sim-pcr-primer-row"):
+                    yield Label("Forward:")
+                    yield Input(placeholder="5' → 3' (ACGT only, 10–80 bp)",
+                                  id="sim-pcr-fwd")
+                    yield Static("Tm —", classes="sim-tm", id="sim-pcr-fwd-tm")
+                with Horizontal(classes="sim-pcr-primer-row"):
+                    yield Label("Reverse:")
+                    yield Input(placeholder="5' → 3' (ACGT only, 10–80 bp)",
+                                  id="sim-pcr-rev")
+                    yield Static("Tm —", classes="sim-tm", id="sim-pcr-rev-tm")
+                with Horizontal(id="sim-pcr-params-row"):
+                    yield Label("Max amplicon (bp):")
+                    yield Input(str(_PCR_DEFAULT_MAX_AMPLICON),
+                                  id="sim-pcr-maxamp")
+                    yield Static("· primers must match template exactly",
+                                  id="sim-pcr-hint")
+                with Horizontal(id="sim-pcr-btns"):
+                    yield Button("Run PCR", id="btn-sim-pcr-run",
+                                  variant="primary")
+                    yield Button("Save amplicon to library",
+                                  id="btn-sim-pcr-save")
+                    yield Button("Send to Gel lane",
+                                  id="btn-sim-pcr-togel")
+                yield Static("Enter forward + reverse primers, then click Run.",
+                              id="sim-pcr-status")
+                table = DataTable(id="sim-pcr-table", cursor_type="row",
+                                   zebra_stripes=True)
+                table.add_columns("#", "Start", "End", "Length", "Wrap",
+                                   "GC%", "Fwd Tm", "Rev Tm")
+                yield table
+                yield Static("(no amplicon selected)", id="sim-pcr-preview")
 
     def _compose_gel_pane(self):
         with Vertical(id="sim-gel-pane"):
@@ -45906,8 +46007,11 @@ class SimulatorScreen(Screen):
                     value=str(self._agarose_pct),
                     allow_blank=False,
                 )
-                yield Static("lanes left-to-right, well-at-top, dye front "
-                              "at bottom · pick a source per lane below")
+            yield Static(
+                "Lanes run left-to-right · well at top, dye front at "
+                "bottom · pick a source per lane below.",
+                id="sim-gel-hint",
+            )
             with Horizontal(id="sim-gel-split"):
                 with Vertical(id="sim-gel-left"):
                     with Vertical(id="sim-gel-lanes"):

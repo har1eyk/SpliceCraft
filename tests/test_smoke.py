@@ -778,6 +778,122 @@ class TestDeleteFocusRouting:
             pm_after = app.query_one("#plasmid-map", sc.PlasmidMap)
             assert len(pm_after._feats) == n_feats_before - 1
 
+    # ── Cursor-stickiness on delete (regression guard 2026-05-18) ──────────
+    # Deleting a library row should park the cursor on the plasmid just
+    # above the deleted one so the scroll neighbourhood feels sticky
+    # instead of snapping back to row 0.
+
+    def _seed_lib(self, names: list[str]) -> None:
+        """Persist a library of N stub entries in natural-sort order.
+        IDs match names so cursor-row indexing is unambiguous."""
+        sc._save_library([
+            {
+                "name":    n,
+                "id":      n,
+                "size":    100,
+                "n_feats": 0,
+                "source":  "test",
+                "added":   "2026-05-18",
+                "gb_text": "",
+            }
+            for n in names
+        ])
+
+    async def test_delete_middle_row_cursor_lands_on_row_above(
+        self, isolated_library
+    ):
+        """Delete the middle of 5 rows → cursor lands on the row above."""
+        self._seed_lib(["pA1", "pA2", "pA3", "pA4", "pA5"])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            t.focus()
+            t.move_cursor(row=2)  # pA3
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            from splicecraft import LibraryDeleteConfirmModal
+            modal = app.screen
+            assert isinstance(modal, LibraryDeleteConfirmModal)
+            modal.dismiss(True)
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            assert t.row_count == 4
+            assert t.cursor_row == 1  # pA2, the row just above pA3
+            assert sc._cursor_row_key(t) == "pA2"
+
+    async def test_delete_top_row_cursor_stays_at_zero(
+        self, isolated_library
+    ):
+        """Delete the top row → no row above, cursor clamps to 0
+        (which is now the next-down plasmid)."""
+        self._seed_lib(["pA1", "pA2", "pA3"])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            t.focus()
+            t.move_cursor(row=0)  # pA1
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            modal = app.screen
+            modal.dismiss(True)
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            assert t.row_count == 2
+            assert t.cursor_row == 0
+            assert sc._cursor_row_key(t) == "pA2"
+
+    async def test_delete_bottom_row_cursor_lands_above(
+        self, isolated_library
+    ):
+        """Delete the bottom row → cursor on the new bottom row
+        (the previous row-above)."""
+        self._seed_lib(["pA1", "pA2", "pA3"])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            t.focus()
+            t.move_cursor(row=2)  # pA3
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            modal = app.screen
+            modal.dismiss(True)
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            assert t.row_count == 2
+            assert t.cursor_row == 1
+            assert sc._cursor_row_key(t) == "pA2"
+
+    async def test_delete_last_remaining_row_leaves_empty_table(
+        self, isolated_library
+    ):
+        """Delete the only library row → table is empty; cursor
+        restore must skip (no row to land on) without raising."""
+        self._seed_lib(["pSolo"])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            t.focus()
+            t.move_cursor(row=0)
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            modal = app.screen
+            modal.dismiss(True)
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            assert t.row_count == 0
+
 
 class TestImportAutoPersist:
     """Every 'user imports a plasmid' entry point should auto-save the
