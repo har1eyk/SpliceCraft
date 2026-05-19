@@ -14,6 +14,14 @@
 
 ---
 
+## [0.9.7] — 2026-05-19
+
+_(auto-generated from commits since v0.9.6)_
+
+* Adversarial audit sweep #9 · pre-v1.0.0 hardening · 21 HIGH/MEDIUM + 11 deferred
+
+---
+
 ## [0.9.6] — 2026-05-19 — Experiments lab notebook · projects layer · gels library
 
 Builds the Experiments toolbar entry from scratch (markdown editor,
