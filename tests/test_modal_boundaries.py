@@ -466,3 +466,77 @@ class TestAddFeatureModalRegressionGuards:
                 btn = modal.query_one(btn_id)
                 _assert_widget_in_bounds(btn, term_w, term_h,
                                          f"AddFeatureModal {btn_id}")
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Centering invariant — sweep #13 (2026-05-20 UX audit)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestModalCenteringInvariant:
+    """Every ModalScreen subclass — except DropdownScreen (which is
+    a positioned popup anchored to a menubar item via explicit
+    `styles.offset`) — must sit at the centre of the terminal
+    window. Backed by the global `ModalScreen { align: center
+    middle; }` rule in PlasmidApp.CSS that the 2026-05-20 audit
+    added so future modals get centring for free.
+    """
+
+    def _all_modal_subclasses(self) -> list[type]:
+        """Walk sc.* for every class derived from textual.screen.ModalScreen
+        (excluding ModalScreen itself, abstract bases, and DropdownScreen).
+        """
+        from textual.screen import ModalScreen
+        out: list[type] = []
+        for name in dir(sc):
+            obj = getattr(sc, name, None)
+            if (isinstance(obj, type)
+                    and issubclass(obj, ModalScreen)
+                    and obj is not ModalScreen
+                    and name != "DropdownScreen"):
+                out.append(obj)
+        return out
+
+    def test_global_modalscreen_centering_rule_present(self):
+        """The PlasmidApp.CSS must carry the global centering rule
+        so every ModalScreen subclass inherits centre alignment
+        without needing to repeat the rule per-class."""
+        assert "ModalScreen { align: center middle; }" in sc.PlasmidApp.CSS
+
+    def test_dropdownscreen_override_present(self):
+        """DropdownScreen's explicit `styles.offset` positioning
+        needs the global ModalScreen centring undone — verify the
+        override is in PlasmidApp.CSS so the menubar dropdown
+        keeps landing under its triggering menu item."""
+        assert "DropdownScreen { align: left top; }" in sc.PlasmidApp.CSS
+
+    def test_audit_subclass_coverage_substantial(self):
+        """Sanity check the test harness — must discover the bulk
+        of the modal subclasses, not a handful. Catches an import
+        regression that would silently empty the audit set."""
+        klasses = self._all_modal_subclasses()
+        assert len(klasses) >= 30, (
+            f"only {len(klasses)} modal subclasses discovered — "
+            "expected 30+, possible import regression"
+        )
+
+    async def test_dropdownscreen_still_top_left_aligned(self):
+        """The DropdownScreen override must keep its natural top-
+        left layout so `styles.offset = (x, y)` continues to anchor
+        the popup correctly to its menubar item."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            modal = sc.DropdownScreen(
+                items=[("Item A", "noop"), ("Item B", "noop")],
+                x=5, y=2,
+            )
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            assert str(scr.styles.align_horizontal) == "left"
+            assert str(scr.styles.align_vertical) == "top"
+            modal.dismiss(None)
+            await pilot.pause()

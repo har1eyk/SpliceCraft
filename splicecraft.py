@@ -18234,7 +18234,11 @@ class HistoryViewerModal(ModalScreen):
     DEFAULT_CSS = """
     HistoryViewerModal { align: center middle; }
     #hist-box {
-        width: 110; height: 36;
+        /* Was `height: 36;` (rigid) — switched to flex height with a
+           cap so the dialog shrinks to content on a sparse history
+           and still leaves Tree room to scroll on a deep one
+           (2026-05-20 UX audit). */
+        width: 110; height: 90%; max-height: 36; min-height: 18;
         background: $surface; border: solid $accent;
         padding: 1 2;
     }
@@ -23103,8 +23107,8 @@ class MenuBar(Widget):
     """
 
     MENUS = ["File", "Settings", "Edit", "Enzymes", "Features", "Primers",
-             "Mutagenize", "Parts", "Constructor", "Simulator", "Sequencing",
-             "Experiments", "History"]
+             "Mutagenize", "Synthesis", "Parts", "Constructor", "Simulator",
+             "Sequencing", "Experiments", "History"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -29909,6 +29913,8 @@ class AddFeatureModal(ModalScreen):
         self,
         prefill: "dict | None" = None,
         selection_range: "tuple[int, int] | None" = None,
+        *,
+        total_len: "int | None" = None,
     ) -> None:
         super().__init__()
         self._prefill = dict(prefill) if prefill else {}
@@ -29920,6 +29926,12 @@ class AddFeatureModal(ModalScreen):
         # marks an origin-spanning wrap that becomes a CompoundLocation
         # at insert time.
         self._selection_range = selection_range
+        # `total_len` lets callers running outside the main app (e.g.
+        # SynthesisScreen, which doesn't host `#seq-panel`) supply the
+        # length used by the CDS divisibility check. None falls back
+        # to the live `#seq-panel` query — the original behaviour for
+        # the on-canvas Ctrl+F path.
+        self._total_len = total_len
         # Current color override for this entry. None = Auto (type default).
         self._color: "str | None" = self._prefill.get("color") or None
 
@@ -30127,11 +30139,14 @@ class AddFeatureModal(ModalScreen):
         # — agents and humans can edit the textarea, but the feature
         # is anchored to the bp range. Wrap-aware via `_feat_len`.
         if entry.get("feature_type") == "CDS":
-            try:
-                sp = self.app.query_one("#seq-panel", SequencePanel)
-                total = len(sp._seq) if sp._seq else 0
-            except (NoMatches, AttributeError):
-                total = 0
+            if self._total_len is not None:
+                total = max(0, int(self._total_len))
+            else:
+                try:
+                    sp = self.app.query_one("#seq-panel", SequencePanel)
+                    total = len(sp._seq) if sp._seq else 0
+                except (NoMatches, AttributeError):
+                    total = 0
             s, e = self._selection_range
             span = _feat_len(s, e, total) if total else 0
             if span > 0 and span % 3 != 0:
@@ -31619,7 +31634,7 @@ class PrimerPlasmidsModal(ModalScreen):
     PrimerPlasmidsModal { align: center middle; }
     #pmp-dlg {
         width: 92;
-        height: 40;
+        height: auto; max-height: 40;
         background: $surface;
         border: heavy $primary;
         padding: 1 2;
@@ -45256,6 +45271,3681 @@ class ExperimentsScreen(Screen):
         )
 
 
+# ── Synthesis composer (linear gene-synthesis workbench) ──────────────────────
+#
+# A full-screen workbench for penning a linear DNA fragment ready for
+# commercial gene synthesis. Linear, single-row, horizontally-scrolling
+# editor — same per-base style as SequencePanel (feature stripes +
+# restriction overlay + AA translation) but with cursor-based editing
+# instead of EditSeqDialog (direct typing, click-to-place-cursor,
+# Backspace / Delete). Saves as a linear plasmid into the active
+# collection via the standard `LibraryPanel.add_entry` flow.
+#
+# Document model: load a linear entry, edit, Save → silent replace by
+# id. Save As / Rename / New available from the toolbar.
+
+# Cap chosen so synthesis stays interactive on a single render pass —
+# commercial gene synthesis tops out at ~10 kb for most vendors, with
+# extreme cases up to ~30 kb. 50 kb is generous headroom that still
+# keeps `_build_seq_text` snappy on a single chunk.
+_SYNTHESIS_MAX_BP: int = 50_000
+
+# Allowed bases for programmatic insertion at the cursor — the broader
+# set that includes IUPAC ambiguity codes. Restriction sites (AvaI =
+# CYCGRG, DraI = TTTAAA, etc.) and feature-library sequences may
+# legitimately carry IUPAC, so the Ctrl+R / featlib-Insert paths use
+# this lenient set. Matches the AddFeatureModal validation set so a
+# fragment composed here round-trips through the feature library
+# without surprises.
+_SYNTHESIS_TYPEABLE_BASES: frozenset[str] = frozenset("ACGTRYWSMKBDHVN")
+
+# Bases the user can type DIRECTLY on the keyboard. Restricted to
+# A/C/G/T/N — the only bases a commercial gene-synthesis vendor will
+# universally accept as-is. IUPAC ambiguity codes are still permitted
+# via restriction-site / feature-library inserts (where the ambiguity
+# is part of an established biological convention), but typing them
+# at the cursor is gated off to prevent accidental ambiguity slipping
+# into a fragment that's about to ship for synthesis.
+_SYNTHESIS_KEYBOARD_BASES: frozenset[str] = frozenset("ACGTN")
+
+# 20 standard amino acids + '*' for stop. The ProteinEditor's
+# keyboard typing path filters against this set; non-AA letters
+# (B, J, O, U, X, Z) and any other character are rejected.
+_PROTEIN_AA_ALPHABET: frozenset[str] = frozenset("ACDEFGHIKLMNPQRSTVWY*")
+
+# Cap on protein length so the eventual back-translated DNA stays
+# under _SYNTHESIS_MAX_BP. Each AA → 3 DNA bases plus a TAA stop
+# elsewhere, so divide by 3.
+_PROTEIN_MAX_AA: int = _SYNTHESIS_MAX_BP // 3
+
+# Builtin protein-motif / domain library — common tags + linkers +
+# protease sites a synthetic-biology user reaches for when composing
+# a recombinant protein. Stored as a module-level list so it's
+# always available without needing a user-managed file. Entry shape
+# mirrors the DNA feature library so the side-panel renderer can
+# reuse the same row-build code.
+_PROTEIN_MOTIFS: list[dict] = [
+    # ── Affinity tags ──────────────────────────────────────────────
+    {"name": "His6",        "feature_type": "Tag",
+     "sequence": "HHHHHH",
+     "description": "Hexahistidine affinity tag (Ni-NTA / IMAC purification)."},
+    {"name": "His8",        "feature_type": "Tag",
+     "sequence": "HHHHHHHH",
+     "description": "Octahistidine — tighter Ni-NTA binding than 6xHis."},
+    {"name": "His10",       "feature_type": "Tag",
+     "sequence": "HHHHHHHHHH",
+     "description": "Decahistidine — even tighter, for harsh-wash purification."},
+    {"name": "FLAG",        "feature_type": "Tag",
+     "sequence": "DYKDDDDK",
+     "description": "FLAG tag (anti-FLAG M2 affinity purification)."},
+    {"name": "3xFLAG",      "feature_type": "Tag",
+     "sequence": "DYKDHDGDYKDHDIDYKDDDDK",
+     "description": "Triple FLAG — higher sensitivity for low-expression targets."},
+    {"name": "HA",          "feature_type": "Tag",
+     "sequence": "YPYDVPDYA",
+     "description": "Influenza hemagglutinin epitope (anti-HA antibodies)."},
+    {"name": "Myc",         "feature_type": "Tag",
+     "sequence": "EQKLISEEDL",
+     "description": "c-Myc epitope tag (9E10 antibody)."},
+    {"name": "V5",          "feature_type": "Tag",
+     "sequence": "GKPIPNPLLGLDST",
+     "description": "V5 epitope tag (paramyxovirus)."},
+    {"name": "Strep-II",    "feature_type": "Tag",
+     "sequence": "WSHPQFEK",
+     "description": "Strep-Tactin affinity tag (mild biotin elution)."},
+    {"name": "T7",          "feature_type": "Tag",
+     "sequence": "MASMTGGQQMG",
+     "description": "T7 leader peptide (anti-T7 monoclonal)."},
+    # ── Localisation signals ───────────────────────────────────────
+    {"name": "NLS (SV40)",  "feature_type": "Signal",
+     "sequence": "PKKKRKV",
+     "description": "Classical SV40 large T-antigen nuclear localisation signal."},
+    {"name": "NLS (bipartite)", "feature_type": "Signal",
+     "sequence": "KRPAATKKAGQAKKKK",
+     "description": "Nucleoplasmin bipartite NLS."},
+    {"name": "NES",         "feature_type": "Signal",
+     "sequence": "LPPLERLTL",
+     "description": "HIV-Rev nuclear export signal (CRM1-dependent)."},
+    # ── Linkers ────────────────────────────────────────────────────
+    {"name": "GSG",         "feature_type": "Linker",
+     "sequence": "GSG",
+     "description": "Minimal flexible linker."},
+    {"name": "GGS",         "feature_type": "Linker",
+     "sequence": "GGS",
+     "description": "Short flexible linker."},
+    {"name": "(GGGGS)x3",   "feature_type": "Linker",
+     "sequence": "GGGGSGGGGSGGGGS",
+     "description": "Classic flexible linker for scFv / fusion proteins."},
+    {"name": "(GGGGS)x4",   "feature_type": "Linker",
+     "sequence": "GGGGSGGGGSGGGGSGGGGS",
+     "description": "Longer flexible linker for domain separation."},
+    {"name": "EAAAK x3",    "feature_type": "Linker",
+     "sequence": "EAAAKEAAAKEAAAK",
+     "description": "Rigid α-helical linker."},
+    # ── Protease cleavage sites ─────────────────────────────────────
+    {"name": "TEV",         "feature_type": "Cleavage",
+     "sequence": "ENLYFQG",
+     "description": "TEV protease site (cuts between Q and G)."},
+    {"name": "PreScission", "feature_type": "Cleavage",
+     "sequence": "LEVLFQGP",
+     "description": "HRV 3C / PreScission protease site (cuts between Q and G)."},
+    {"name": "Thrombin",    "feature_type": "Cleavage",
+     "sequence": "LVPRGS",
+     "description": "Thrombin cleavage site."},
+    {"name": "Factor Xa",   "feature_type": "Cleavage",
+     "sequence": "IEGR",
+     "description": "Factor Xa protease site."},
+    {"name": "Furin",       "feature_type": "Cleavage",
+     "sequence": "RRRR",
+     "description": "Furin recognition site (R-X-K/R-R minimal)."},
+    # ── Self-cleaving 2A peptides ──────────────────────────────────
+    {"name": "P2A",         "feature_type": "2A",
+     "sequence": "GSGATNFSLLKQAGDVEENPGP",
+     "description": "Porcine teschovirus 2A self-cleaving peptide."},
+    {"name": "T2A",         "feature_type": "2A",
+     "sequence": "GSGEGRGSLLTCGDVEENPGP",
+     "description": "Thosea asigna 2A peptide."},
+    {"name": "E2A",         "feature_type": "2A",
+     "sequence": "GSGQCTNYALLKLAGDVESNPGP",
+     "description": "Equine rhinitis A 2A peptide."},
+    {"name": "F2A",         "feature_type": "2A",
+     "sequence": "GSGVKQTLNFDLLKLAGDVESNPGP",
+     "description": "Foot-and-mouth-disease virus 2A peptide."},
+    # ── Common functional motifs ───────────────────────────────────
+    {"name": "Kozak start", "feature_type": "Motif",
+     "sequence": "M",
+     "description": "Start codon (methionine) — required N-terminal."},
+    {"name": "Stop",        "feature_type": "Motif",
+     "sequence": "*",
+     "description": "Translation stop codon."},
+    {"name": "FLAG+Stop",   "feature_type": "Motif",
+     "sequence": "DYKDDDDK*",
+     "description": "FLAG tag followed by stop — quick C-terminal tagging."},
+]
+
+
+class SynthesisEditor(Widget):
+    """Linear horizontal-scroll DNA editor with per-base feature /
+    restriction-site / AA-translation overlays.
+
+    State model (mirrors SequencePanel's vocabulary for grep symmetry):
+      * ``_seq``       — the bases.
+      * ``_feats``     — feature dicts (start, end, label, type, color, …).
+      * ``_cursor_pos``— 0..len(seq) — sits *between* bases (text-editor
+                         convention). 0 = before the first base; n = after
+                         the last base.
+      * ``_user_sel``  — drag-or-Shift+arrow selection range, half-open
+                         (start, end). None when nothing is selected.
+
+    Rendering: passes ``line_width = len(seq) + 1`` to ``_build_seq_text``
+    so the whole sequence renders as a single chunk on one row group
+    (feature lanes above + DNA row + AA lanes below). The resulting
+    Text is dropped into a ``Static`` inside a ``ScrollableContainer`` —
+    the wide content surfaces a native horizontal scrollbar.
+
+    Editing semantics:
+      * Insert at cursor — bases right of cursor shift right; features
+        whose start ≥ cursor shift; features whose end > cursor shift.
+        A feature whose end == cursor extends to include the new base
+        (the typical "extend the feature I'm appending to" behaviour).
+      * Backspace — deletes one base left of cursor; cursor moves left.
+        Features clip to the surviving span; zero-length features drop.
+      * Delete — deletes one base right of cursor; cursor stays put.
+      * Selection delete — Backspace / Delete with a non-empty
+        selection deletes the selected range.
+
+    Click model:
+      * Click on DNA → place cursor at that bp.
+      * Drag → build selection from anchor → cursor.
+      * Shift+click → extend selection from cursor to click.
+
+    Messages emitted:
+      * ``SynthesisEditor.Changed`` — fires after any mutation (insert,
+        delete, replace) so the parent screen can mark the buffer dirty
+        and refresh the bp-count label. NOT fired on cursor-only moves.
+    """
+
+    DEFAULT_CSS = """
+    SynthesisEditor {
+        height: 1fr;
+        background: #0a0a0a;
+    }
+    SynthesisEditor:focus-within { background: #0c0c0c; }
+    /* `overflow-x: auto` surfaces a horizontal scrollbar when the
+       rendered Static is wider than the viewport (the
+       `line_width = len(seq) + 1` render produces a single-line
+       chunk that grows with the fragment); `overflow-y: hidden`
+       suppresses the vertical scrollbar because the editor
+       pre-pads the Text top/bottom for vertical centering, so
+       there's no off-viewport content above or below to scroll to.
+       Without `overflow-y: hidden` Textual would draw a vertical
+       scrollbar that does nothing — the inserted blank-line pad
+       inflates the content height past the viewport.
+       Sweep-on-this-feature: `scrollbar-gutter: stable` reserves
+       the column even when the bar disappears, so the centered
+       layout doesn't jitter as the user pans. */
+    #syn-scroll {
+        height: 1fr;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-gutter: stable;
+    }
+    /* `width: auto` lets the Static size to its rendered content
+       (the no-wrap Rich Text). Without this the Static would
+       inherit the parent width (`1fr`) and the no-wrap renderer
+       would just clip the right edge instead of letting the
+       container scroll. */
+    #syn-view {
+        width: auto;
+        height: auto;
+    }
+    """
+
+    class Changed(Message):
+        """Sent on any sequence / feature mutation."""
+
+    class CursorMoved(Message):
+        """Sent on cursor or selection change (no dirty side-effect)."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._seq: str = ""
+        self._feats: list[dict] = []
+        self._cursor_pos: int = 0
+        self._user_sel: "tuple[int, int] | None" = None
+        self._sel_anchor: int = -1
+        # Per-base overlays mirror the SequencePanel toggles.
+        self._re_highlight: "dict | None" = None
+        self._aa_highlight: "dict | None" = None
+        # Drag-to-select state — pattern lifted from SequencePanel.
+        self._drag_start_bp: int = -1
+        self._has_dragged: bool = False
+        self._mouse_button_held: bool = False
+        self._last_was_drag: bool = False
+        # Rows of blank-line padding currently prepended to the
+        # rendered Text for DNA-strand vertical centring. Set by
+        # `_refresh_view`; consulted by future hover/AA-resolution code
+        # that needs to translate viewport-y → DNA-row.
+        self._pad_above_rows: int = 0
+        # Cells of left padding currently prepended to each line for
+        # horizontal centring of short sequences. Set by
+        # `_apply_horizontal_centering`; consulted by `_click_to_bp`
+        # and `_ensure_cursor_visible` so cursor / click math lands at
+        # the right bp under any centring offset.
+        self._pad_left_cols: int = 0
+
+    def compose(self) -> ComposeResult:
+        with ScrollableContainer(id="syn-scroll"):
+            yield Static("", id="syn-view", markup=False)
+
+    def on_mount(self) -> None:
+        self._refresh_view()
+        try:
+            self.query_one("#syn-scroll", ScrollableContainer).can_focus = True
+        except NoMatches:
+            pass
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def load(self, seq: str, feats: "list[dict] | None" = None) -> None:
+        """Replace the buffer with `seq` + `feats`. Resets cursor + sel."""
+        self._seq = str(seq or "")
+        self._feats = [dict(f) for f in (feats or [])]
+        self._cursor_pos = 0
+        self._user_sel = None
+        self._sel_anchor = -1
+        self._re_highlight = None
+        self._aa_highlight = None
+        self._refresh_view()
+
+    def get_state(self) -> "tuple[str, list[dict]]":
+        """Return a deep-ish copy of (seq, feats) for snapshotting /
+        comparison. The seq is immutable; feats are dict-copied so
+        downstream mutation can't leak into the live state."""
+        return self._seq, [dict(f) for f in self._feats]
+
+    # ── Render ─────────────────────────────────────────────────────────────
+
+    # Visual flank markers — reflect anti-parallel DNA polarity. Top
+    # strand reads 5'→3' left-to-right, bottom strand reads 3'→5'
+    # left-to-right (it's the reverse complement, drawn under the
+    # top strand). Width is 3 chars on each side. Stored as constants
+    # so `_click_to_bp` / `_ensure_cursor_visible` /
+    # `_wrap_with_53_markers` all agree on the same offset.
+    _FLANK_MARKER_TOP_LEFT:    str = "5'-"
+    _FLANK_MARKER_TOP_RIGHT:   str = "-3'"
+    _FLANK_MARKER_BOT_LEFT:    str = "3'-"
+    _FLANK_MARKER_BOT_RIGHT:   str = "-5'"
+    _FLANK_MARKER_WIDTH:       int = 3
+    _FLANK_MARKER_STYLE:       str = "bold #4CC4FF"
+    # Back-compat aliases (older test fixtures reference these names).
+    _FLANK_MARKER_5: str = "5'-"
+    _FLANK_MARKER_3: str = "-3'"
+
+    def _wrap_with_53_markers(self, txt: Text) -> Text:
+        """Strip the line-number gutter from the rendered Text and
+        inject DNA polarity markers on BOTH strand rows; pad every
+        non-DNA row with equivalent-width whitespace at the same
+        column so feature-lane / AA-row glyphs stay column-aligned
+        with the bases.
+
+        The line-number gutter (`num_w + 2` chars of ` 1 ` etc.) is
+        dropped because the synthesis editor always renders ONE chunk
+        — one row group of bases — and the leading "1" gutter adds
+        no information at that single-chunk granularity.
+
+        Anti-parallel DNA — top strand 5'→3', bottom strand 3'→5'
+        when read left-to-right under standard orientation:
+
+            5'-ATGCATGC-3'
+            3'-TACGTACG-5'
+
+        Markers are visual-only — they NEVER enter ``self._seq``.
+        ``_user_sel = (0, n)`` (Ctrl+A) leaves them untouched because
+        the renderer paints highlight on bp coordinates, and the
+        markers sit OUTSIDE that range. Clicks on the markers
+        collapse to bp 0 / bp n by `_click_to_bp`'s clamp.
+        """
+        if not self._seq:
+            return txt
+        n = len(self._seq)
+        num_w = len(str(n)) if n else 1
+        gutter = num_w + 2   # column where the bases start in each line
+        dna_row = self._dna_top_row_offset()
+        # The bottom strand sits directly below the top strand. Per
+        # `_chunk_layout`'s "+2" in the prefix arithmetic, the DNA
+        # pair occupies (above_rows, above_rows + 1) — the
+        # complement bases get drawn under the top strand bases at
+        # row index `dna_row + 1`.
+        bot_row = dna_row + 1
+        try:
+            lines = txt.split("\n")
+        except Exception:
+            return txt
+        if dna_row >= len(lines):
+            return txt
+        top_l = Text(self._FLANK_MARKER_TOP_LEFT,
+                      style=self._FLANK_MARKER_STYLE, no_wrap=True)
+        top_r = Text(self._FLANK_MARKER_TOP_RIGHT,
+                      style=self._FLANK_MARKER_STYLE, no_wrap=True)
+        bot_l = Text(self._FLANK_MARKER_BOT_LEFT,
+                      style=self._FLANK_MARKER_STYLE, no_wrap=True)
+        bot_r = Text(self._FLANK_MARKER_BOT_RIGHT,
+                      style=self._FLANK_MARKER_STYLE, no_wrap=True)
+        marker_w   = self._FLANK_MARKER_WIDTH
+        blank_pre  = Text(" " * marker_w, no_wrap=True)
+        blank_post = Text(" " * marker_w, no_wrap=True)
+        new_lines: list[Text] = []
+        for i, line in enumerate(lines):
+            if len(line) < gutter:
+                # Short / blank line (the inter-chunk gap row at the
+                # end of a chunk renders as empty) — keep as-is so
+                # we don't manufacture spurious markers.
+                new_lines.append(line)
+                continue
+            # Drop the line-number gutter — `line[gutter:]` is the
+            # bases (DNA row) / lane glyphs (lane rows) / AA letters
+            # (AA rows), all column-aligned with one another.
+            stripped = line[gutter:]
+            if i == dna_row:
+                new_lines.append(top_l + stripped + top_r)
+            elif i == bot_row:
+                new_lines.append(bot_l + stripped + bot_r)
+            else:
+                new_lines.append(blank_pre + stripped + blank_post)
+        return Text("\n", no_wrap=True).join(new_lines)
+
+    def _viewport_width(self) -> int:
+        """Current `#syn-scroll` width in cells, or 0 if not mounted /
+        sized yet. Used by `_horizontal_center_pad` to decide whether
+        to centre or left-anchor the rendered Text."""
+        try:
+            scroll = self.query_one("#syn-scroll", ScrollableContainer)
+            return max(0, int(scroll.size.width))
+        except (NoMatches, AttributeError):
+            return 0
+
+    def _content_width(self) -> int:
+        """Natural width of the marker-wrapped render: ``marker_w + n
+        + marker_w``. Used by `_horizontal_center_pad`."""
+        if not self._seq:
+            # Placeholder text varies in length; use its display width
+            # so the centring pad lands the placeholder mid-viewport.
+            return 64
+        return 2 * self._FLANK_MARKER_WIDTH + len(self._seq)
+
+    def _horizontal_center_pad(self) -> int:
+        """Cells of left padding to prepend to each line so that
+        content narrower than the viewport sits at the horizontal
+        centre. Returns 0 when content is at least as wide as the
+        viewport (the natural left-anchored layout — the user pans
+        right via the horizontal scrollbar)."""
+        vp_w = self._viewport_width()
+        c_w  = self._content_width()
+        if vp_w <= 0 or c_w >= vp_w:
+            return 0
+        return (vp_w - c_w) // 2
+
+    def _apply_horizontal_centering(self, txt: Text) -> Text:
+        """Prepend `_horizontal_center_pad` spaces to every line of
+        ``txt`` so a short fragment sits centred in the viewport.
+        Long fragments fall through unchanged (the natural left-
+        anchored layout enables horizontal scrolling). Stashes the
+        applied pad in ``_pad_left_cols`` so click resolution can
+        subtract it to land cursors at the right bp."""
+        pad = self._horizontal_center_pad()
+        self._pad_left_cols = pad
+        if pad <= 0:
+            return txt
+        try:
+            lines = txt.split("\n")
+        except Exception:
+            return txt
+        pad_text = Text(" " * pad, no_wrap=True)
+        return Text("\n", no_wrap=True).join(
+            pad_text + line for line in lines
+        )
+
+    def _viewport_height(self) -> int:
+        """Current `#syn-scroll` height in rows, or 0 if not mounted /
+        sized yet. Used by `_refresh_view` to decide how many blank
+        lines to pre-pend so the DNA strand lands at viewport
+        vertical center."""
+        try:
+            scroll = self.query_one("#syn-scroll", ScrollableContainer)
+            return max(0, int(scroll.size.height))
+        except (NoMatches, AttributeError):
+            return 0
+
+    def _dna_top_row_offset(self) -> int:
+        """Row index of the DNA top strand within the rendered
+        `_build_seq_text` output (chunk 0). Per `_chunk_layout`, the
+        per-chunk row layout is:
+            above_rows  -- feature lanes above
+            2           -- DNA top + bottom strand
+            below_rows  -- feature lanes below
+            1           -- inter-chunk gap
+        So the DNA top strand sits at row index `above_rows` within
+        the chunk. With a single-chunk render (our `line_width = n + 1`
+        configuration) that's the absolute row index inside the
+        rendered Text. Returns 0 on empty / failure.
+        """
+        if not self._seq:
+            return 0
+        try:
+            chunks_layout, _pf_dna2, _pf_lanes = _chunk_layout(
+                self._seq, self._feats, len(self._seq) + 1,
+            )
+        except (TypeError, ValueError, IndexError):
+            return 0
+        if not chunks_layout:
+            return 0
+        # chunks_layout[i] = (chunk_start, chunk_end, groups,
+        #                     above_rows, below_rows)
+        _cs, _ce, _grp, above_rows, _below = chunks_layout[0]
+        return int(above_rows)
+
+    def _pad_above_for_centering(self, *, base_row: int) -> int:
+        """Blank-line count to prepend to the rendered Text so that
+        ``base_row`` lands at the viewport's vertical centre. Returns
+        0 if the viewport isn't sized yet (first paint before
+        layout) — the Text falls back to top-anchored which still
+        renders correctly; a subsequent `on_resize` re-render fills
+        in the centring once Textual has a real height."""
+        vp_h = self._viewport_height()
+        if vp_h <= 0:
+            return 0
+        return max(0, vp_h // 2 - int(base_row))
+
+    def _refresh_view(self) -> None:
+        try:
+            view = self.query_one("#syn-view", Static)
+        except NoMatches:
+            return
+        n = len(self._seq)
+        if n == 0:
+            placeholder = (
+                "(empty fragment — start typing bases, "
+                "Ctrl+E to insert from clipboard, or use Insert site)"
+            )
+            empty = Text(
+                placeholder,
+                style="dim italic",
+                no_wrap=True,
+                overflow="crop",
+            )
+            # Horizontal centring of the placeholder: prepend spaces
+            # so it lands mid-viewport. Same `_pad_left_cols` plumbing
+            # as the with-seq case but using the placeholder's own
+            # width.
+            vp_w = self._viewport_width()
+            if vp_w > 0 and len(placeholder) < vp_w:
+                pad_left = (vp_w - len(placeholder)) // 2
+                empty = Text(" " * pad_left, no_wrap=True) + empty
+                self._pad_left_cols = pad_left
+            else:
+                self._pad_left_cols = 0
+            pad_above = self._pad_above_for_centering(base_row=0)
+            if pad_above > 0:
+                empty = Text("\n" * pad_above, no_wrap=True) + empty
+            view.update(empty)
+            return
+        # One chunk = one row group, no wrap. `_build_seq_text` produces
+        # the feature lanes + DNA + AA lanes for the whole sequence.
+        try:
+            txt = _build_seq_text(
+                self._seq, self._feats,
+                line_width=n + 1,
+                user_sel=self._user_sel,
+                cursor_pos=self._cursor_pos,
+                re_highlight=self._re_highlight,
+                aa_highlight=self._aa_highlight,
+                viewport_y_range=None,
+            )
+        except (TypeError, ValueError, IndexError):
+            # Defence-in-depth: a malformed feature dict from a
+            # hostile .gb load shouldn't kill the editor. Surface a
+            # plain-text fallback so the user can still see + fix it.
+            _log.exception("SynthesisEditor: _build_seq_text failed; "
+                            "rendering plain seq")
+            txt = Text(self._seq, no_wrap=True, overflow="crop")
+        # Inject 5'-/-3' (top) and 3'-/-5' (bottom) flanking markers
+        # on the DNA strand rows; pad every other row with equivalent
+        # whitespace at the same column so feature-lane / AA-row
+        # glyph alignment with the bases survives. `_user_sel = (0, n)`
+        # (Ctrl+A) doesn't touch the markers because the renderer
+        # paints highlights on bp coordinates, and the markers sit
+        # OUTSIDE that range — the selection visual covers DNA bases
+        # only by construction.
+        txt = self._wrap_with_53_markers(txt)
+        # Horizontally centre sequences narrower than the viewport;
+        # wider sequences fall through to the natural left-anchored
+        # layout that pairs with horizontal scrolling. Pad value is
+        # stashed on `_pad_left_cols` so cursor / click resolution
+        # below subtracts the same offset.
+        txt = self._apply_horizontal_centering(txt)
+        # Vertical centring of the DNA strand: prepend blank lines so
+        # the DNA top-strand row lands at the viewport's vertical
+        # centre. Padding is recomputed each refresh because feature
+        # density (`above_rows`) and viewport height both vary over
+        # the editor's lifetime. The horizontal scrollbar is unaffected
+        # — blank lines are width-0, so the rendered content's natural
+        # width is still the no-wrap one-line render.
+        dna_row = self._dna_top_row_offset()
+        pad = self._pad_above_for_centering(base_row=dna_row)
+        if pad > 0:
+            txt = Text("\n" * pad, no_wrap=True) + txt
+        # Stash the pad value so `_click_to_bp` can subtract it from
+        # the click's content-y before resolving — without this, a
+        # click on the DNA row would compute the wrong column because
+        # the viewport-x→content-x mapping is unaffected by padding
+        # (vertical pad doesn't shift columns) but the Y-anchor used
+        # by future hover/AA features would be wrong. Click resolution
+        # only uses X today so the stash is forward-compat.
+        self._pad_above_rows = pad
+        view.update(txt)
+
+    def on_resize(self, _event) -> None:
+        """Re-render on container resize so the centring padding is
+        recomputed against the new viewport height. Cheap — the chunk
+        layout cache hits on the same (seq, feats, line_width) key."""
+        self._refresh_view()
+
+    # ── Cursor + selection arithmetic ─────────────────────────────────────
+
+    def _clamp_cursor(self) -> None:
+        self._cursor_pos = max(0, min(len(self._seq), self._cursor_pos))
+
+    def set_cursor(self, pos: int, *, extend_sel: bool = False) -> None:
+        n = len(self._seq)
+        pos = max(0, min(n, int(pos)))
+        if extend_sel:
+            # Direction-aware anchor pinning for a FRESH extension
+            # (no active user_sel yet). The cursor visually OCCUPIES
+            # base[cursor_pos] — `_build_seq_text` paints reverse-
+            # video on that base index — so a naïve anchor at
+            # cursor_pos for a shift+left gives
+            # half-open (pos, anchor) = (cursor_pos - 1, cursor_pos),
+            # which highlights ONLY base[cursor_pos - 1], skipping
+            # the base the user thinks they're on. Pinning anchor
+            # at cursor_pos + 1 for left-extension fixes that: the
+            # range (cursor_pos - 1, cursor_pos + 1) covers BOTH
+            # base[cursor_pos - 1] AND base[cursor_pos]. Shift+right
+            # works as-is with anchor = cursor_pos because the
+            # natural (cursor_pos, cursor_pos + 1) already covers
+            # base[cursor_pos]. Subsequent shift-arrows leave the
+            # anchor alone — only the FIRST extension in a fresh
+            # cursor position picks the anchor.
+            if self._user_sel is None:
+                if pos < self._cursor_pos:
+                    # Extending LEFT — anchor at the right edge of
+                    # the cursor base so the half-open coord
+                    # includes base[cursor_pos].
+                    self._sel_anchor = min(n, self._cursor_pos + 1)
+                else:
+                    # Extending RIGHT (or no movement) — anchor at
+                    # cursor_pos; half-open (cursor_pos, pos)
+                    # naturally covers base[cursor_pos] when
+                    # pos > cursor_pos.
+                    self._sel_anchor = self._cursor_pos
+            elif self._sel_anchor < 0:
+                # Defensive — user_sel is set but anchor isn't.
+                # Shouldn't normally happen, but fall back to cursor.
+                self._sel_anchor = self._cursor_pos
+            anchor = self._sel_anchor
+            lo, hi = sorted((anchor, pos))
+            self._user_sel = (lo, hi) if lo != hi else None
+        else:
+            self._user_sel = None
+            self._sel_anchor = -1
+        self._cursor_pos = pos
+        self._refresh_view()
+        self._ensure_cursor_visible()
+        self.post_message(self.CursorMoved())
+
+    def _ensure_cursor_visible(self) -> None:
+        """Scroll the container horizontally so the cursor column is
+        in view. Mirrors SequencePanel._ensure_cursor_visible's intent
+        but for the horizontal axis (since we never wrap).
+
+        Column origin after the row-marker drop + 5'- marker insert +
+        horizontal-centring pad:
+            target_col = pad_left + FLANK_MARKER_WIDTH + cursor_pos
+        When the content is wider than the viewport the centring pad
+        is 0 (the natural left-anchored layout), so the formula
+        collapses to ``FLANK_MARKER_WIDTH + cursor_pos``.
+        """
+        try:
+            scroll = self.query_one("#syn-scroll", ScrollableContainer)
+        except NoMatches:
+            return
+        target_col = (self._pad_left_cols
+                       + self._FLANK_MARKER_WIDTH
+                       + self._cursor_pos)
+        try:
+            vp_w = max(1, int(scroll.size.width))
+            cur_x = int(scroll.scroll_x)
+        except (AttributeError, TypeError):
+            return
+        margin = max(4, vp_w // 6)
+        if target_col < cur_x + margin:
+            scroll.scroll_to(x=max(0, target_col - margin), animate=False)
+        elif target_col > cur_x + vp_w - margin:
+            scroll.scroll_to(
+                x=max(0, target_col - vp_w + margin), animate=False,
+            )
+
+    # ── Click → bp ────────────────────────────────────────────────────────
+
+    def _click_to_bp(self, screen_x: int, screen_y: int) -> int:
+        """Map a screen click to a base position. Returns the bp index
+        (0..len(seq)) — the column-within-sequence is interpreted as a
+        cursor *position* (between bases), so a click on column 0 lands
+        cursor at bp 0 (before the first base) and a click past the
+        last base lands cursor at len(seq)."""
+        if not self._seq:
+            return 0
+        try:
+            view = self.query_one("#syn-view", Static)
+            scroll = self.query_one("#syn-scroll", ScrollableContainer)
+        except NoMatches:
+            return -1
+        try:
+            vp_x = int(scroll.scroll_x)
+        except (AttributeError, TypeError):
+            vp_x = 0
+        view_region = view.region
+        if view_region.width == 0:
+            return -1
+        # Column within the rendered Text — `region.x` is the
+        # screen-x of the content's left edge; subtract to get
+        # content-local x, then add scroll offset.
+        col = (screen_x - view_region.x) + vp_x
+        n = len(self._seq)
+        # Subtract horizontal-centring pad AND the 5'- marker (3 chars)
+        # so a click on the very first base lands at bp 0. Clicks on
+        # the centring pad / 5'- marker collapse to bp 0; clicks past
+        # the -3' marker collapse to bp n. The line-number gutter was
+        # stripped by `_wrap_with_53_markers` so no `num_w + 2` term.
+        bp_col = col - (self._pad_left_cols + self._FLANK_MARKER_WIDTH)
+        if bp_col < 0:
+            return 0
+        if bp_col >= n:
+            return n
+        return bp_col
+
+    # ── Mouse handlers ────────────────────────────────────────────────────
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        if event.button != 1:
+            return
+        bp = self._click_to_bp(event.screen_x, event.screen_y)
+        if bp < 0:
+            return
+        self._mouse_button_held = True
+        self._drag_start_bp = bp
+        self._has_dragged = False
+        # Shift+down extends selection from current anchor.
+        if event.shift and self._cursor_pos >= 0:
+            if self._sel_anchor < 0:
+                self._sel_anchor = self._cursor_pos
+            lo, hi = sorted((self._sel_anchor, bp))
+            self._user_sel = (lo, hi) if lo != hi else None
+        else:
+            self._user_sel = None
+            self._sel_anchor = bp
+        self._cursor_pos = bp
+        self._refresh_view()
+        self.post_message(self.CursorMoved())
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        if not self._mouse_button_held or self._drag_start_bp < 0:
+            return
+        bp = self._click_to_bp(event.screen_x, event.screen_y)
+        if bp < 0:
+            return
+        if bp != self._drag_start_bp:
+            self._has_dragged = True
+            lo, hi = sorted((self._drag_start_bp, bp))
+            self._user_sel = (lo, hi) if lo != hi else None
+            self._cursor_pos = bp
+            self._refresh_view()
+            self.post_message(self.CursorMoved())
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        if event.button != 1:
+            return
+        self._last_was_drag = self._has_dragged
+        self._mouse_button_held = False
+        self._drag_start_bp = -1
+        self._has_dragged = False
+
+    def on_click(self, event: Click) -> None:
+        if self._last_was_drag:
+            self._last_was_drag = False
+            return
+        bp = self._click_to_bp(event.screen_x, event.screen_y)
+        if bp < 0:
+            return
+        # Plain click — place cursor, clear selection (mouse_down
+        # already handled shift+click extend).
+        if not event.shift:
+            self._cursor_pos = bp
+            self._user_sel = None
+            self._sel_anchor = bp
+            self._refresh_view()
+            self.post_message(self.CursorMoved())
+
+    # ── Editing primitives ────────────────────────────────────────────────
+
+    def insert_at_cursor(self, bases: str) -> bool:
+        """Insert `bases` at cursor. Returns True if anything landed.
+        Bases are upper-cased; non-IUPAC chars are silently dropped
+        (with a notify warning so a paste of garbage doesn't go
+        unnoticed). Total length capped at ``_SYNTHESIS_MAX_BP``."""
+        if not bases:
+            return False
+        # Replace selection if any.
+        if self._user_sel is not None:
+            self._delete_range(*self._user_sel)
+        clean = "".join(
+            c for c in bases.upper()
+            if c in _SYNTHESIS_TYPEABLE_BASES
+        )
+        if not clean:
+            self.app.notify(
+                "No valid bases in input (ACGT/IUPAC only).",
+                severity="warning",
+            )
+            return False
+        if len(clean) != len(bases):
+            self.app.notify(
+                f"Dropped {len(bases) - len(clean)} non-IUPAC char(s); "
+                "kept the valid bases.",
+                severity="information",
+            )
+        if len(self._seq) + len(clean) > _SYNTHESIS_MAX_BP:
+            remaining = max(0, _SYNTHESIS_MAX_BP - len(self._seq))
+            if remaining == 0:
+                self.app.notify(
+                    f"Fragment cap reached ({_SYNTHESIS_MAX_BP:,} bp). "
+                    "Delete some bases or split the fragment.",
+                    severity="warning",
+                )
+                return False
+            clean = clean[:remaining]
+            self.app.notify(
+                f"Truncated to fit {_SYNTHESIS_MAX_BP:,} bp cap "
+                f"(kept {len(clean):,} bp).",
+                severity="warning",
+            )
+        self._clamp_cursor()  # defence-in-depth before mutating state
+        cur = self._cursor_pos
+        n_ins = len(clean)
+        self._seq = self._seq[:cur] + clean + self._seq[cur:]
+        # Feature shift: half-open [s, e). Bases at-or-after cur shift
+        # by n_ins. A feature whose end == cur extends to include the
+        # inserted bases (typical "extend the feature I'm appending
+        # to" behaviour). A feature whose start == cur shifts (the
+        # insert sits BEFORE the feature's first base).
+        new_feats: list[dict] = []
+        for f in self._feats:
+            s = int(f.get("start", 0))
+            e = int(f.get("end", 0))
+            new_f = dict(f)
+            if s >= cur:
+                new_f["start"] = s + n_ins
+            if e >= cur and not (e == cur and s == cur):
+                new_f["end"] = e + n_ins
+            new_feats.append(new_f)
+        self._feats = new_feats
+        self._cursor_pos = cur + n_ins
+        self._user_sel = None
+        self._sel_anchor = -1
+        self._refresh_view()
+        self._ensure_cursor_visible()
+        self.post_message(self.Changed())
+        return True
+
+    def _delete_range(self, start: int, end: int) -> None:
+        """Delete the half-open [start, end) range. Internal — assumes
+        a sanitised range; callers handle clamping."""
+        if start >= end:
+            return
+        n_del = end - start
+        self._seq = self._seq[:start] + self._seq[end:]
+        new_feats: list[dict] = []
+        for f in self._feats:
+            s = int(f.get("start", 0))
+            e = int(f.get("end", 0))
+            new_f = dict(f)
+            if e <= start:
+                # entirely left of deletion — unchanged
+                new_feats.append(new_f)
+                continue
+            if s >= end:
+                # entirely right — shift left
+                new_f["start"] = s - n_del
+                new_f["end"]   = e - n_del
+                new_feats.append(new_f)
+                continue
+            # overlap: clip
+            new_s = min(s, start)
+            new_e = max(start, e - n_del)
+            if new_e <= new_s:
+                # feature disappeared
+                continue
+            new_f["start"] = new_s
+            new_f["end"]   = new_e
+            new_feats.append(new_f)
+        self._feats = new_feats
+        self._cursor_pos = start
+        self._user_sel = None
+        self._sel_anchor = -1
+
+    def delete_at_cursor(self, *, forward: bool = False) -> bool:
+        """Backspace (forward=False) or Delete (forward=True). Returns
+        True if anything was deleted."""
+        if self._user_sel is not None:
+            s, e = self._user_sel
+            self._delete_range(s, e)
+            self._refresh_view()
+            self._ensure_cursor_visible()
+            self.post_message(self.Changed())
+            return True
+        cur = self._cursor_pos
+        if forward:
+            if cur >= len(self._seq):
+                return False
+            self._delete_range(cur, cur + 1)
+        else:
+            if cur <= 0:
+                return False
+            self._delete_range(cur - 1, cur)
+        self._refresh_view()
+        self._ensure_cursor_visible()
+        self.post_message(self.Changed())
+        return True
+
+    def replace_selection_or_insert(self, bases: str) -> bool:
+        """Convenience: if there's a selection, delete + insert at the
+        same anchor. Otherwise just insert at cursor."""
+        if self._user_sel is not None:
+            s, _e = self._user_sel
+            self._delete_range(*self._user_sel)
+            self._cursor_pos = s
+        return self.insert_at_cursor(bases)
+
+    def add_feature(self, feat: dict) -> None:
+        """Append a feature dict to the buffer. Caller supplies start,
+        end, label, type, color, qualifiers, strand. Coordinates are
+        in absolute bp; no validation here — the AddFeatureModal
+        already gated them."""
+        if not isinstance(feat, dict):
+            return
+        self._feats.append(dict(feat))
+        self._refresh_view()
+        self.post_message(self.Changed())
+
+    def select_all(self) -> None:
+        if not self._seq:
+            return
+        self._user_sel = (0, len(self._seq))
+        self._sel_anchor = 0
+        self._cursor_pos = len(self._seq)
+        self._refresh_view()
+
+    def current_selection(self) -> "tuple[int, int] | None":
+        return self._user_sel
+
+    # ── Key handler ───────────────────────────────────────────────────────
+
+    def on_key(self, event) -> None:
+        """Capture base-typing + cursor navigation. We don't use Textual
+        ``Binding`` here because the editor needs to consume *every*
+        letter as a base, and Binding sets a tighter contract (one
+        action per key). The handler also covers arrow keys,
+        Backspace, Delete, Home, End so the parent screen's bindings
+        don't have to."""
+        k = event.key
+        # Modifier-bearing keys flow up to the screen (Ctrl+F, Ctrl+S,
+        # etc. — we never want to swallow them).
+        if k in ("ctrl+f", "ctrl+s", "ctrl+n", "ctrl+o", "ctrl+r",
+                  "ctrl+l", "ctrl+a", "ctrl+e", "ctrl+z", "ctrl+y",
+                  "escape", "tab", "shift+tab"):
+            return
+        # Cursor navigation.
+        if k == "left":
+            event.stop()
+            self.set_cursor(self._cursor_pos - 1)
+            return
+        if k == "right":
+            event.stop()
+            self.set_cursor(self._cursor_pos + 1)
+            return
+        if k == "shift+left":
+            event.stop()
+            self.set_cursor(self._cursor_pos - 1, extend_sel=True)
+            return
+        if k == "shift+right":
+            event.stop()
+            self.set_cursor(self._cursor_pos + 1, extend_sel=True)
+            return
+        if k == "home":
+            event.stop()
+            self.set_cursor(0)
+            return
+        if k == "end":
+            event.stop()
+            self.set_cursor(len(self._seq))
+            return
+        if k == "shift+home":
+            event.stop()
+            self.set_cursor(0, extend_sel=True)
+            return
+        if k == "shift+end":
+            event.stop()
+            self.set_cursor(len(self._seq), extend_sel=True)
+            return
+        if k == "pageup":
+            event.stop()
+            self.set_cursor(self._cursor_pos - 60)
+            return
+        if k == "pagedown":
+            event.stop()
+            self.set_cursor(self._cursor_pos + 60)
+            return
+        if k == "backspace":
+            event.stop()
+            self.delete_at_cursor(forward=False)
+            return
+        if k == "delete":
+            event.stop()
+            self.delete_at_cursor(forward=True)
+            return
+        # Base typing — only A/C/G/T/N. Restricted to the keyboard set
+        # (not the broader IUPAC set used for programmatic insert) so
+        # accidental ambiguity codes can't slip into a fragment via a
+        # keystroke; vendors universally accept ACGTN only. IUPAC
+        # bases still flow in via restriction-site / feature-library
+        # paths, where the ambiguity is intentional.
+        ch = event.character
+        if ch and len(ch) == 1 and ch.upper() in _SYNTHESIS_KEYBOARD_BASES:
+            event.stop()
+            self.insert_at_cursor(ch.upper())
+            return
+        # Anything else (modifier keys, function keys, IUPAC codes
+        # like Y/R/W, …) bubbles up.
+
+
+class ProteinEditor(Widget):
+    """Linear horizontal-scroll PROTEIN editor — sibling of
+    SynthesisEditor for the Protein tab of the synthesis composer.
+
+    Two render modes:
+      * **Codon-translated** (default): each amino acid letter sits
+        centred over its 3-bp DNA codon, sourced from the active
+        codon table's most-frequent codon for that amino acid. This
+        is the design surface where a user can SEE the eventual
+        synthesis-ready DNA while composing the protein.
+      * **AA-only**: just the amino acid letters, one cell per
+        residue, no DNA below. Useful for fast typing when the user
+        doesn't care about codon choice yet.
+
+      Toggle with Ctrl+T at the screen level.
+
+    State model (aa-coords, not bp-coords):
+      * ``_aa_seq``   — the amino acid string (single-letter codes,
+                         '*' for stop).
+      * ``_cursor_pos`` — 0..len(_aa_seq) — sits visually ON
+                          ``_aa_seq[cursor_pos]`` (reverse-video).
+      * ``_user_sel`` — selection range in AA coords (half-open).
+      * ``_codon_mode`` — True = codon-translated render; False = AA only.
+      * ``_codon_table_raw`` — ``{codon: (aa, count)}`` from the
+                                active codon table; set by the screen.
+      * ``_codon_cache`` — ``{aa: best_codon}`` derived from
+                            ``_codon_table_raw`` once per table change.
+
+    N-/-C markers flank the protein (N-terminus left, C-terminus
+    right) — biology convention. Width is 2 chars on each side so
+    ``_FLANK_MARKER_WIDTH = 2``; the column-arithmetic helpers use
+    that constant so changing the marker text in one place doesn't
+    break click resolution.
+    """
+
+    DEFAULT_CSS = """
+    ProteinEditor {
+        height: 1fr;
+        background: #0a0a0a;
+    }
+    ProteinEditor:focus-within { background: #0c0c0c; }
+    #pe-scroll {
+        height: 1fr;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-gutter: stable;
+    }
+    #pe-view {
+        width: auto;
+        height: auto;
+    }
+    """
+
+    class Changed(Message):
+        """Sent on any AA / codon-mode / codon-table mutation."""
+
+    class CursorMoved(Message):
+        """Sent on cursor or selection change (no dirty side-effect)."""
+
+    _FLANK_MARKER_N:        str = "N-"
+    _FLANK_MARKER_C:        str = "-C"
+    _FLANK_MARKER_WIDTH:    int = 2
+    _FLANK_MARKER_STYLE:    str = "bold #FF6B9D"
+    _DNA_BELOW_STYLE:       str = "dim #88CCFF"
+    _AA_DEFAULT_STYLE:      str = "bold white"
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._aa_seq: str = ""
+        self._cursor_pos: int = 0
+        self._user_sel: "tuple[int, int] | None" = None
+        self._sel_anchor: int = -1
+        self._codon_mode: bool = True
+        self._codon_table_raw: dict = {}
+        self._codon_cache: dict[str, str] = {}
+        # Drag-select state — mirrors SynthesisEditor.
+        self._drag_start_aa: int = -1
+        self._has_dragged: bool = False
+        self._mouse_button_held: bool = False
+        self._last_was_drag: bool = False
+        # Centring pads — same scheme as SynthesisEditor so cursor /
+        # click math has a single offset to subtract.
+        self._pad_above_rows: int = 0
+        self._pad_left_cols: int = 0
+
+    def compose(self) -> ComposeResult:
+        with ScrollableContainer(id="pe-scroll"):
+            yield Static("", id="pe-view", markup=False)
+
+    def on_mount(self) -> None:
+        self._refresh_view()
+        try:
+            self.query_one("#pe-scroll", ScrollableContainer).can_focus = True
+        except NoMatches:
+            pass
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def load(self, aa_seq: str) -> None:
+        """Replace the buffer. Resets cursor + selection."""
+        self._aa_seq = "".join(
+            c for c in str(aa_seq or "").upper()
+            if c in _PROTEIN_AA_ALPHABET
+        )
+        self._cursor_pos = 0
+        self._user_sel = None
+        self._sel_anchor = -1
+        self._refresh_view()
+
+    def get_state(self) -> "tuple[str, bool]":
+        """Return (aa_seq, codon_mode) snapshot for dirty / save flow."""
+        return self._aa_seq, self._codon_mode
+
+    def set_codon_mode(self, on: bool) -> None:
+        if bool(on) == self._codon_mode:
+            return
+        self._codon_mode = bool(on)
+        self._refresh_view()
+        self.post_message(self.CursorMoved())
+
+    def set_codon_table(self, raw: dict) -> None:
+        """Update the active codon table. Rebuilds the ``_codon_cache``
+        (aa → most-frequent codon) so re-renders are cheap."""
+        try:
+            self._codon_table_raw = dict(raw or {})
+            self._codon_cache = self._build_codon_cache(self._codon_table_raw)
+        except (TypeError, ValueError):
+            _log.exception(
+                "ProteinEditor: codon table load failed; falling back to NNN",
+            )
+            self._codon_table_raw = {}
+            self._codon_cache = {}
+        self._refresh_view()
+
+    @staticmethod
+    def _build_codon_cache(raw: dict) -> dict[str, str]:
+        """``{aa: most_frequent_codon}`` derived from the raw codon
+        usage table. Returns 'NNN' for any AA missing in the table
+        (defensive — a hostile / partial table doesn't crash the
+        renderer)."""
+        try:
+            aa_codons, _ = _codon_build_aa_map(raw)
+        except (TypeError, ValueError):
+            return {}
+        cache: dict[str, str] = {}
+        for aa, codons in aa_codons.items():
+            if not codons:
+                continue
+            cache[aa] = codons[0][0]
+        # Stop codon — not in aa_codons (filtered out by
+        # _codon_build_aa_map). Pull the most-frequent stop codon
+        # straight from the raw table.
+        stop_codons = [
+            (codon, int(cnt)) for codon, (aa, cnt) in raw.items()
+            if aa == "*"
+        ]
+        if stop_codons:
+            stop_codons.sort(key=lambda x: -x[1])
+            cache["*"] = stop_codons[0][0]
+        else:
+            cache["*"] = "TAA"
+        return cache
+
+    def current_selection(self) -> "tuple[int, int] | None":
+        return self._user_sel
+
+    # ── Render ─────────────────────────────────────────────────────────────
+
+    def _viewport_width(self) -> int:
+        try:
+            scroll = self.query_one("#pe-scroll", ScrollableContainer)
+            return max(0, int(scroll.size.width))
+        except (NoMatches, AttributeError):
+            return 0
+
+    def _viewport_height(self) -> int:
+        try:
+            scroll = self.query_one("#pe-scroll", ScrollableContainer)
+            return max(0, int(scroll.size.height))
+        except (NoMatches, AttributeError):
+            return 0
+
+    def _cols_per_aa(self) -> int:
+        """How many columns one AA occupies in the rendered Text:
+        3 in codon mode (centred letter + 3-bp codon below), 1 in
+        aa-only mode."""
+        return 3 if self._codon_mode else 1
+
+    def _content_width(self) -> int:
+        """Natural width of the marker-wrapped render."""
+        if not self._aa_seq:
+            return 64
+        return 2 * self._FLANK_MARKER_WIDTH + len(self._aa_seq) * self._cols_per_aa()
+
+    def _horizontal_center_pad(self) -> int:
+        vp_w = self._viewport_width()
+        c_w  = self._content_width()
+        if vp_w <= 0 or c_w >= vp_w:
+            return 0
+        return (vp_w - c_w) // 2
+
+    def _row_count(self) -> int:
+        """Rows the rendered Text occupies (excluding centring pads).
+        Codon mode = 2 (AA row + DNA codon row); AA-only = 1."""
+        return 2 if self._codon_mode else 1
+
+    def _vertical_center_pad(self) -> int:
+        vp_h = self._viewport_height()
+        rows = self._row_count()
+        if vp_h <= 0 or rows >= vp_h:
+            return 0
+        return (vp_h - rows) // 2
+
+    def _refresh_view(self) -> None:
+        try:
+            view = self.query_one("#pe-view", Static)
+        except NoMatches:
+            return
+        if not self._aa_seq:
+            placeholder = (
+                "(empty protein — type amino acids, "
+                "Alt+T to toggle AA-only mode, "
+                "pick a motif on the right to insert)"
+            )
+            empty = Text(
+                placeholder,
+                style="dim italic",
+                no_wrap=True,
+                overflow="crop",
+            )
+            vp_w = self._viewport_width()
+            if vp_w > 0 and len(placeholder) < vp_w:
+                pad_left = (vp_w - len(placeholder)) // 2
+                empty = Text(" " * pad_left, no_wrap=True) + empty
+                self._pad_left_cols = pad_left
+            else:
+                self._pad_left_cols = 0
+            pad_above = self._vertical_center_pad()
+            self._pad_above_rows = pad_above
+            if pad_above > 0:
+                empty = Text("\n" * pad_above, no_wrap=True) + empty
+            view.update(empty)
+            return
+        # Build the body — codon mode = 2 rows, aa-only = 1 row.
+        if self._codon_mode:
+            txt = self._build_codon_mode_text()
+        else:
+            txt = self._build_aa_only_text()
+        # Horizontal centring pad — short proteins sit at viewport
+        # centre; long proteins left-anchor + horizontal scroll.
+        pad_left = self._horizontal_center_pad()
+        self._pad_left_cols = pad_left
+        if pad_left > 0:
+            pad_text = Text(" " * pad_left, no_wrap=True)
+            try:
+                lines = txt.split("\n")
+            except Exception:
+                lines = [txt]
+            txt = Text("\n", no_wrap=True).join(
+                pad_text + ln for ln in lines
+            )
+        # Vertical centring — same scheme as SynthesisEditor.
+        pad_above = self._vertical_center_pad()
+        self._pad_above_rows = pad_above
+        if pad_above > 0:
+            txt = Text("\n" * pad_above, no_wrap=True) + txt
+        view.update(txt)
+
+    def _build_codon_mode_text(self) -> Text:
+        """Two-row Text: AA letters centred over their 3-bp codons.
+
+        For each AA:
+            AA row:  ' X '   (3 cells: leading space, letter, trailing space)
+            DNA row: 'XYZ'   (3 cells: the codon)
+
+        N- / -C markers flank both rows. Cursor at AA[N] reverse-
+        videos column N*3+1 (the AA letter) AND the 3 cells beneath
+        (the codon under the cursor). Selection paints the same
+        background on AA + codon cells across the span.
+        """
+        cursor = self._cursor_pos
+        sel = self._user_sel
+        sel_lo, sel_hi = (sel if sel is not None else (-1, -1))
+        n_aa = len(self._aa_seq)
+        aa_row  = Text(no_wrap=True, overflow="crop")
+        dna_row = Text(no_wrap=True, overflow="crop")
+        # Flank markers — N-terminus left, C-terminus right.
+        n_marker = Text(self._FLANK_MARKER_N,
+                         style=self._FLANK_MARKER_STYLE, no_wrap=True)
+        c_marker = Text(self._FLANK_MARKER_C,
+                         style=self._FLANK_MARKER_STYLE, no_wrap=True)
+        # Below-strand marker pad — DNA codon row gets same-width
+        # blanks so the AA row's markers don't shift the codon row.
+        blank_marker = Text(" " * self._FLANK_MARKER_WIDTH, no_wrap=True)
+        aa_row.append_text(n_marker)
+        dna_row.append_text(blank_marker)
+        for i, aa in enumerate(self._aa_seq):
+            on_cursor = (i == cursor)
+            in_sel    = (sel_lo <= i < sel_hi)
+            aa_style = self._AA_DEFAULT_STYLE
+            cell_style = ""
+            if in_sel:
+                cell_style = "on #003366"
+            if on_cursor:
+                cell_style = "reverse"
+            # AA row: 3 cells (leading space, letter, trailing space).
+            aa_row.append(" ", style=cell_style)
+            aa_row.append(aa, style=f"{aa_style} {cell_style}".strip())
+            aa_row.append(" ", style=cell_style)
+            # DNA row: codon (3 chars) under the AA. Fallback NNN.
+            codon = self._codon_cache.get(aa, "NNN")
+            if len(codon) != 3:
+                codon = "NNN"
+            dna_style = (cell_style or self._DNA_BELOW_STYLE)
+            for c in codon:
+                dna_row.append(c, style=dna_style)
+        aa_row.append_text(c_marker)
+        dna_row.append_text(blank_marker)
+        # Hint for past-end cursor: when cursor sits at n_aa (past
+        # the last residue), draw a faint caret in the trailing
+        # margin so the user can see WHERE the next insert lands.
+        if cursor == n_aa and n_aa > 0:
+            # Overlay a caret in the trailing space cell. Simplest:
+            # append a soft pipe AFTER -C marker in the AA row.
+            aa_row.append("│", style="bold #FF6B9D")
+            dna_row.append(" ")
+        return aa_row + Text("\n", no_wrap=True) + dna_row
+
+    def _build_aa_only_text(self) -> Text:
+        """Single-row Text: contiguous AA letters. One cell per AA."""
+        cursor = self._cursor_pos
+        sel = self._user_sel
+        sel_lo, sel_hi = (sel if sel is not None else (-1, -1))
+        n_aa = len(self._aa_seq)
+        row = Text(no_wrap=True, overflow="crop")
+        n_marker = Text(self._FLANK_MARKER_N,
+                         style=self._FLANK_MARKER_STYLE, no_wrap=True)
+        c_marker = Text(self._FLANK_MARKER_C,
+                         style=self._FLANK_MARKER_STYLE, no_wrap=True)
+        row.append_text(n_marker)
+        for i, aa in enumerate(self._aa_seq):
+            on_cursor = (i == cursor)
+            in_sel    = (sel_lo <= i < sel_hi)
+            style = self._AA_DEFAULT_STYLE
+            if in_sel:
+                style = f"{style} on #003366"
+            if on_cursor:
+                style = "reverse"
+            row.append(aa, style=style)
+        row.append_text(c_marker)
+        if cursor == n_aa and n_aa > 0:
+            row.append("│", style="bold #FF6B9D")
+        return row
+
+    # ── Cursor + selection ────────────────────────────────────────────────
+
+    def _clamp_cursor(self) -> None:
+        self._cursor_pos = max(0, min(len(self._aa_seq), self._cursor_pos))
+
+    def set_cursor(self, pos: int, *, extend_sel: bool = False) -> None:
+        n = len(self._aa_seq)
+        pos = max(0, min(n, int(pos)))
+        if extend_sel:
+            # Direction-aware anchor — same fix as SynthesisEditor so
+            # the FIRST shift+left includes the AA under the cursor
+            # in the selection.
+            if self._user_sel is None:
+                if pos < self._cursor_pos:
+                    self._sel_anchor = min(n, self._cursor_pos + 1)
+                else:
+                    self._sel_anchor = self._cursor_pos
+            elif self._sel_anchor < 0:
+                self._sel_anchor = self._cursor_pos
+            anchor = self._sel_anchor
+            lo, hi = sorted((anchor, pos))
+            self._user_sel = (lo, hi) if lo != hi else None
+        else:
+            self._user_sel = None
+            self._sel_anchor = -1
+        self._cursor_pos = pos
+        self._refresh_view()
+        self._ensure_cursor_visible()
+        self.post_message(self.CursorMoved())
+
+    def _ensure_cursor_visible(self) -> None:
+        try:
+            scroll = self.query_one("#pe-scroll", ScrollableContainer)
+        except NoMatches:
+            return
+        # Column of cursor's AA in the rendered Text = pad_left +
+        # marker_width + cursor_pos * cols_per_aa. For codon mode the
+        # AA letter sits at cell +1 of its 3-cell group so we shift
+        # by +1 to land the scroll target right on the letter.
+        cell_offset = 1 if self._codon_mode else 0
+        target_col = (self._pad_left_cols + self._FLANK_MARKER_WIDTH
+                       + self._cursor_pos * self._cols_per_aa() + cell_offset)
+        try:
+            vp_w = max(1, int(scroll.size.width))
+            cur_x = int(scroll.scroll_x)
+        except (AttributeError, TypeError):
+            return
+        margin = max(4, vp_w // 6)
+        if target_col < cur_x + margin:
+            scroll.scroll_to(x=max(0, target_col - margin), animate=False)
+        elif target_col > cur_x + vp_w - margin:
+            scroll.scroll_to(
+                x=max(0, target_col - vp_w + margin), animate=False,
+            )
+
+    # ── Click → AA ────────────────────────────────────────────────────────
+
+    def _click_to_aa(self, screen_x: int, screen_y: int) -> int:
+        """Map a screen click to an AA position 0..len(_aa_seq).
+        Clicks on the N- / -C markers / centring pad collapse to the
+        nearest AA endpoint."""
+        if not self._aa_seq:
+            return 0
+        try:
+            view = self.query_one("#pe-view", Static)
+            scroll = self.query_one("#pe-scroll", ScrollableContainer)
+        except NoMatches:
+            return -1
+        try:
+            vp_x = int(scroll.scroll_x)
+        except (AttributeError, TypeError):
+            vp_x = 0
+        view_region = view.region
+        if view_region.width == 0:
+            return -1
+        col = (screen_x - view_region.x) + vp_x
+        # Subtract centring pad + N- marker → column inside the AA
+        # content area.
+        aa_col = col - (self._pad_left_cols + self._FLANK_MARKER_WIDTH)
+        if aa_col < 0:
+            return 0
+        # In codon mode each AA spans 3 columns; in aa-only mode 1.
+        n_aa = len(self._aa_seq)
+        cpa = self._cols_per_aa()
+        idx = aa_col // cpa
+        if idx >= n_aa:
+            return n_aa
+        return int(idx)
+
+    # ── Mouse handlers ────────────────────────────────────────────────────
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        if event.button != 1:
+            return
+        aa = self._click_to_aa(event.screen_x, event.screen_y)
+        if aa < 0:
+            return
+        self._mouse_button_held = True
+        self._drag_start_aa = aa
+        self._has_dragged = False
+        if event.shift and self._cursor_pos >= 0:
+            if self._sel_anchor < 0:
+                self._sel_anchor = self._cursor_pos
+            lo, hi = sorted((self._sel_anchor, aa))
+            self._user_sel = (lo, hi) if lo != hi else None
+        else:
+            self._user_sel = None
+            self._sel_anchor = aa
+        self._cursor_pos = aa
+        self._refresh_view()
+        self.post_message(self.CursorMoved())
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        if not self._mouse_button_held or self._drag_start_aa < 0:
+            return
+        aa = self._click_to_aa(event.screen_x, event.screen_y)
+        if aa < 0:
+            return
+        if aa != self._drag_start_aa:
+            self._has_dragged = True
+            lo, hi = sorted((self._drag_start_aa, aa))
+            self._user_sel = (lo, hi) if lo != hi else None
+            self._cursor_pos = aa
+            self._refresh_view()
+            self.post_message(self.CursorMoved())
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        if event.button != 1:
+            return
+        self._last_was_drag = self._has_dragged
+        self._mouse_button_held = False
+        self._drag_start_aa = -1
+        self._has_dragged = False
+
+    def on_click(self, event: Click) -> None:
+        if self._last_was_drag:
+            self._last_was_drag = False
+            return
+        aa = self._click_to_aa(event.screen_x, event.screen_y)
+        if aa < 0:
+            return
+        if not event.shift:
+            self._cursor_pos = aa
+            self._user_sel = None
+            self._sel_anchor = aa
+            self._refresh_view()
+            self.post_message(self.CursorMoved())
+
+    # ── Editing primitives ────────────────────────────────────────────────
+
+    def insert_at_cursor(self, aas: str) -> bool:
+        """Insert ``aas`` at cursor. Non-AA chars are dropped with a
+        notify. Total length capped at ``_PROTEIN_MAX_AA``."""
+        if not aas:
+            return False
+        if self._user_sel is not None:
+            self._delete_range(*self._user_sel)
+        clean = "".join(
+            c for c in aas.upper()
+            if c in _PROTEIN_AA_ALPHABET
+        )
+        if not clean:
+            self.app.notify(
+                "No valid amino acids in input "
+                "(20 standard AAs + '*' only).",
+                severity="warning",
+            )
+            return False
+        if len(clean) != len(aas):
+            self.app.notify(
+                f"Dropped {len(aas) - len(clean)} non-AA char(s); "
+                "kept the valid amino acids.",
+                severity="information",
+            )
+        if len(self._aa_seq) + len(clean) > _PROTEIN_MAX_AA:
+            remaining = max(0, _PROTEIN_MAX_AA - len(self._aa_seq))
+            if remaining == 0:
+                self.app.notify(
+                    f"Protein cap reached ({_PROTEIN_MAX_AA:,} aa). "
+                    "Delete some residues or split the protein.",
+                    severity="warning",
+                )
+                return False
+            clean = clean[:remaining]
+            self.app.notify(
+                f"Truncated to fit {_PROTEIN_MAX_AA:,} aa cap "
+                f"(kept {len(clean):,} aa).",
+                severity="warning",
+            )
+        self._clamp_cursor()
+        cur = self._cursor_pos
+        n_ins = len(clean)
+        self._aa_seq = self._aa_seq[:cur] + clean + self._aa_seq[cur:]
+        self._cursor_pos = cur + n_ins
+        self._user_sel = None
+        self._sel_anchor = -1
+        self._refresh_view()
+        self._ensure_cursor_visible()
+        self.post_message(self.Changed())
+        return True
+
+    def _delete_range(self, start: int, end: int) -> None:
+        if start >= end:
+            return
+        self._aa_seq = self._aa_seq[:start] + self._aa_seq[end:]
+        self._cursor_pos = start
+        self._user_sel = None
+        self._sel_anchor = -1
+
+    def delete_at_cursor(self, *, forward: bool = False) -> bool:
+        if self._user_sel is not None:
+            s, e = self._user_sel
+            self._delete_range(s, e)
+            self._refresh_view()
+            self._ensure_cursor_visible()
+            self.post_message(self.Changed())
+            return True
+        cur = self._cursor_pos
+        if forward:
+            if cur >= len(self._aa_seq):
+                return False
+            self._delete_range(cur, cur + 1)
+        else:
+            if cur <= 0:
+                return False
+            self._delete_range(cur - 1, cur)
+        self._refresh_view()
+        self._ensure_cursor_visible()
+        self.post_message(self.Changed())
+        return True
+
+    def select_all(self) -> None:
+        if not self._aa_seq:
+            return
+        self._user_sel = (0, len(self._aa_seq))
+        self._sel_anchor = 0
+        self._cursor_pos = len(self._aa_seq)
+        self._refresh_view()
+
+    # ── Key handler ───────────────────────────────────────────────────────
+
+    def on_key(self, event) -> None:
+        k = event.key
+        if k in ("ctrl+f", "ctrl+s", "ctrl+n", "ctrl+o", "ctrl+r",
+                  "ctrl+l", "ctrl+a", "ctrl+e", "ctrl+z", "ctrl+y",
+                  "ctrl+t", "ctrl+m", "alt+t",
+                  "escape", "tab", "shift+tab"):
+            return
+        if k == "left":
+            event.stop()
+            self.set_cursor(self._cursor_pos - 1)
+            return
+        if k == "right":
+            event.stop()
+            self.set_cursor(self._cursor_pos + 1)
+            return
+        if k == "shift+left":
+            event.stop()
+            self.set_cursor(self._cursor_pos - 1, extend_sel=True)
+            return
+        if k == "shift+right":
+            event.stop()
+            self.set_cursor(self._cursor_pos + 1, extend_sel=True)
+            return
+        if k == "home":
+            event.stop()
+            self.set_cursor(0)
+            return
+        if k == "end":
+            event.stop()
+            self.set_cursor(len(self._aa_seq))
+            return
+        if k == "shift+home":
+            event.stop()
+            self.set_cursor(0, extend_sel=True)
+            return
+        if k == "shift+end":
+            event.stop()
+            self.set_cursor(len(self._aa_seq), extend_sel=True)
+            return
+        if k == "pageup":
+            event.stop()
+            self.set_cursor(self._cursor_pos - 20)
+            return
+        if k == "pagedown":
+            event.stop()
+            self.set_cursor(self._cursor_pos + 20)
+            return
+        if k == "backspace":
+            event.stop()
+            self.delete_at_cursor(forward=False)
+            return
+        if k == "delete":
+            event.stop()
+            self.delete_at_cursor(forward=True)
+            return
+        ch = event.character
+        if ch and len(ch) == 1 and ch.upper() in _PROTEIN_AA_ALPHABET:
+            event.stop()
+            self.insert_at_cursor(ch.upper())
+            return
+
+    def on_resize(self, _event) -> None:
+        self._refresh_view()
+
+
+class RestrictionInsertModal(ModalScreen):
+    """Searchable picker for inserting a restriction-enzyme recognition
+    site at the synthesis cursor.
+
+    Dismiss payload:
+      * ``str`` — the enzyme name (caller looks up the recognition
+        site via ``_site_for_enzyme`` and inserts at cursor).
+      * ``None`` — user cancelled."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter",  "pick",   "Insert"),
+    ]
+
+    DEFAULT_CSS = """
+    #ri-dlg {
+        width: 60%; max-width: 80; height: 80%; max-height: 36;
+        background: $surface; padding: 1 2; border: solid $primary-darken-2;
+    }
+    #ri-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #ri-search { height: 3; margin-top: 1; }
+    #ri-table  { height: 1fr; border: solid $primary-darken-2;
+                 margin-top: 1; }
+    #ri-btns   { height: 3; align: right middle; margin-top: 1; }
+    #ri-btns Button { margin-left: 1; min-width: 10; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Pre-build the full enzyme list once so search re-filtering
+        # is cheap. (name, site, n_bp).
+        self._all_rows: list[tuple[str, str, int]] = sorted(
+            (
+                (name, info[0], len(info[0].replace("N", "")))
+                for name, info in _NEB_ENZYMES.items()
+                if isinstance(info, tuple) and info
+            ),
+            key=lambda r: _natural_sort_key(r[0]),
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ri-dlg"):
+            yield Static(" Insert restriction site at cursor ",
+                          id="ri-title")
+            yield Input(placeholder="filter by name or site "
+                         "(e.g. EcoRI, GAATTC, BsaI)",
+                          id="ri-search")
+            yield DataTable(id="ri-table",
+                              cursor_type="row",
+                              zebra_stripes=True)
+            with Horizontal(id="ri-btns"):
+                yield Button("Insert", id="btn-ri-insert", variant="primary")
+                yield Button("Cancel", id="btn-ri-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#ri-table", DataTable)
+            t.add_columns("Enzyme", "Recognition", "bp")
+        except NoMatches:
+            return
+        self._repopulate("")
+        try:
+            self.query_one("#ri-search", Input).focus()
+        except NoMatches:
+            pass
+
+    def _repopulate(self, needle: str) -> None:
+        try:
+            t = self.query_one("#ri-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        needle_up = needle.strip().upper()
+        for name, site, n_bp in self._all_rows:
+            if needle_up and needle_up not in name.upper() \
+                    and needle_up not in site.upper():
+                continue
+            t.add_row(name, site, str(n_bp), key=name)
+
+    @on(Input.Changed, "#ri-search")
+    def _on_search(self, event: Input.Changed) -> None:
+        self._repopulate(event.value)
+
+    @on(Input.Submitted, "#ri-search")
+    def _on_search_submit(self, _) -> None:
+        self.action_pick()
+
+    @on(Button.Pressed, "#btn-ri-insert")
+    def _btn_insert(self, _) -> None:
+        self.action_pick()
+
+    @on(Button.Pressed, "#btn-ri-cancel")
+    def _btn_cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_pick(self) -> None:
+        try:
+            t = self.query_one("#ri-table", DataTable)
+        except NoMatches:
+            self.dismiss(None)
+            return
+        if t.cursor_row < 0 or t.row_count == 0:
+            return
+        try:
+            row_key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key
+        except (LookupError, AttributeError):
+            self.dismiss(None)
+            return
+        enzyme = row_key.value if hasattr(row_key, "value") else str(row_key)
+        self.dismiss(enzyme)
+
+
+class SynthesisLoadModal(ModalScreen):
+    """Picker for loading a linear-topology library entry into the
+    synthesis editor. Filters the active library to entries whose
+    parsed topology is ``linear`` (circular plasmids don't belong in
+    the synthesis editor — they have an origin invariant the linear
+    editor can't represent).
+
+    Dismiss payload:
+      * ``str`` — the entry id to load.
+      * ``None`` — user cancelled."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter",  "pick",   "Load"),
+    ]
+
+    DEFAULT_CSS = """
+    #sl-dlg {
+        width: 70%; max-width: 90; height: 80%; max-height: 38;
+        background: $surface; padding: 1 2; border: solid $primary-darken-2;
+    }
+    #sl-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #sl-search { height: 3; margin-top: 1; }
+    #sl-table  { height: 1fr; border: solid $primary-darken-2;
+                 margin-top: 1; }
+    #sl-hint   { height: 1; color: $text-muted; margin-top: 1; }
+    #sl-btns   { height: 3; align: right middle; margin-top: 1; }
+    #sl-btns Button { margin-left: 1; min-width: 10; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._rows: list[tuple[str, str, int]] = []  # (id, name, size)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sl-dlg"):
+            yield Static(" Load fragment from library ",
+                          id="sl-title")
+            yield Input(placeholder="filter by name or id",
+                          id="sl-search")
+            yield DataTable(id="sl-table",
+                              cursor_type="row",
+                              zebra_stripes=True)
+            yield Static(
+                "[dim]Only linear-topology entries shown. "
+                "Saving back overwrites the same entry (document model).[/]",
+                id="sl-hint", markup=True,
+            )
+            with Horizontal(id="sl-btns"):
+                yield Button("Load", id="btn-sl-load", variant="primary")
+                yield Button("Cancel", id="btn-sl-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#sl-table", DataTable)
+            t.add_columns("Name", "ID", "bp")
+        except NoMatches:
+            return
+        # Filter library to linear entries via a cheap LOCUS-line peek
+        # (avoids parsing every gb_text just to read topology).
+        rows: list[tuple[str, str, int]] = []
+        for e in _load_library():
+            if not isinstance(e, dict):
+                continue
+            gb_text = e.get("gb_text", "") or ""
+            # LOCUS line in GenBank carries the topology word; cheap
+            # substring test beats a full BioPython parse.
+            first_line = gb_text.split("\n", 1)[0] if gb_text else ""
+            if "linear" not in first_line.lower():
+                continue
+            rows.append((
+                e.get("id", "") or "",
+                e.get("name", "") or e.get("id", "") or "(unnamed)",
+                int(e.get("size", 0) or 0),
+            ))
+        rows.sort(key=lambda r: _natural_sort_key(r[1]))
+        self._rows = rows
+        self._repopulate("")
+        try:
+            self.query_one("#sl-search", Input).focus()
+        except NoMatches:
+            pass
+
+    def _repopulate(self, needle: str) -> None:
+        try:
+            t = self.query_one("#sl-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        needle_lo = needle.strip().lower()
+        for eid, name, size in self._rows:
+            if needle_lo and needle_lo not in name.lower() \
+                    and needle_lo not in eid.lower():
+                continue
+            t.add_row(name, eid, f"{size:,}", key=eid)
+
+    @on(Input.Changed, "#sl-search")
+    def _on_search(self, event: Input.Changed) -> None:
+        self._repopulate(event.value)
+
+    @on(Input.Submitted, "#sl-search")
+    def _on_search_submit(self, _) -> None:
+        self.action_pick()
+
+    @on(Button.Pressed, "#btn-sl-load")
+    def _btn_load(self, _) -> None:
+        self.action_pick()
+
+    @on(Button.Pressed, "#btn-sl-cancel")
+    def _btn_cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_pick(self) -> None:
+        try:
+            t = self.query_one("#sl-table", DataTable)
+        except NoMatches:
+            self.dismiss(None)
+            return
+        if t.cursor_row < 0 or t.row_count == 0:
+            return
+        try:
+            row_key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key
+        except (LookupError, AttributeError):
+            self.dismiss(None)
+            return
+        eid = row_key.value if hasattr(row_key, "value") else str(row_key)
+        self.dismiss(eid)
+
+
+class SynthesisUnsavedChangesModal(ModalScreen):
+    """Save / Abandon / Cancel prompt when leaving a dirty synthesis
+    buffer. Mirrors the ExperimentUnsavedChangesModal pattern."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    #suc-dlg {
+        width: 60; height: 12;
+        background: $surface; padding: 1 2;
+        border: solid $primary-darken-2;
+    }
+    #suc-title {
+        background: $warning; color: black;
+        padding: 0 1; height: 1;
+    }
+    #suc-body { height: 1fr; margin-top: 1; }
+    #suc-btns { height: 3; align: right middle; }
+    #suc-btns Button { margin-left: 1; min-width: 12; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="suc-dlg"):
+            yield Static(" Unsaved fragment ", id="suc-title")
+            yield Static(
+                "The current fragment has unsaved edits. "
+                "Save before continuing?",
+                id="suc-body",
+            )
+            with Horizontal(id="suc-btns"):
+                yield Button("Save", id="btn-suc-save", variant="primary")
+                yield Button("Abandon", id="btn-suc-abandon",
+                              variant="error")
+                yield Button("Cancel", id="btn-suc-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn-suc-cancel", Button).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-suc-save")
+    def _save(self, _) -> None:
+        self.dismiss("save")
+
+    @on(Button.Pressed, "#btn-suc-abandon")
+    def _abandon(self, _) -> None:
+        self.dismiss("abandon")
+
+    @on(Button.Pressed, "#btn-suc-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SynthesisScreen(Screen):
+    """Full-screen gene-synthesis composer.
+
+    Toolbar (top row): New / Load / Save / Save As / Rename / Insert site /
+    Add feature / Close. Status bar shows name + bp + dirty flag. Editor
+    fills the rest.
+
+    Document model on save: ``_loaded_id`` carries the library entry id
+    we're currently editing. On Save:
+      * If ``_loaded_id`` is set → silent replace by id (the id-match
+        branch in ``LibraryPanel.add_entry``).
+      * If ``_loaded_id`` is None → prompt for name via
+        ``NamePlasmidModal``; on accept, set ``_loaded_id`` and save.
+    Save As always prompts, then re-targets ``_loaded_id``.
+
+    Dismisses with ``None`` on Close / Esc. If the buffer is dirty,
+    pushes ``SynthesisUnsavedChangesModal`` first.
+    """
+
+    # App-level Ctrl+Z would otherwise pop the canvas underneath while
+    # the user is composing a fragment (invariant #41 — modal Ctrl+Z
+    # opts out).
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",        "Close", show=True),
+        Binding("ctrl+s", "save",          "Save",  show=True),
+        Binding("ctrl+n", "new_fragment",  "New",   show=True),
+        Binding("ctrl+o", "load_fragment", "Load",  show=True),
+        Binding("ctrl+f", "add_feature",   "Add feature", show=True),
+        Binding("ctrl+r", "insert_site",   "Insert site", show=True),
+        Binding("ctrl+a", "select_all",    "Select all", show=False),
+        # Screen-level Backspace / Delete fallback — only fires when
+        # no focused widget consumed the keystroke (Input widgets
+        # handle their own backspace internally, so this doesn't
+        # interfere with typing in the search / name inputs). Routes
+        # to the active editor's delete_at_cursor when the editor has
+        # a visible selection — so a Ctrl+A → Backspace sequence
+        # erases the highlighted fragment even if focus has drifted.
+        Binding("backspace", "delete_selection_backward",
+                "Delete selection", show=False),
+        Binding("delete",    "delete_selection_forward",
+                "Delete selection", show=False),
+        # Alt+T — toggle protein-tab codon-translated mode vs
+        # AA-only mode. No-op on the DNA tab. (NOT Ctrl+M — Ctrl+M is
+        # the CR control character ^M at the terminal protocol level,
+        # so the terminal swallows it before Textual sees it. Alt+T
+        # sends an ESC-prefixed sequence that's unambiguous across
+        # every supported terminal.)
+        Binding("alt+t", "toggle_codon_mode", "AA mode toggle", show=True),
+        Binding("tab",    "app.focus_next", "Next",      show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #syn-box {
+        width: 100%; height: 1fr;
+        background: $surface; padding: 0 1;
+    }
+    #syn-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #syn-toolbar {
+        height: 3; margin-top: 1; align: left middle;
+    }
+    #syn-toolbar Button {
+        margin-right: 1; min-width: 12;
+    }
+    #syn-status {
+        height: 1; padding: 0 1; color: $text-muted;
+    }
+    /* Body split: editor on the left, feature library on the right.
+       Mirrors the ExperimentsScreen entries-vs-details split. */
+    #syn-tabs { width: 100%; height: 1fr; margin-top: 1; }
+    #syn-tabs > TabPane { padding: 0; }
+    #syn-body-split {
+        width: 100%; height: 1fr; margin-top: 0;
+    }
+    #syn-editor-frame, #syn-protein-editor-frame {
+        width: 4fr; height: 1fr;
+        border: solid $primary-darken-2;
+    }
+    #syn-featlib-pane, #syn-motif-pane {
+        width: 1fr; min-width: 28; height: 1fr;
+        padding: 0 0 0 1;
+    }
+    #syn-featlib-title, #syn-motif-title {
+        height: 1; color: $text-muted; padding: 0 1;
+    }
+    #syn-featlib-search, #syn-motif-search { height: 3; margin-top: 0; }
+    #syn-featlib-table, #syn-motif-table {
+        height: 1fr; min-height: 6;
+        border: solid $primary-darken-2;
+    }
+    #syn-featlib-btns, #syn-motif-btns { height: 3; margin-top: 1; align: left middle; }
+    #syn-featlib-btns Button, #syn-motif-btns Button {
+        margin-right: 1; min-width: 10; width: 1fr;
+    }
+    #syn-featlib-hint, #syn-motif-hint {
+        height: 2; color: $text-muted; padding: 0 1;
+    }
+    /* Protein-tab top row: codon table + mode toggle. */
+    #syn-protein-controls {
+        height: 3; margin-top: 1; align: left middle;
+    }
+    #syn-codon-table-label { width: auto; padding: 1 1 0 1; color: $text-muted; }
+    #syn-codon-table-select { width: 36; }
+    #syn-codon-mode-label { width: auto; padding: 1 1 0 2; color: $text-muted; }
+    #btn-syn-toggle-codon-mode { width: 22; margin-left: 1; }
+    #syn-bottom {
+        height: 3; margin-top: 1; align: right middle;
+    }
+    #syn-bottom Button { margin-left: 1; min-width: 12; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Per-tab document state. The DNA / Protein tabs each track
+        # their own loaded library entry id, display name, and dirty
+        # snapshot so switching tabs preserves edit context. Save /
+        # Load / Rename actions dispatch based on the active tab.
+        # `_loaded_id` / `_loaded_name` / `_dirty` / `_saved_snapshot`
+        # are kept as the DNA-tab aliases so the existing handlers
+        # don't need rewiring; the protein tab carries explicit
+        # `_protein_*` variants. `_active_tab` is one of "dna" /
+        # "protein" — read from the TabbedContent's active id on
+        # action dispatch.
+        self._loaded_id:   "str | None" = None
+        self._loaded_name: "str | None" = None
+        self._saved_snapshot: "tuple[str, list[dict]] | None" = ("", [])
+        self._dirty: bool = False
+        # Feature library side panel — DNA tab.
+        self._featlib_rows: list[tuple[str, dict]] = []
+        # Protein tab state.
+        self._protein_loaded_id:   "str | None" = None
+        self._protein_loaded_name: "str | None" = None
+        self._protein_saved_snapshot: "str" = ""
+        self._protein_dirty: bool = False
+        self._motif_rows: list[tuple[str, dict]] = []
+        # Active codon table — id ("name|taxid") plus raw dict. Set
+        # by `_apply_codon_table_choice` on Select.Changed; defaults
+        # to the first available table (built-in E. coli K12 always
+        # present per `_codon_tables_load` invariant).
+        self._codon_table_choice: "str" = ""
+        self._codon_table_raw: dict = {}
+        # Lock guarding cross-tab save operations so concurrent
+        # actions (rapid Ctrl+S spam, GUI-vs-keyboard double-fire)
+        # can't interleave a half-built SeqRecord with another
+        # tab's. ATOMIC: build + library hand-off all happen inside.
+        import threading as _thr
+        self._save_lock = _thr.RLock()
+        # Cached active-tab identifier — refreshed by
+        # `_active_tab_id()` which queries the TabbedContent.
+        self._active_tab_cache: str = "dna"
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        return True
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="syn-box"):
+            yield Static(
+                " Synthesis — gene-fragment composer ", id="syn-title",
+            )
+            with Horizontal(id="syn-toolbar"):
+                yield Button("New",       id="btn-syn-new",
+                              variant="primary")
+                yield Button("Load",      id="btn-syn-load")
+                yield Button("Save",      id="btn-syn-save",
+                              variant="success")
+                yield Button("Save As",   id="btn-syn-saveas")
+                yield Button("Rename",    id="btn-syn-rename")
+                yield Button("Insert site", id="btn-syn-insertsite")
+                yield Button("Add feature", id="btn-syn-addfeat")
+            yield Static("", id="syn-status", markup=True)
+            with TabbedContent(initial="syn-tab-dna", id="syn-tabs"):
+                with TabPane("DNA", id="syn-tab-dna"):
+                    yield from self._compose_dna_pane()
+                with TabPane("Protein", id="syn-tab-protein"):
+                    yield from self._compose_protein_pane()
+            with Horizontal(id="syn-bottom"):
+                yield Button("Close", id="btn-syn-close")
+        yield Footer()
+
+    def _compose_dna_pane(self) -> ComposeResult:
+        with Horizontal(id="syn-body-split"):
+            with Vertical(id="syn-editor-frame"):
+                yield SynthesisEditor(id="syn-editor")
+            with Vertical(id="syn-featlib-pane"):
+                yield Static(
+                    "[b]Feature library[/b]",
+                    id="syn-featlib-title", markup=True,
+                )
+                yield Input(
+                    placeholder="filter by name or type",
+                    id="syn-featlib-search",
+                )
+                yield DataTable(
+                    id="syn-featlib-table",
+                    cursor_type="row",
+                    zebra_stripes=True,
+                )
+                with Horizontal(id="syn-featlib-btns"):
+                    yield Button(
+                        "Insert", id="btn-syn-featlib-insert",
+                        variant="primary",
+                        tooltip=(
+                            "Insert this feature's sequence at the "
+                            "cursor AND annotate it."
+                        ),
+                    )
+                    yield Button(
+                        "Annotate", id="btn-syn-featlib-annotate",
+                        tooltip=(
+                            "Annotate the current selection with this "
+                            "feature's type / colour (no DNA change). "
+                            "Requires a selection."
+                        ),
+                    )
+                    yield Button(
+                        "↻", id="btn-syn-featlib-refresh",
+                        tooltip="Reload from the feature library "
+                                 "(picks up entries added since opening "
+                                 "Synthesis).",
+                    )
+                yield Static(
+                    "[dim]Insert = sequence + annotation at cursor. "
+                    "Annotate = overlay onto current selection.[/]",
+                    id="syn-featlib-hint", markup=True,
+                )
+
+    def _compose_protein_pane(self) -> ComposeResult:
+        # Codon-table + mode toggle row above the protein body.
+        with Horizontal(id="syn-protein-controls"):
+            yield Static("Codon table:", id="syn-codon-table-label")
+            yield Select(
+                self._codon_table_options(),
+                id="syn-codon-table-select",
+                allow_blank=False,
+            )
+            yield Static("Mode:", id="syn-codon-mode-label")
+            yield Button(
+                "Codon-translated", id="btn-syn-toggle-codon-mode",
+                tooltip="Alt+T — toggle codon display under each AA.",
+            )
+        with Horizontal(id="syn-body-split"):
+            with Vertical(id="syn-protein-editor-frame"):
+                yield ProteinEditor(id="syn-protein-editor")
+            with Vertical(id="syn-motif-pane"):
+                yield Static(
+                    "[b]Protein motifs / domains[/b]",
+                    id="syn-motif-title", markup=True,
+                )
+                yield Input(
+                    placeholder="filter by name or type",
+                    id="syn-motif-search",
+                )
+                yield DataTable(
+                    id="syn-motif-table",
+                    cursor_type="row",
+                    zebra_stripes=True,
+                )
+                with Horizontal(id="syn-motif-btns"):
+                    yield Button(
+                        "Insert", id="btn-syn-motif-insert",
+                        variant="primary",
+                        tooltip="Insert this motif's amino acid "
+                                 "sequence at the cursor.",
+                    )
+                yield Static(
+                    "[dim]Tags, linkers, protease sites, NLS, 2A "
+                    "peptides — built-in catalog.[/]",
+                    id="syn-motif-hint", markup=True,
+                )
+
+    def _codon_table_options(self) -> list[tuple[str, str]]:
+        """Build the Select widget's options from the codon-table
+        registry. Returns ``[(label, value)]`` where value is the
+        registry's ``name|taxid`` identifier."""
+        try:
+            tables = _codon_tables_load()
+        except (OSError, ValueError, json.JSONDecodeError):
+            _log.exception(
+                "SynthesisScreen: codon table load failed; falling back to K12",
+            )
+            tables = []
+        if not tables:
+            return [("E. coli K12", "E. coli K12|83333")]
+        opts: list[tuple[str, str]] = []
+        for t in tables:
+            name = str(t.get("name", "?") or "?")
+            taxid = str(t.get("taxid", "") or "")
+            label = f"{name}" + (f"  ({taxid})" if taxid else "")
+            value = f"{name}|{taxid}"
+            opts.append((label, value))
+        return opts
+
+    def on_mount(self) -> None:
+        self._refresh_status()
+        try:
+            self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            pass
+        try:
+            t = self.query_one("#syn-featlib-table", DataTable)
+            t.add_columns("Name", "Type", "bp")
+        except NoMatches:
+            pass
+        self._refresh_featlib_table()
+        # Protein-tab init: motif table headers + load first codon
+        # table into both the cache and the editor.
+        try:
+            mt = self.query_one("#syn-motif-table", DataTable)
+            mt.add_columns("Name", "Type", "aa")
+        except NoMatches:
+            pass
+        self._refresh_motif_table()
+        self._init_codon_table()
+
+    def _init_codon_table(self) -> None:
+        """Seed the codon-table cache + push it to the ProteinEditor.
+        Picks the first registry entry (K12 by convention — the
+        seeded builtin per `_codon_tables_load`)."""
+        try:
+            tables = _codon_tables_load()
+        except (OSError, ValueError, json.JSONDecodeError):
+            tables = []
+        if not tables:
+            _log.warning("SynthesisScreen: no codon tables available")
+            return
+        first = tables[0]
+        name = str(first.get("name", "?") or "?")
+        taxid = str(first.get("taxid", "") or "")
+        choice = f"{name}|{taxid}"
+        self._codon_table_choice = choice
+        self._codon_table_raw = dict(first.get("raw") or {})
+        try:
+            sel = self.query_one("#syn-codon-table-select", Select)
+            # Force the Select to the same choice so the Select.Changed
+            # handler doesn't fire on its own initial value.
+            sel.value = choice
+        except NoMatches:
+            pass
+        try:
+            pe = self.query_one("#syn-protein-editor", ProteinEditor)
+            pe.set_codon_table(self._codon_table_raw)
+        except NoMatches:
+            pass
+
+    # ── Feature library side panel ─────────────────────────────────────────
+
+    def _refresh_featlib_table(self, *, filter_str: str = "") -> None:
+        """Repopulate the feature-library DataTable. Filters case-
+        insensitively against the entry's `name`, `feature_type`, and
+        `description`. Sorted natural by name so `mCherry` lands near
+        `mCherry-2`."""
+        try:
+            t = self.query_one("#syn-featlib-table", DataTable)
+        except NoMatches:
+            return
+        # Re-read on every refresh: a save in a sibling FeatureLibrary
+        # screen could've landed new entries since we last looked. The
+        # cost is one O(N) read; the user hits Refresh manually if they
+        # need fresher state mid-edit.
+        entries = [e for e in _load_features() if isinstance(e, dict)]
+        entries.sort(key=lambda e: _natural_sort_key(
+            (e.get("name") or "").lower()
+        ))
+        rows: list[tuple[str, dict]] = []
+        needle = filter_str.strip().lower()
+        for e in entries:
+            name = str(e.get("name", "") or "")
+            ftype = str(e.get("feature_type", "") or "")
+            desc = str(e.get("description", "") or "")
+            seq = str(e.get("sequence", "") or "")
+            if needle:
+                if (needle not in name.lower()
+                        and needle not in ftype.lower()
+                        and needle not in desc.lower()):
+                    continue
+            # Synthesise a row key — name + type + seq-hash so dup
+            # names with different sequences still resolve uniquely.
+            key = f"{name}|{ftype}|{hash(seq) & 0xFFFFFF:06x}"
+            rows.append((key, e))
+        self._featlib_rows = rows
+        t.clear()
+        for key, e in rows:
+            name = e.get("name", "") or ""
+            ftype = e.get("feature_type", "") or ""
+            bp = len((e.get("sequence", "") or "").replace(" ", ""))
+            t.add_row(name or "(unnamed)", ftype or "?", str(bp), key=key)
+
+    @on(Input.Changed, "#syn-featlib-search")
+    def _on_featlib_search(self, event: Input.Changed) -> None:
+        self._refresh_featlib_table(filter_str=event.value)
+
+    @on(Button.Pressed, "#btn-syn-featlib-refresh")
+    def _on_featlib_refresh(self, _) -> None:
+        try:
+            needle = self.query_one("#syn-featlib-search", Input).value
+        except NoMatches:
+            needle = ""
+        self._refresh_featlib_table(filter_str=needle)
+        self.app.notify("Feature library reloaded.",
+                         severity="information")
+
+    @on(Button.Pressed, "#btn-syn-featlib-insert")
+    def _on_featlib_insert(self, _) -> None:
+        self._featlib_insert_selected(mode="insert")
+
+    @on(Button.Pressed, "#btn-syn-featlib-annotate")
+    def _on_featlib_annotate(self, _) -> None:
+        self._featlib_insert_selected(mode="annotate")
+
+    def _featlib_selected_entry(self) -> "dict | None":
+        """Resolve the highlighted feature-library row → entry dict."""
+        try:
+            t = self.query_one("#syn-featlib-table", DataTable)
+        except NoMatches:
+            return None
+        if t.cursor_row < 0 or t.row_count == 0:
+            return None
+        try:
+            row_key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key
+        except (LookupError, AttributeError):
+            return None
+        key_val = row_key.value if hasattr(row_key, "value") else str(row_key)
+        for key, entry in self._featlib_rows:
+            if key == key_val:
+                return entry
+        return None
+
+    def _featlib_insert_selected(self, *, mode: str) -> None:
+        """Apply the highlighted feature-library entry to the editor.
+
+        ``mode == "insert"`` — insert the entry's sequence at the cursor
+        and annotate the inserted bases with the entry's type / colour
+        / qualifiers.
+
+        ``mode == "annotate"`` — overlay the entry's annotation onto
+        the editor's current selection (no DNA change). Requires a
+        selection; notifies otherwise.
+        """
+        entry = self._featlib_selected_entry()
+        if entry is None:
+            self.app.notify(
+                "Pick a feature in the library list first.",
+                severity="information",
+            )
+            return
+        try:
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            return
+        name = str(entry.get("name", "") or "feature")
+        ftype = str(entry.get("feature_type", "") or "misc_feature")
+        color = entry.get("color")
+        if not color:
+            color = _GB_TYPE_COLORS.get(ftype, "white")
+        strand = int(entry.get("strand", 1) or 0)
+        quals = dict(entry.get("qualifiers") or {})
+        if "label" not in quals:
+            quals["label"] = [name]
+        if mode == "annotate":
+            sel = ed.current_selection()
+            if sel is None:
+                self.app.notify(
+                    "Highlight a region in the editor first to "
+                    "annotate it.",
+                    severity="information",
+                )
+                return
+            s, e = sel
+            if s >= e:
+                return
+            ed.add_feature({
+                "start": s, "end": e,
+                "label": name, "type": ftype,
+                "color": str(color),
+                "strand": strand,
+                "qualifiers": quals,
+            })
+            _log_event("synthesis.featlib.annotate",
+                       name=name, ftype=ftype, start=s, end=e)
+            self.app.notify(
+                f"Annotated bp {s}-{e} as '{name}' ({ftype}).",
+                severity="information",
+            )
+            return
+        # mode == "insert"
+        seq = "".join(
+            c for c in str(entry.get("sequence", "") or "").upper()
+            if c in _SYNTHESIS_TYPEABLE_BASES
+        )
+        if not seq:
+            self.app.notify(
+                f"Feature '{name}' has no usable sequence "
+                "(ACGT/IUPAC only).",
+                severity="warning",
+            )
+            return
+        start = ed._cursor_pos
+        # Strand orientation: if the library entry is reverse-strand,
+        # insert the reverse complement so the annotation matches the
+        # template strand the user sees in the editor.
+        insert_seq = _rc(seq) if strand == -1 else seq
+        ok = ed.insert_at_cursor(insert_seq)
+        if not ok:
+            return
+        end = start + len(insert_seq)
+        ed.add_feature({
+            "start": start, "end": end,
+            "label": name, "type": ftype,
+            "color": str(color),
+            "strand": strand,
+            "qualifiers": quals,
+        })
+        _log_event("synthesis.featlib.insert",
+                   name=name, ftype=ftype,
+                   start=start, end=end, bp=len(insert_seq))
+        self.app.notify(
+            f"Inserted '{name}' ({len(insert_seq)} bp) at bp {start}.",
+            severity="information",
+        )
+
+    # ── Status line ───────────────────────────────────────────────────────
+
+    def _active_tab_id(self) -> str:
+        """Returns 'dna' or 'protein' depending on which tab is
+        currently visible. Cached in `_active_tab_cache` so the
+        accessor is cheap. Falls back to the cache on query failure."""
+        try:
+            tabs = self.query_one("#syn-tabs", TabbedContent)
+            active = str(tabs.active or "")
+        except (NoMatches, AttributeError):
+            return self._active_tab_cache
+        if active == "syn-tab-protein":
+            self._active_tab_cache = "protein"
+            return "protein"
+        self._active_tab_cache = "dna"
+        return "dna"
+
+    def _refresh_status(self) -> None:
+        """Dispatch status refresh to the active tab's renderer.
+        Each tab carries its own dirty / loaded-name / cursor info
+        so the status line reflects the surface the user is
+        composing on."""
+        if self._active_tab_id() == "protein":
+            self._refresh_status_protein()
+        else:
+            self._refresh_status_dna()
+
+    def _refresh_status_dna(self) -> None:
+        try:
+            status = self.query_one("#syn-status", Static)
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            return
+        seq, feats = ed.get_state()
+        name = self._loaded_name or "(unsaved)"
+        sel = ed.current_selection()
+        # Build via Text.append so a user-typed name containing `[`
+        # or other markup-significant chars can't accidentally break
+        # the status render. Same defensive pattern as the addfeat
+        # colour swatch (see `_refresh_color_swatch`).
+        txt = Text()
+        txt.append("[DNA] ", style="dim")
+        txt.append(name, style="bold")
+        if self._dirty:
+            txt.append(" ●", style="yellow")
+        txt.append(f"  ·  {len(seq):,} bp  ·  ")
+        n_feats = len(feats)
+        txt.append(f"{n_feats} feature{'s' if n_feats != 1 else ''}")
+        txt.append(f"  ·  cursor {ed._cursor_pos}")
+        if sel is not None:
+            s, e = sel
+            txt.append(f"  ·  sel {s}-{e} ({e - s} bp)")
+        status.update(txt)
+
+    def _refresh_status_protein(self) -> None:
+        try:
+            status = self.query_one("#syn-status", Static)
+            pe = self.query_one("#syn-protein-editor", ProteinEditor)
+        except NoMatches:
+            return
+        aa_seq, codon_mode = pe.get_state()
+        name = self._protein_loaded_name or "(unsaved)"
+        sel = pe.current_selection()
+        n_aa = len(aa_seq)
+        n_bp = n_aa * 3
+        mode_label = "codon" if codon_mode else "AA-only"
+        # Codon table name (just the part before the '|' separator).
+        table_label = self._codon_table_choice.split("|")[0] \
+            if self._codon_table_choice else "?"
+        txt = Text()
+        txt.append("[Protein] ", style="dim")
+        txt.append(name, style="bold")
+        if self._protein_dirty:
+            txt.append(" ●", style="yellow")
+        txt.append(f"  ·  {n_aa:,} aa ({n_bp:,} bp)")
+        txt.append(f"  ·  codons: {table_label}", style="dim")
+        txt.append(f"  ·  mode: {mode_label}", style="dim")
+        txt.append(f"  ·  cursor {pe._cursor_pos}")
+        if sel is not None:
+            s, e = sel
+            txt.append(f"  ·  sel {s}-{e} ({e - s} aa)")
+        status.update(txt)
+
+    @on(SynthesisEditor.Changed)
+    def _on_editor_changed(self, _event: "SynthesisEditor.Changed") -> None:
+        """DNA editor mutation → mark DNA tab dirty + refresh status."""
+        self._dirty = True
+        self._refresh_status()
+
+    @on(SynthesisEditor.CursorMoved)
+    def _on_editor_cursor_moved(
+        self, _event: "SynthesisEditor.CursorMoved",
+    ) -> None:
+        """DNA cursor / selection change → refresh status (no dirty)."""
+        self._refresh_status()
+
+    @on(ProteinEditor.Changed)
+    def _on_protein_changed(self, _event: "ProteinEditor.Changed") -> None:
+        """Protein editor mutation → mark protein tab dirty."""
+        self._protein_dirty = True
+        self._refresh_status()
+
+    @on(ProteinEditor.CursorMoved)
+    def _on_protein_cursor_moved(
+        self, _event: "ProteinEditor.CursorMoved",
+    ) -> None:
+        self._refresh_status()
+
+    @on(TabbedContent.TabActivated)
+    def _on_tab_activated(
+        self, _event: "TabbedContent.TabActivated",
+    ) -> None:
+        """Tab switch → refresh status line for the now-active tab."""
+        self._refresh_status()
+
+    # ── Cursor / selection live-update for status bar ─────────────────────
+
+    def on_descendant_focus(self, _) -> None:
+        self._refresh_status()
+
+    # ── Actions ───────────────────────────────────────────────────────────
+
+    def action_cancel(self) -> None:
+        # Close prompts only if EITHER tab has unsaved work — the user
+        # might be looking at the DNA tab but the protein tab is also
+        # dirty. The modal copy doesn't differentiate (a "save"
+        # decision saves the active tab; "abandon" drops everything).
+        any_dirty = self._dirty or self._protein_dirty
+        if not any_dirty:
+            self.dismiss(None)
+            return
+        def _on_resolved(choice: "str | None") -> None:
+            if choice == "save":
+                # Save the ACTIVE tab and then dismiss on success.
+                if self._active_tab_id() == "protein":
+                    self._do_protein_save(
+                        after=lambda ok: ok and self.dismiss(None),
+                    )
+                else:
+                    self._do_save(
+                        after=lambda ok: ok and self.dismiss(None),
+                    )
+                return
+            if choice == "abandon":
+                self.dismiss(None)
+                return
+            # cancel → stay on screen
+        self.app.push_screen(SynthesisUnsavedChangesModal(),
+                              callback=_on_resolved)
+
+    @on(Button.Pressed, "#btn-syn-close")
+    def _btn_close(self, _) -> None:
+        self.action_cancel()
+
+    @on(Button.Pressed, "#btn-syn-new")
+    def _btn_new(self, _) -> None:
+        self.action_new_fragment()
+
+    @on(Button.Pressed, "#btn-syn-load")
+    def _btn_load(self, _) -> None:
+        self.action_load_fragment()
+
+    @on(Button.Pressed, "#btn-syn-save")
+    def _btn_save(self, _) -> None:
+        self.action_save()
+
+    @on(Button.Pressed, "#btn-syn-saveas")
+    def _btn_saveas(self, _) -> None:
+        self._save_as()
+
+    @on(Button.Pressed, "#btn-syn-rename")
+    def _btn_rename(self, _) -> None:
+        self._rename()
+
+    @on(Button.Pressed, "#btn-syn-insertsite")
+    def _btn_insertsite(self, _) -> None:
+        self.action_insert_site()
+
+    @on(Button.Pressed, "#btn-syn-addfeat")
+    def _btn_addfeat(self, _) -> None:
+        self.action_add_feature()
+
+    def action_select_all(self) -> None:
+        """Ctrl+A — select the entire active-tab buffer AND focus the
+        editor so subsequent Backspace / Delete keystrokes reach its
+        on_key handler. Pre-fix, focus stayed on whatever widget the
+        user clicked last (typically a toolbar Button on modal open),
+        and Backspace was eaten by Textual's default no-op route."""
+        try:
+            if self._active_tab_id() == "protein":
+                pe = self.query_one(
+                    "#syn-protein-editor", ProteinEditor,
+                )
+                pe.select_all()
+                try:
+                    pe.query_one(
+                        "#pe-scroll", ScrollableContainer,
+                    ).focus()
+                except NoMatches:
+                    pass
+            else:
+                ed = self.query_one(
+                    "#syn-editor", SynthesisEditor,
+                )
+                ed.select_all()
+                try:
+                    ed.query_one(
+                        "#syn-scroll", ScrollableContainer,
+                    ).focus()
+                except NoMatches:
+                    pass
+        except NoMatches:
+            return
+        self._refresh_status()
+
+    def _delete_active_editor_selection(self, *, forward: bool) -> bool:
+        """Screen-level fallback for Backspace / Delete: routes to the
+        active tab's editor.delete_at_cursor when no focused widget
+        handled the keystroke. Defence-in-depth — Ctrl+A already
+        focuses the editor, but if focus drifts (Tab navigation,
+        click on a Static, etc.) we still want a selection delete to
+        work after the visible highlight."""
+        try:
+            if self._active_tab_id() == "protein":
+                pe = self.query_one(
+                    "#syn-protein-editor", ProteinEditor,
+                )
+                if pe._user_sel is None:
+                    return False
+                return pe.delete_at_cursor(forward=forward)
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+            if ed._user_sel is None:
+                return False
+            return ed.delete_at_cursor(forward=forward)
+        except NoMatches:
+            return False
+
+    def action_delete_selection_backward(self) -> None:
+        """Screen-level Backspace fallback — only meaningful when the
+        active editor has a live `_user_sel` (= the highlight is
+        showing). Single-base backspace stays inside the editor's
+        on_key when focus is there; this action covers the case
+        where focus drifted but the user expects the visible
+        selection to vanish."""
+        self._delete_active_editor_selection(forward=False)
+
+    def action_delete_selection_forward(self) -> None:
+        """Mirror of action_delete_selection_backward for Delete."""
+        self._delete_active_editor_selection(forward=True)
+
+    def action_toggle_codon_mode(self) -> None:
+        """Alt+T — toggle ProteinEditor's codon-translated mode vs
+        AA-only mode. No-op when the DNA tab is active. Updates the
+        button label.
+
+        Bound to Alt+T (NOT Ctrl+M) because Ctrl+M is the CR control
+        character at the terminal protocol level — the terminal sends
+        Enter instead of Ctrl+M, so a Ctrl+M binding never fires.
+        Alt+T sends an ESC-prefixed sequence that's distinct on every
+        supported terminal."""
+        if self._active_tab_id() != "protein":
+            self.app.notify(
+                "Codon mode toggle applies to the Protein tab.",
+                severity="information",
+            )
+            return
+        try:
+            pe = self.query_one("#syn-protein-editor", ProteinEditor)
+        except NoMatches:
+            return
+        new_mode = not pe._codon_mode
+        pe.set_codon_mode(new_mode)
+        # Update the toggle button label + protein dirty status.
+        try:
+            btn = self.query_one("#btn-syn-toggle-codon-mode", Button)
+            btn.label = "Codon-translated" if new_mode else "AA-only"
+        except NoMatches:
+            pass
+        _log_event("synthesis.protein.mode_toggle",
+                   codon_mode=new_mode)
+        self._refresh_status()
+
+    @on(Button.Pressed, "#btn-syn-toggle-codon-mode")
+    def _btn_toggle_codon_mode(self, _) -> None:
+        self.action_toggle_codon_mode()
+
+    # ── Codon-table dropdown ───────────────────────────────────────────────
+
+    @on(Select.Changed, "#syn-codon-table-select")
+    def _on_codon_table_changed(self, event: "Select.Changed") -> None:
+        """User picked a different codon table → re-render the
+        protein editor's DNA-codon row with the new most-frequent
+        codons. Also persisted via `_log_event` for audit trail."""
+        new_choice = str(event.value or "")
+        if not new_choice or new_choice == self._codon_table_choice:
+            return
+        self._apply_codon_table_choice(new_choice)
+
+    def _apply_codon_table_choice(self, choice: str) -> None:
+        try:
+            tables = _codon_tables_load()
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.app.notify("Couldn't load codon tables.",
+                             severity="error")
+            return
+        for t in tables:
+            name = str(t.get("name", "") or "")
+            taxid = str(t.get("taxid", "") or "")
+            if f"{name}|{taxid}" == choice:
+                self._codon_table_choice = choice
+                self._codon_table_raw = dict(t.get("raw") or {})
+                try:
+                    pe = self.query_one(
+                        "#syn-protein-editor", ProteinEditor,
+                    )
+                    pe.set_codon_table(self._codon_table_raw)
+                except NoMatches:
+                    pass
+                _log_event("synthesis.protein.codon_table_changed",
+                           choice=choice, n_codons=len(self._codon_table_raw))
+                self._refresh_status()
+                return
+
+    # ── Motif library side panel ──────────────────────────────────────────
+
+    def _refresh_motif_table(self, *, filter_str: str = "") -> None:
+        try:
+            t = self.query_one("#syn-motif-table", DataTable)
+        except NoMatches:
+            return
+        rows: list[tuple[str, dict]] = []
+        needle = filter_str.strip().lower()
+        for m in _PROTEIN_MOTIFS:
+            name = str(m.get("name", "") or "")
+            ftype = str(m.get("feature_type", "") or "")
+            seq = str(m.get("sequence", "") or "")
+            desc = str(m.get("description", "") or "")
+            if needle and (needle not in name.lower()
+                            and needle not in ftype.lower()
+                            and needle not in desc.lower()):
+                continue
+            key = f"{name}|{ftype}"
+            rows.append((key, m))
+        self._motif_rows = rows
+        t.clear()
+        for key, m in rows:
+            name = m.get("name", "") or ""
+            ftype = m.get("feature_type", "") or ""
+            aa = len((m.get("sequence", "") or "").replace(" ", ""))
+            t.add_row(name, ftype or "?", str(aa), key=key)
+
+    @on(Input.Changed, "#syn-motif-search")
+    def _on_motif_search(self, event: Input.Changed) -> None:
+        self._refresh_motif_table(filter_str=event.value)
+
+    @on(Button.Pressed, "#btn-syn-motif-insert")
+    def _on_motif_insert(self, _) -> None:
+        self._motif_insert_selected()
+
+    def _motif_selected_entry(self) -> "dict | None":
+        try:
+            t = self.query_one("#syn-motif-table", DataTable)
+        except NoMatches:
+            return None
+        if t.cursor_row < 0 or t.row_count == 0:
+            return None
+        try:
+            row_key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key
+        except (LookupError, AttributeError):
+            return None
+        key_val = row_key.value if hasattr(row_key, "value") else str(row_key)
+        for key, motif in self._motif_rows:
+            if key == key_val:
+                return motif
+        return None
+
+    def _motif_insert_selected(self) -> None:
+        motif = self._motif_selected_entry()
+        if motif is None:
+            self.app.notify(
+                "Pick a motif from the library list first.",
+                severity="information",
+            )
+            return
+        try:
+            pe = self.query_one("#syn-protein-editor", ProteinEditor)
+        except NoMatches:
+            return
+        aa_seq = "".join(
+            c for c in str(motif.get("sequence", "") or "").upper()
+            if c in _PROTEIN_AA_ALPHABET
+        )
+        if not aa_seq:
+            self.app.notify(
+                f"Motif '{motif.get('name', '?')}' has no usable AA sequence.",
+                severity="warning",
+            )
+            return
+        ok = pe.insert_at_cursor(aa_seq)
+        if ok:
+            _log_event(
+                "synthesis.protein.motif_insert",
+                name=motif.get("name"),
+                type=motif.get("feature_type"),
+                aa_len=len(aa_seq),
+            )
+            self.app.notify(
+                f"Inserted '{motif.get('name')}' ({len(aa_seq)} aa).",
+                severity="information",
+            )
+
+    def _is_active_dirty(self) -> bool:
+        return (self._protein_dirty
+                 if self._active_tab_id() == "protein"
+                 else self._dirty)
+
+    def action_new_fragment(self) -> None:
+        """Reset the active tab's buffer. Prompts via unsaved-changes
+        modal when dirty."""
+        if self._active_tab_id() == "protein":
+            self._new_protein_fragment()
+            return
+        def _proceed():
+            try:
+                ed = self.query_one("#syn-editor", SynthesisEditor)
+            except NoMatches:
+                return
+            ed.load("", [])
+            self._loaded_id = None
+            self._loaded_name = None
+            self._saved_snapshot = ("", [])
+            self._dirty = False
+            self._refresh_status()
+            _log_event("synthesis.new")
+        if not self._dirty:
+            _proceed()
+            return
+        def _on_resolved(choice):
+            if choice == "save":
+                self._do_save(after=lambda ok: ok and _proceed())
+            elif choice == "abandon":
+                _proceed()
+        self.app.push_screen(SynthesisUnsavedChangesModal(),
+                              callback=_on_resolved)
+
+    def action_load_fragment(self) -> None:
+        """Open the library picker, then load the selected entry into
+        the active tab's editor. Prompts via unsaved-changes modal
+        when the active tab is dirty."""
+        if self._active_tab_id() == "protein":
+            self._load_protein_fragment()
+            return
+        def _do_pick():
+            def _on_picked(eid):
+                if not eid:
+                    return
+                self._load_entry_by_id(eid)
+            self.app.push_screen(SynthesisLoadModal(),
+                                  callback=_on_picked)
+        if not self._dirty:
+            _do_pick()
+            return
+        def _on_resolved(choice):
+            if choice == "save":
+                self._do_save(after=lambda ok: ok and _do_pick())
+            elif choice == "abandon":
+                _do_pick()
+        self.app.push_screen(SynthesisUnsavedChangesModal(),
+                              callback=_on_resolved)
+
+    def _load_entry_by_id(self, eid: str) -> None:
+        entry = None
+        for e in _load_library():
+            if isinstance(e, dict) and e.get("id") == eid:
+                entry = e
+                break
+        if entry is None:
+            self.app.notify(f"Fragment '{eid}' no longer in library.",
+                             severity="warning")
+            return
+        gb_text = entry.get("gb_text", "") or ""
+        try:
+            record = _gb_text_to_record(gb_text)
+        except ValueError as exc:
+            self.app.notify(f"Couldn't parse fragment: {exc}",
+                             severity="error")
+            _log.exception("SynthesisScreen: load failed for %s", eid)
+            return
+        if record is None:
+            self.app.notify(f"Fragment '{eid}' parsed as empty.",
+                             severity="warning")
+            return
+        seq = str(record.seq)
+        # Convert record.features → editor feat dicts. Reuse the same
+        # shape `_build_seq_text` consumes (start, end, label, type,
+        # color, qualifiers, strand).
+        feats: list[dict] = []
+        n = len(seq)
+        for sf in record.features:
+            if sf.type == "source":
+                continue
+            try:
+                s = int(sf.location.start)
+                e = int(sf.location.end)
+            except (TypeError, AttributeError, ValueError):
+                continue
+            if s < 0 or e > n or e <= s:
+                continue
+            label = (
+                (sf.qualifiers.get("label") or [None])[0]
+                or sf.qualifiers.get("gene", [None])[0]
+                or sf.type
+            )
+            color = (sf.qualifiers.get("ApEinfo_fwdcolor") or [None])[0]
+            if not color:
+                color = _GB_TYPE_COLORS.get(sf.type, "white")
+            strand = sf.location.strand or 0
+            feats.append({
+                "start": s, "end": e,
+                "label": str(label),
+                "type":  sf.type,
+                "color": str(color),
+                "strand": int(strand),
+                "qualifiers": dict(sf.qualifiers),
+            })
+        try:
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            return
+        ed.load(seq, feats)
+        self._loaded_id   = entry.get("id") or eid
+        self._loaded_name = entry.get("name") or self._loaded_id
+        self._saved_snapshot = (seq, [dict(f) for f in feats])
+        self._dirty = False
+        self._refresh_status()
+        _log_event("synthesis.load", id=self._loaded_id,
+                   bp=len(seq), n_feats=len(feats))
+
+    def action_save(self) -> None:
+        if self._active_tab_id() == "protein":
+            self._do_protein_save()
+            return
+        self._do_save()
+
+    def _save_as(self) -> None:
+        """Save As — always prompt for a fresh name and reset the
+        loaded id so the next Save targets the new entry."""
+        if self._active_tab_id() == "protein":
+            self._protein_save_as()
+            return
+        try:
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            return
+        seq, feats = ed.get_state()
+        if not seq:
+            self.app.notify("Nothing to save — fragment is empty.",
+                             severity="warning")
+            return
+        default = self._loaded_name or "new_fragment"
+        def _on_named(name):
+            if not name:
+                return
+            self._loaded_id   = None
+            self._loaded_name = name
+            self._do_save()
+        self.app.push_screen(
+            NamePlasmidModal(default, target_label="fragment"),
+            callback=_on_named,
+        )
+
+    def _rename(self) -> None:
+        """Rename the loaded fragment for the active tab."""
+        if self._active_tab_id() == "protein":
+            if self._protein_loaded_id is None:
+                self.app.notify(
+                    "Save the protein first before renaming.",
+                    severity="warning",
+                )
+                return
+            default = self._protein_loaded_name or "protein"
+            def _on_named_pr(name):
+                if not name:
+                    return
+                self._protein_loaded_name = name
+                self._protein_dirty = True
+                self._refresh_status()
+                _log_event("synthesis.protein.rename",
+                           id=self._protein_loaded_id, name=name)
+            self.app.push_screen(
+                NamePlasmidModal(default, target_label="protein"),
+                callback=_on_named_pr,
+            )
+            return
+        if self._loaded_id is None:
+            self.app.notify("Save the fragment first before renaming.",
+                             severity="warning")
+            return
+        default = self._loaded_name or "fragment"
+        def _on_named(name):
+            if not name:
+                return
+            self._loaded_name = name
+            self._dirty = True
+            self._refresh_status()
+            _log_event("synthesis.rename", id=self._loaded_id, name=name)
+        self.app.push_screen(
+            NamePlasmidModal(default, target_label="fragment"),
+            callback=_on_named,
+        )
+
+    def _do_save(self, *, after=None) -> None:
+        """Actual save flow. ``after(ok: bool)`` fires when the save
+        attempt resolves (True on success, False on cancel/failure)."""
+        try:
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            if after:
+                after(False)
+            return
+        seq, feats = ed.get_state()
+        if not seq:
+            self.app.notify("Nothing to save — fragment is empty.",
+                             severity="warning")
+            if after:
+                after(False)
+            return
+        if self._loaded_id is None:
+            # Fresh save → prompt for name.
+            default = self._loaded_name or "new_fragment"
+            def _on_named(name):
+                if not name:
+                    if after:
+                        after(False)
+                    return
+                self._loaded_name = name
+                self._loaded_id = self._make_entry_id(name)
+                self._commit_save(seq, feats, after)
+            self.app.push_screen(
+                NamePlasmidModal(default, target_label="fragment"),
+                callback=_on_named,
+            )
+            return
+        self._commit_save(seq, feats, after)
+
+    def _make_entry_id(self, name: str) -> str:
+        """Sanitise a name into a library-safe entry id. Mirrors the
+        same scrub the amplicon-export path uses (alphanum + dash +
+        underscore only)."""
+        base = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") \
+            or "fragment"
+        return base[:32]
+
+    def _commit_save(self, seq: str, feats: list[dict],
+                       after) -> None:
+        """Build the SeqRecord, push through LibraryPanel.add_entry,
+        update saved snapshot, fire callback. Atomic via `_save_lock`
+        so concurrent DNA/protein saves can't interleave construction."""
+        try:
+            from Bio.Seq import Seq
+            from Bio.SeqRecord import SeqRecord
+            from Bio.SeqFeature import SeqFeature, FeatureLocation
+        except ImportError:
+            self.app.notify("BioPython not available — install Biopython.",
+                             severity="error")
+            if after:
+                after(False)
+            return
+        with self._save_lock:
+            eid  = self._loaded_id or self._make_entry_id(
+                self._loaded_name or "fragment",
+            )
+            name = self._loaded_name or eid
+            rec = SeqRecord(
+                Seq(seq), id=eid, name=eid[:16],
+                description=f"Gene-synthesis fragment ({len(seq)} bp)",
+            )
+            rec.annotations["molecule_type"] = "DNA"
+            rec.annotations["topology"]      = "linear"
+            try:
+                rec._tui_display_name = name  # type: ignore[attr-defined]
+                rec._tui_source       = f"synthesis:{eid}"  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+            n = len(seq)
+            for f in feats:
+                try:
+                    s = int(f.get("start", 0))
+                    e = int(f.get("end", 0))
+                except (TypeError, ValueError):
+                    continue
+                if s < 0 or e > n or e <= s:
+                    continue
+                strand = int(f.get("strand", 1) or 0)
+                label  = str(f.get("label", "")
+                              or f.get("type", "misc_feature"))
+                ftype  = str(f.get("type", "misc_feature"))
+                quals  = dict(f.get("qualifiers") or {})
+                if label and "label" not in quals:
+                    quals["label"] = [label]
+                color = f.get("color")
+                if color and "white" not in str(color).lower():
+                    quals.setdefault("ApEinfo_fwdcolor", [str(color)])
+                    quals.setdefault("ApEinfo_revcolor", [str(color)])
+                try:
+                    loc = FeatureLocation(s, e, strand=strand or None)
+                except (TypeError, ValueError):
+                    continue
+                rec.features.append(
+                    SeqFeature(loc, type=ftype, qualifiers=quals),
+                )
+            # Push through the standard library save path. With
+            # `id == eid` already in the library, ``add_entry`` takes
+            # the silent-replace branch (document model). With a new
+            # id, lands as a fresh entry.
+            try:
+                lib = self.app.query_one("#library", LibraryPanel)
+            except NoMatches:
+                self.app.notify("Library panel not available.",
+                                 severity="error")
+                if after:
+                    after(False)
+                return
+            ok = lib.add_entry(rec)
+            if not ok:
+                if after:
+                    after(False)
+                return
+            self._saved_snapshot = (seq, [dict(f) for f in feats])
+            self._dirty = False
+        # Lock released — UI / log calls outside the critical section.
+        self._refresh_status()
+        _log_event("synthesis.save",
+                   id=eid, name=name, bp=len(seq), n_feats=len(feats))
+        self.app.notify(f"Saved '{name}' ({len(seq):,} bp).",
+                         severity="information")
+        if after:
+            after(True)
+
+    def action_add_feature(self) -> None:
+        """Ctrl+F — open AddFeatureModal with the current selection as
+        the feature span. The modal's standard ``insert`` payload feeds
+        a feat dict back; we land it on the editor. Protein tab uses
+        the motif library instead — gentle notify."""
+        if self._active_tab_id() == "protein":
+            self.app.notify(
+                "Add Feature is DNA-tab only. On the Protein tab use "
+                "the motif library (right pane).",
+                severity="information",
+            )
+            return
+        try:
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            return
+        sel = ed.current_selection()
+        if sel is None:
+            self.app.notify(
+                "Highlight a region first (drag in the editor or "
+                "Shift+arrow), then Ctrl+F.",
+                severity="information",
+            )
+            return
+        s, e = sel
+        if s >= e:
+            return
+        seq_slice = ed._seq[s:e]
+        prefill = {
+            "sequence": seq_slice,
+            "feature_type": "misc_feature",
+            "strand": 1,
+        }
+        n = len(ed._seq)
+        def _on_result(payload):
+            if not payload or not isinstance(payload, dict):
+                return
+            action = payload.get("action")
+            entry  = payload.get("entry") or {}
+            rng    = payload.get("range") or sel
+            if action not in ("annotate", "save", "insert"):
+                return
+            feat = {
+                "start":  int(rng[0]),
+                "end":    int(rng[1]),
+                "label":  entry.get("name", "feature"),
+                "type":   entry.get("feature_type", "misc_feature"),
+                "color":  entry.get("color")
+                          or _GB_TYPE_COLORS.get(
+                              entry.get("feature_type", ""), "white",
+                          ),
+                "strand": int(entry.get("strand", 1) or 0),
+                "qualifiers": dict(entry.get("qualifiers") or {}),
+            }
+            # Defensive clip — AddFeatureModal could in principle return
+            # a CDS span we didn't gate locally.
+            if feat["start"] < 0 or feat["end"] > n \
+                    or feat["end"] <= feat["start"]:
+                self.app.notify(
+                    "Feature span out of range — discarded.",
+                    severity="warning",
+                )
+                return
+            ed.add_feature(feat)
+            _log_event("synthesis.feature.add",
+                       label=feat["label"], type=feat["type"],
+                       start=feat["start"], end=feat["end"])
+        self.app.push_screen(
+            AddFeatureModal(prefill=prefill, selection_range=sel,
+                              total_len=n),
+            callback=_on_result,
+        )
+
+    def action_insert_site(self) -> None:
+        """Ctrl+R — open RestrictionInsertModal, insert site at
+        cursor on accept. Protein tab uses motif library — re-route."""
+        if self._active_tab_id() == "protein":
+            self.app.notify(
+                "Insert site is DNA-tab only. On the Protein tab use "
+                "the motif library (right pane).",
+                severity="information",
+            )
+            return
+        try:
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            return
+        def _on_picked(enzyme):
+            if not enzyme:
+                return
+            site = _site_for_enzyme(str(enzyme))
+            if not site:
+                self.app.notify(f"Unknown enzyme '{enzyme}'.",
+                                 severity="warning")
+                return
+            # IUPAC degeneracy expanded? No — leave IUPAC bases in the
+            # sequence; they're legal for synthesis (vendor will fill
+            # in via stochastic synthesis or reject with feedback).
+            inserted = ed.insert_at_cursor(site)
+            if inserted:
+                _log_event("synthesis.insert_site",
+                           enzyme=enzyme, site=site,
+                           cursor=ed._cursor_pos)
+        self.app.push_screen(RestrictionInsertModal(),
+                              callback=_on_picked)
+
+    # ── Protein-tab actions ────────────────────────────────────────────────
+
+    def _new_protein_fragment(self) -> None:
+        """Reset the protein buffer. Prompts via unsaved-changes
+        modal when the protein tab is dirty."""
+        def _proceed():
+            try:
+                pe = self.query_one(
+                    "#syn-protein-editor", ProteinEditor,
+                )
+            except NoMatches:
+                return
+            pe.load("")
+            self._protein_loaded_id = None
+            self._protein_loaded_name = None
+            self._protein_saved_snapshot = ""
+            self._protein_dirty = False
+            self._refresh_status()
+            _log_event("synthesis.protein.new")
+        if not self._protein_dirty:
+            _proceed()
+            return
+        def _on_resolved(choice):
+            if choice == "save":
+                self._do_protein_save(after=lambda ok: ok and _proceed())
+            elif choice == "abandon":
+                _proceed()
+        self.app.push_screen(SynthesisUnsavedChangesModal(),
+                              callback=_on_resolved)
+
+    def _load_protein_fragment(self) -> None:
+        """Open the library picker, then load the selected entry's
+        CDS translation into the protein editor. Prompts via
+        unsaved-changes modal when the protein tab is dirty."""
+        def _do_pick():
+            def _on_picked(eid):
+                if not eid:
+                    return
+                self._load_protein_entry_by_id(eid)
+            self.app.push_screen(SynthesisLoadModal(),
+                                  callback=_on_picked)
+        if not self._protein_dirty:
+            _do_pick()
+            return
+        def _on_resolved(choice):
+            if choice == "save":
+                self._do_protein_save(after=lambda ok: ok and _do_pick())
+            elif choice == "abandon":
+                _do_pick()
+        self.app.push_screen(SynthesisUnsavedChangesModal(),
+                              callback=_on_resolved)
+
+    def _load_protein_entry_by_id(self, eid: str) -> None:
+        """Locate the library entry by id, parse the first CDS
+        feature carrying a ``translation`` qualifier, load that AA
+        sequence into the protein editor. Falls back to translating
+        the whole DNA sequence (frame 1) when no CDS is found."""
+        entry = None
+        for e in _load_library():
+            if isinstance(e, dict) and e.get("id") == eid:
+                entry = e
+                break
+        if entry is None:
+            self.app.notify(
+                f"Fragment '{eid}' no longer in library.",
+                severity="warning",
+            )
+            return
+        gb_text = entry.get("gb_text", "") or ""
+        try:
+            record = _gb_text_to_record(gb_text)
+        except ValueError as exc:
+            self.app.notify(f"Couldn't parse fragment: {exc}",
+                             severity="error")
+            _log.exception(
+                "SynthesisScreen: protein load failed for %s", eid,
+            )
+            return
+        if record is None:
+            self.app.notify(f"Fragment '{eid}' parsed as empty.",
+                             severity="warning")
+            return
+        aa_seq = self._extract_protein_from_record(record)
+        if not aa_seq:
+            self.app.notify(
+                "No protein sequence found in this fragment "
+                "(no CDS with translation qualifier).",
+                severity="warning",
+            )
+            return
+        try:
+            pe = self.query_one("#syn-protein-editor", ProteinEditor)
+        except NoMatches:
+            return
+        pe.load(aa_seq)
+        self._protein_loaded_id = entry.get("id") or eid
+        self._protein_loaded_name = entry.get("name") or self._protein_loaded_id
+        self._protein_saved_snapshot = aa_seq
+        self._protein_dirty = False
+        self._refresh_status()
+        _log_event("synthesis.protein.load",
+                   id=self._protein_loaded_id, aa=len(aa_seq))
+
+    @staticmethod
+    def _extract_protein_from_record(record) -> str:
+        """Pull an AA sequence out of a SeqRecord. Strategy:
+        1. First CDS feature with a non-empty ``translation``
+           qualifier → use that.
+        2. Otherwise, translate the whole record's sequence in
+           frame 1 via BioPython.
+        Returns '' on total failure (defensive — caller falls back to
+        a notify)."""
+        try:
+            for sf in record.features:
+                if sf.type != "CDS":
+                    continue
+                quals = sf.qualifiers or {}
+                trans = quals.get("translation")
+                if trans:
+                    val = trans[0] if isinstance(trans, list) else str(trans)
+                    aa = "".join(
+                        c for c in str(val).upper()
+                        if c in _PROTEIN_AA_ALPHABET
+                    )
+                    if aa:
+                        return aa
+        except (AttributeError, TypeError):
+            pass
+        try:
+            from Bio.Seq import Seq
+            seq = Seq(str(record.seq))
+            trans = str(seq.translate())
+            return "".join(
+                c for c in trans.upper()
+                if c in _PROTEIN_AA_ALPHABET
+            )
+        except (ImportError, ValueError, TypeError):
+            return ""
+
+    def _protein_save_as(self) -> None:
+        try:
+            pe = self.query_one("#syn-protein-editor", ProteinEditor)
+        except NoMatches:
+            return
+        aa_seq, _mode = pe.get_state()
+        if not aa_seq:
+            self.app.notify("Nothing to save — protein is empty.",
+                             severity="warning")
+            return
+        default = self._protein_loaded_name or "new_protein"
+        def _on_named(name):
+            if not name:
+                return
+            self._protein_loaded_id   = None
+            self._protein_loaded_name = name
+            self._do_protein_save()
+        self.app.push_screen(
+            NamePlasmidModal(default, target_label="protein"),
+            callback=_on_named,
+        )
+
+    def _do_protein_save(self, *, after=None) -> None:
+        """Save the protein tab. Builds a linear DNA SeqRecord with a
+        CDS feature carrying both the AA sequence (``translation``
+        qualifier) and the back-translated DNA bases via the active
+        codon table's most-frequent codons."""
+        try:
+            pe = self.query_one("#syn-protein-editor", ProteinEditor)
+        except NoMatches:
+            if after:
+                after(False)
+            return
+        aa_seq, _mode = pe.get_state()
+        if not aa_seq:
+            self.app.notify("Nothing to save — protein is empty.",
+                             severity="warning")
+            if after:
+                after(False)
+            return
+        if self._protein_loaded_id is None:
+            default = self._protein_loaded_name or "new_protein"
+            def _on_named(name):
+                if not name:
+                    if after:
+                        after(False)
+                    return
+                self._protein_loaded_name = name
+                self._protein_loaded_id = self._make_entry_id(name)
+                self._commit_protein_save(aa_seq, after)
+            self.app.push_screen(
+                NamePlasmidModal(default, target_label="protein"),
+                callback=_on_named,
+            )
+            return
+        self._commit_protein_save(aa_seq, after)
+
+    def _commit_protein_save(self, aa_seq: str, after) -> None:
+        """Build the back-translated SeqRecord + library hand-off,
+        guarded by `_save_lock` so concurrent saves can't race the
+        SeqRecord construction with each other."""
+        try:
+            from Bio.Seq import Seq
+            from Bio.SeqRecord import SeqRecord
+            from Bio.SeqFeature import SeqFeature, FeatureLocation
+        except ImportError:
+            self.app.notify("BioPython not available — install Biopython.",
+                             severity="error")
+            if after:
+                after(False)
+            return
+        # Atomic guard: lock around back-translate + record build +
+        # library hand-off so a concurrent _commit_save (DNA tab) or
+        # another _commit_protein_save can't interleave construction.
+        with self._save_lock:
+            eid = self._protein_loaded_id or self._make_entry_id(
+                self._protein_loaded_name or "protein",
+            )
+            name = self._protein_loaded_name or eid
+            codon_cache = ProteinEditor._build_codon_cache(
+                self._codon_table_raw,
+            )
+            if not codon_cache:
+                self.app.notify(
+                    "Active codon table has no usable codons; "
+                    "cannot back-translate.",
+                    severity="error",
+                )
+                if after:
+                    after(False)
+                return
+            # Build back-translated DNA. Unknown AAs fall back to NNN
+            # (defensive — _PROTEIN_AA_ALPHABET filtering should have
+            # caught these but a stale buffer could carry one).
+            dna_parts: list[str] = []
+            for aa in aa_seq:
+                codon = codon_cache.get(aa)
+                if not codon or len(codon) != 3:
+                    codon = "NNN"
+                dna_parts.append(codon)
+            dna = "".join(dna_parts)
+            if not dna:
+                self.app.notify("Back-translation produced empty DNA.",
+                                 severity="error")
+                if after:
+                    after(False)
+                return
+            rec = SeqRecord(
+                Seq(dna), id=eid, name=eid[:16],
+                description=(
+                    f"Gene-synthesis protein ({len(aa_seq)} aa, "
+                    f"{len(dna)} bp; codons from "
+                    f"{self._codon_table_choice.split('|')[0] or '?'})"
+                ),
+            )
+            rec.annotations["molecule_type"] = "DNA"
+            rec.annotations["topology"]      = "linear"
+            try:
+                rec._tui_display_name = name  # type: ignore[attr-defined]
+                rec._tui_source       = f"synthesis-protein:{eid}"  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+            # CDS feature carries translation= qualifier so a re-load
+            # into the protein editor recovers the AA sequence exactly
+            # (not via re-translation, which could go through codon
+            # table drift if the active table changed between save +
+            # load).
+            try:
+                loc = FeatureLocation(0, len(dna), strand=1)
+                quals = {
+                    "label":       [name],
+                    "translation": [aa_seq],
+                    "note":        [
+                        f"Back-translated from protein editor; "
+                        f"codon table: "
+                        f"{self._codon_table_choice.split('|')[0] or '?'}",
+                    ],
+                }
+                rec.features.append(
+                    SeqFeature(loc, type="CDS", qualifiers=quals),
+                )
+            except (TypeError, ValueError):
+                _log.exception(
+                    "Synthesis: protein-save CDS feature build failed",
+                )
+            try:
+                lib = self.app.query_one("#library", LibraryPanel)
+            except NoMatches:
+                self.app.notify("Library panel not available.",
+                                 severity="error")
+                if after:
+                    after(False)
+                return
+            ok = lib.add_entry(rec)
+            if not ok:
+                if after:
+                    after(False)
+                return
+            self._protein_saved_snapshot = aa_seq
+            self._protein_dirty = False
+        # Lock released — log + UI work outside the critical section.
+        self._refresh_status()
+        _log_event("synthesis.protein.save",
+                   id=eid, name=name, aa=len(aa_seq), bp=len(dna),
+                   codon_table=self._codon_table_choice)
+        self.app.notify(
+            f"Saved '{name}' ({len(aa_seq):,} aa = {len(dna):,} bp).",
+            severity="information",
+        )
+        if after:
+            after(True)
+
+
 # ── Alignment visualisation screen ────────────────────────────────────────────
 #
 # Renders a pairwise alignment as parallel rows of bases with mismatches
@@ -45511,7 +49201,10 @@ class MultiAlignPickerModal(ModalScreen):
     MultiAlignPickerModal { align: center middle; }
     #mam-dlg {
         width: 96;
-        height: 36;
+        /* Was rigid `height: 36;`; switched to flex height + cap so
+           a short library list doesn't leave half a screen of dead
+           space below the table (2026-05-20 UX audit). */
+        height: 90%; max-height: 36; min-height: 18;
         background: $surface;
         border: heavy $primary;
         padding: 1 2;
@@ -63435,6 +67128,18 @@ class PlasmidApp(App):
     CSS = """
 Screen { background: $background; }
 
+/* ── Modal centering baseline ─────────────────────────── */
+/* Every ModalScreen subclass should sit at the centre of the
+   terminal window. Per-class DEFAULT_CSS used to repeat
+   `ClassName { align: center middle; }` 60+ times; this single
+   global rule covers the lot, and the per-class versions still
+   work as no-op overrides. DropdownScreen is the one exception —
+   it's a positioned popup anchored to a menubar item via explicit
+   `styles.offset`, so we restore its natural top-left layout
+   below. (2026-05-20 UX audit.) */
+ModalScreen { align: center middle; }
+DropdownScreen { align: left top; }
+
 /* ── Toast notifications — semantic colour tinting ────── */
 /* Textual ships three severities (information / warning / error); we
    also accept "success" (custom — see `_notify_success`). Red is
@@ -70051,6 +73756,9 @@ SpeciesPickerModal { align: center middle; }
         if name == "Mutagenize":
             self.action_open_mutagenize()
             return
+        if name == "Synthesis":
+            self.action_open_synthesis()
+            return
         if name == "Simulator":
             self.action_open_simulator()
             return
@@ -70260,6 +73968,17 @@ SpeciesPickerModal { align: center middle; }
     # toolbar (2026-05-18) supersedes it; keep the old action name so
     # any persisted keybindings / agent callers still resolve.
     action_open_align_zip = action_open_sequencing
+
+    @_action_log("app.open.synthesis")
+    def action_open_synthesis(self) -> None:
+        """Synthesis menu → open the gene-synthesis composer screen.
+
+        Full-screen workbench for penning a linear DNA fragment ready
+        for gene synthesis. Document model: load a linear plasmid from
+        the active library, edit bases / annotate features / insert
+        restriction sites, save back as the same library entry. New /
+        Save As / Rename available from the toolbar."""
+        self.push_screen(SynthesisScreen())
 
     @_action_log("app.open.experiments")
     def action_open_experiments(self) -> None:

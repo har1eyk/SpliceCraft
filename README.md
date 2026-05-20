@@ -80,6 +80,42 @@ installs and the user-data directory location.
   button — name + save the current lane layout + agarose %, load
   it back later, or reference it as `&<id>` in an Experiments
   entry.
+- **Compose gene-synthesis fragments** from the **Synthesis** menu
+  — full-screen workbench with **two tabs**:
+    * **DNA tab** — horizontally-scrolling linear DNA editor
+      (per-base style: feature stripes + restriction overlay + AA
+      translation), `5'-` / `-3'` (top) and `3'-` / `-5'` (bottom)
+      anti-parallel strand markers, cursor-based typing
+      (A/C/G/T/N only on the keyboard; IUPAC ambiguity codes flow
+      in via Ctrl+R restriction-site picker and feature-library
+      Insert), Ctrl+F highlight → **Add Feature** modal, and a
+      right-side **feature library** pane with two action modes:
+      *Insert* splices the entry's sequence at the cursor and
+      annotates it; *Annotate* overlays the entry's type / colour
+      onto the current selection without changing DNA.
+    * **Protein tab** — amino-acid composer with `N-` / `-C`
+      polarity markers. Type any of the 20 standard AAs (plus `*`
+      for stop) and a DNA codon manifests below each residue using
+      the **most-frequent codon** from the active codon table (top
+      dropdown — picks from any registered codon table including
+      the built-in E. coli K12). **Alt+T** toggles between
+      **codon-translated mode** (AA centred over its 3-bp codon)
+      and **AA-only mode** (just the letters, no DNA below).
+      Right-side **protein motif library** ships 30 built-in tags
+      (His6, FLAG, HA, Myc, V5, Strep-II, T7), linkers ((GGGGS)x3,
+      EAAAK), protease sites (TEV, PreScission, Thrombin),
+      self-cleaving 2A peptides (P2A, T2A, E2A, F2A), and
+      localisation signals (NLS, NES). Insert splices the motif's
+      AA sequence at the cursor. Saves as a linear DNA library
+      entry with a CDS feature carrying the `translation=`
+      qualifier so round-trip back into the protein tab recovers
+      the exact AA sequence (no codon-table-drift on reload).
+  Document model on save — load a linear plasmid, edit, Save
+  overwrites the same library entry. Save As / Rename / New
+  available from the toolbar. 50 kb cap per DNA fragment;
+  protein cap derived as 50 kb ÷ 3 ≈ 16.6k aa. Save flow
+  guarded by an RLock so concurrent DNA + protein saves can't
+  interleave SeqRecord construction.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
 - **Drive from outside** via a 60+ endpoint localhost JSON API
