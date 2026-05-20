@@ -14,6 +14,14 @@
 
 ---
 
+## [0.9.8] — 2026-05-19
+
+_(auto-generated from commits since v0.9.7)_
+
+* Every save is a full plasmid + cross-platform contract · invariants #44–#45
+
+---
+
 ## [0.9.7] — 2026-05-19
 
 _(auto-generated from commits since v0.9.6)_
