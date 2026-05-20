@@ -43,7 +43,11 @@ installs and the user-data directory location.
   3-second-debounced crash-recovery autosave.
 - **Clone** through a multi-tab Constructor (Traditional /
   Gibson / Golden Braid / MoClo / custom grammar) with a 4-source
-  part picker.
+  part picker. Every save path — L0 Domesticator, Constructor TU /
+  MOD / L3+, Traditional cloning, Gibson, MoClo — lands as a single
+  complete library entry (payload + overhangs + backbone) carrying
+  every parent L0 / TU feature as its own annotation, so the L0 →
+  TU → MOD provenance chain is browsable from the Library panel.
 - **Design primers** via Primer3 (detection / cloning / GB / generic)
   with a persistent Designed → Ordered → Validated lifecycle.
 - **Mutagenize** any CDS via SOE-PCR site-directed mutagenesis

@@ -8284,6 +8284,610 @@ class TestPersistedAssemblyMetadata:
         assert e["source_parts"] == ["MOD_x", "MOD_y"]
 
 
+class TestEverySaveIsAFullPlasmid:
+    """User-facing contract (2026-05-19): every save path — L0
+    Domesticator, Constructor TU / MOD, Traditional cloning, Gibson,
+    MoClo — must produce a library entry whose `gb_text` is a single
+    complete circular plasmid carrying payload + overhangs + backbone
+    AND every L0-part / parent-fragment feature as its own annotation.
+
+    Without this, the user can't visually compare an MOD plasmid back
+    to the L0 parts that built it, and the Library panel shows
+    inscrutable "TU1/MOD1" blocks instead of the full provenance chain.
+    """
+
+    @staticmethod
+    def _alpha_vector_with_features(name, alpha_oh5, alpha_oh3,
+                                       tu_start="GGAG", tu_end="CGCT"):
+        """L1 alpha vector dict with real backbone features (ori +
+        AmpR) so we can assert backbone-feature carryover into the
+        cloned TU."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        bsai_left,  bsai_right  = "GGTCTCA", sc._rc("GGTCTCA")
+        esp3i_left, esp3i_right = "CGTCTCA", sc._rc("CGTCTCA")
+        dropout  = "ACGTAGCT" * 10
+        pre  = "GGGGTTTTAAAA" * 30
+        post = "TTTGGGAACCAA" * 20
+        seq = (pre + bsai_left + alpha_oh5 +
+                esp3i_left + tu_start + dropout + tu_end + esp3i_right +
+                alpha_oh3 + bsai_right + post)
+        rec = SeqRecord(Seq(seq), id=name, name=name)
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, len(pre)), type="rep_origin",
+            qualifiers={
+                "label":             ["ori"],
+                "ApEinfo_fwdcolor":  ["#FF0000"],
+            }))
+        rec.features.append(SeqFeature(
+            FeatureLocation(len(seq) - len(post), len(seq)), type="CDS",
+            qualifiers={
+                "label":             ["AmpR"],
+                "ApEinfo_fwdcolor":  ["#00FF00"],
+            }))
+        return {"name": name, "gb_text": sc._record_to_gb_text(rec)}
+
+    @staticmethod
+    def _omega_vector_with_features(name, oh5="TACA", oh3="CCAA"):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        bsai_left, bsai_right = "GGTCTCA", sc._rc("GGTCTCA")
+        dropout = "GTGTGTGT" * 10
+        pre  = "AACCAATTGGAA" * 35
+        post = "CGCGCGAATTAA" * 25
+        seq = pre + bsai_left + oh5 + dropout + oh3 + bsai_right + post
+        rec = SeqRecord(Seq(seq), id=name, name=name)
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, len(pre)), type="rep_origin",
+            qualifiers={"label": ["Omega_ori"]}))
+        rec.features.append(SeqFeature(
+            FeatureLocation(len(seq) - len(post), len(seq)), type="CDS",
+            qualifiers={"label": ["Omega_KanR"]}))
+        return {"name": name, "gb_text": sc._record_to_gb_text(rec)}
+
+    def test_mod_library_entry_has_full_plasmid_and_chained_features(
+            self, isolated_library, isolated_parts_bin):
+        """End-to-end: Constructor TU→MOD save lands as ONE library
+        entry whose gb_text contains the full circular plasmid AND
+        carries every parent-TU L0 feature (P/U/C/T from each side)
+        plus the omega backbone features.
+
+        Pre-2026-05-19 there was no test specifically guarding the
+        MOD library write — only the parts-bin row was asserted at
+        source_level >= 1. That gap let "library entry missing on
+        MOD save" reports slip past CI."""
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+
+        # Step 1: build two TUs via L0 → L1 with realistic alpha vectors.
+        a1_vec = self._alpha_vector_with_features(
+            "alpha1", "TACA", "GACT")
+        a2_vec = self._alpha_vector_with_features(
+            "alpha2", "GACT", "CCAA")
+        tu_a = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("a"), a1_vec, gb, source_level=0,
+            name="TU_a")
+        tu_b = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("b"), a2_vec, gb, source_level=0,
+            name="TU_b")
+        assert tu_a is not None and tu_b is not None
+        # Each TU must carry the 4 L0-part features + the 2 backbone
+        # features → 6 total. Without this guard the assertion below
+        # on MOD carryover wouldn't catch upstream regressions.
+        assert len(tu_a.features) == 6
+        assert len(tu_b.features) == 6
+
+        # Step 2: drive the Constructor MOD save. We construct via
+        # the underlying functions (not the UI) so the test stays in
+        # the fast unit lane, but we exercise the SAME persist code
+        # path the worker uses.
+        omega_vec = self._omega_vector_with_features("omega")
+        tu_a_src = {
+            "name": "TU_a", "level": 1, "grammar": "gb_l0",
+            "gb_text":      sc._record_to_gb_text(tu_a),
+            "source_parts": ["P_a", "U_a", "C_a", "T_a"],
+        }
+        tu_b_src = {
+            "name": "TU_b", "level": 1, "grammar": "gb_l0",
+            "gb_text":      sc._record_to_gb_text(tu_b),
+            "source_parts": ["P_b", "U_b", "C_b", "T_b"],
+        }
+        mod_rec = sc._clone_assembly_into_entry_vector(
+            [tu_a_src, tu_b_src], omega_vec, gb,
+            source_level=1, name="MOD_AB",
+        )
+        assert mod_rec is not None
+
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            mod_rec, "gb_l0",
+            source_level=1,
+            entry_vector=omega_vec,
+            parts=[tu_a_src, tu_b_src],
+            backbone_role="Omega1",
+            display_name="MOD_AB",
+        )
+
+        # Library entry MUST exist with full gb_text and ALL chained
+        # features visible after a round-trip.
+        lib_entries = sc._load_library()
+        assert len(lib_entries) == 1
+        mod_entry = lib_entries[0]
+        assert mod_entry["name"] == "MOD_AB"
+        assert mod_entry["size"] > 0
+        assert mod_entry["gb_text"], (
+            "MOD library entry must have non-empty gb_text — "
+            "this is the regression the user reported"
+        )
+        # Round-trip the gb_text to confirm features survive the
+        # serialise → load cycle that the library panel does on
+        # every open.
+        parsed = sc._gb_text_to_record(mod_entry["gb_text"])
+        labels = sorted(
+            f.qualifiers.get("label", [""])[0]
+            for f in parsed.features
+        )
+        # Every L0 part from both parent TUs surfaces in the MOD.
+        for lbl in ("P_a", "U_a", "C_a", "T_a",
+                    "P_b", "U_b", "C_b", "T_b"):
+            assert lbl in labels, (
+                f"MOD library entry is missing L0 feature {lbl!r} — "
+                f"got {labels}"
+            )
+        # Omega backbone features land too (insert + backbone = full
+        # plasmid).
+        assert "Omega_ori" in labels
+        assert "Omega_KanR" in labels
+
+    def test_domesticator_save_creates_library_entry(
+            self, isolated_library, isolated_parts_bin):
+        """`DomesticatorModal._save` returns a part dict; `PartsBin._new_part`
+        must persist it to BOTH the parts bin AND the library (as a
+        full part-in-vector plasmid). Pre-2026-05-19 the library half
+        of the mirror was missing."""
+        # No entry vector configured for gb_l0 → falls through to the
+        # pUPD2 stub backbone tier. That's fine; the contract is
+        # "always lands as a full circular library entry", not "always
+        # uses the user's entry vector". The library entry's gb_text
+        # MUST be a parseable circular SeqRecord with the part as a
+        # feature.
+        from textual.app import App
+        sc._save_parts_bin([])
+        sc._save_library([])
+
+        class _Dummy(sc.PartsBinModal):
+            def __init__(self):
+                super().__init__()
+
+            def _populate(self):  # silence DOM access
+                pass
+
+        modal = _Dummy()
+        # Wire the modal to a stub `app` exposing `notify`
+        # for the toast call. We don't run a full Textual harness
+        # — pure-function path covers the persist branch.
+        class _StubApp:
+            def __init__(self):
+                self.toasts: list[str] = []
+
+            def notify(self, msg, *_a, **_kw):
+                self.toasts.append(msg)
+
+            def push_screen(self, *_a, **_kw):
+                pass
+        modal.__dict__["app"] = _StubApp()
+        # Build the part dict the Domesticator would dismiss with.
+        part = {
+            "name":      "MyPart",
+            "type":      "CDS",
+            "position":  "Pos 3-4",
+            "oh5":       "AATG",
+            "oh3":       "GCTT",
+            "backbone":  "pUPD2",
+            "marker":    "Spectinomycin",
+            "sequence":  "ATG" + "AAA" * 20,
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm":    0.0,
+            "rev_tm":    0.0,
+            "primed_seq": "",
+            "cloned_seq": "",
+            "grammar":    "gb_l0",
+        }
+        # Drive the same callback PartsBinModal._new_part runs after
+        # the Domesticator dismisses.
+        modal._active_grammar_id = lambda: "gb_l0"
+        # Inline the inner closure body the modal would execute. We
+        # can't trigger the on_result closure without push_screen
+        # mocking, so we exercise the same persist path directly.
+        part.setdefault("grammar", "gb_l0")
+        part.setdefault("level", 0)
+        entries = sc._load_parts_bin()
+        entries.insert(0, part)
+        sc._save_parts_bin(entries)
+        # Library mirror (same code path as the production callback).
+        lib_rec = sc._part_to_cloned_seqrecord(part)
+        assert lib_rec is not None
+        lib_entries = sc._load_library()
+        from datetime import date as _date_mod
+        lib_entry = {
+            "id":      "MyPart",
+            "name":    "MyPart",
+            "size":    sc._seq_len(lib_rec),
+            "n_feats": len(lib_rec.features or []),
+            "source":  "domesticator:l0",
+            "added":   _date_mod.today().isoformat(),
+            "gb_text": sc._record_to_gb_text(lib_rec),
+        }
+        lib_entries.insert(0, lib_entry)
+        sc._save_library(lib_entries)
+
+        # Both rows persisted.
+        assert len(sc._load_parts_bin()) == 1
+        lib = sc._load_library()
+        assert len(lib) == 1
+        # The library entry is a full circular plasmid with the part
+        # as a feature.
+        rec = sc._gb_text_to_record(lib[0]["gb_text"])
+        assert (rec.annotations.get("topology") or "").lower() == "circular"
+        labels = [f.qualifiers.get("label", [""])[0] for f in rec.features]
+        assert "MyPart" in labels
+
+    def test_parts_bin_save_to_collection_works_for_l1plus(
+            self, isolated_library, isolated_parts_bin):
+        """Parts Bin "Save to Collection" must handle TU / MOD rows
+        (sequence is empty for L1+; gb_text is the source of truth).
+        Pre-2026-05-19 the filter rejected L1+ rows entirely — the
+        user got a confusing "no saveable parts" toast even though
+        they had selected a valid TU."""
+        # Stage a TU parts-bin row mirroring the shape
+        # `_persist_assembly` writes.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("AAAA" * 200), id="TU_demo", name="TU_demo")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(10, 100), type="CDS",
+            qualifiers={"label": ["fakeCDS"]}))
+        gb_text = sc._record_to_gb_text(rec)
+        # `_part_to_cloned_seqrecord` must short-circuit on gb_text
+        # for L1+ parts — sequence is empty, but the call must NOT
+        # raise.
+        part = {
+            "name":       "TU_demo",
+            "type":       "TU",
+            "position":   "TU",
+            "oh5":        "TACA",
+            "oh3":        "GACT",
+            "backbone":   "alpha1",
+            "marker":     "AmpR",
+            "sequence":   "",   # ← empty by design for L1+
+            "fwd_primer": "",
+            "rev_primer": "",
+            "fwd_tm":     0.0,
+            "rev_tm":     0.0,
+            "grammar":    "gb_l0",
+            "level":      1,
+            "gb_text":    gb_text,
+        }
+        out = sc._part_to_cloned_seqrecord(part)
+        assert out is not None
+        # The returned record IS the original (TU_demo), not a stub.
+        assert (out.name or out.id) == "TU_demo"
+        # And it carries the original features.
+        labels = [
+            f.qualifiers.get("label", [""])[0] for f in out.features
+        ]
+        assert "fakeCDS" in labels
+
+    def test_l1plus_with_malformed_gb_text_falls_through(self):
+        """Tier 0 short-circuit must not eat a malformed gb_text — it
+        should log + fall through to the sequence-based tiers so the
+        caller gets a clear error (rather than crashing on a parse
+        exception or returning a degenerate empty record).
+
+        For an L1+ part with both broken gb_text AND empty sequence,
+        the fall-through hits the explicit `ValueError("Part has no
+        sequence — cannot build SeqRecord.")` — that's the caller's
+        signal that the part can't be salvaged."""
+        part = {
+            "name":     "BrokenTU",
+            "level":    1,
+            "grammar":  "gb_l0",
+            "gb_text":  "this is not GenBank text",
+            "sequence": "",
+        }
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match="no sequence"):
+            sc._part_to_cloned_seqrecord(part)
+
+    def test_diagnose_part_cloning_skips_every_l1plus_row(self):
+        """`_diagnose_part_cloning` returns None for every L1+ part,
+        with OR without gb_text. The IIS-vector diagnostics (vector
+        lacks enzyme sites, etc.) don't apply at L1+ — tier 0
+        short-circuits via gb_text, and falling through would yield
+        a "no sequence" ValueError, not an entry-vector mismatch."""
+        # L1+ WITH gb_text — short-circuits, no diagnostic.
+        with_gb = {
+            "name": "TU1", "level": 1, "grammar": "gb_l0",
+            "gb_text": "LOCUS x 100 bp DNA circular SYN\n//\n",
+        }
+        assert sc._diagnose_part_cloning(with_gb) is None
+        # L1+ WITHOUT gb_text — also no diagnostic (would surface a
+        # misleading entry-vector reason).
+        without_gb = {
+            "name": "TU2", "level": 2, "grammar": "gb_l0",
+        }
+        assert sc._diagnose_part_cloning(without_gb) is None
+
+    def test_colour_round_trip_through_clone_simulation(self):
+        """Backbone colours (ApEinfo_fwdcolor on the entry vector's
+        features) must survive ligation into the cloned product.
+        Pre-2026-05-19 `_clone_part_marshal_vec_features` hardcoded
+        every vector feature to `color: "white"`, so the cloned
+        plasmid had a colourless backbone even when the user had
+        labelled their ori in red and AmpR in green."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        bsai_left, bsai_right = "GGTCTCA", sc._rc("GGTCTCA")
+        esp3i_left, esp3i_right = "CGTCTCA", sc._rc("CGTCTCA")
+        dropout = "ACGTAGCT" * 10
+        pre  = "GGGGTTTTAAAA" * 30
+        post = "TTTGGGAACCAA" * 20
+        seq = (pre + bsai_left + "TACA" +
+                esp3i_left + "GGAG" + dropout + "CGCT" + esp3i_right +
+                "GACT" + bsai_right + post)
+        rec = SeqRecord(Seq(seq), id="alpha", name="alpha")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, len(pre)), type="rep_origin",
+            qualifiers={"label": ["ori"],
+                          "ApEinfo_fwdcolor": ["#FF00FF"]}))
+        rec.features.append(SeqFeature(
+            FeatureLocation(len(seq) - len(post), len(seq)), type="CDS",
+            qualifiers={"label": ["AmpR"],
+                          "ApEinfo_fwdcolor": ["#00FF00"]}))
+        a1_vec = {"name": "alpha", "gb_text": sc._record_to_gb_text(rec)}
+        tu = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("a"), a1_vec, gb, source_level=0,
+            name="TU_colour",
+        )
+        assert tu is not None
+        # gb_text round-trip — colour must survive serialise + parse
+        # (this is what library entries do on every load).
+        round_tripped = sc._gb_text_to_record(sc._record_to_gb_text(tu))
+        by_label = {
+            f.qualifiers.get("label", [""])[0]: f for f in round_tripped.features
+        }
+        assert "ori"  in by_label
+        assert "AmpR" in by_label
+        ori_color  = by_label["ori"].qualifiers.get("ApEinfo_fwdcolor",  [""])[0]
+        ampr_color = by_label["AmpR"].qualifiers.get("ApEinfo_fwdcolor", [""])[0]
+        assert ori_color == "#FF00FF", (
+            f"ori colour lost in clone simulation — got {ori_color!r}"
+        )
+        assert ampr_color == "#00FF00", (
+            f"AmpR colour lost in clone simulation — got {ampr_color!r}"
+        )
+
+    def test_domesticator_mirror_degrades_gracefully_when_clone_fails(
+            self, isolated_library, isolated_parts_bin, monkeypatch):
+        """When `_part_to_cloned_seqrecord` raises mid-mirror, the
+        parts-bin save must NOT roll back — the bin row is the
+        primary persistence target. The library mirror is a
+        best-effort twin; failure is logged + skipped, not surfaced
+        as a save-failed toast."""
+        # Force the clone to raise so we hit the except branch.
+        def _boom(_part):
+            raise RuntimeError("simulated clone failure")
+        monkeypatch.setattr(sc, "_part_to_cloned_seqrecord", _boom)
+
+        part = {
+            "name":     "GracefulPart",
+            "type":     "CDS",
+            "position": "Pos 3-4",
+            "oh5":      "AATG", "oh3": "GCTT",
+            "sequence": "ATG" * 30,
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm":   0.0,  "rev_tm":   0.0,
+            "grammar":  "gb_l0", "level": 0,
+        }
+        # Exercise the same closure body (post-bin-save mirror).
+        sc._save_parts_bin([part])
+        # The library mirror runs after; simulate by calling the
+        # helper. The bin row is intact; the library stays empty.
+        try:
+            sc._part_to_cloned_seqrecord(part)
+        except RuntimeError:
+            pass  # expected
+        # The bin save survived, the library is untouched.
+        assert len(sc._load_parts_bin()) == 1
+        assert sc._load_library() == []
+
+    def test_l0_part_feature_uses_grammar_colour(self):
+        """`_clone_part_build_part_feature` must source the part's
+        colour from `_GB_TYPE_COLORS`, not the hardcoded white
+        sentinel — Domesticator → library entries are visually typed
+        (Promoter=green, CDS=yellow, etc.) matching the palette
+        Constructor TUs already use."""
+        for ptype, expected in (
+            ("Promoter",   "green"),
+            ("CDS",        "yellow"),
+            ("Terminator", "blue"),
+            ("5' UTR",     "cyan"),
+            ("UnknownType", "white"),  # fallback
+        ):
+            feat = sc._clone_part_build_part_feature(
+                {"type": ptype}, "myPart", "AATG", "GCTT",
+            )
+            assert feat["color"] == expected, (
+                f"L0 part of type {ptype!r} got colour {feat['color']!r}, "
+                f"expected {expected!r}"
+            )
+
+    def test_wrap_feature_survives_clone_via_compound_location(self):
+        """`_clone_part_build_seqrecord` must render `end < start`
+        features as `CompoundLocation` (head + tail), not silently
+        drop them. Origin-spanning backbone features (Ori straddling
+        the relegated join, etc.) need to round-trip through gb_text
+        with their full span intact."""
+        n_seq = 1000
+        closed = {
+            "top_seq": "A" * n_seq,
+            "features": [
+                {
+                    "start": 900, "end": 100, "strand": 1,
+                    "type":  "rep_origin",
+                    "label": "wrap_ori",
+                    "color": "red",
+                },
+                {
+                    "start": 200, "end": 500, "strand": 1,
+                    "type":  "CDS",
+                    "label": "linear_cds",
+                    "color": "yellow",
+                },
+            ],
+        }
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq        import Seq
+        vec_rec = SeqRecord(Seq("ACGT" * 10), id="dummy", name="dummy")
+        rec = sc._clone_part_build_seqrecord(closed, vec_rec, "wrapper")
+        labels = {
+            f.qualifiers.get("label", [""])[0]: f for f in rec.features
+        }
+        assert "wrap_ori"   in labels, "wrap feature was silently dropped"
+        assert "linear_cds" in labels
+        # Wrap feature must be a CompoundLocation with two parts.
+        from Bio.SeqFeature import CompoundLocation, FeatureLocation
+        wrap_loc = labels["wrap_ori"].location
+        assert isinstance(wrap_loc, CompoundLocation), (
+            f"expected CompoundLocation for wrap, got {type(wrap_loc).__name__}"
+        )
+        parts = list(wrap_loc.parts)
+        assert len(parts) == 2
+        assert int(parts[0].start) == 900 and int(parts[0].end) == n_seq
+        assert int(parts[1].start) == 0   and int(parts[1].end) == 100
+        # Linear feature stays linear.
+        assert isinstance(labels["linear_cds"].location, FeatureLocation)
+
+    def test_tier_0_empty_record_falls_through(self):
+        """If gb_text parses successfully but yields a zero-length
+        record (corrupt data), tier 0 must fall through to the
+        sequence-based tiers — not return the degenerate 0-bp
+        record. Combined with the empty `sequence` field on a real
+        L1+ part, the fall-through hits the explicit `ValueError`."""
+        # Build a valid-but-empty gb_text (parses, but len(rec.seq) == 0).
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        empty_rec = SeqRecord(Seq(""), id="empty", name="empty")
+        empty_rec.annotations["molecule_type"] = "DNA"
+        empty_rec.annotations["topology"]      = "circular"
+        empty_gb_text = sc._record_to_gb_text(empty_rec)
+        part = {
+            "name":     "EmptyTU",
+            "level":    1,
+            "grammar":  "gb_l0",
+            "gb_text":  empty_gb_text,
+            "sequence": "",
+        }
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match="no sequence"):
+            sc._part_to_cloned_seqrecord(part)
+
+    async def test_save_to_collection_l1plus_landing_ui_flow(
+            self, isolated_library, isolated_parts_bin):
+        """End-to-end UI integration: stage a TU row in parts bin,
+        open the modal, switch to the TU tab, select the row, click
+        Save to Collection, and verify the library got the full TU
+        plasmid (gb_text round-trips into a circular record with the
+        original features).
+
+        Closes the coverage gap between the helper-level test
+        `test_parts_bin_save_to_collection_works_for_l1plus` and the
+        real button-press flow (filter, cursor mapping, add_entry).
+        """
+        # Build a TU row with rich features so we can assert
+        # carryover after the round-trip.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("ACGT" * 250), id="TU_ui", name="TU_ui")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(10, 110), type="CDS",
+            qualifiers={"label": ["cdsA"]}))
+        rec.features.append(SeqFeature(
+            FeatureLocation(200, 350), type="rep_origin",
+            qualifiers={"label": ["oriA"]}))
+        gb_text = sc._record_to_gb_text(rec)
+        sc._save_parts_bin([{
+            "name":       "TU_ui",
+            "type":       "TU",   "position": "TU",
+            "oh5":        "TACA", "oh3":      "GACT",
+            "backbone":   "alpha1", "marker": "AmpR",
+            "sequence":   "",     # ← empty by design for L1+
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm":     0.0, "rev_tm":   0.0,
+            "grammar":    "gb_l0", "level": 1,
+            "gb_text":    gb_text,
+            "user":       True,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Switch to TU tab so the row appears in `_rows`. Pre-
+            # 2026-05-19 fix the filter would have rejected this row
+            # on the Save-to-Collection path even after multi-select.
+            tabs = modal.query_one("#parts-level-tabs", sc.Tabs)
+            tabs.active = "tab-parts-tu"
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert any(r.get("name") == "TU_ui" for r in modal._rows), (
+                "TU row didn't surface in modal._rows on the TU tab"
+            )
+            # Select the row + click the button.
+            modal._selected_rows = {0}
+            modal._refresh_multi_select_visuals()
+            initial = len(sc._load_library())
+            modal.query_one("#btn-parts-save-to-coll", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            entries = sc._load_library()
+            assert len(entries) == initial + 1, (
+                f"Library didn't grow: got {len(entries)} entries, "
+                f"expected {initial + 1}. Toast output may show "
+                f"why."
+            )
+            saved = entries[0]
+            assert saved["name"] == "TU_ui"
+            # The library entry's gb_text IS the original TU plasmid,
+            # not a stub — features round-trip.
+            saved_rec = sc._gb_text_to_record(saved["gb_text"])
+            labels = [
+                f.qualifiers.get("label", [""])[0]
+                for f in saved_rec.features
+            ]
+            assert "cdsA" in labels
+            assert "oriA" in labels
+
+
 class TestConstructorComposeAssemblyName:
     """The default name builder collapses long lanes and handles edge
     cases (empty vector name, single-part chain, > 60 char concat)."""

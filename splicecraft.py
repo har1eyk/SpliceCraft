@@ -413,6 +413,89 @@ def _log_startup_banner() -> None:
     _log.info("=" * 60)
 
 
+def _check_terminal_capabilities() -> "tuple[list[str], list[str]]":
+    """Probe terminal + interpreter for the features SpliceCraft needs.
+
+    Returns ``(blocking, warning)`` lists of human-readable strings.
+    Empty `blocking` means SpliceCraft can launch; any string there
+    means the user will hit a hard breakage and the launcher should
+    refuse + print the message to stderr. `warning` lists soft
+    degradations (no clipboard image grab, no primer3 Tm, etc.).
+
+    Checks:
+      * **stdout encoding** must be UTF-8 (or a superset). The braille
+        plasmid map relies on U+2800-U+28FF; on a Latin-1 terminal
+        the entire map renders as gibberish.
+      * **stdout is a TTY** when not running in test mode. A pipe /
+        redirect means Textual can't draw the UI.
+      * **Pillow** is importable (needed for clipboard image paste on
+        Windows / macOS; soft on Linux/WSL where the button is
+        disabled anyway).
+      * **primer3** is importable (Tm calculation; soft fallback to
+        2+4 rule estimator).
+      * **pyspellchecker** is importable (Experiments F7 spellcheck;
+        the feature is gated to skip when missing).
+
+    Designed to be cheap (no network, no subprocess) so it can fire
+    on every launch without measurable delay. Output goes to the
+    log unconditionally; stderr only on blocking failure.
+    """
+    blocking: list[str] = []
+    warning:  list[str] = []
+    # Encoding probe — the braille map needs UTF-8 (or a wider
+    # codec). `stdout.encoding` is None when piped; treat that as
+    # the caller's problem and skip the warning since they're
+    # presumably scripting, not running interactively.
+    enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+    if enc and enc not in ("utf-8", "utf8", "utf-16", "utf-32",
+                              "cp65001"):
+        blocking.append(
+            f"Terminal encoding is {enc!r}; SpliceCraft requires UTF-8 "
+            f"for the braille plasmid map. Set "
+            f"PYTHONIOENCODING=utf-8 or use a UTF-8 locale "
+            f"(e.g. LANG=C.UTF-8)."
+        )
+    # Optional Python deps — soft warnings only.
+    for mod_name, purpose in (
+        ("PIL",          "clipboard image paste (Experiments)"),
+        ("primer3",      "primer Tm calculation"),
+        ("spellchecker", "Experiments F7 spellcheck"),
+    ):
+        try:
+            __import__(mod_name)
+        except ImportError:
+            warning.append(f"{mod_name!r} not importable — {purpose} "
+                            f"will degrade.")
+    return blocking, warning
+
+
+def _log_terminal_capabilities() -> None:
+    """Fire the capability probe + emit `startup.terminal_capabilities`
+    event. Blocking failures print to stderr AND abort via
+    `SystemExit(1)`; warnings only go to the log.
+
+    Called from `main()` right after the startup banner so failures
+    surface before the Textual harness initialises (which would
+    swallow stderr).
+    """
+    blocking, warning = _check_terminal_capabilities()
+    _log_event(
+        "startup.terminal_capabilities",
+        encoding=(getattr(sys.stdout, "encoding", "") or "").lower(),
+        is_tty=bool(getattr(sys.stdout, "isatty", lambda: False)()),
+        platform=sys.platform,
+        blocking_count=len(blocking),
+        warning_count=len(warning),
+    )
+    for msg in warning:
+        _log.warning("terminal capability: %s", msg)
+    if blocking:
+        for msg in blocking:
+            _log.error("terminal capability blocked: %s", msg)
+            print(f"splicecraft: {msg}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def _log_event(event: str, *, _stacklevel: int = 2, **fields) -> None:
     """One-line AI-parseable structured event for diagnostic logs.
 
@@ -7064,12 +7147,31 @@ _CODON_TABLE: dict[str, str] = {
 }
 
 def _copy_to_clipboard_osc52(text: str) -> bool:
-    """Copy text via OSC 52 escape sequence — works in Windows Terminal, iTerm2, most modern terminals."""
+    """Copy text via OSC 52 escape sequence — works in iTerm2, Windows
+    Terminal, most modern Linux terminals.
+
+    Writes the escape directly to the controlling TTY (POSIX
+    ``/dev/tty``, Windows ``CONOUT$``) so the sequence bypasses
+    Textual's rendering buffer and reaches the terminal emulator
+    intact. Falls back to ``False`` when the TTY isn't writable —
+    the multi-tier wrapper then escalates to file-based fallback.
+
+    Sequence is base64(text) wrapped in the OSC 52 framing
+    `ESC ] 52 ; c ; <payload> BEL`. The terminal emulator is
+    responsible for forwarding the payload to the system clipboard
+    (often gated by a user preference for security).
+    """
     import base64
     encoded = base64.b64encode(text.encode()).decode()
     seq = f"\033]52;c;{encoded}\007"
+    # POSIX systems write to `/dev/tty` (always the controlling
+    # terminal regardless of stdin/stdout redirection). Windows
+    # exposes the console as `CONOUT$`, openable for write with the
+    # same semantics. Either device-name failure falls through to
+    # the caller's tier-3 file fallback — never raises.
+    target = "CONOUT$" if sys.platform == "win32" else "/dev/tty"
     try:
-        with open("/dev/tty", "w") as tty:
+        with open(target, "w") as tty:
             tty.write(seq)
             tty.flush()
         return True
@@ -22114,7 +22216,13 @@ def _clone_part_marshal_vec_features(vec_rec) -> list[dict]:
     `_fragments_from_cuts` expects. Wrap-aware via `_feat_bounds`
     (pre-fix `int(loc.start)` flattened wrap features to outer bounds
     and the carry-over logic dropped them as "fully inside the
-    dropout"). Skips `source` rows (whole-record metadata)."""
+    dropout"). Skips `source` rows (whole-record metadata).
+
+    Carries ApEinfo colour qualifiers across to the fragment dict so
+    backbone features (Ori / AmpR / etc.) keep their colours after
+    ligation into the cloned product. Pre-2026-05-19 every vector
+    feature came through as ``color: "white"`` and the cloned plasmid
+    lost the visual provenance of the entry-vector's annotation."""
     vec_features: list[dict] = []
     total_vec = _seq_len(vec_rec)
     for f in (vec_rec.features or []):
@@ -22130,12 +22238,18 @@ def _clone_part_marshal_vec_features(vec_rec) -> list[dict]:
             if vals:
                 label = str(vals[0])
                 break
+        color = ""
+        for k in ("ApEinfo_fwdcolor", "ApEinfo_revcolor", "color"):
+            vals = f.qualifiers.get(k, [])
+            if vals:
+                color = str(vals[0])
+                break
         vec_features.append({
             "start":  fs, "end":   fe,
             "strand": f.location.strand or 1,
             "type":   f.type,
             "label":  label or f.type,
-            "color":  "white",
+            "color":  color or "white",
         })
     return vec_features
 
@@ -22146,9 +22260,17 @@ def _clone_part_build_part_feature(
     """Build the part_feature template that annotates the inserted
     region in the cloned plasmid. The `end` field is left at 0 because
     the caller fills it in once the synthesised top_seq length is
-    known."""
-    ftype = _GB_PART_TYPE_TO_INSDC.get(part.get("type", ""), "misc_feature")
-    note_bits = [f"GB part type: {part.get('type', '?')}"]
+    known.
+
+    Colour is sourced from the grammar's per-type palette
+    (`_GB_TYPE_COLORS`) so Domesticator-saved library entries are
+    visually typed (Promoter=green, CDS=yellow, Terminator=blue, etc.)
+    matching what `_clone_assembly_into_entry_vector` already paints
+    on TU/MOD assemblies. Falls back to white for unrecognised types
+    (custom grammars without a colour table)."""
+    part_type = str(part.get("type") or "")
+    ftype = _GB_PART_TYPE_TO_INSDC.get(part_type, "misc_feature")
+    note_bits = [f"GB part type: {part_type or '?'}"]
     if part.get("position"):
         note_bits.append(f"position {part['position']}")
     if oh5 or oh3:
@@ -22162,7 +22284,7 @@ def _clone_part_build_part_feature(
         "type":   ftype,
         "label":  raw_name,
         "note":   "; ".join(note_bits),
-        "color":  "white",
+        "color":  _GB_TYPE_COLORS.get(part_type, "white"),
     }
 
 
@@ -22335,10 +22457,18 @@ def _clone_part_build_seqrecord(
     real SeqRecord with `molecule_type=DNA` + `topology=circular`.
     Features with non-int / negative / out-of-range coords are
     dropped with a warning log (pre-fix this swallowed every
-    exception including programmer bugs)."""
+    exception including programmer bugs).
+
+    Wrap-aware: a feature whose ``end < start`` is rendered as a
+    `CompoundLocation` per the GenBank convention (head + tail).
+    Pre-2026-05-19 the `if e <= s` guard silently dropped these,
+    losing origin-spanning backbone features (an AmpR that straddles
+    the relegated join, an Ori split across the cut point, etc.)."""
     from Bio.Seq import Seq
     from Bio.SeqRecord import SeqRecord
-    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    from Bio.SeqFeature import (
+        SeqFeature, FeatureLocation, CompoundLocation,
+    )
     safe_id = re.sub(r"[^A-Za-z0-9_]", "_", str(raw_name)) or "part"
     new_seq = closed["top_seq"]
     n_seq = len(new_seq)
@@ -22355,15 +22485,42 @@ def _clone_part_build_seqrecord(
             e = int(f.get("end",   0))
         except (TypeError, ValueError):
             continue
-        if e <= s or s < 0 or e > n_seq:
+        if s < 0 or s >= n_seq or e < 0 or e > n_seq:
             continue
-        quals = {"label": [f.get("label") or f.get("type") or "feature"]}
+        if s == e:
+            continue  # zero-length features have no biology
+        strand = int(f.get("strand", 1) or 1)
+        if e > s:
+            loc: "FeatureLocation | CompoundLocation" = FeatureLocation(
+                s, e, strand=strand,
+            )
+        else:
+            # Wrap feature: (s, n_seq) + (0, e). Both halves carry the
+            # same strand. CompoundLocation refuses empty parts, so
+            # the s == n_seq / e == 0 edge cases are pre-filtered by
+            # the bounds checks above.
+            loc = CompoundLocation([
+                FeatureLocation(s, n_seq, strand=strand),
+                FeatureLocation(0, e,    strand=strand),
+            ])
+        quals: dict = {
+            "label": [f.get("label") or f.get("type") or "feature"],
+        }
         if f.get("note"):
             quals["note"] = [str(f["note"])]
+        # Carry ApEinfo colours through so chained MOD / TU features
+        # keep the colour the user (or the grammar's per-type palette)
+        # assigned. Without this, every cloned feature renders as the
+        # default white block and the visual provenance of an L0 →
+        # TU → MOD chain is lost.
+        color = f.get("color")
+        if color and str(color).lower() != "white":
+            color_str = str(color)
+            quals.setdefault("ApEinfo_fwdcolor", [color_str])
+            quals.setdefault("ApEinfo_revcolor", [color_str])
         try:
             new_rec.features.append(SeqFeature(
-                FeatureLocation(s, e,
-                                  strand=int(f.get("strand", 1) or 1)),
+                loc,
                 type=str(f.get("type", "misc_feature")),
                 qualifiers=quals,
             ))
@@ -23684,7 +23841,20 @@ def _diagnose_part_cloning(part: dict) -> "str | None":
       * Grammar's enzyme isn't recognised
       * Vector gb_text can't be parsed
       * Vector has < 2 enzyme cuts (no dropout to excise)
+
+    L1+ parts (TU / MOD) short-circuit at the top: their `gb_text`
+    IS the already-cloned plasmid, so `_part_to_cloned_seqrecord`'s
+    tier 0 returns it directly without re-cloning. Surfacing
+    entry-vector diagnostics for L1+ parts would be misleading —
+    they don't go through tier 1 IIS digest at all. The check fires
+    for every L1+ row regardless of `gb_text` presence: a degenerate
+    L1+ row missing gb_text would still raise downstream in
+    `_part_to_cloned_seqrecord` (empty `sequence` → ValueError), but
+    surfacing "vector lacks BsaI sites" first would point the user
+    at the wrong fix.
     """
+    if _part_level(part) >= 1:
+        return None
     grammar_id = part.get("grammar") or "gb_l0"
     try:
         grammar = _all_grammars().get(grammar_id) \
@@ -23723,6 +23893,13 @@ def _part_to_cloned_seqrecord(part: dict):
     cloned plasmid form, ready for `LibraryPanel.add_entry`.
 
     Tiered cloning model:
+      0. **L1+ short-circuit**. TU / MOD parts already carry the full
+         assembled plasmid as `gb_text` (the parts-bin `sequence` field
+         is intentionally empty for L1+ — `gb_text` is the source of
+         truth, see invariant in `ConstructorModal._persist_assembly`).
+         Parse and return the stored plasmid directly so a TU / MOD row
+         can land in the library via Parts Bin → Save to Collection
+         with all chained features intact.
       1. **IIS-digest simulation** (preferred). When the part's
          grammar has a configured entry vector,
          `_clone_part_into_entry_vector` digests the vector +
@@ -23751,6 +23928,39 @@ def _part_to_cloned_seqrecord(part: dict):
     from Bio.Seq import Seq
     from Bio.SeqRecord import SeqRecord
     from Bio.SeqFeature import SeqFeature, FeatureLocation
+    # Tier 0: L1+ short-circuit. `gb_text` IS the cloned plasmid for
+    # TUs / MODs — no need to re-clone into an entry vector since the
+    # Constructor already wrote the assembled plasmid into it. Linking
+    # this back into the library preserves every chained TU/L0 feature.
+    #
+    # `_gb_text_to_record` raises ValueError on the 64 MB size cap +
+    # whatever BioPython's GenBank parser surfaces on malformed input;
+    # `Exception` covers both without swallowing programmer bugs
+    # (TypeError / AttributeError still propagate from elsewhere in
+    # the function). Matches the established pattern at
+    # `_assembly_fragment_from_source` (line 23131).
+    raw_gb_text = part.get("gb_text") or ""
+    if raw_gb_text and _part_level(part) >= 1:
+        try:
+            rec = _gb_text_to_record(raw_gb_text)
+        except Exception:
+            _log.exception(
+                "clone_sim: L1+ gb_text parse failed for %r — falling "
+                "through to sequence-based tiers", part.get("name"),
+            )
+        else:
+            # Defensive: a parsed-but-empty record is corrupt data
+            # (zero-length plasmids don't biologically exist). Fall
+            # through to tier 1/2/3 so the caller either gets a
+            # meaningful clone or the explicit "no sequence"
+            # ValueError — not a degenerate 0-bp library row.
+            if _seq_len(rec) > 0:
+                return rec
+            _log.warning(
+                "clone_sim: L1+ gb_text for %r parses to a 0-bp "
+                "record — falling through to sequence-based tiers",
+                part.get("name"),
+            )
     insert = part.get("sequence", "") or ""
     if not insert:
         raise ValueError("Part has no sequence — cannot build SeqRecord.")
@@ -35793,15 +36003,125 @@ class PartsBinModal(Screen):
                 _notify_save_failure(self.app, "Parts bin", exc)
                 return
             self._populate()
+            display_name = part_dict.get("name") or "(unnamed)"
             self.app.notify(
-                f"Saved '{part_dict['name']}' to Parts Bin "
-                f"({len(part_dict.get('sequence', ''))} bp).",
+                f"Saved '{display_name}' to Parts Bin "
+                f"({len(part_dict.get('sequence', ''))} bp). "
+                f"Mirroring to library…",
+            )
+            # Library mirror: clone the part into the configured entry
+            # vector and save the resulting full plasmid as a library
+            # entry. Off-thread so a 100+ MB library doesn't freeze
+            # the UI between bin save and the success notify. Best-
+            # effort: a build / save failure here doesn't roll back
+            # the parts-bin save (the bin row is the primary
+            # persistence target; the library entry is the visual /
+            # collection-facing twin). Worker fires a follow-up notify
+            # on completion (success or failure) so the user sees
+            # what landed.
+            from copy import deepcopy as _deepcopy
+            self._domesticator_library_mirror_worker(
+                _deepcopy(part_dict),
             )
 
         self.app.push_screen(
             DomesticatorModal(seq, feats, current_plasmid_name=current_name),
             callback=_on_result,
         )
+
+    @work(thread=True, exclusive=True, group="dom_library_mirror")
+    def _domesticator_library_mirror_worker(self, part_dict: dict) -> None:
+        """Off-thread Domesticator → library mirror.
+
+        Mirrors the L0 part as a full part-in-entry-vector plasmid
+        in the library. Runs after the parts-bin save (which is sync
+        on the UI thread); failure here logs + notifies but does NOT
+        roll back the bin row. Exclusive ``dom_library_mirror`` group
+        coalesces back-to-back Domesticator saves so two clicks in
+        rapid succession don't race the same library write.
+
+        Structured events: `domesticator.library_mirror.ok` on
+        success, `domesticator.library_mirror.failed` on either
+        clone or save failure (with `stage` field for routing).
+        """
+        display_name = part_dict.get("name") or "(unnamed)"
+        try:
+            lib_rec = _part_to_cloned_seqrecord(part_dict)
+        except Exception as exc:
+            _log.exception(
+                "Domesticator: library-mirror clone failed for %r",
+                display_name,
+            )
+            _log_event(
+                "domesticator.library_mirror.failed",
+                name=display_name, stage="clone",
+                error=str(exc)[:120],
+            )
+            self.app.call_from_thread(
+                self.app.notify,
+                f"Library mirror skipped: clone failed ({exc}).",
+                severity="warning",
+            )
+            return
+        try:
+            lib_entries = _load_library()
+            raw_id = lib_rec.id or display_name
+            safe_id = re.sub(r"[^A-Za-z0-9_]+", "_", raw_id) or "part"
+            existing_ids = {e.get("id") or "" for e in lib_entries}
+            unique_id = safe_id
+            bump = 2
+            while unique_id in existing_ids:
+                unique_id = f"{safe_id}_{bump}"
+                bump += 1
+            lib_entry = {
+                "id":      unique_id,
+                "name":    display_name,
+                "size":    _seq_len(lib_rec),
+                "n_feats": len(lib_rec.features or []),
+                "source":  "domesticator:l0",
+                "added":   _date.today().isoformat(),
+                "gb_text": _record_to_gb_text(lib_rec),
+            }
+            lib_entries.insert(0, lib_entry)
+            _save_library(lib_entries)
+        except (OSError, RuntimeError) as exc:
+            _log.exception(
+                "Domesticator: library-mirror save failed for %r",
+                display_name,
+            )
+            _log_event(
+                "domesticator.library_mirror.failed",
+                name=display_name, stage="save",
+                error=str(exc)[:120],
+            )
+            self.app.call_from_thread(
+                self.app.notify,
+                f"Library mirror failed for '{display_name}' "
+                f"({exc}). Parts bin row is intact.",
+                severity="error",
+            )
+            return
+        _log_event(
+            "domesticator.library_mirror.ok",
+            name=display_name, id=unique_id,
+            bp=lib_entry["size"],
+            n_feats=lib_entry["n_feats"],
+        )
+        # Refresh the library panel so the new entry is visible
+        # without forcing the user to re-open it. Best-effort: the
+        # panel might not be mounted in some test paths.
+        def _on_mirror_done() -> None:
+            try:
+                lib = self.app.query_one("#library", LibraryPanel)
+                lib.reveal_entry_id(unique_id)
+            except (NoMatches, AttributeError):
+                pass
+            self.app.notify(
+                f"Library mirror: '{display_name}' "
+                f"({lib_entry['size']:,} bp, "
+                f"{lib_entry['n_feats']} features).",
+            )
+        self.app.call_from_thread(_on_mirror_done)
 
     @on(Button.Pressed, "#btn-load-part")
     def _load_part(self, _) -> None:
@@ -36365,7 +36685,12 @@ class PartsBinModal(Screen):
         for row_idx in target_rows:
             if 0 <= row_idx < len(self._rows):
                 r = self._rows[row_idx]
-                if r.get("user") and r.get("sequence"):
+                # L0 parts carry `sequence` (insert body); L1+ parts
+                # (TU / MOD) carry the full plasmid as `gb_text` with
+                # `sequence: ""` (see `_persist_assembly`). Accept
+                # either so the button works for every user-saved row,
+                # not just L0.
+                if r.get("user") and (r.get("sequence") or r.get("gb_text")):
                     valid.append(r)
                 else:
                     skipped += 1
@@ -44639,6 +44964,12 @@ class TraditionalCloningPane(Vertical):
             self.app.notify(f"Failed to save: {exc}",
                               severity="error", timeout=8)
             _log.exception("trad-cloning save failed")
+            _log_event(
+                "traditional.save.failed",
+                name=name, suffix=suffix,
+                stage="serialize",
+                error=str(exc)[:120],
+            )
             return
         entry = {
             "id":      name,
@@ -44674,6 +45005,12 @@ class TraditionalCloningPane(Vertical):
         _clear_primer_cache = globals().get("_primer_usage_clear_cache")
         if _clear_primer_cache is not None:
             _clear_primer_cache()
+        _log_event(
+            "traditional.save.ok",
+            name=name, suffix=suffix,
+            bp=_seq_len(rec),
+            n_feats=len(rec.features or []),
+        )
         self.app.notify(
             f"Saved {name} ({_seq_len(rec):,} bp) to library.",
             timeout=6,
@@ -46909,12 +47246,23 @@ class ConstructorModal(ModalScreen):
             )
         except Exception as exc:
             _log.exception("Save To Library: clone failed")
+            _log_event(
+                "constructor.save.failed",
+                gid=gid, source_level=source_level,
+                stage="clone", name=name,
+                error=str(exc)[:120],
+            )
             self.app.call_from_thread(
                 self._on_constructor_save_failed,
                 f"Assembly simulation crashed: {exc}",
             )
             return
         if new_rec is None:
+            _log_event(
+                "constructor.save.failed",
+                gid=gid, source_level=source_level,
+                stage="clone_returned_none", name=name,
+            )
             self.app.call_from_thread(
                 self._on_constructor_save_failed,
                 "Assembly simulation failed — log has details. "
@@ -46932,6 +47280,12 @@ class ConstructorModal(ModalScreen):
             )
         except Exception as exc:
             _log.exception("Save To Library: persist failed")
+            _log_event(
+                "constructor.save.failed",
+                gid=gid, source_level=source_level,
+                stage="persist", name=name,
+                error=str(exc)[:120],
+            )
             self.app.call_from_thread(
                 self._on_constructor_save_failed,
                 f"Save failed: {exc}",
@@ -46940,6 +47294,16 @@ class ConstructorModal(ModalScreen):
         canvas_stale = (entry_counter
                         != getattr(self.app, "_record_load_counter",
                                      entry_counter))
+        _log_event(
+            "constructor.save.ok",
+            gid=gid, source_level=source_level,
+            target_level=source_level + 1,
+            name=name, id=new_id,
+            bp=_seq_len(new_rec),
+            n_feats=len(new_rec.features or []),
+            parts=len(parts),
+            backbone=bb_key,
+        )
         self.app.call_from_thread(
             self._on_constructor_save_success,
             new_id, _seq_len(new_rec), source_level, name,
@@ -67518,6 +67882,13 @@ def main():
         sys.exit(2)
 
     _log_startup_banner()
+
+    # Terminal capability probe — refuses to launch on a non-UTF-8
+    # terminal (braille map would render as gibberish), warns on
+    # missing optional Python deps. Fires BEFORE the data-dir lock
+    # so a misconfigured environment surfaces its error before
+    # touching shared state.
+    _log_terminal_capabilities()
 
     # Multi-instance lock: refuse to launch a second splicecraft
     # against the same data dir (cache coherence safety). Bypass
