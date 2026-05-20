@@ -14,6 +14,14 @@
 
 ---
 
+## [0.9.9] — 2026-05-20
+
+_(auto-generated from commits since v0.9.8)_
+
+* Master Delete · File menu wipe-all-user-data · invariant #46
+
+---
+
 ## [0.9.8] — 2026-05-19
 
 _(auto-generated from commits since v0.9.7)_
