@@ -223,6 +223,27 @@ _MODAL_CASES = [
                                                   "MyCollection", 5)),
     ("ScaryDeleteConfirmModal",      lambda: sc.ScaryDeleteConfirmModal(
                                                   "MyCollection", 12)),
+    # Master Delete trio — File → wipe all user data. Three modals
+    # in sequence: typed-YES gate, cooldown-gated confirm, single-
+    # button result summary. All three must fit at the baseline.
+    ("MasterDeleteModal",            lambda: sc.MasterDeleteModal(
+                                                  files_count=14,
+                                                  dirs_count=4,
+                                                  pre_update_present=True)),
+    ("MasterDeleteConfirmModal",     lambda: sc.MasterDeleteConfirmModal(
+                                                  files_count=14,
+                                                  dirs_count=4,
+                                                  pre_update_present=True,
+                                                  cooldown_s=0.0)),
+    ("MasterDeleteResultModal",      lambda: sc.MasterDeleteResultModal({
+                                                  "files_removed":     14,
+                                                  "dirs_removed":       4,
+                                                  "log_files_removed":  2,
+                                                  "pre_update_removed": True,
+                                                  "residual_files":     0,
+                                                  "residual_dirs":      0,
+                                                  "errors":             0,
+                                              })),
     ("QuitConfirmModal",             lambda: sc.QuitConfirmModal()),
     ("SplashScreen",                 lambda: sc.SplashScreen()),
     ("HelpModal",                    lambda: sc.HelpModal()),

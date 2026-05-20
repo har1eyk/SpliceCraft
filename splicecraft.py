@@ -18895,6 +18895,537 @@ def _iter_user_data_paths() -> "list[tuple[str, str, Path, str]]":
     return out
 
 
+# ── Master Delete (Settings → File → wipe all user data) ─────────────────────
+#
+# User-triggered nuclear option. Wipes every persistent SpliceCraft file
+# the user can produce — library, collections, parts bin, primers,
+# experiments, gels, custom grammars, codon tables, feature library,
+# feature colours, entry vectors, settings, pre-update snapshots,
+# crash-recovery autosaves, .dna sidecars, daily snapshots, lost-entries
+# spillover, UI snapshots, clipboard tmpfiles, rotated logs, and the
+# agent-API token. Sibling pre-update-backups dir wiped too — true clean
+# slate is the user contract.
+#
+# SACRED — two independent blockers against accidental fire:
+#
+#   1. **No agent endpoint.** `_AGENT_HANDLERS` has no `master_delete`
+#      / `wipe` / `nuke` entry by design. An agent that knows the
+#      function name cannot reach the wipe over HTTP. Enforced by
+#      `tests/test_master_delete.py::test_no_agent_endpoint_exposes_wipe`.
+#
+#   2. **Module-local sentinel.** `_perform_master_delete` refuses to
+#      run unless the caller passes `_MASTER_DELETE_SENTINEL` — a
+#      module-private `object()`. The GUI modal flow is the only path
+#      that has the reference. Any direct call (e.g. from an
+#      `exec`-style debugger or a future API misuse) without the
+#      sentinel raises RuntimeError BEFORE any file is touched.
+#      Enforced by `tests/test_master_delete.py::test_sentinel_mismatch_refused`.
+#
+# UI-side hardening (`MasterDeleteModal`/`MasterDeleteConfirmModal`):
+#   * Stage 1 = typed-YES gate (case-sensitive, exact match — "yes"/" YES"/
+#     "YESS" all refused). Cancel default-focused. Esc → cancel.
+#   * Stage 2 = "are you sure?" with Yes-button GATED by a 3-second
+#     cool-down. No default-focused. Esc → No. Both `_blocks_undo=True`.
+#   * No keyboard binding on `action_master_delete` — menu-only.
+#   * Re-entrancy guard on `PlasmidApp._master_delete_in_progress`
+#     prevents stacking two modal flows.
+
+_MASTER_DELETE_SENTINEL = object()
+
+# Cool-down before the Stage 2 confirm button enables. 3 seconds was
+# chosen as the shortest delay that forces the user to read the
+# warning copy after they've already typed YES + confirmed in the
+# first modal — long enough to interrupt muscle-memory click-through,
+# short enough not to feel like a punishment for a user who's
+# deliberately wiping their workspace.
+_MASTER_DELETE_CONFIRM_COOLDOWN_S = 3.0
+
+# Module-level cache globals that hold cleared persisted state. Every
+# entry MUST exist as `_<name>_cache: ... | None = None` somewhere in
+# this module — `_perform_master_delete` looks them up by name and
+# resets to None so the next read re-loads from (now empty) disk.
+# Adding a new cache? Append it here AND to `_protect_user_data` in
+# tests/conftest.py.
+_MASTER_DELETE_CACHE_ATTRS: tuple = (
+    "_library_cache",
+    "_collections_cache",
+    "_parts_bin_cache",
+    "_parts_bin_collections_cache",
+    "_primers_cache",
+    "_features_cache",
+    "_feature_colors_cache",
+    "_grammars_cache",
+    "_entry_vectors_cache",
+    "_codon_tables_cache",
+    "_settings_cache",
+    "_experiments_cache",
+    "_experiment_projects_cache",
+    "_gels_cache",
+)
+
+
+def _master_delete_file_targets() -> "list[Path]":
+    """Every regular file under `_DATA_DIR` that Master Delete removes.
+
+    Built from `_USER_DATA_FILE_ATTRS` + `_OPERATIONAL_FILE_ATTRS`
+    plus each file's `.bak` / `.bak.<ts>[.N]` siblings (`_safe_save_json`
+    writes both single-gen + timestamped backups; cf. invariant #31).
+    Reads live module attributes so the autouse `_protect_user_data`
+    fixture's monkeypatch flows through.
+    """
+    out: list[Path] = []
+    for attr in _USER_DATA_FILE_ATTRS + _OPERATIONAL_FILE_ATTRS:
+        p = globals().get(attr)
+        if not isinstance(p, Path):
+            continue
+        out.append(p)
+        # Single-generation backup.
+        out.append(p.with_suffix(p.suffix + ".bak"))
+        # Timestamped rotating backups + same-second collision bumps.
+        parent = p.parent
+        if parent.is_dir():
+            try:
+                for sib in parent.glob(p.name + ".bak.*"):
+                    out.append(sib)
+            except OSError:
+                pass
+    return out
+
+
+def _master_delete_dir_targets() -> "list[Path]":
+    """Every directory directly under `_DATA_DIR` that Master Delete
+    removes.
+
+    `_USER_DATA_DIR_ATTRS` covers crash_recovery / dna_originals /
+    experiments / plugins. The four ad-hoc dirs created inline by
+    other code paths (snapshots / lost_entries / clipboard /
+    ui_snapshots) are appended here so the wipe is exhaustive.
+
+    Excludes the logs directory — the active log file is held open
+    by `RotatingFileHandler`; rotated backups are handled separately
+    by `_master_delete_log_files`. Excludes `_DATA_DIR` itself so the
+    process-held lockfile survives.
+    """
+    out: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(p: Path) -> None:
+        try:
+            key = p.resolve(strict=False)
+        except OSError:
+            key = p
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    for attr in _USER_DATA_DIR_ATTRS:
+        p = globals().get(attr)
+        if isinstance(p, Path):
+            _add(p)
+    # Ad-hoc dirs created inline elsewhere (no module constant for
+    # most). Resolve `_DATA_DIR` at call time so monkeypatched test
+    # paths are honoured.
+    data_root = globals().get("_DATA_DIR")
+    if isinstance(data_root, Path):
+        for name in ("snapshots", "lost_entries", "clipboard"):
+            _add(data_root / name)
+    ui = globals().get("_UI_SNAPSHOTS_DIR")
+    if isinstance(ui, Path):
+        _add(ui)
+    return out
+
+
+def _master_delete_sibling_targets() -> "list[Path]":
+    """Pre-update backup directory (sibling of `_DATA_DIR`).
+
+    Resolved via `_resolve_pre_update_backup_dir` so
+    `$SPLICECRAFT_UPDATE_BACKUP_DIR` (set by tests) takes precedence.
+    Returns an empty list if the resolver refuses (filesystem root
+    edge case) — nothing to wipe there.
+    """
+    out: list[Path] = []
+    try:
+        cand = _resolve_pre_update_backup_dir()
+    except OSError:
+        return out
+    if isinstance(cand, Path):
+        out.append(cand)
+    return out
+
+
+def _master_delete_extra_root_files() -> "list[Path]":
+    """Stragglers directly under `_DATA_DIR` that aren't covered by
+    `_USER_DATA_FILE_ATTRS` / `_OPERATIONAL_FILE_ATTRS` but are still
+    user-impacting state. As of 2026-05-20 this is just the
+    `.migrated` marker from `_migrate_legacy_data`; future additions
+    can be appended here so they're explicitly enumerated rather
+    than relying on the residual-sweep fallback.
+    """
+    out: list[Path] = []
+    data_root = globals().get("_DATA_DIR")
+    if isinstance(data_root, Path):
+        out.append(data_root / ".migrated")
+    return out
+
+
+def _master_delete_residual_paths() -> "tuple[list[Path], list[Path]]":
+    """Return (files, dirs) under `_DATA_DIR` left over after the
+    named-target wipe finished. Returns empty lists if the data dir
+    no longer exists.
+
+    `splicecraft.lock` and the `logs/` directory are excluded — the
+    lockfile is held by the running process; the logs dir contains
+    the active log handle that `RotatingFileHandler` writes into.
+    Both are handled by other parts of `_perform_master_delete`.
+
+    Designed to be re-runnable: a second sweep should find nothing.
+    Used as the final defense-in-depth pass so any future code that
+    writes a new file under `_DATA_DIR` (without registering it in
+    `_USER_DATA_FILE_ATTRS` / `_OPERATIONAL_FILE_ATTRS`) still gets
+    wiped on Master Delete.
+    """
+    files: list[Path] = []
+    dirs: list[Path] = []
+    data_root = globals().get("_DATA_DIR")
+    if not isinstance(data_root, Path):
+        return files, dirs
+    if not data_root.is_dir():
+        return files, dirs
+    # Anchor to the active lockfile + log dir resolved values so a
+    # symlink-mediated path mismatch can't bypass the skip.
+    lock_path = data_root / "splicecraft.lock"
+    log_dir = data_root / "logs"
+    try:
+        lock_resolved = lock_path.resolve(strict=False)
+    except OSError:
+        lock_resolved = lock_path
+    try:
+        log_resolved = log_dir.resolve(strict=False)
+    except OSError:
+        log_resolved = log_dir
+    try:
+        children = list(data_root.iterdir())
+    except OSError:
+        return files, dirs
+    for child in children:
+        try:
+            child_resolved = child.resolve(strict=False)
+        except OSError:
+            child_resolved = child
+        if child_resolved == lock_resolved:
+            continue
+        if child_resolved == log_resolved:
+            continue
+        try:
+            if child.is_symlink():
+                # Symlinks under DATA_DIR are unusual; remove them
+                # via unlink (don't follow into shared filesystems).
+                files.append(child)
+            elif child.is_file():
+                files.append(child)
+            elif child.is_dir():
+                dirs.append(child)
+        except OSError:
+            continue
+    return files, dirs
+
+
+def _master_delete_log_files() -> "list[Path]":
+    """Rotated log backups (`splicecraft.log.1`, `.2`, …) ready for
+    deletion. The currently-open `_LOG_PATH` is excluded — closing the
+    file handle out from under the running `RotatingFileHandler`
+    works on POSIX but raises `PermissionError` on Windows. Restart
+    rolls the active log into a fresh file naturally.
+    """
+    out: list[Path] = []
+    log_path = globals().get("_LOG_PATH")
+    if not log_path:
+        return out
+    try:
+        log_file = Path(log_path)
+    except (TypeError, ValueError):
+        return out
+    log_dir = log_file.parent
+    if not log_dir.is_dir():
+        return out
+    try:
+        active_resolved = log_file.resolve(strict=False)
+    except OSError:
+        active_resolved = log_file
+    try:
+        children = list(log_dir.iterdir())
+    except OSError:
+        return out
+    for child in children:
+        try:
+            if not child.is_file():
+                continue
+            if child.resolve(strict=False) == active_resolved:
+                continue
+            out.append(child)
+        except OSError:
+            continue
+    return out
+
+
+def _perform_master_delete(app, *, sentinel) -> "dict[str, int | bool]":
+    """Wipe every persistent SpliceCraft data file the user can produce.
+
+    IRREVERSIBLE. No built-in restore path — Master Delete is for the
+    user who actually wants a clean slate. Returns a summary dict
+    (file/dir counts + error count + pre-update-dir flag) the
+    success modal can quote.
+
+    CONTRACT — sentinel must be `_MASTER_DELETE_SENTINEL`. Any other
+    value raises RuntimeError BEFORE any disk operation. This is one
+    of two independent blockers against agent / external misuse; the
+    other is the absence of an `_AGENT_HANDLERS` entry.
+
+    Locking — holds `_cache_lock` for the file-level delete + cache
+    reset so a concurrent `_save_*` (settings flush daemon, agent
+    save worker) cannot interleave a write into a wiped-then-half-
+    revived state.
+
+    Settings flush — cancels the pending payload before the cache
+    reset; otherwise the daemon flush worker would write a stale
+    settings dict onto the now-deleted file path.
+
+    Agent server — stopped first so any in-flight authenticated
+    agent connection cannot save data back into the wiped tree.
+    `_stop_agent_api` unlinks the token file too.
+
+    Active log file — left open. Lockfile — left in place. The wipe
+    deliberately stays a no-op on those two so the running process
+    survives. Caller's responsibility to ask the user to restart.
+    """
+    if sentinel is not _MASTER_DELETE_SENTINEL:
+        raise RuntimeError(
+            "Master Delete refused: sentinel mismatch. This function "
+            "is GUI-only and intentionally not exposed to the agent "
+            "API. If you see this error you are calling the function "
+            "directly — don't."
+        )
+
+    summary: dict[str, int | bool] = {
+        "files_removed":      0,
+        "dirs_removed":       0,
+        "log_files_removed":  0,
+        "pre_update_removed": False,
+        "residual_files":     0,
+        "residual_dirs":      0,
+        "errors":             0,
+    }
+
+    _log_event(
+        "masterdelete.start",
+        data_dir=str(globals().get("_DATA_DIR", "")),
+    )
+
+    # 1. Stop the agent API server BEFORE wipe. Defeats the race in
+    #    which an authenticated agent session keeps writing to disk
+    #    after Step 4a has nuked the files.
+    try:
+        srv = getattr(app, "_agent_api_server", None) if app else None
+        if srv is not None:
+            _stop_agent_api(srv)
+            try:
+                app._agent_api_server = None
+            except AttributeError:
+                pass
+    except Exception:
+        _log.exception("masterdelete: stop agent api failed")
+
+    # 2. Drain in-flight workers (best-effort, 2 s). Heavy ops
+    #    (BLAST runs, pairwise aligns) are non-cancellable; we wait
+    #    out the timeout and continue regardless.
+    try:
+        _drain_in_flight_workers(timeout_s=2.0)
+    except Exception:
+        _log.exception("masterdelete: drain workers failed")
+
+    # 3. Clear the BLAST LRU. Reuses the existing cache-invalidation
+    #    hook used by collection saves.
+    try:
+        clear_blast = globals().get("_blast_clear_cache")
+        if callable(clear_blast):
+            clear_blast()
+    except Exception:
+        _log.exception("masterdelete: blast cache clear failed")
+
+    # 4. Cancel pending settings flush BEFORE acquiring the cache
+    #    lock — otherwise the daemon would write a stale settings
+    #    dict immediately after we wipe the file.
+    global _settings_flush_pending
+    try:
+        with _settings_flush_lock:
+            _settings_flush_pending = None
+    except NameError:
+        pass
+
+    # 5. Hold the cache lock across file deletion + cache reset.
+    #    Every `_save_*` helper takes this same lock, so a save
+    #    queued behind us waits for the wipe to finish — and then
+    #    finds the cache emptied so its `_typed_clone` returns a
+    #    fresh-empty payload to write back to a never-existing file.
+    with _cache_lock:
+        # 5a. Files: enumerated user-data + operational + extra
+        #     stragglers (.migrated marker etc.).
+        for path in (_master_delete_file_targets()
+                     + _master_delete_extra_root_files()):
+            try:
+                if path.is_symlink() or path.is_file():
+                    path.unlink(missing_ok=True)
+                    summary["files_removed"] += 1
+            except OSError as exc:
+                summary["errors"] += 1
+                _log.warning(
+                    "masterdelete: unlink %s failed: %s", path, exc,
+                )
+
+        # 5b. Directories under _DATA_DIR.
+        for path in _master_delete_dir_targets():
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                    summary["dirs_removed"] += 1
+            except OSError as exc:
+                summary["errors"] += 1
+                _log.warning(
+                    "masterdelete: rmtree %s failed: %s", path, exc,
+                )
+
+        # 5c. Sibling pre-update-backups dir (user contract: true
+        #     clean slate, no recovery path).
+        for path in _master_delete_sibling_targets():
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                    summary["pre_update_removed"] = True
+            except OSError as exc:
+                summary["errors"] += 1
+                _log.warning(
+                    "masterdelete: rmtree sibling %s failed: %s",
+                    path, exc,
+                )
+
+        # 5d. Rotated log backups. Active log handle preserved.
+        for path in _master_delete_log_files():
+            try:
+                path.unlink(missing_ok=True)
+                summary["log_files_removed"] += 1
+            except OSError as exc:
+                summary["errors"] += 1
+                _log.warning(
+                    "masterdelete: unlink log %s failed: %s", path, exc,
+                )
+
+        # 5e. Defense-in-depth: residual-sweep `_DATA_DIR` for any
+        #     leftover file / dir that wasn't covered by the named
+        #     targets above. Catches future code that writes a new
+        #     persistent file under `_DATA_DIR` without registering
+        #     it in `_USER_DATA_FILE_ATTRS` — without this pass a
+        #     contributor could quietly leak data past a Master
+        #     Delete by adding a new persistence file and forgetting
+        #     to declare it. The active log and the lockfile are
+        #     excluded inside `_master_delete_residual_paths`.
+        residual_files, residual_dirs = _master_delete_residual_paths()
+        for path in residual_files:
+            try:
+                path.unlink(missing_ok=True)
+                summary["residual_files"] += 1
+                _log_event(
+                    "masterdelete.residual.file",
+                    path=str(path),
+                )
+            except OSError as exc:
+                summary["errors"] += 1
+                _log.warning(
+                    "masterdelete: residual unlink %s failed: %s",
+                    path, exc,
+                )
+        for path in residual_dirs:
+            try:
+                shutil.rmtree(path)
+                summary["residual_dirs"] += 1
+                _log_event(
+                    "masterdelete.residual.dir",
+                    path=str(path),
+                )
+            except OSError as exc:
+                summary["errors"] += 1
+                _log.warning(
+                    "masterdelete: residual rmtree %s failed: %s",
+                    path, exc,
+                )
+
+        # 5f. Reset every module-level cache. The next read sees an
+        #     empty disk → returns the empty-shape payload (`[]` /
+        #     `{}`) without any further side effect.
+        for cache_attr in _MASTER_DELETE_CACHE_ATTRS:
+            if cache_attr in globals():
+                globals()[cache_attr] = None
+
+    # 6. Soft-reset in-memory app state OUTSIDE the lock. Best-effort
+    #    — the data is already gone; never let a UI race re-raise.
+    if app is not None:
+        try:
+            _reset_app_state_after_master_delete(app)
+        except Exception:
+            _log.exception("masterdelete: reset_app_state failed")
+
+    _log_event(
+        "masterdelete.completed",
+        files_removed=summary["files_removed"],
+        dirs_removed=summary["dirs_removed"],
+        log_files_removed=summary["log_files_removed"],
+        pre_update_removed=summary["pre_update_removed"],
+        residual_files=summary["residual_files"],
+        residual_dirs=summary["residual_dirs"],
+        errors=summary["errors"],
+    )
+    return summary
+
+
+def _reset_app_state_after_master_delete(app) -> None:
+    """Clear in-memory state on `PlasmidApp` so the UI reflects the
+    just-wiped disk. Best-effort: every attribute access is wrapped
+    so a Textual quirk on shutdown never re-raises past the wipe
+    itself.
+
+    Does NOT clear the currently-loaded record on the canvas — the
+    user may want to save it to disk after restart (the only reason
+    to keep editing post-wipe). The post-wipe summary modal nudges
+    them to restart for a fully clean state.
+    """
+    # Undo / redo stacks (loaded plasmid history) — never restore
+    # plasmid state across a wipe.
+    for attr in ("_undo_stack", "_redo_stack",
+                  "_stashed_undo_stacks", "_stashed_redo_stacks",
+                  "_stash_order"):
+        try:
+            value = getattr(app, attr, None)
+            if isinstance(value, list):
+                value.clear()
+            elif isinstance(value, dict):
+                value.clear()
+        except (AttributeError, Exception):
+            pass
+    try:
+        app._current_undo_key = None
+    except (AttributeError, Exception):
+        pass
+    # LibraryPanel is now empty on disk; refresh table so the UI
+    # reflects that without waiting for a manual click.
+    try:
+        lib_panel = app.query_one("#library")
+        refresh = getattr(lib_panel, "_refresh_table", None)
+        if callable(refresh):
+            refresh()
+    except Exception:
+        pass
+
+
 def _sha256_file(path: Path) -> str:
     """SHA-256 of a file, computed in 64 KB chunks. Used in the
     manifest so a partial / truncated copy in a snapshot can be
@@ -55032,6 +55563,505 @@ class ScaryDeleteConfirmModal(ModalScreen):
         self.dismiss(False)
 
 
+class MasterDeleteModal(ModalScreen):
+    """Stage 1 of the Master Delete flow.
+
+    Gates the destructive button behind a typed challenge: the user
+    must type exactly ``YES`` (case-sensitive, no whitespace, no
+    normalisation) into the Input field before the Delete button
+    activates. Cancel is default-focused; Esc → cancel. Dismisses
+    ``True`` (proceed to confirm modal) or ``False`` (abort).
+
+    Design contract — this is the LEAST destructive of the two
+    Master Delete modals. Even hitting "Delete" here only opens
+    Stage 2; nothing on disk is touched until the Stage 2 button
+    fires AFTER its 3 s cool-down expires.
+
+    Sacred — must satisfy ALL of:
+      * input matches `"YES"` byte-for-byte (case-sensitive); "yes",
+        " YES", "YES ", "YESS", "" all keep Delete disabled.
+      * Delete button starts disabled — no race where the user can
+        click it before the first `Input.Changed` lands.
+      * Cancel is the default-focused button so a stray Enter at the
+        modal level cancels rather than commits.
+      * `_blocks_undo = True` so app-level Ctrl+Z under the modal
+        doesn't fire on whatever canvas is loaded underneath.
+      * No keyboard binding for "delete" — only the visible button
+        with an explicit click commits the user to Stage 2.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    MasterDeleteModal { align: center middle; }
+    #md-dlg {
+        width: 78; height: auto; max-height: 90%;
+        background: #1c1c1c; border: solid $error; padding: 1 2;
+    }
+    #md-title {
+        background: $error-darken-1; color: $text;
+        padding: 0 1; margin-bottom: 1;
+    }
+    #md-warn { margin-bottom: 1; }
+    #md-scope-label { margin-top: 1; color: $warning; }
+    #md-scope { color: $text; margin-bottom: 1; }
+    #md-prompt { margin-top: 1; color: $warning; }
+    #md-input { margin-bottom: 1; }
+    #md-status { margin-bottom: 1; }
+    #md-btns { height: 3; margin-top: 1; }
+    #md-btns Button { margin-right: 1; min-width: 22; }
+    """
+
+    # Exact required input. Sacred — DO NOT loosen to a casefold or
+    # `.strip()` compare. A user typing "yes" hasn't deliberately
+    # spelled out the affirmative; they've muscle-memoried it.
+    _REQUIRED_INPUT = "YES"
+
+    def __init__(self, *,
+                  files_count: int,
+                  dirs_count: int,
+                  pre_update_present: bool) -> None:
+        super().__init__()
+        # Pre-computed scope counts. Caller (the action handler)
+        # runs the enumeration once on the main thread before
+        # pushing the modal so the user sees the same numbers in
+        # both stages.
+        self._files_count = int(files_count)
+        self._dirs_count = int(dirs_count)
+        self._pre_update_present = bool(pre_update_present)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="md-dlg"):
+            yield Static(
+                "  ⚠   MASTER DELETE — WIPE ALL USER DATA   ⚠  ",
+                id="md-title", markup=False,
+            )
+            yield Static(
+                "  This will [bold red]permanently and "
+                "irreversibly[/bold red] delete every plasmid,\n"
+                "  collection, experiment, gel, primer, part, "
+                "feature, grammar,\n"
+                "  codon table, custom setting and saved "
+                "preference in this\n"
+                "  SpliceCraft data directory.\n\n"
+                "  There is [bold red]no built-in restore[/bold red]. "
+                "Pre-update snapshots,\n"
+                "  daily backups, .bak files, and lost-entries "
+                "spillover\n"
+                "  will [bold red]all be wiped[/bold red] too — true "
+                "clean slate.",
+                id="md-warn", markup=True,
+            )
+            scope_lines = [
+                f"  • {self._files_count} user-data file(s) (plus "
+                "every `.bak` sibling)",
+                f"  • {self._dirs_count} user-data directory tree(s)",
+            ]
+            if self._pre_update_present:
+                scope_lines.append(
+                    "  • Sibling [italic]pre-update-backups[/italic] "
+                    "directory (your last recovery copy)"
+                )
+            scope_lines.append(
+                "  • Rotated log backups (active log stays open)"
+            )
+            yield Static(
+                "  Scope of this deletion:", id="md-scope-label",
+            )
+            yield Static(
+                "\n".join(scope_lines),
+                id="md-scope", markup=True,
+            )
+            yield Static(
+                f"  To enable the Delete button, type exactly  "
+                f"[bold]{self._REQUIRED_INPUT}[/bold]  (case-sensitive)\n"
+                f"  in the field below. Anything else keeps the "
+                f"button disabled.",
+                id="md-prompt", markup=True,
+            )
+            yield Input(
+                value="",
+                placeholder='type "YES" (case-sensitive, no spaces) to enable',
+                id="md-input",
+            )
+            yield Static(
+                "[dim]Delete button stays disabled until input "
+                "matches.[/dim]",
+                id="md-status", markup=True,
+            )
+            with Horizontal(id="md-btns"):
+                yield Button(
+                    "Cancel (default)", id="btn-md-cancel",
+                    variant="default",
+                )
+                yield Button(
+                    "Delete… (disabled)", id="btn-md-delete",
+                    variant="error", disabled=True,
+                )
+
+    def on_mount(self) -> None:
+        # Cancel is the default focus so a stray Enter at the modal
+        # level fires Cancel, NOT Delete. The Input below grabs
+        # focus only after we explicitly Tab into it — see
+        # invariant on Cancel-default-focus across destructive modals.
+        try:
+            self.query_one("#btn-md-cancel", Button).focus()
+        except NoMatches:
+            pass
+
+    @on(Input.Changed, "#md-input")
+    def _on_input_changed(self, event: Input.Changed) -> None:
+        # Strict byte-for-byte compare. No `.strip()`, no `.upper()`,
+        # no `.casefold()` — the user must type the exact 3 chars.
+        # If we ever loosened this it would defeat the whole point
+        # of the typed challenge.
+        try:
+            btn = self.query_one("#btn-md-delete", Button)
+            status = self.query_one("#md-status", Static)
+        except NoMatches:
+            return
+        if event.value == self._REQUIRED_INPUT:
+            btn.disabled = False
+            btn.label = "Delete…"
+            status.update(
+                "[bold green]✓ Match — Delete button enabled.[/bold green] "
+                "[dim](next stage has a 3 s cool-down)[/dim]"
+            )
+        else:
+            btn.disabled = True
+            btn.label = "Delete… (disabled)"
+            if event.value == "":
+                status.update(
+                    "[dim]Delete button stays disabled until "
+                    "input matches.[/dim]"
+                )
+            else:
+                # Helpful but not too helpful — tell the user the
+                # value didn't match without revealing the exact
+                # mismatch (case, whitespace, extra chars).
+                status.update(
+                    "[red]✗ Doesn't match. Type the exact word "
+                    f"[/red][bold]{self._REQUIRED_INPUT}[/bold]"
+                    "[red] — case-sensitive, no spaces.[/red]"
+                )
+
+    @on(Button.Pressed, "#btn-md-cancel")
+    def _cancel_btn(self, _) -> None:
+        _log_event("masterdelete.stage1.cancel")
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-md-delete")
+    def _delete_btn(self, _) -> None:
+        # Final guard — even if a stale `Input.Changed` missed a
+        # disable, re-check the value here so the only path that
+        # dismisses True has a verified match. Pulls the live
+        # widget value (not a stashed one) so a fast retype-and-
+        # click sequence still validates the visible string.
+        try:
+            inp = self.query_one("#md-input", Input)
+        except NoMatches:
+            self.dismiss(False)
+            return
+        if inp.value != self._REQUIRED_INPUT:
+            # Re-disable + status nudge.
+            try:
+                btn = self.query_one("#btn-md-delete", Button)
+                btn.disabled = True
+                btn.label = "Delete… (disabled)"
+            except NoMatches:
+                pass
+            try:
+                self.query_one("#md-status", Static).update(
+                    "[red]✗ Input no longer matches — type "
+                    f"[/red][bold]{self._REQUIRED_INPUT}[/bold]"
+                    "[red] exactly.[/red]"
+                )
+            except NoMatches:
+                pass
+            return
+        _log_event("masterdelete.stage1.confirmed")
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        _log_event("masterdelete.stage1.cancel", reason="esc")
+        self.dismiss(False)
+
+
+class MasterDeleteConfirmModal(ModalScreen):
+    """Stage 2 of the Master Delete flow — the "are you absolutely
+    sure?" gate.
+
+    Hardening atop the spec:
+      * **3-second cool-down** before the destructive button enables.
+        Reuses Textual's `set_interval` to repaint a countdown into
+        the button label. Bypassable only by waiting; no keyboard
+        shortcut shortcuts the timer.
+      * Default focus on **No, keep everything** — Esc / Enter at
+        the modal level both abort.
+      * Button labels deliberately diverge from Stage 1 so muscle
+        memory from clicking through Stage 1 doesn't carry over.
+
+    Dismisses ``True`` (commit the wipe) or ``False`` (abort).
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    MasterDeleteConfirmModal { align: center middle; }
+    #mdc-dlg {
+        width: 74; height: auto; max-height: 80%;
+        background: #1c1c1c; border: thick $error; padding: 1 2;
+    }
+    #mdc-title {
+        background: $error; color: $text;
+        padding: 0 1; margin-bottom: 1;
+    }
+    #mdc-msg { margin-bottom: 1; }
+    #mdc-btns { height: 3; margin-top: 1; }
+    #mdc-btns Button { margin-right: 1; min-width: 28; }
+    """
+
+    def __init__(self, *,
+                  files_count: int,
+                  dirs_count: int,
+                  pre_update_present: bool,
+                  cooldown_s: "float | None" = None,
+                  ) -> None:
+        super().__init__()
+        self._files_count = int(files_count)
+        self._dirs_count = int(dirs_count)
+        self._pre_update_present = bool(pre_update_present)
+        # Resolve the default at call time, not at function-def time,
+        # so tests can monkeypatch `_MASTER_DELETE_CONFIRM_COOLDOWN_S`
+        # to a shorter value and have it actually take effect.
+        if cooldown_s is None:
+            cooldown_s = _MASTER_DELETE_CONFIRM_COOLDOWN_S
+        self._cooldown_total = max(0.0, float(cooldown_s))
+        self._cooldown_remaining = self._cooldown_total
+        self._cooldown_timer = None
+
+    def compose(self) -> ComposeResult:
+        plural_f = "" if self._files_count == 1 else "s"
+        plural_d = "" if self._dirs_count == 1 else "s"
+        pre = (
+            "  • Sibling [italic]pre-update-backups[/italic] dir "
+            "[bold red](your last recovery copy)[/bold red]\n"
+            if self._pre_update_present else ""
+        )
+        with Vertical(id="mdc-dlg"):
+            yield Static(
+                "  ⚠   FINAL CONFIRMATION — IRREVERSIBLE   ⚠  ",
+                id="mdc-title", markup=False,
+            )
+            yield Static(
+                "  You typed [bold]YES[/bold]. This is the final "
+                "confirmation.\n\n"
+                f"  About to delete [bold red]"
+                f"{self._files_count}[/bold red] data file{plural_f} + "
+                f"[bold red]{self._dirs_count}[/bold red] "
+                f"directory tree{plural_d}:\n"
+                f"{pre}"
+                "  • Every plasmid, collection, experiment, gel, "
+                "primer, part\n"
+                "  • Every custom grammar, codon table, feature "
+                "library entry\n"
+                "  • Every settings preference + saved active "
+                "selection\n"
+                "  • Every backup, snapshot, lost-entries copy + "
+                "rotated log\n\n"
+                "  [bold red]No restore path.[/bold red] This is a "
+                "true clean slate.\n\n"
+                "  [dim]The destructive button has a "
+                "3-second cool-down — you have a moment to "
+                "step back.[/dim]",
+                id="mdc-msg", markup=True,
+            )
+            with Horizontal(id="mdc-btns"):
+                yield Button(
+                    "No, keep my data", id="btn-mdc-no",
+                    variant="default",
+                )
+                yield Button(
+                    self._format_confirm_label(),
+                    id="btn-mdc-yes",
+                    variant="error",
+                    disabled=self._cooldown_remaining > 0,
+                )
+
+    def on_mount(self) -> None:
+        # Default focus on "No, keep my data". Esc / Enter both
+        # abort. Sacred for the same reason every other destructive
+        # confirm modal in this app focuses the safe button first.
+        try:
+            self.query_one("#btn-mdc-no", Button).focus()
+        except NoMatches:
+            pass
+        if self._cooldown_remaining > 0:
+            # 100 ms tick — small enough to feel responsive without
+            # spamming the layout. Each tick decrements the
+            # remaining time and re-renders the button label;
+            # `_finish_cooldown` enables the button when it hits 0.
+            self._cooldown_timer = self.set_interval(
+                0.1, self._tick_cooldown,
+            )
+
+    def _format_confirm_label(self) -> str:
+        rem = max(0, int(round(self._cooldown_remaining * 10)) / 10.0)
+        if rem > 0:
+            # Show one decimal so the user sees motion — a flat
+            # "3 → 2 → 1" reads like the dialog might be frozen.
+            return f"Yes, delete EVERYTHING ({rem:.1f}s)"
+        return "Yes, delete EVERYTHING"
+
+    def _tick_cooldown(self) -> None:
+        if self._cooldown_remaining <= 0:
+            self._finish_cooldown()
+            return
+        self._cooldown_remaining = max(0.0, self._cooldown_remaining - 0.1)
+        try:
+            btn = self.query_one("#btn-mdc-yes", Button)
+            btn.label = self._format_confirm_label()
+        except NoMatches:
+            return
+        if self._cooldown_remaining <= 0:
+            self._finish_cooldown()
+
+    def _finish_cooldown(self) -> None:
+        self._cooldown_remaining = 0.0
+        if self._cooldown_timer is not None:
+            try:
+                self._cooldown_timer.stop()
+            except Exception:
+                pass
+            self._cooldown_timer = None
+        try:
+            btn = self.query_one("#btn-mdc-yes", Button)
+            btn.disabled = False
+            btn.label = self._format_confirm_label()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-mdc-no")
+    def _no_btn(self, _) -> None:
+        _log_event("masterdelete.stage2.cancel")
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-mdc-yes")
+    def _yes_btn(self, _) -> None:
+        # Belt-and-braces against a race where the timer thinks
+        # it's done but the button somehow fires early.
+        if self._cooldown_remaining > 0:
+            return
+        _log_event("masterdelete.stage2.confirmed")
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        _log_event("masterdelete.stage2.cancel", reason="esc")
+        self.dismiss(False)
+
+
+class MasterDeleteResultModal(ModalScreen):
+    """Stage 3 — post-wipe summary + restart nudge. One button
+    ("OK, I'll restart") so the user can't accidentally dismiss the
+    confirmation while they're still reading. Dismisses ``None``.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "ok", "OK"),
+        Binding("enter",  "ok", "OK", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    MasterDeleteResultModal { align: center middle; }
+    #mdr-dlg {
+        width: 70; height: auto; max-height: 70%;
+        background: #1c1c1c; border: solid $accent; padding: 1 2;
+    }
+    #mdr-title {
+        background: $accent-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1;
+    }
+    #mdr-msg { margin-bottom: 1; }
+    #mdr-btns { height: 3; margin-top: 1; }
+    #mdr-btns Button { margin-right: 1; min-width: 22; }
+    """
+
+    def __init__(self, summary: "dict[str, int | bool]") -> None:
+        super().__init__()
+        self._summary = dict(summary or {})
+
+    def compose(self) -> ComposeResult:
+        s = self._summary
+        files = int(s.get("files_removed", 0) or 0)
+        dirs = int(s.get("dirs_removed", 0) or 0)
+        logs = int(s.get("log_files_removed", 0) or 0)
+        residual_f = int(s.get("residual_files", 0) or 0)
+        residual_d = int(s.get("residual_dirs", 0) or 0)
+        errors = int(s.get("errors", 0) or 0)
+        pre = bool(s.get("pre_update_removed", False))
+        residual_line = (
+            f"  [dim]+ {residual_f} extra file(s) and "
+            f"{residual_d} extra dir(s) caught by the "
+            "residual-sweep pass.[/dim]\n"
+            if (residual_f or residual_d) else ""
+        )
+        err_line = (
+            f"\n  [yellow]⚠ {errors} path(s) could not be removed "
+            "— see the log file for details.[/yellow]"
+            if errors else ""
+        )
+        with Vertical(id="mdr-dlg"):
+            yield Static(
+                "  Master Delete complete  ",
+                id="mdr-title", markup=False,
+            )
+            yield Static(
+                f"  [bold]{files}[/bold] user-data file(s) removed.\n"
+                f"  [bold]{dirs}[/bold] directory tree(s) removed.\n"
+                f"  [bold]{logs}[/bold] rotated log backup(s) "
+                "removed.\n"
+                f"  Pre-update backups: "
+                + ("[bold]wiped[/bold]" if pre else "[dim]none "
+                   "present[/dim]") +
+                ".\n"
+                f"{residual_line}"
+                f"{err_line}\n\n"
+                "  Some panels may still show stale state in this\n"
+                "  session — quit and restart SpliceCraft for a\n"
+                "  fully clean canvas.",
+                id="mdr-msg", markup=True,
+            )
+            with Horizontal(id="mdr-btns"):
+                yield Button(
+                    "OK", id="btn-mdr-ok", variant="primary",
+                )
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn-mdr-ok", Button).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-mdr-ok")
+    def _ok(self, _) -> None:
+        self.dismiss(None)
+
+    def action_ok(self) -> None:
+        self.dismiss(None)
+
+
 def _sanitize_plasmid_name(raw: str, *,
                             fallback: str = "assembly",
                             max_len: int = 60) -> str:
@@ -60058,6 +61088,17 @@ class PlasmidApp(App):
     # `_skip_snapshot` / `_skip_primer_dedupe_check`. `main()` flips
     # this False for production.
     _skip_launch_update_modal: bool = True
+    # Master Delete re-entrancy guard. Flipped True at the entry of
+    # `action_master_delete`, flipped back False in every terminal
+    # callback (stage-1 cancel / stage-2 cancel / post-result-modal
+    # dismiss). Without this, a menu double-click or a stray Enter on
+    # the menu item could push two modal flows on top of each other —
+    # the inner one's "Yes" would commit the wipe, the outer one
+    # would then commit a SECOND wipe on the already-empty disk
+    # (harmless on its own, but the second flow stays on the screen
+    # stack and could capture a stray Enter after the result modal
+    # dismisses). The single-flag guard cuts that off.
+    _master_delete_in_progress: bool = False
     # Stash for an `update.available` event that lands while the
     # splash is still up. `_notify_update_available` writes the
     # validated version string here and returns; `_on_splash_dismissed`
@@ -63866,6 +64907,165 @@ SpeciesPickerModal { align: center middle; }
 
         self.push_screen(RestoreFromBackupModal(), callback=_on_done)
 
+    @_action_log("app.master_delete.open")
+    def action_master_delete(self) -> None:
+        """Open the two-stage Master Delete flow.
+
+        Sacred — this is the only entry point to `_perform_master_delete`.
+        The flow is:
+
+          1. ``MasterDeleteModal`` — typed-YES gate. Cancel default-
+             focused. Dismisses False unless input matches "YES"
+             exactly.
+          2. ``MasterDeleteConfirmModal`` — are-you-sure with a 3-second
+             cool-down on the confirm button. Default-focus No.
+          3. ``_perform_master_delete`` — wipes every persistent file
+             under `_DATA_DIR` + sibling pre-update-backups dir. Holds
+             the cache lock; resets every module-level cache.
+          4. ``MasterDeleteResultModal`` — single-button summary +
+             restart nudge.
+
+        Re-entrancy guarded by ``_master_delete_in_progress`` so a
+        second invocation (e.g. menu double-click) finds the flag set
+        and refuses to stack a second flow on top. Cleared in every
+        terminal callback path so a stage-1/stage-2 cancel doesn't
+        wedge the menu entry permanently.
+
+        NO keyboard binding for this action — menu-only. NO agent
+        endpoint — see the `_AGENT_HANDLERS` test in
+        `tests/test_master_delete.py`.
+        """
+        if getattr(self, "_master_delete_in_progress", False):
+            self.notify(
+                "Master Delete is already running. Cancel the open "
+                "dialog first.",
+                severity="warning", timeout=6,
+            )
+            return
+        # Lift the flag NOW so a synchronous re-trigger between
+        # `push_screen` and the modal's first render can't race in.
+        self._master_delete_in_progress = True
+
+        # Pre-compute the scope counts on the main thread so the two
+        # modals + the summary all quote the same numbers. Counting
+        # files / dirs touches the disk but is read-only.
+        try:
+            files = _master_delete_file_targets()
+            dirs = _master_delete_dir_targets()
+            sibling = _master_delete_sibling_targets()
+            files_count = sum(
+                1 for p in files
+                if p.exists() and not p.is_dir()
+            )
+            dirs_count = sum(
+                1 for p in dirs
+                if p.is_dir() and not p.is_symlink()
+            )
+            pre_update_present = any(
+                p.is_dir() and not p.is_symlink()
+                for p in sibling
+            )
+        except OSError:
+            # Disk hiccup while counting — the wipe still works, the
+            # user just sees zeros in the scope text. Tolerable; the
+            # wipe doesn't depend on these counts.
+            _log.exception(
+                "masterdelete: scope enumeration failed (continuing)"
+            )
+            files_count = 0
+            dirs_count = 0
+            pre_update_present = False
+
+        def _clear_flag() -> None:
+            try:
+                self._master_delete_in_progress = False
+            except AttributeError:
+                pass
+
+        def _on_stage2_result(committed) -> None:
+            if not committed:
+                _clear_flag()
+                self.notify(
+                    "Master Delete cancelled. No data was removed.",
+                    severity="information", timeout=4,
+                )
+                return
+            # Final commit. Wipe runs inline on the main thread —
+            # it holds the cache lock briefly and finishes in
+            # well under a second on any sane data dir size. The
+            # workload is O(file-count + tree-walk); even a power
+            # user's 10 000-entry library wipes in ~100 ms.
+            try:
+                summary = _perform_master_delete(
+                    self, sentinel=_MASTER_DELETE_SENTINEL,
+                )
+            except Exception:
+                _log.exception("masterdelete: wipe raised")
+                self.notify(
+                    "Master Delete encountered an error — see the "
+                    "log file. Some data may still be on disk.",
+                    severity="error", timeout=12,
+                )
+                _clear_flag()
+                return
+
+            def _on_result_dismissed(_payload) -> None:
+                _clear_flag()
+
+            # Defensive: if the result-modal push itself fails (e.g.
+            # screen-stack-cap exceeded), still clear the flag so the
+            # menu entry isn't permanently wedged. The wipe itself
+            # has already succeeded by this point — losing the
+            # confirmation modal is a UI quirk, not a data event.
+            try:
+                self.push_screen(
+                    MasterDeleteResultModal(summary),
+                    callback=_on_result_dismissed,
+                )
+            except Exception:
+                _log.exception(
+                    "masterdelete: result modal push failed"
+                )
+                _clear_flag()
+                self.notify(
+                    f"Master Delete done: {summary['files_removed']} "
+                    f"file(s) + {summary['dirs_removed']} dir(s) "
+                    "removed. Restart for a clean canvas.",
+                    severity="warning", timeout=10,
+                )
+
+        def _on_stage1_result(typed_yes) -> None:
+            if not typed_yes:
+                _clear_flag()
+                return
+            try:
+                self.push_screen(
+                    MasterDeleteConfirmModal(
+                        files_count=files_count,
+                        dirs_count=dirs_count,
+                        pre_update_present=pre_update_present,
+                    ),
+                    callback=_on_stage2_result,
+                )
+            except Exception:
+                _log.exception(
+                    "masterdelete: stage-2 modal push failed"
+                )
+                _clear_flag()
+
+        try:
+            self.push_screen(
+                MasterDeleteModal(
+                    files_count=files_count,
+                    dirs_count=dirs_count,
+                    pre_update_present=pre_update_present,
+                ),
+                callback=_on_stage1_result,
+            )
+        except Exception:
+            _log.exception("masterdelete: stage-1 modal push failed")
+            _clear_flag()
+
     @_action_log("app.export.gff")
     def action_export_gff(self) -> None:
         """Prompt for a path and write the loaded record as GFF3.
@@ -66572,6 +67772,15 @@ SpeciesPickerModal { align: center middle; }
                 ("Collections...",               "open_collections"),
                 ("---",                          None),
                 ("What's New…",                  "show_whats_new"),
+                ("---",                          None),
+                # Master Delete sits in its own separator-bracketed
+                # block at the bottom of File, immediately above Quit
+                # but visually distinct from every other entry. No
+                # keyboard shortcut by design — see
+                # `_perform_master_delete` for the two-blocker safety
+                # contract (no agent endpoint + module-local sentinel).
+                ("⚠ Master Delete (wipe all user data)…",
+                                                  "master_delete"),
                 ("---",                          None),
                 ("Quit  [q]",                    "quit"),
             ],

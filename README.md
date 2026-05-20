@@ -104,6 +104,13 @@ Full feature reference: [`docs/features.md`](docs/features.md).
   bodies, CLI responses).
 - **Lock-file PID-fsync + stale-PID detection** so a SpliceCraft
   killed on a shared filesystem releases its lock on next launch.
+- **Master Delete** under File → "⚠ Master Delete (wipe all user
+  data)…" lets you wipe every plasmid, collection, experiment, gel,
+  primer, part, grammar, codon table, feature, setting, backup,
+  snapshot, and pre-update recovery copy in one go — true clean
+  slate. Triple-gated: typed `YES` (case-sensitive) to enable the
+  Delete button, then a default-No confirm with a 3-second cool-down
+  on the destructive button. No keyboard shortcut. No agent endpoint.
 
 Full data-safety writeup: [`docs/data-safety.md`](docs/data-safety.md).
 Security policy: [`SECURITY.md`](SECURITY.md).
