@@ -812,6 +812,17 @@ def main(argv: list[str] | None = None) -> int:
     _verify_bump(PYPROJECT,   new_version, "version")
     _verify_bump(SPLICECRAFT, new_version, "__version__")
 
+    # Run ruff BEFORE pytest — sweep #16 (2026-05-21) added this so a
+    # lint-failing commit can't slip through release and turn the CI
+    # badge red. The same `ruff check` runs in `.github/workflows/
+    # test.yml`'s `lint` job; matching the local invocation means a
+    # release that passes here also passes CI's lint gate. Pyright is
+    # NOT bundled into release.py because it shells out to a separate
+    # JS-pinned binary that's slow + flaky offline — it's a CI-only
+    # gate (`PYRIGHT_PYTHON_FORCE_VERSION=latest` in test.yml).
+    _heading("Running ruff lint")
+    _run(["ruff", "check", "."])
+
     _heading("Running test suite")
     # Parallel via pytest-xdist; previously serial took ~13 min, -n auto
     # cuts that to ~5 min on an 8-core box. Tests are isolated by the

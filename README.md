@@ -125,9 +125,13 @@ installs and the user-data directory location.
   store the Features menu uses); the Protein tab edits motifs
   with copy-on-write so built-in motifs are preserved in code
   while your changes land in `protein_motifs.json`. Motif inserts
-  on the protein tab arrive as **pre-colored AA features** (band
-  painted under the residues) and round-trip through save as CDS
-  sub-features.
+  on the protein tab arrive as **pre-colored AA features** —
+  each built-in motif has its own distinct color so His6, FLAG,
+  HA, and so on read at a glance both in the side panel and in
+  the dithered ▒-block lane art above the AA strand (mirrors the
+  main sequence panel's feature lanes — strand arrowheads,
+  centred labels, multi-lane stacking on overlap). Round-trips
+  through save as CDS sub-features.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
 - **Drive from outside** via a 60+ endpoint localhost JSON API

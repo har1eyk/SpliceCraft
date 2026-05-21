@@ -799,6 +799,22 @@ class TestDeleteFocusRouting:
             for n in names
         ])
 
+    async def _await_row_count(self, app, target: int, pilot,
+                                  max_ticks: int = 20) -> "sc.DataTable":
+        """Poll the library DataTable for ``row_count == target``.
+        Returns the table once it converges. Sweep #16 helper —
+        Textual's message-bus dispatch of modal-dismiss callbacks
+        can take more ticks than a single 50 ms pause provides in
+        slower CI runners, and the delete UI updates run on that
+        bus. Common-case completes in <100 ms; cap at 1 s."""
+        t: "sc.DataTable | None" = None
+        for _ in range(max_ticks):
+            await pilot.pause(0.05)
+            t = app.query_one("#lib-table", sc.DataTable)
+            if t.row_count == target:
+                return t
+        return t  # caller asserts; we just give up polling
+
     async def test_delete_middle_row_cursor_lands_on_row_above(
         self, isolated_library
     ):
@@ -818,8 +834,7 @@ class TestDeleteFocusRouting:
             modal = app.screen
             assert isinstance(modal, LibraryDeleteConfirmModal)
             modal.dismiss(True)
-            await pilot.pause(0.05)
-            t = app.query_one("#lib-table", sc.DataTable)
+            t = await self._await_row_count(app, 4, pilot)
             assert t.row_count == 4
             assert t.cursor_row == 1  # pA2, the row just above pA3
             assert sc._cursor_row_key(t) == "pA2"
@@ -842,8 +857,7 @@ class TestDeleteFocusRouting:
             await pilot.pause(0.05)
             modal = app.screen
             modal.dismiss(True)
-            await pilot.pause(0.05)
-            t = app.query_one("#lib-table", sc.DataTable)
+            t = await self._await_row_count(app, 2, pilot)
             assert t.row_count == 2
             assert t.cursor_row == 0
             assert sc._cursor_row_key(t) == "pA2"
@@ -866,8 +880,7 @@ class TestDeleteFocusRouting:
             await pilot.pause(0.05)
             modal = app.screen
             modal.dismiss(True)
-            await pilot.pause(0.05)
-            t = app.query_one("#lib-table", sc.DataTable)
+            t = await self._await_row_count(app, 2, pilot)
             assert t.row_count == 2
             assert t.cursor_row == 1
             assert sc._cursor_row_key(t) == "pA2"
@@ -876,7 +889,16 @@ class TestDeleteFocusRouting:
         self, isolated_library
     ):
         """Delete the only library row → table is empty; cursor
-        restore must skip (no row to land on) without raising."""
+        restore must skip (no row to land on) without raising.
+
+        Sweep #16 (2026-05-21): the post-dismiss pause was tightened
+        to a multi-tick poll because CI's Python 3.12 runner was
+        intermittently observing `row_count == 1` — Textual's
+        message-bus dispatch of the modal callback can take a few
+        more ticks than `await pilot.pause(0.05)` provides under load.
+        Poll up to 1s; bail early once the table empties so the
+        common-case wall-clock cost stays minimal.
+        """
         self._seed_lib(["pSolo"])
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -890,8 +912,14 @@ class TestDeleteFocusRouting:
             await pilot.pause(0.05)
             modal = app.screen
             modal.dismiss(True)
-            await pilot.pause(0.05)
-            t = app.query_one("#lib-table", sc.DataTable)
+            # Poll for up to 1s — usually completes in <100 ms but the
+            # CI runner can lag. Once row_count hits 0 we break out
+            # so the test stays fast on the common path.
+            for _ in range(20):
+                await pilot.pause(0.05)
+                t = app.query_one("#lib-table", sc.DataTable)
+                if t.row_count == 0:
+                    break
             assert t.row_count == 0
 
 

@@ -9756,7 +9756,6 @@ def _summarize_perbase_tsv(fh, *, max_bytes: "int | None" = None) -> dict:
     cap for trusted callers (no current caller hits this path — the
     Plasmidsaurus parser always passes its cap).
     """
-    import io
     total = 0
     n = 0
     lo = 10 ** 9
@@ -14321,7 +14320,7 @@ class LibraryPanel(Widget):
 
         def _on_cancelled() -> None:
             self.app.notify(
-                f"Plasmid save cancelled. Library unchanged.",
+                "Plasmid save cancelled. Library unchanged.",
                 severity="warning",
             )
             _log_event(
@@ -14333,7 +14332,7 @@ class LibraryPanel(Widget):
                          replace_names: "set[str]") -> None:
             if not items_to_save and not replace_names:
                 self.app.notify(
-                    f"Skipped duplicate plasmid. Library unchanged.",
+                    "Skipped duplicate plasmid. Library unchanged.",
                     severity="warning",
                 )
                 _log_event(
@@ -14583,12 +14582,12 @@ class LibraryPanel(Widget):
             autodetect_msg = _auto_bind_entry_vectors_from_entries(
                 entries
             )
-        except Exception as exc:
+        except Exception:
             _log.exception("auto-bind worker: detection failed")
             self.app.call_from_thread(
                 self.app.notify,
                 f"Entry-vector auto-detect failed for '{collection_name}'"
-                f" — see log. Bindings unchanged.",
+                " — see log. Bindings unchanged.",
                 severity="warning", markup=False,
             )
             return
@@ -26541,13 +26540,11 @@ def _detect_entry_vector_role(
     if len(digests) == 2 and tu_start and tu_end:
         canonical = (tu_start.upper(), tu_end.upper())
         inner_enz = None
-        outer_enz = None
         outer_pair = None
         for enz, pair in digests.items():
             if pair == canonical:
                 inner_enz = enz
             else:
-                outer_enz = enz
                 outer_pair = pair
         if inner_enz and outer_pair:
             role = _resolve_acceptor_role(grammar, inner_enz, outer_pair)
@@ -45414,14 +45411,21 @@ _PROTEIN_MAX_AA: int = _SYNTHESIS_MAX_BP // 3
 # ontology (Tag, Signal, Linker, …) that wouldn't match GenBank, so
 # they get a dedicated map. Colors picked to be distinguishable on
 # the muted-grey AA-row background and read OK against the bold-
-# white AA letters above.
+# white AA letters above. Sweep #16 (2026-05-21): the keys here are
+# the FALLBACK for any user-added motif that doesn't carry its own
+# `color` field — built-in motifs each get their own distinct
+# `color` in `_PROTEIN_MOTIFS` below. Key spelling matches the
+# `feature_type` strings in `_PROTEIN_MOTIFS` (the pre-sweep #16
+# "2A peptide" key never matched the "2A" data, so every 2A motif
+# silently fell back to the Motif default; fix the key spelling and
+# the fallback works).
 _PROTEIN_FEATURE_TYPE_COLORS: dict[str, str] = {
-    "Tag":        "#3B82F6",  # blue — affinity / epitope tags
-    "Signal":     "#F59E0B",  # amber — NLS / NES / signal peptides
-    "Linker":     "#6B7280",  # grey — flexible / rigid linkers
-    "Cleavage":   "#DC2626",  # red — protease sites
-    "2A peptide": "#10B981",  # green — self-cleaving 2A
-    "Motif":      "#A855F7",  # purple — start codon / stop / other
+    "Tag":      "#3B82F6",  # blue — affinity / epitope tags
+    "Signal":   "#F59E0B",  # amber — NLS / NES / signal peptides
+    "Linker":   "#6B7280",  # grey — flexible / rigid linkers
+    "Cleavage": "#DC2626",  # red — protease sites
+    "2A":       "#10B981",  # green — self-cleaving 2A
+    "Motif":    "#A855F7",  # purple — start codon / stop / other
 }
 
 # Builtin protein-motif / domain library — common tags + linkers +
@@ -45430,102 +45434,110 @@ _PROTEIN_FEATURE_TYPE_COLORS: dict[str, str] = {
 # always available without needing a user-managed file. Entry shape
 # mirrors the DNA feature library so the side-panel renderer can
 # reuse the same row-build code.
+# Sweep #16 (2026-05-21): each built-in motif carries its own unique
+# ``color`` hex so the user can tell them apart at a glance in the
+# motif library AND in the dithered feature bars above the AA row.
+# The palette spreads visually within each family (e.g. Tags shift
+# from deep blue → cyan → indigo → violet so a side-by-side stack of
+# His6 + FLAG + Myc + V5 reads as four obviously different bars).
+# User edits via the Edit button persist to `protein_motifs.json`
+# and override these defaults.
 _PROTEIN_MOTIFS: list[dict] = [
-    # ── Affinity tags ──────────────────────────────────────────────
+    # ── Affinity tags (cool spectrum: blue → cyan → indigo → violet) ──
     {"name": "His6",        "feature_type": "Tag",
-     "sequence": "HHHHHH",
+     "sequence": "HHHHHH", "color": "#1E40AF",
      "description": "Hexahistidine affinity tag (Ni-NTA / IMAC purification)."},
     {"name": "His8",        "feature_type": "Tag",
-     "sequence": "HHHHHHHH",
+     "sequence": "HHHHHHHH", "color": "#3B82F6",
      "description": "Octahistidine — tighter Ni-NTA binding than 6xHis."},
     {"name": "His10",       "feature_type": "Tag",
-     "sequence": "HHHHHHHHHH",
+     "sequence": "HHHHHHHHHH", "color": "#60A5FA",
      "description": "Decahistidine — even tighter, for harsh-wash purification."},
     {"name": "FLAG",        "feature_type": "Tag",
-     "sequence": "DYKDDDDK",
+     "sequence": "DYKDDDDK", "color": "#0E7490",
      "description": "FLAG tag (anti-FLAG M2 affinity purification)."},
     {"name": "3xFLAG",      "feature_type": "Tag",
-     "sequence": "DYKDHDGDYKDHDIDYKDDDDK",
+     "sequence": "DYKDHDGDYKDHDIDYKDDDDK", "color": "#06B6D4",
      "description": "Triple FLAG — higher sensitivity for low-expression targets."},
     {"name": "HA",          "feature_type": "Tag",
-     "sequence": "YPYDVPDYA",
+     "sequence": "YPYDVPDYA", "color": "#67E8F9",
      "description": "Influenza hemagglutinin epitope (anti-HA antibodies)."},
     {"name": "Myc",         "feature_type": "Tag",
-     "sequence": "EQKLISEEDL",
+     "sequence": "EQKLISEEDL", "color": "#4338CA",
      "description": "c-Myc epitope tag (9E10 antibody)."},
     {"name": "V5",          "feature_type": "Tag",
-     "sequence": "GKPIPNPLLGLDST",
+     "sequence": "GKPIPNPLLGLDST", "color": "#6366F1",
      "description": "V5 epitope tag (paramyxovirus)."},
     {"name": "Strep-II",    "feature_type": "Tag",
-     "sequence": "WSHPQFEK",
+     "sequence": "WSHPQFEK", "color": "#A78BFA",
      "description": "Strep-Tactin affinity tag (mild biotin elution)."},
     {"name": "T7",          "feature_type": "Tag",
-     "sequence": "MASMTGGQQMG",
+     "sequence": "MASMTGGQQMG", "color": "#7C3AED",
      "description": "T7 leader peptide (anti-T7 monoclonal)."},
-    # ── Localisation signals ───────────────────────────────────────
+    # ── Localisation signals (warm yellows / golds) ────────────────
     {"name": "NLS (SV40)",  "feature_type": "Signal",
-     "sequence": "PKKKRKV",
+     "sequence": "PKKKRKV", "color": "#EAB308",
      "description": "Classical SV40 large T-antigen nuclear localisation signal."},
     {"name": "NLS (bipartite)", "feature_type": "Signal",
-     "sequence": "KRPAATKKAGQAKKKK",
+     "sequence": "KRPAATKKAGQAKKKK", "color": "#FBBF24",
      "description": "Nucleoplasmin bipartite NLS."},
     {"name": "NES",         "feature_type": "Signal",
-     "sequence": "LPPLERLTL",
+     "sequence": "LPPLERLTL", "color": "#F59E0B",
      "description": "HIV-Rev nuclear export signal (CRM1-dependent)."},
-    # ── Linkers ────────────────────────────────────────────────────
+    # ── Linkers (neutral greys, light → dark, warm at the end) ─────
     {"name": "GSG",         "feature_type": "Linker",
-     "sequence": "GSG",
+     "sequence": "GSG", "color": "#94A3B8",
      "description": "Minimal flexible linker."},
     {"name": "GGS",         "feature_type": "Linker",
-     "sequence": "GGS",
+     "sequence": "GGS", "color": "#64748B",
      "description": "Short flexible linker."},
     {"name": "(GGGGS)x3",   "feature_type": "Linker",
-     "sequence": "GGGGSGGGGSGGGGS",
+     "sequence": "GGGGSGGGGSGGGGS", "color": "#475569",
      "description": "Classic flexible linker for scFv / fusion proteins."},
     {"name": "(GGGGS)x4",   "feature_type": "Linker",
-     "sequence": "GGGGSGGGGSGGGGSGGGGS",
+     "sequence": "GGGGSGGGGSGGGGSGGGGS", "color": "#57534E",
      "description": "Longer flexible linker for domain separation."},
     {"name": "EAAAK x3",    "feature_type": "Linker",
-     "sequence": "EAAAKEAAAKEAAAK",
+     "sequence": "EAAAKEAAAKEAAAK", "color": "#78716C",
      "description": "Rigid α-helical linker."},
-    # ── Protease cleavage sites ─────────────────────────────────────
+    # ── Protease cleavage sites (reds → pinks) ──────────────────────
     {"name": "TEV",         "feature_type": "Cleavage",
-     "sequence": "ENLYFQG",
+     "sequence": "ENLYFQG", "color": "#B91C1C",
      "description": "TEV protease site (cuts between Q and G)."},
     {"name": "PreScission", "feature_type": "Cleavage",
-     "sequence": "LEVLFQGP",
+     "sequence": "LEVLFQGP", "color": "#DC2626",
      "description": "HRV 3C / PreScission protease site (cuts between Q and G)."},
     {"name": "Thrombin",    "feature_type": "Cleavage",
-     "sequence": "LVPRGS",
+     "sequence": "LVPRGS", "color": "#F87171",
      "description": "Thrombin cleavage site."},
     {"name": "Factor Xa",   "feature_type": "Cleavage",
-     "sequence": "IEGR",
+     "sequence": "IEGR", "color": "#EC4899",
      "description": "Factor Xa protease site."},
     {"name": "Furin",       "feature_type": "Cleavage",
-     "sequence": "RRRR",
+     "sequence": "RRRR", "color": "#DB2777",
      "description": "Furin recognition site (R-X-K/R-R minimal)."},
-    # ── Self-cleaving 2A peptides ──────────────────────────────────
+    # ── Self-cleaving 2A peptides (greens) ─────────────────────────
     {"name": "P2A",         "feature_type": "2A",
-     "sequence": "GSGATNFSLLKQAGDVEENPGP",
+     "sequence": "GSGATNFSLLKQAGDVEENPGP", "color": "#15803D",
      "description": "Porcine teschovirus 2A self-cleaving peptide."},
     {"name": "T2A",         "feature_type": "2A",
-     "sequence": "GSGEGRGSLLTCGDVEENPGP",
+     "sequence": "GSGEGRGSLLTCGDVEENPGP", "color": "#16A34A",
      "description": "Thosea asigna 2A peptide."},
     {"name": "E2A",         "feature_type": "2A",
-     "sequence": "GSGQCTNYALLKLAGDVESNPGP",
+     "sequence": "GSGQCTNYALLKLAGDVESNPGP", "color": "#22C55E",
      "description": "Equine rhinitis A 2A peptide."},
     {"name": "F2A",         "feature_type": "2A",
-     "sequence": "GSGVKQTLNFDLLKLAGDVESNPGP",
+     "sequence": "GSGVKQTLNFDLLKLAGDVESNPGP", "color": "#10B981",
      "description": "Foot-and-mouth-disease virus 2A peptide."},
-    # ── Common functional motifs ───────────────────────────────────
+    # ── Common functional motifs (fuchsias / magentas) ─────────────
     {"name": "Kozak start", "feature_type": "Motif",
-     "sequence": "M",
+     "sequence": "M", "color": "#C026D3",
      "description": "Start codon (methionine) — required N-terminal."},
     {"name": "Stop",        "feature_type": "Motif",
-     "sequence": "*",
+     "sequence": "*", "color": "#A21CAF",
      "description": "Translation stop codon."},
     {"name": "FLAG+Stop",   "feature_type": "Motif",
-     "sequence": "DYKDDDDK*",
+     "sequence": "DYKDDDDK*", "color": "#D946EF",
      "description": "FLAG tag followed by stop — quick C-terminal tagging."},
 ]
 
@@ -46631,8 +46643,40 @@ class ProteinEditor(Widget):
 
     def _row_count(self) -> int:
         """Rows the rendered Text occupies (excluding centring pads).
-        Codon mode = 2 (AA row + DNA codon row); AA-only = 1."""
-        return 2 if self._codon_mode else 1
+        Codon mode = 2 (AA row + DNA codon row); AA-only = 1.
+        Sweep #16: when AA features are present, multi-lane art is
+        prepended — each lane = bar + label = 2 rows, stacked per
+        the 2D greedy pack in `_build_protein_lane_text`. The base
+        count grows by the actual pack height."""
+        base = 2 if self._codon_mode else 1
+        if not self._aa_feats:
+            return base
+        return base + self._lane_height()
+
+    def _lane_height(self) -> int:
+        """Cached row count for the feature lane art at the current
+        feature set. Recomputes on every call — the editor doesn't
+        cache lane state today, and the pack is cheap (O(N × n_aa)
+        in the worst case, and n_aa is capped at 16k aa)."""
+        n_aa = len(self._aa_seq)
+        if n_aa == 0 or not self._aa_feats:
+            return 0
+        col_top = [-1] * n_aa
+        max_top = -1
+        for f in self._aa_feats:
+            try:
+                fs = max(0, int(f.get("start", 0)))
+                fe = min(n_aa, int(f.get("end", 0)))
+            except (TypeError, ValueError):
+                continue
+            if fe <= fs:
+                continue
+            mt = max(col_top[fs:fe])
+            top = mt + 2   # bar + label
+            col_top[fs:fe] = [top] * (fe - fs)
+            if top > max_top:
+                max_top = top
+        return max(0, max_top + 1)
 
     def _vertical_center_pad(self) -> int:
         vp_h = self._viewport_height()
@@ -46724,38 +46768,21 @@ class ProteinEditor(Widget):
         blank_marker = Text(" " * self._FLANK_MARKER_WIDTH, no_wrap=True)
         aa_row.append_text(n_marker)
         dna_row.append_text(blank_marker)
-        # Sweep #15: feature backgrounds. Build a per-AA color array
-        # ONCE so the inner loop is O(1) per cell instead of O(F) per
-        # cell. Last-feature-wins on overlap (mirrors the DNA tab's
-        # `_build_seq_text` overlay rule).
-        feat_bg: list[str] = [""] * n_aa
-        for f in self._aa_feats:
-            try:
-                fs = max(0, int(f.get("start", 0)))
-                fe = min(n_aa, int(f.get("end", 0)))
-            except (TypeError, ValueError):
-                continue
-            color = str(f.get("color") or "").strip()
-            if not color or fs >= fe:
-                continue
-            for k in range(fs, fe):
-                feat_bg[k] = color
+        # Sweep #16 (2026-05-21): drop the per-cell feature
+        # background painting — features now appear as a dithered
+        # ▒-block row ABOVE the AA strand, matching the main seq
+        # panel's ``_paint_feature_bar`` style. Cursor + selection
+        # stay loud (cursor=reverse, sel=#003366 background); the
+        # AA cell foreground is otherwise just the default style.
         for i, aa in enumerate(self._aa_seq):
             on_cursor = (i == cursor)
             in_sel    = (sel_lo <= i < sel_hi)
             aa_style = self._AA_DEFAULT_STYLE
             cell_style = ""
-            # Priority: cursor (reverse) > selection > feature bg.
-            # Cursor + selection don't combine with feature bg —
-            # they fully replace the cell paint so the cursor / sel
-            # stays visually loud.
             if in_sel:
                 cell_style = "on #003366"
-            elif feat_bg[i]:
-                cell_style = f"on {feat_bg[i]}"
             if on_cursor:
                 cell_style = "reverse"
-            # AA row: 3 cells (leading space, letter, trailing space).
             aa_row.append(" ", style=cell_style)
             aa_row.append(aa, style=f"{aa_style} {cell_style}".strip())
             aa_row.append(" ", style=cell_style)
@@ -46772,14 +46799,29 @@ class ProteinEditor(Widget):
         # the last residue), draw a faint caret in the trailing
         # margin so the user can see WHERE the next insert lands.
         if cursor == n_aa and n_aa > 0:
-            # Overlay a caret in the trailing space cell. Simplest:
-            # append a soft pipe AFTER -C marker in the AA row.
             aa_row.append("│", style="bold #FF6B9D")
             dna_row.append(" ")
+        # Multi-lane feature art prepended when motifs are present.
+        # Empty case keeps the original 2-row layout (AA + codon) so
+        # users who haven't inserted a motif see the same view they
+        # always did.
+        if self._aa_feats:
+            lanes, _n = self._build_protein_lane_text(cols_per_aa=3)
+            if _n > 0:
+                return (
+                    lanes
+                    + Text("\n", no_wrap=True)
+                    + aa_row
+                    + Text("\n", no_wrap=True)
+                    + dna_row
+                )
         return aa_row + Text("\n", no_wrap=True) + dna_row
 
     def _build_aa_only_text(self) -> Text:
-        """Single-row Text: contiguous AA letters. One cell per AA."""
+        """Single-row Text: contiguous AA letters. One cell per AA.
+        Sweep #16: dither row prepended when features are present —
+        AA cells no longer carry feature backgrounds; the dither bar
+        above shows the feature color instead."""
         cursor = self._cursor_pos
         sel = self._user_sel
         sel_lo, sel_hi = (sel if sel is not None else (-1, -1))
@@ -46790,36 +46832,159 @@ class ProteinEditor(Widget):
         c_marker = Text(self._FLANK_MARKER_C,
                          style=self._FLANK_MARKER_STYLE, no_wrap=True)
         row.append_text(n_marker)
-        # Feature background overlay — mirrors the codon-mode build
-        # so AA-only and codon-translated views render identical
-        # feature stripes (just without the codon row below).
-        feat_bg: list[str] = [""] * n_aa
-        for f in self._aa_feats:
-            try:
-                fs = max(0, int(f.get("start", 0)))
-                fe = min(n_aa, int(f.get("end", 0)))
-            except (TypeError, ValueError):
-                continue
-            color = str(f.get("color") or "").strip()
-            if not color or fs >= fe:
-                continue
-            for k in range(fs, fe):
-                feat_bg[k] = color
         for i, aa in enumerate(self._aa_seq):
             on_cursor = (i == cursor)
             in_sel    = (sel_lo <= i < sel_hi)
             style = self._AA_DEFAULT_STYLE
             if in_sel:
                 style = f"{style} on #003366"
-            elif feat_bg[i]:
-                style = f"{style} on {feat_bg[i]}"
             if on_cursor:
                 style = "reverse"
             row.append(aa, style=style)
         row.append_text(c_marker)
         if cursor == n_aa and n_aa > 0:
             row.append("│", style="bold #FF6B9D")
+        if self._aa_feats:
+            lanes, _n = self._build_protein_lane_text(cols_per_aa=1)
+            if _n > 0:
+                return lanes + Text("\n", no_wrap=True) + row
         return row
+
+    def _build_dither_row(self, *, cols_per_aa: int) -> Text:
+        """Legacy single-row dither — kept as a back-compat alias
+        for `_build_protein_lane_text` consumers that only want one
+        line (test helpers). The real renderer uses the multi-lane
+        variant below."""
+        text, _rows = self._build_protein_lane_text(
+            cols_per_aa=cols_per_aa,
+        )
+        if not text.plain:
+            # Synthesise an empty single-row dither (all spaces) so
+            # callers can still rely on a Text being returned.
+            n_aa = len(self._aa_seq)
+            blank_marker = Text(
+                " " * self._FLANK_MARKER_WIDTH, no_wrap=True,
+            )
+            row = Text(no_wrap=True, overflow="crop")
+            row.append_text(blank_marker)
+            row.append(" " * (n_aa * cols_per_aa))
+            row.append_text(blank_marker)
+            return row
+        # When multi-lane, the LAST line is the one adjacent to AA —
+        # return that single line so simple consumers see the "bar"
+        # nearest the strand. Multi-lane callers use the full text +
+        # row count directly.
+        lines = text.split("\n")
+        return lines[-1] if lines else text
+
+    def _build_protein_lane_text(
+        self, *, cols_per_aa: int,
+    ) -> "tuple[Text, int]":
+        """Build multi-lane feature art above the AA strand, matching
+        the seq panel's ``_chunk_lane_groups`` + ``_paint_feature_bar``
+        + ``_paint_feature_label`` style.
+
+        Each feature occupies 2 rows in its lane:
+          * row 0 (adjacent to AA): the ▒-block bar with a ▶/◀
+            strand arrowhead at the terminus
+          * row 1 (above the bar): the feature label, centred within
+            the span (truncated when wider than the span)
+
+        Overlapping features stack — older features pack into the
+        lane closest to the AA strand; newer features get pushed up.
+        Greedy 2D packing identical to ``_pack_features_2d`` (the seq
+        panel uses the same algorithm).
+
+        Returns ``(text, n_rows)`` — the Text already includes the
+        N-/-C marker-width padding on both sides so it column-aligns
+        with the AA row. n_rows is the number of rendered lines
+        (0 when no features → caller should skip the prepend).
+        """
+        n_aa = len(self._aa_seq)
+        if n_aa == 0 or not self._aa_feats:
+            return Text(""), 0
+        total_cells = n_aa * cols_per_aa
+        # ── 2D greedy pack (AA coords) ────────────────────────────
+        # `col_top[i]` = highest row currently occupied at AA col i.
+        # New features land at `max(col_top[span]) + 1`. Bar row
+        # closest to AA; label row directly above.
+        placements: list[tuple[dict, int]] = []
+        col_top = [-1] * n_aa
+        for f in self._aa_feats:
+            try:
+                fs = max(0, int(f.get("start", 0)))
+                fe = min(n_aa, int(f.get("end", 0)))
+            except (TypeError, ValueError):
+                continue
+            if fe <= fs:
+                continue
+            max_top = max(col_top[fs:fe]) if fs < fe else -1
+            bottom_row = max_top + 1   # bar row
+            top_row    = bottom_row + 1   # label row
+            col_top[fs:fe] = [top_row] * (fe - fs)
+            placements.append((f, bottom_row))
+        if not placements:
+            return Text(""), 0
+        total_rows = max(p[1] + 2 for p in placements)  # +2 = bar + label
+        # ── Render grid ───────────────────────────────────────────
+        # Build a (total_rows × total_cells) array of (char, style).
+        blank_cell = (" ", "")
+        grid: list[list[tuple[str, str]]] = [
+            [blank_cell] * total_cells for _ in range(total_rows)
+        ]
+        for f, bottom_row in placements:
+            try:
+                fs = max(0, int(f.get("start", 0)))
+                fe = min(n_aa, int(f.get("end", 0)))
+            except (TypeError, ValueError):
+                continue
+            color = str(f.get("color") or "").strip()
+            if not color:
+                continue
+            try:
+                strand = int(f.get("strand", 1) or 0)
+            except (TypeError, ValueError):
+                strand = 1
+            col_s = fs * cols_per_aa
+            col_e = fe * cols_per_aa
+            bar_row   = bottom_row       # closer to AA
+            label_row = bottom_row + 1   # one above the bar
+            # Bar row — ▒ blocks across the span.
+            for k in range(col_s, col_e):
+                grid[bar_row][k] = ("▒", color)
+            if col_e > col_s:
+                if strand >= 1:
+                    grid[bar_row][col_e - 1] = ("▶", color)
+                elif strand <= -1:
+                    grid[bar_row][col_s] = ("◀", color)
+            # Label row — centred within the bar span, truncated to
+            # the span width if longer. Skip when the label is empty.
+            label = str(f.get("label") or "").strip()
+            if label and label_row < total_rows:
+                span = col_e - col_s
+                if len(label) > span:
+                    label = label[:span]
+                label_start = col_s + max(0, (span - len(label)) // 2)
+                style = f"bold {color}"
+                for j, ch in enumerate(label):
+                    pos = label_start + j
+                    if pos < col_e and pos < total_cells:
+                        grid[label_row][pos] = (ch, style)
+        # ── Emit rows in reverse so highest stack sits FIRST  ─────
+        # (closest to AA at the bottom). Same orientation as the
+        # seq panel's above-DNA lanes.
+        blank_marker = Text(
+            " " * self._FLANK_MARKER_WIDTH, no_wrap=True,
+        )
+        lines: list[Text] = []
+        for row_idx in reversed(range(total_rows)):
+            line = Text(no_wrap=True, overflow="crop")
+            line.append_text(blank_marker)
+            for ch, st in grid[row_idx]:
+                line.append(ch, style=st)
+            line.append_text(blank_marker)
+            lines.append(line)
+        return Text("\n", no_wrap=True).join(lines), total_rows
 
     # ── Cursor + selection ────────────────────────────────────────────────
 
@@ -48456,7 +48621,6 @@ class SynthesisScreen(Screen):
         for m in _load_protein_motifs():
             name = str(m.get("name", "") or "")
             ftype = str(m.get("feature_type", "") or "")
-            seq = str(m.get("sequence", "") or "")
             desc = str(m.get("description", "") or "")
             if needle and (needle not in name.lower()
                             and needle not in ftype.lower()
@@ -61058,7 +61222,6 @@ class FeatureSearchModal(ModalScreen):
 
     def _dismiss_with_cursor(self, t: DataTable) -> None:
         try:
-            from textual.coordinate import Coordinate
             row_key = t.coordinate_to_cell_key(_Coordinate(t.cursor_row, 0)).row_key
         except Exception:
             return
@@ -63389,7 +63552,7 @@ class ExactCopyConfirmModal(ModalScreen):
                     id="btn-copydlg-skip", variant="default",
                 )
                 yield Button(
-                    f"Keep as COPY",
+                    "Keep as COPY",
                     id="btn-copydlg-keep", variant="warning",
                 )
 

@@ -2603,3 +2603,225 @@ class TestSynthesisEditButtons:
             his6 = next(m for m in merged if m["name"] == "His6")
             assert his6["sequence"] == "HHHHHHHHHH"
             assert his6.get("color") == "#FF00FF"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sweep #16 — distinct motif colors + dithered protein render
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProteinMotifsDistinctColors:
+    """Every built-in motif carries its own `color` hex so the user
+    can tell them apart in the motif library list AND in the dither
+    bar above the AA row."""
+
+    def test_every_builtin_motif_has_color(self):
+        for m in sc._PROTEIN_MOTIFS:
+            color = m.get("color")
+            assert color, (
+                f"motif {m.get('name')!r} missing color field"
+            )
+            assert isinstance(color, str)
+            assert color.startswith("#"), (
+                f"motif {m.get('name')!r} color {color!r} not a hex"
+            )
+
+    def test_all_motif_colors_are_distinct(self):
+        seen: dict[str, str] = {}
+        for m in sc._PROTEIN_MOTIFS:
+            name  = m.get("name")
+            color = (m.get("color") or "").lower()
+            assert color, f"motif {name!r} missing color"
+            if color in seen:
+                raise AssertionError(
+                    f"motif {name!r} reuses color {color} already "
+                    f"taken by {seen[color]!r}"
+                )
+            seen[color] = name
+
+    def test_palette_key_matches_motif_feature_types(self):
+        """Every `feature_type` used in `_PROTEIN_MOTIFS` must have a
+        matching key in the fallback palette so user-added motifs
+        without an explicit color resolve to the right family default.
+        Pre-sweep #16 the palette had `"2A peptide"` while the data
+        used `"2A"` — silent fallback to `Motif` purple for every
+        2A motif.
+        """
+        used_types = {m.get("feature_type", "") for m in sc._PROTEIN_MOTIFS}
+        palette_keys = set(sc._PROTEIN_FEATURE_TYPE_COLORS.keys())
+        missing = used_types - palette_keys
+        assert not missing, (
+            f"feature_type(s) {missing} appear in _PROTEIN_MOTIFS but "
+            "aren't in _PROTEIN_FEATURE_TYPE_COLORS — silent fallback"
+        )
+
+
+class TestProteinDitherRender:
+    """The Protein tab now renders features as a dithered ▒-block row
+    above the AA letters, matching the seq panel's lane style."""
+
+    def test_lane_art_emitted_only_when_features_present(self):
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGS")
+        # No features → row count should be 2 (codon mode default).
+        assert pe._row_count() == 2
+        pe.load("MASGGGS", feats=[
+            {"start": 0, "end": 4, "label": "x",
+             "type": "Motif", "color": "#FF0000", "strand": 1},
+        ])
+        # Features present → 1 lane = 2 rows (bar + label) prepended.
+        # 2 base (AA + codon) + 2 lane = 4 rows.
+        assert pe._row_count() == 4
+
+    def test_lane_bar_codon_mode_emits_block_glyphs(self):
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGS", feats=[
+            {"start": 1, "end": 4, "label": "x",
+             "type": "Motif", "color": "#FF0000", "strand": 1},
+        ])
+        # The legacy `_build_dither_row` returns the bar row (the
+        # line closest to AA, i.e. the LAST line of the reversed
+        # lane text).
+        dither = pe._build_dither_row(cols_per_aa=3)
+        body = dither.plain[pe._FLANK_MARKER_WIDTH:]
+        assert body[0:3] == "   "
+        assert body[3:11].count("▒") == 8
+        assert body[11] == "▶"
+
+    def test_lane_aa_only_mode_one_cell_per_aa(self):
+        pe = sc.ProteinEditor()
+        pe.set_codon_mode(False)
+        pe.load("MASGGGS", feats=[
+            {"start": 0, "end": 3, "label": "x",
+             "type": "Motif", "color": "#FF0000", "strand": 1},
+        ])
+        dither = pe._build_dither_row(cols_per_aa=1)
+        body = dither.plain[pe._FLANK_MARKER_WIDTH:]
+        # AA 0..3 covered: 2 ▒ + 1 ▶ at the right terminus.
+        assert body[:3].count("▒") == 2
+        assert body[2] == "▶"
+
+    def test_reverse_strand_uses_left_arrowhead(self):
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGS", feats=[
+            {"start": 1, "end": 5, "label": "rev",
+             "type": "Motif", "color": "#00FF00", "strand": -1},
+        ])
+        dither = pe._build_dither_row(cols_per_aa=3)
+        body = dither.plain[pe._FLANK_MARKER_WIDTH:]
+        # Feature 1..5 → cols 3..15. Leftmost (3) should be ◀.
+        assert body[3] == "◀"
+        # Rightmost (14) should be ▒ not ▶ (reverse strand).
+        assert body[14] == "▒"
+
+    def test_no_feature_color_skips_lane_cell(self):
+        # A feature without a `color` field shouldn't paint anything
+        # on the bar. The lane height stays 0 (the empty-color path
+        # in `_build_protein_lane_text` skips the feature entirely
+        # so it doesn't contribute to either the pack or the render).
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGS", feats=[
+            {"start": 0, "end": 4, "label": "no-color",
+             "type": "Motif"},
+        ])
+        # The pack still places the feature, but the bar render skips
+        # painting because color is empty. So we should see blank.
+        text, n = pe._build_protein_lane_text(cols_per_aa=3)
+        plain = text.plain
+        assert "▒" not in plain
+        assert "▶" not in plain
+
+    def test_lane_includes_centred_label_row(self):
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGSAAAA", feats=[
+            {"start": 0, "end": 6, "label": "His6",
+             "type": "Tag", "color": "#1E40AF", "strand": 1},
+        ])
+        text, n_rows = pe._build_protein_lane_text(cols_per_aa=3)
+        # 1 feature → 2 rows (label + bar).
+        assert n_rows == 2
+        lines = text.split("\n")
+        assert len(lines) == 2
+        # Reversed order: highest stack row first; bar row LAST.
+        label_line = lines[0].plain[pe._FLANK_MARKER_WIDTH:]
+        bar_line   = lines[1].plain[pe._FLANK_MARKER_WIDTH:]
+        # Bar row: ▒ blocks across cols 0..18 (AA 0..6, cpa=3).
+        # Last cell becomes ▶.
+        assert "▒" in bar_line
+        assert "▶" in bar_line
+        # Label row centres "His6" within the 18-cell span.
+        # 18-cell span, 4-char label → starts at col (18-4)//2 = 7.
+        # So the H of His6 should be at body[7].
+        assert "His6" in label_line
+        # Label NOT on bar row.
+        assert "His6" not in bar_line
+
+    def test_overlapping_features_stack_in_separate_lanes(self):
+        # Two motifs overlapping the same AA range stack into two
+        # lanes — older feature closer to AA, newer one above.
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGSAAAAA", feats=[
+            {"start": 0, "end": 4, "label": "near",
+             "type": "Tag", "color": "#FF0000", "strand": 1},
+            {"start": 2, "end": 6, "label": "above",
+             "type": "Tag", "color": "#00FF00", "strand": 1},
+        ])
+        # 2 overlapping features → 2 lanes × 2 rows = 4 lane rows.
+        # + 2 base = 6 total rows in codon mode.
+        assert pe._row_count() == 6
+        text, n_rows = pe._build_protein_lane_text(cols_per_aa=3)
+        assert n_rows == 4
+
+    def test_non_overlapping_features_share_one_lane(self):
+        # Two features in disjoint AA ranges pack into the same lane.
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGSAAAAA", feats=[
+            {"start": 0, "end": 4, "label": "left",
+             "type": "Tag", "color": "#FF0000", "strand": 1},
+            {"start": 5, "end": 10, "label": "right",
+             "type": "Tag", "color": "#00FF00", "strand": 1},
+        ])
+        # 2 non-overlapping → 1 lane × 2 rows = 2 lane rows.
+        assert pe._row_count() == 4
+        text, n_rows = pe._build_protein_lane_text(cols_per_aa=3)
+        assert n_rows == 2
+
+
+class TestProteinMotifInsertColorIsUnique:
+    """End-to-end check: inserting two different built-in motifs
+    produces features with different colors."""
+
+    async def test_two_distinct_motif_inserts_have_different_colors(
+        self,
+    ):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one(
+                "#syn-protein-editor", sc.ProteinEditor,
+            )
+            pe.load("M")
+            # Find two motifs of the same feature_type so we know we're
+            # actually testing per-motif distinct colors (not just
+            # per-family-type fallbacks).
+            his6 = next(m for m in sc._PROTEIN_MOTIFS
+                          if m.get("name") == "His6")
+            flag = next(m for m in sc._PROTEIN_MOTIFS
+                          if m.get("name") == "FLAG")
+            # Both are "Tag" — pre-sweep #16 they shared "#3B82F6".
+            assert his6.get("feature_type") == flag.get("feature_type")
+            assert his6.get("color") != flag.get("color")
+            # Insert both and confirm each lands a distinct color.
+            pe._cursor_pos = 1
+            scr._motif_selected_entry = lambda: dict(his6)
+            scr._motif_insert_selected()
+            pe._cursor_pos = len(pe._aa_seq)
+            scr._motif_selected_entry = lambda: dict(flag)
+            scr._motif_insert_selected()
+            await pilot.pause()
+            colors = {f["color"] for f in pe._aa_feats}
+            assert len(colors) == 2
