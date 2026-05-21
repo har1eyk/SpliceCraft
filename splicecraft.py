@@ -46156,11 +46156,22 @@ class SynthesisEditor(Widget):
 
     # ── Editing primitives ────────────────────────────────────────────────
 
-    def insert_at_cursor(self, bases: str) -> bool:
+    def insert_at_cursor(self, bases: str,
+                         *, extend_adjacent_feats: bool = True) -> bool:
         """Insert `bases` at cursor. Returns True if anything landed.
         Bases are upper-cased; non-IUPAC chars are silently dropped
         (with a notify warning so a paste of garbage doesn't go
-        unnoticed). Total length capped at ``_SYNTHESIS_MAX_BP``."""
+        unnoticed). Total length capped at ``_SYNTHESIS_MAX_BP``.
+
+        ``extend_adjacent_feats`` (sweep #17, 2026-05-21): when True
+        (default), a feature whose end == cursor extends to include
+        the inserted bases — the "I'm typing into the tail of this
+        feature" case. When False, the boundary feature stays at its
+        original end; useful for callers inserting a SEPARATE
+        annotated unit (feature-library Insert, etc.) where the new
+        annotation needs to land cleanly downstream without
+        overlapping the upstream feature.
+        """
         if not bases:
             return False
         # Replace selection if any.
@@ -46202,10 +46213,14 @@ class SynthesisEditor(Widget):
         n_ins = len(clean)
         self._seq = self._seq[:cur] + clean + self._seq[cur:]
         # Feature shift: half-open [s, e). Bases at-or-after cur shift
-        # by n_ins. A feature whose end == cur extends to include the
-        # inserted bases (typical "extend the feature I'm appending
-        # to" behaviour). A feature whose start == cur shifts (the
-        # insert sits BEFORE the feature's first base).
+        # by n_ins. With `extend_adjacent_feats=True` a feature whose
+        # end == cur extends to include the inserted bases (typical
+        # "extend the feature I'm appending to" behaviour). With
+        # False, only features strictly past the cursor extend; the
+        # boundary feature stays put so a separate library entry can
+        # land cleanly downstream. A feature whose start == cur
+        # always shifts (the insert sits BEFORE the feature's first
+        # base) — regardless of the kwarg.
         new_feats: list[dict] = []
         for f in self._feats:
             s = int(f.get("start", 0))
@@ -46213,8 +46228,12 @@ class SynthesisEditor(Widget):
             new_f = dict(f)
             if s >= cur:
                 new_f["start"] = s + n_ins
-            if e >= cur and not (e == cur and s == cur):
-                new_f["end"] = e + n_ins
+            if extend_adjacent_feats:
+                if e >= cur and not (e == cur and s == cur):
+                    new_f["end"] = e + n_ins
+            else:
+                if e > cur:
+                    new_f["end"] = e + n_ins
             new_feats.append(new_f)
         self._feats = new_feats
         self._cursor_pos = cur + n_ins
@@ -47136,9 +47155,25 @@ class ProteinEditor(Widget):
 
     # ── Editing primitives ────────────────────────────────────────────────
 
-    def insert_at_cursor(self, aas: str) -> bool:
+    def insert_at_cursor(self, aas: str,
+                         *, extend_adjacent_feats: bool = True) -> bool:
         """Insert ``aas`` at cursor. Non-AA chars are dropped with a
-        notify. Total length capped at ``_PROTEIN_MAX_AA``."""
+        notify. Total length capped at ``_PROTEIN_MAX_AA``.
+
+        ``extend_adjacent_feats`` (sweep #17, 2026-05-21): True
+        (default) extends a feature whose end == cursor by the
+        inserted length — typing inside / appending to a feature's
+        tail grows the feature bar, matching the seq panel's
+        feel. False keeps a boundary feature at its original end;
+        used by `_motif_insert_selected` so a second motif inserted
+        at the 3' boundary of an existing motif lands as a SEPARATE
+        downstream feature without stacking on top. Features whose
+        start == cursor always shift right (the insert sits BEFORE
+        their first AA) regardless of the kwarg. Features whose
+        cursor sits STRICTLY INSIDE (fs < cur < fe) always extend —
+        that's the "I'm typing inside a feature" case the user
+        explicitly wants to preserve.
+        """
         if not aas:
             return False
         if self._user_sel is not None:
@@ -47179,10 +47214,12 @@ class ProteinEditor(Widget):
         cur = self._cursor_pos
         n_ins = len(clean)
         self._aa_seq = self._aa_seq[:cur] + clean + self._aa_seq[cur:]
-        # Sweep #15: shift AA-coord features. Mirrors SynthesisEditor:
-        # features whose start >= cur shift; features whose end >= cur
-        # extend, with the carve-out that a zero-length feature parked
-        # at the cursor (end == cur && start == cur) doesn't extend.
+        # Feature shift — same rules as SynthesisEditor's
+        # `insert_at_cursor`. Strictly-inside (fs < cur < fe) ALWAYS
+        # extends so typing inside a motif grows the bar. The
+        # boundary case (fe == cur && fs < cur) is what the kwarg
+        # controls — default extends (typing-at-tail), False keeps
+        # the original end (separate-feature inserts).
         for f in self._aa_feats:
             try:
                 fs = int(f.get("start", 0))
@@ -47191,8 +47228,16 @@ class ProteinEditor(Widget):
                 continue
             if fs >= cur:
                 f["start"] = fs + n_ins
-            if fe >= cur and not (fe == cur and fs == cur):
-                f["end"] = fe + n_ins
+            if extend_adjacent_feats:
+                if fe >= cur and not (fe == cur and fs == cur):
+                    f["end"] = fe + n_ins
+            else:
+                # Only extend when the cursor is STRICTLY inside
+                # (fe > cur). Boundary features (fe == cur) keep
+                # their original end so the caller's new feature
+                # lands as a clean downstream sibling.
+                if fe > cur:
+                    f["end"] = fe + n_ins
         self._cursor_pos = cur + n_ins
         self._user_sel = None
         self._sel_anchor = -1
@@ -48261,7 +48306,14 @@ class SynthesisScreen(Screen):
         # insert the reverse complement so the annotation matches the
         # template strand the user sees in the editor.
         insert_seq = _rc(seq) if strand == -1 else seq
-        ok = ed.insert_at_cursor(insert_seq)
+        # Sweep #17 (2026-05-21): `extend_adjacent_feats=False` so a
+        # library entry inserted at the 3' boundary of an upstream
+        # feature lands as a SEPARATE downstream feature (the new
+        # annotation we add below) instead of stacking on top of an
+        # upstream feature that grew to cover the insert. Typing-
+        # inside-a-feature still extends because the boundary-only
+        # rule lets `fs < cur < fe` paths through unchanged.
+        ok = ed.insert_at_cursor(insert_seq, extend_adjacent_feats=False)
         if not ok:
             return
         end = start + len(insert_seq)
@@ -48755,8 +48807,15 @@ class SynthesisScreen(Screen):
         # feature. The cursor advances past the inserted span by
         # ``insert_at_cursor``, so reading ``pe._cursor_pos`` after
         # the splice would give the END not the START.
+        # Sweep #17 (2026-05-21): `extend_adjacent_feats=False` so a
+        # second motif inserted at the 3' boundary of an existing
+        # motif lands as a SEPARATE downstream feature instead of
+        # extending the upstream motif's bar (which would stack the
+        # new feature on top of an overgrown upstream). Typing-
+        # inside-a-feature still extends — only the BOUNDARY case
+        # (cursor at fe) is affected.
         start_aa = pe._cursor_pos
-        ok = pe.insert_at_cursor(aa_seq)
+        ok = pe.insert_at_cursor(aa_seq, extend_adjacent_feats=False)
         if not ok:
             return
         # Build the feature — color from the motif's stored color

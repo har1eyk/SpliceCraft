@@ -2825,3 +2825,232 @@ class TestProteinMotifInsertColorIsUnique:
             await pilot.pause()
             colors = {f["color"] for f in pe._aa_feats}
             assert len(colors) == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sweep #17 — insert-at-cursor boundary-extend fix
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProteinMotifNonOverlapAtBoundary:
+    """Regression guard for 2026-05-21 fix.
+
+    Pre-sweep, inserting a second motif at the 3' boundary of an
+    existing motif extended the first motif's `end` to cover the
+    insertion AND stacked the new motif's feature on top — a visible
+    overlap. Post-sweep the first motif's `end` stays put and the
+    new motif lands as a clean downstream feature.
+    """
+
+    async def test_two_motifs_back_to_back_dont_overlap(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one(
+                "#syn-protein-editor", sc.ProteinEditor,
+            )
+            pe.load("")
+            # Insert His6 at start.
+            scr._motif_selected_entry = lambda: {
+                "name": "His6", "feature_type": "Tag",
+                "sequence": "HHHHHH", "color": "#1E40AF",
+            }
+            scr._motif_insert_selected()
+            await pilot.pause()
+            # Cursor is now at the 3' end of His6 (position 6).
+            assert pe._cursor_pos == 6
+            assert len(pe._aa_feats) == 1
+            assert pe._aa_feats[0]["start"] == 0
+            assert pe._aa_feats[0]["end"]   == 6
+            # Insert FLAG at the same cursor (3' boundary of His6).
+            scr._motif_selected_entry = lambda: {
+                "name": "FLAG", "feature_type": "Tag",
+                "sequence": "DYKDDDDK", "color": "#0E7490",
+            }
+            scr._motif_insert_selected()
+            await pilot.pause()
+            # His6 must NOT have extended.
+            his6 = next(f for f in pe._aa_feats if f["label"] == "His6")
+            flag = next(f for f in pe._aa_feats if f["label"] == "FLAG")
+            assert his6["start"] == 0
+            assert his6["end"]   == 6, (
+                f"His6 must not extend; got end={his6['end']}"
+            )
+            # FLAG sits cleanly downstream — no overlap.
+            assert flag["start"] == 6
+            assert flag["end"]   == 14
+            # The sequence appended in order.
+            assert pe._aa_seq == "HHHHHHDYKDDDDK"
+
+    async def test_motif_insert_at_5p_boundary_shifts_existing(self):
+        # 5' boundary case: insert a NEW motif at position 0 with an
+        # existing motif already at [0..6). The existing motif's start
+        # was at the cursor, so it shifts right; the new motif lands at
+        # [0..N) where N is its length. Neither feature overlaps.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one(
+                "#syn-protein-editor", sc.ProteinEditor,
+            )
+            pe.load("HHHHHH", feats=[
+                {"start": 0, "end": 6, "label": "His6",
+                 "type": "Tag", "color": "#1E40AF", "strand": 1},
+            ])
+            # Move cursor to position 0 (5' end / start of His6).
+            pe._cursor_pos = 0
+            scr._motif_selected_entry = lambda: {
+                "name": "Kozak", "feature_type": "Motif",
+                "sequence": "M", "color": "#C026D3",
+            }
+            scr._motif_insert_selected()
+            await pilot.pause()
+            kozak = next(
+                f for f in pe._aa_feats if f["label"] == "Kozak"
+            )
+            his6 = next(
+                f for f in pe._aa_feats if f["label"] == "His6"
+            )
+            # Kozak at [0..1), His6 shifted to [1..7) — no overlap.
+            assert kozak["start"] == 0
+            assert kozak["end"]   == 1
+            assert his6["start"]  == 1
+            assert his6["end"]    == 7
+
+    async def test_typing_inside_feature_still_extends_bar(self):
+        # Sweep #17 invariant: the boundary-extend fix MUST NOT change
+        # the "typing inside a feature" behaviour. With the cursor
+        # strictly inside a feature span, inserting bases must STILL
+        # extend the feature's end.
+        pe = sc.ProteinEditor()
+        pe.load("HHHHHH", feats=[
+            {"start": 0, "end": 6, "label": "His6",
+             "type": "Tag", "color": "#1E40AF", "strand": 1},
+        ])
+        # Cursor strictly inside (between H3 and H4).
+        pe._cursor_pos = 3
+        # Test the editor primitive directly (skip the AddFeature flow).
+        # extend_adjacent_feats=False mode (the new path) still extends
+        # because cur is STRICTLY inside the feature.
+        pe.insert_at_cursor("HH", extend_adjacent_feats=False)
+        his6 = pe._aa_feats[0]
+        assert his6["start"] == 0
+        assert his6["end"]   == 8, (
+            f"His6 should grow when typing inside; got end={his6['end']}"
+        )
+        assert pe._aa_seq == "HHHHHHHH"
+
+    async def test_typing_inside_feature_default_path_also_extends(self):
+        # Same scenario but with default kwarg (extend=True) — the
+        # editor's keyboard-typing path uses this. Verifies neither
+        # branch broke the inside-extend rule.
+        pe = sc.ProteinEditor()
+        pe.load("HHHHHH", feats=[
+            {"start": 0, "end": 6, "label": "His6",
+             "type": "Tag", "color": "#1E40AF", "strand": 1},
+        ])
+        pe._cursor_pos = 3
+        pe.insert_at_cursor("HH")  # default extend_adjacent_feats=True
+        his6 = pe._aa_feats[0]
+        assert his6["end"] == 8
+
+    async def test_deleting_inside_feature_contracts_bar(self):
+        # Sweep #17 invariant: deleting bases inside a feature
+        # contracts the bar.
+        pe = sc.ProteinEditor()
+        pe.load("HHHHHHHH", feats=[
+            {"start": 0, "end": 8, "label": "His8",
+             "type": "Tag", "color": "#3B82F6", "strand": 1},
+        ])
+        # Delete the middle two H's.
+        pe._delete_range(3, 5)
+        his = pe._aa_feats[0]
+        assert his["start"] == 0
+        assert his["end"]   == 6, (
+            f"His8 should contract on delete; got end={his['end']}"
+        )
+        assert pe._aa_seq == "HHHHHH"
+
+
+class TestDnaFeatLibNonOverlapAtBoundary:
+    """Mirror sweep #17 — same boundary-extend fix on the DNA tab."""
+
+    async def test_dna_featlib_insert_at_3p_boundary_no_overlap(
+        self, isolated_library,
+    ):
+        # Seed the feature library with two entries we can insert.
+        sc._save_features([
+            {"name": "alpha", "feature_type": "misc_feature",
+             "sequence": "AAA", "color": "#FF0000", "strand": 1,
+             "qualifiers": {}},
+            {"name": "beta",  "feature_type": "misc_feature",
+             "sequence": "GGG", "color": "#00FF00", "strand": 1,
+             "qualifiers": {}},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("", [])
+            # Insert alpha at start.
+            scr._featlib_selected_entry = lambda: {
+                "name": "alpha", "feature_type": "misc_feature",
+                "sequence": "AAA", "color": "#FF0000", "strand": 1,
+                "qualifiers": {},
+            }
+            scr._featlib_insert_selected(mode="insert")
+            await pilot.pause()
+            assert ed._cursor_pos == 3
+            assert len(ed._feats) == 1
+            assert ed._feats[0]["start"] == 0
+            assert ed._feats[0]["end"]   == 3
+            # Insert beta at the 3' boundary of alpha.
+            scr._featlib_selected_entry = lambda: {
+                "name": "beta", "feature_type": "misc_feature",
+                "sequence": "GGG", "color": "#00FF00", "strand": 1,
+                "qualifiers": {},
+            }
+            scr._featlib_insert_selected(mode="insert")
+            await pilot.pause()
+            alpha = next(f for f in ed._feats if f["label"] == "alpha")
+            beta  = next(f for f in ed._feats if f["label"] == "beta")
+            # alpha must NOT have extended.
+            assert alpha["start"] == 0
+            assert alpha["end"]   == 3, (
+                f"alpha must not extend; got end={alpha['end']}"
+            )
+            # beta sits cleanly downstream.
+            assert beta["start"] == 3
+            assert beta["end"]   == 6
+            assert ed._seq == "AAAGGG"
+
+    async def test_dna_typing_inside_feature_still_extends_bar(self):
+        # The user-typing path passes extend_adjacent_feats=True by
+        # default. Inside-feature typing must still extend the bar
+        # (and verifies the boundary-extend fix didn't regress the
+        # inside-extend rule).
+        ed = sc.SynthesisEditor()
+        ed.load("AAAGGG", [{
+            "start": 0, "end": 6, "label": "joined",
+            "type": "misc_feature", "color": "#FF0000", "strand": 1,
+        }])
+        ed._cursor_pos = 3   # strictly inside [0..6)
+        ed.insert_at_cursor("TT", extend_adjacent_feats=False)
+        # extend_adjacent_feats=False ALSO extends inside-feature
+        # because cur strictly < fe.
+        assert ed._feats[0]["start"] == 0
+        assert ed._feats[0]["end"]   == 8
