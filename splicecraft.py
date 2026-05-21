@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.13"
+__version__ = "0.9.11"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -46945,11 +46945,17 @@ class ProteinEditor(Widget):
         if not placements:
             return Text(""), 0
         total_rows = max(p[1] + 2 for p in placements)  # +2 = bar + label
-        # ── Render grid ───────────────────────────────────────────
-        # Build a (total_rows × total_cells) array of (char, style).
-        blank_cell = (" ", "")
-        grid: list[list[tuple[str, str]]] = [
-            [blank_cell] * total_cells for _ in range(total_rows)
+        # ── Per-row segment lists (sweep #19 perf fix) ────────────
+        # Pre-sweep this allocated a (rows × cells) grid and called
+        # `Text.append` per cell — O(rows × cells) appends, which
+        # measured at 354 ms for the 16.6k AA / 30-feature cap and
+        # 2.5 s in the all-overlap worst case. New shape: collect
+        # per-row segments (col_s, text, style) as we walk the
+        # placements; emit at the end via run-merge so each
+        # contiguous-style stretch becomes ONE append. Total work
+        # drops to O(rows × segments) where segments ≪ cells.
+        row_segments: list[list[tuple[int, int, str, str]]] = [
+            [] for _ in range(total_rows)
         ]
         for f, bottom_row in placements:
             try:
@@ -46966,32 +46972,54 @@ class ProteinEditor(Widget):
                 strand = 1
             col_s = fs * cols_per_aa
             col_e = fe * cols_per_aa
-            bar_row   = bottom_row       # closer to AA
-            label_row = bottom_row + 1   # one above the bar
-            # Bar row — ▒ blocks across the span.
-            for k in range(col_s, col_e):
-                grid[bar_row][k] = ("▒", color)
-            if col_e > col_s:
-                if strand >= 1:
-                    grid[bar_row][col_e - 1] = ("▶", color)
-                elif strand <= -1:
-                    grid[bar_row][col_s] = ("◀", color)
-            # Label row — centred within the bar span, truncated to
-            # the span width if longer. Skip when the label is empty.
+            bar_row   = bottom_row
+            label_row = bottom_row + 1
+            span = col_e - col_s
+            # Bar segment — one ▒-run plus an optional terminus
+            # arrow. Forward strand: ▒…▒▶; reverse: ◀▒…▒; unstranded:
+            # ▒…▒.
+            if span > 0:
+                if strand >= 1 and span >= 1:
+                    if span > 1:
+                        row_segments[bar_row].append(
+                            (col_s, col_s + span - 1, "▒" * (span - 1),
+                             color),
+                        )
+                    row_segments[bar_row].append(
+                        (col_s + span - 1, col_e, "▶", color),
+                    )
+                elif strand <= -1 and span >= 1:
+                    row_segments[bar_row].append(
+                        (col_s, col_s + 1, "◀", color),
+                    )
+                    if span > 1:
+                        row_segments[bar_row].append(
+                            (col_s + 1, col_e, "▒" * (span - 1),
+                             color),
+                        )
+                else:
+                    row_segments[bar_row].append(
+                        (col_s, col_e, "▒" * span, color),
+                    )
+            # Label segment — centred within the bar span. Truncate
+            # when wider than the span; skip when label is empty.
             label = str(f.get("label") or "").strip()
-            if label and label_row < total_rows:
-                span = col_e - col_s
+            if label and label_row < total_rows and span > 0:
                 if len(label) > span:
                     label = label[:span]
                 label_start = col_s + max(0, (span - len(label)) // 2)
-                style = f"bold {color}"
-                for j, ch in enumerate(label):
-                    pos = label_start + j
-                    if pos < col_e and pos < total_cells:
-                        grid[label_row][pos] = (ch, style)
+                row_segments[label_row].append(
+                    (label_start, label_start + len(label),
+                     label, f"bold {color}"),
+                )
         # ── Emit rows in reverse so highest stack sits FIRST  ─────
         # (closest to AA at the bottom). Same orientation as the
-        # seq panel's above-DNA lanes.
+        # seq panel's above-DNA lanes. Within each row, sort
+        # segments by col_s, then walk: emit blank padding,
+        # segment, blank padding, … Multi-segment rows can have
+        # overlaps (a label sitting on top of an earlier segment
+        # from a different lane); last-wins on overlap matches the
+        # grid behaviour from pre-sweep.
         blank_marker = Text(
             " " * self._FLANK_MARKER_WIDTH, no_wrap=True,
         )
@@ -46999,8 +47027,46 @@ class ProteinEditor(Widget):
         for row_idx in reversed(range(total_rows)):
             line = Text(no_wrap=True, overflow="crop")
             line.append_text(blank_marker)
-            for ch, st in grid[row_idx]:
-                line.append(ch, style=st)
+            segs = row_segments[row_idx]
+            if not segs:
+                # Pure-blank row — single append for the whole span.
+                line.append(" " * total_cells)
+            else:
+                # Sort segments left → right; resolve overlap by
+                # keeping the LATER segment (last-wins, matches
+                # pre-sweep grid-overwrite semantics).
+                segs = sorted(segs, key=lambda s: s[0])
+                # Drop segments fully covered by a later segment.
+                resolved: list[tuple[int, int, str, str]] = []
+                for i, (s, e, txt, st) in enumerate(segs):
+                    masked = False
+                    for j in range(i + 1, len(segs)):
+                        s2, e2, _t2, _st2 = segs[j]
+                        if s2 <= s and e2 >= e:
+                            masked = True
+                            break
+                    if not masked:
+                        resolved.append((s, e, txt, st))
+                # Clip partial overlaps so adjacent segments don't
+                # double-emit cells. We trim the LEFT of each
+                # segment to start where the previous one ended.
+                pen = 0
+                for s, e, txt, st in resolved:
+                    if s > pen:
+                        line.append(" " * (s - pen))
+                    if e <= pen:
+                        continue
+                    if s < pen:
+                        # Trim the left overlap from this segment.
+                        trim = pen - s
+                        if trim >= len(txt):
+                            continue
+                        txt = txt[trim:]
+                        s = pen
+                    line.append(txt, style=st)
+                    pen = e
+                if pen < total_cells:
+                    line.append(" " * (total_cells - pen))
             line.append_text(blank_marker)
             lines.append(line)
         return Text("\n", no_wrap=True).join(lines), total_rows
@@ -49397,7 +49463,12 @@ class SynthesisScreen(Screen):
                     severity="error",
                 )
                 return
-            self.app._apply_record(rec)
+            # `self.app` is typed as the generic Textual App at this
+            # boundary — `_apply_record` lives on PlasmidApp. Pyright
+            # can't see the subclass through the .app pointer; the
+            # attribute-defined ignore here is the same pattern used
+            # in other PlasmidApp-only call sites across the file.
+            self.app._apply_record(rec)  # type: ignore[attr-defined]
             # Capture the full sequence from the saved record so the
             # Domesticator's direct-input TextArea gets the COMPLETE
             # fragment atomically (TextArea.text setter is one shot).
@@ -49599,7 +49670,18 @@ class SynthesisScreen(Screen):
             # exactly one. Sub-features must lie INSIDE this span.
             cds_s, cds_e = cds_starts_ends[0]
             for sf in record.features:
-                if sf.type == "CDS":
+                # Sweep #18 (2026-05-21) — tighten the type filter
+                # from "not CDS" to "misc_feature only". The save
+                # path writes exclusively `misc_feature` sub-features
+                # for protein-tab motifs; the looser pre-sweep filter
+                # would also accept gene / RBS / mat_peptide / etc.
+                # sub-features from an imported GenBank record, then
+                # mis-render them as AA motifs (and round-trip them
+                # back to disk as proteins on save). The strict
+                # filter keeps unrelated annotations off the protein
+                # editor while still picking up everything we
+                # ourselves wrote.
+                if sf.type != "misc_feature":
                     continue
                 try:
                     fs = int(sf.location.start)
@@ -49607,6 +49689,17 @@ class SynthesisScreen(Screen):
                 except (TypeError, AttributeError, ValueError):
                     continue
                 if fs < cds_s or fe > cds_e:
+                    continue
+                # Sweep #18 — codon-alignment guard. The save path
+                # always writes coords as AA × 3, so well-formed
+                # sub-features fall on codon boundaries. Drop any
+                # whose offsets within the CDS aren't multiples of 3
+                # — silently flooring the bp coords would map them
+                # to the wrong AA residues. Defence-in-depth: even
+                # if a misc_feature with mis-aligned coords slipped
+                # past the type filter, the AA bounds we'd compute
+                # would be visually wrong.
+                if (fs - cds_s) % 3 != 0 or (fe - cds_s) % 3 != 0:
                     continue
                 # DNA coords back to AA. Save wrote AA × 3, so /3.
                 aa_s = (fs - cds_s) // 3

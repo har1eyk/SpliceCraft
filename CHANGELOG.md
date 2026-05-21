@@ -14,6 +14,19 @@
 
 ---
 
+## [0.9.11] — 2026-05-21
+
+_(auto-generated from commits since v0.9.13)_
+
+* Sweep #17 — insert-at-cursor boundary-extend kwarg · invariant #58
+* Sweep #16 — dithered protein lane art + distinct motif colors + CI lint gate · invariant #57
+* Sweep #15 — pre-colored AA features + Edit buttons · invariant #56
+* Clone Fragment prefills Domesticator direct-input atomically · invariant #55
+* Synthesis audit sweep #14 — Save As / unique-id / Clone Fragment · invariant #55
+* Synthesis composer (DNA + Protein tabs) · modal centering · invariants #53–#54
+
+---
+
 ## [0.9.13] — 2026-05-20
 
 _(auto-generated from commits since v0.9.10)_

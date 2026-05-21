@@ -3054,3 +3054,170 @@ class TestDnaFeatLibNonOverlapAtBoundary:
         # because cur strictly < fe.
         assert ed._feats[0]["start"] == 0
         assert ed._feats[0]["end"]   == 8
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sweep #18 — protein-load filter tightening
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProteinLoadFilterStrict:
+    """`_extract_aa_feats_from_record` only picks up misc_feature
+    sub-features whose coords are codon-aligned. Tighter than the
+    pre-sweep "not CDS" filter, which would have also pulled in
+    gene/RBS/mat_peptide/etc. annotations from an imported record."""
+
+    def _build_record(self, dna: str, cds_features: list[dict]):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq(dna), id="t", name="t")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "linear"
+        # First feature is the CDS spanning the whole DNA.
+        rec.features.append(
+            SeqFeature(
+                FeatureLocation(0, len(dna), strand=1),
+                type="CDS",
+                qualifiers={
+                    "label": ["protein"],
+                    "translation": [
+                        # back-translate ATGGCC… as M, A, S, H, H, H
+                        "MASHHH"
+                    ],
+                },
+            ),
+        )
+        for f in cds_features:
+            rec.features.append(
+                SeqFeature(
+                    FeatureLocation(
+                        f["start"], f["end"], strand=f.get("strand", 1),
+                    ),
+                    type=f["type"],
+                    qualifiers=dict(f.get("qualifiers") or {}),
+                )
+            )
+        return rec
+
+    def test_misc_feature_is_picked_up(self):
+        rec = self._build_record(
+            "ATGGCCAGCCACCACCAC",   # MASHHH (6 aa)
+            [{"start": 0, "end": 18, "type": "misc_feature",
+              "qualifiers": {
+                  "label": ["HisRich"],
+                  "note": [
+                      "splicecraft-aa-feature-type=Tag",
+                  ],
+                  "ApEinfo_fwdcolor": ["#1E40AF"],
+              }}],
+        )
+        feats = sc.SynthesisScreen._extract_aa_feats_from_record(rec)
+        assert len(feats) == 1
+        assert feats[0]["start"] == 0
+        assert feats[0]["end"]   == 6
+        assert feats[0]["label"] == "HisRich"
+        assert feats[0]["type"]  == "Tag"
+        assert feats[0]["color"] == "#1E40AF"
+
+    def test_gene_subfeature_inside_cds_is_filtered_out(self):
+        # Pre-sweep: a `gene` feature INSIDE the CDS would mis-load
+        # as an AA motif because the filter only skipped CDS. Now
+        # it's filtered out.
+        rec = self._build_record(
+            "ATGGCCAGCCACCACCAC",
+            [{"start": 0, "end": 18, "type": "gene",
+              "qualifiers": {"label": ["intruder"]}}],
+        )
+        feats = sc.SynthesisScreen._extract_aa_feats_from_record(rec)
+        assert feats == [], (
+            f"gene sub-feature should be filtered; got {feats}"
+        )
+
+    def test_rbs_subfeature_inside_cds_is_filtered_out(self):
+        rec = self._build_record(
+            "ATGGCCAGCCACCACCAC",
+            [{"start": 0, "end": 6, "type": "RBS",
+              "qualifiers": {"label": ["fakeRBS"]}}],
+        )
+        feats = sc.SynthesisScreen._extract_aa_feats_from_record(rec)
+        assert feats == []
+
+    def test_mat_peptide_subfeature_inside_cds_is_filtered_out(self):
+        rec = self._build_record(
+            "ATGGCCAGCCACCACCAC",
+            [{"start": 3, "end": 12, "type": "mat_peptide",
+              "qualifiers": {"label": ["mature"]}}],
+        )
+        feats = sc.SynthesisScreen._extract_aa_feats_from_record(rec)
+        assert feats == []
+
+    def test_codon_misaligned_misc_feature_is_dropped(self):
+        # bp 1..10 is NOT codon-aligned. The pre-sweep code would
+        # have floored to AA[0..3) — silently wrong residues.
+        # Post-sweep: dropped.
+        rec = self._build_record(
+            "ATGGCCAGCCACCACCAC",
+            [{"start": 1, "end": 10, "type": "misc_feature",
+              "qualifiers": {
+                  "label": ["misaligned"],
+                  "note": ["splicecraft-aa-feature-type=Motif"],
+              }}],
+        )
+        feats = sc.SynthesisScreen._extract_aa_feats_from_record(rec)
+        assert feats == [], (
+            f"mis-aligned coords should drop; got {feats}"
+        )
+
+    def test_misc_feature_with_only_one_aligned_boundary_dropped(self):
+        # fs=0 (aligned), fe=10 (NOT aligned → 10 % 3 == 1). Drop.
+        rec = self._build_record(
+            "ATGGCCAGCCACCACCAC",
+            [{"start": 0, "end": 10, "type": "misc_feature",
+              "qualifiers": {"label": ["half-aligned"]}}],
+        )
+        feats = sc.SynthesisScreen._extract_aa_feats_from_record(rec)
+        assert feats == []
+
+    def test_mixed_subfeatures_only_misc_aligned_passes(self):
+        # Three sub-features inside the CDS:
+        #   * misc_feature aligned at [0..6) → KEPT (aa 0..2)
+        #   * gene at [0..18) → FILTERED (wrong type)
+        #   * misc_feature mis-aligned at [7..13) → DROPPED (alignment)
+        rec = self._build_record(
+            "ATGGCCAGCCACCACCAC",
+            [
+                {"start": 0,  "end": 6,  "type": "misc_feature",
+                 "qualifiers": {
+                     "label": ["pass"],
+                     "note": ["splicecraft-aa-feature-type=Tag"],
+                 }},
+                {"start": 0,  "end": 18, "type": "gene",
+                 "qualifiers": {"label": ["wrong-type"]}},
+                {"start": 7,  "end": 13, "type": "misc_feature",
+                 "qualifiers": {"label": ["misaligned"]}},
+            ],
+        )
+        feats = sc.SynthesisScreen._extract_aa_feats_from_record(rec)
+        assert len(feats) == 1
+        assert feats[0]["label"] == "pass"
+        assert feats[0]["start"] == 0
+        assert feats[0]["end"]   == 2
+
+    def test_existing_round_trip_still_works(self):
+        # Confirm the sweep doesn't regress the normal motif round-
+        # trip (the path we wrote earlier in sweep #15).
+        rec = self._build_record(
+            "ATGGCCAGCCACCACCAC",  # 18 bp, MASHHH
+            [{"start": 9, "end": 18, "type": "misc_feature",
+              "qualifiers": {
+                  "label": ["His3"],
+                  "note": ["splicecraft-aa-feature-type=Tag"],
+                  "ApEinfo_fwdcolor": ["#3B82F6"],
+              }}],
+        )
+        feats = sc.SynthesisScreen._extract_aa_feats_from_record(rec)
+        assert len(feats) == 1
+        assert feats[0]["start"] == 3
+        assert feats[0]["end"]   == 6
+        assert feats[0]["label"] == "His3"
+        assert feats[0]["type"]  == "Tag"

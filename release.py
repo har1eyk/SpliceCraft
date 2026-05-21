@@ -13,16 +13,26 @@ ordering, same abort-on-failure semantics:
   4. Syncs `conda-recipe/meta.yaml` (version + sha256 + run-deps) from
      the just-built sdist + pyproject — keeps the in-repo recipe in
      lockstep with PyPI so a bioconda PR is one click away.
-  5. Commits the bump, tags v<version>, and pushes.
+  5. Bundles ALL accumulated working-tree changes (version bump +
+     anything else the user has iterated on since the last release)
+     into a single ``Release v<version>`` commit, tags v<version>,
+     and pushes.
   6. GitHub Actions (publish.yml) builds + uploads to PyPI from the tag.
   7. Polls PyPI until the sdist is hosted, then forks
      bioconda-recipes (if needed) and opens a PR with the recipe
      update so end users can `conda install -c bioconda splicecraft`.
 
+Sweep #18 (2026-05-21): the working tree no longer needs to be
+clean before release. release.py prints a summary of pending
+changes, then ``git add -A``'s them into the release commit. This
+keeps the iteration cycle tight — the user accumulates work in the
+tree and ships it all at release time instead of paying a commit
+toll on every change. `.gitignore` is still in effect, so build
+artefacts / caches / logs stay out of the release commit.
+
 Prereqs (one-time, see README):
 
   - Trusted Publishing configured at pypi.org for this project.
-  - git clean working tree (commit everything else first).
   - `gh` CLI authenticated (`gh auth status`) — needed for the
     bioconda fork + PR step. Skipped with a note if missing.
 
@@ -117,18 +127,34 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, **kwargs)
 
 
-def _ensure_clean_tree() -> None:
-    """Refuse to proceed if there are uncommitted changes — same
-    invariant release.sh enforced via ``git status --porcelain``."""
+def _summarize_pending_changes() -> None:
+    """Sweep #18 (2026-05-21): release.py now BUNDLES accumulated
+    work into the release commit instead of refusing to proceed.
+    Pre-sweep `_ensure_clean_tree` rejected any uncommitted changes;
+    the new flow lets the user accumulate iterative work in the
+    working tree between releases and ship it in a single
+    ``Release vX.Y.Z`` commit. This function is informational only:
+    print the pending changes so the user can confirm visually
+    before the build/test/commit/push pipeline proceeds.
+    """
     result = subprocess.run(
         ["git", "status", "--porcelain"],
         check=True, capture_output=True, text=True,
     )
-    if result.stdout.strip():
-        print("Error: working tree is dirty. Commit or stash first.",
-              file=sys.stderr)
-        subprocess.run(["git", "status", "--short"], check=False)
-        sys.exit(1)
+    pending = result.stdout.strip()
+    if not pending:
+        return
+    print("─" * 61)
+    print(" Pending changes that will be bundled into this release:")
+    print("─" * 61)
+    subprocess.run(["git", "status", "--short"], check=False)
+    print()
+
+
+# Pre-sweep #18 alias — kept around for any external invocation that
+# imports release.py and calls the old name. New code should call
+# ``_summarize_pending_changes`` directly.
+_ensure_clean_tree = _summarize_pending_changes
 
 
 def _ensure_tag_unused(version: str) -> None:
@@ -798,7 +824,7 @@ def main(argv: list[str] | None = None) -> int:
     if not _VERSION_RE.match(new_version):
         _die(f"version must look like X.Y.Z (got {new_version!r}).")
 
-    _ensure_clean_tree()
+    _summarize_pending_changes()
     _ensure_tag_unused(new_version)
     _ensure_changelog_entry(new_version)
 
@@ -847,17 +873,15 @@ def main(argv: list[str] | None = None) -> int:
     _sync_conda_recipe(new_version)
 
     _heading("Committing + tagging + pushing")
-    # CHANGELOG.md is always added — `_ensure_changelog_entry` either
-    # confirmed a hand-written entry was already in the tree (a no-op
-    # `git add` then) or auto-wrote a fresh section that needs to land
-    # in the same release commit as the version bump. Without picking
-    # it up here, the auto-generated entry would sit dirty in the
-    # working tree and the next `_ensure_clean_tree` call would
-    # refuse the following release.
-    add_targets = ["pyproject.toml", "splicecraft.py", "CHANGELOG.md"]
-    if CONDA_RECIPE.is_file():
-        add_targets.append(str(CONDA_RECIPE.relative_to(REPO_ROOT)))
-    _run(["git", "add", *add_targets])
+    # Sweep #18 (2026-05-21): bundle ALL accumulated working-tree
+    # changes (tracked + new untracked) into the release commit, not
+    # just the version-bump files. The user's workflow is "iterate
+    # in the working tree, only commit at release time", so the
+    # release commit needs to pick up every modification + every
+    # new file the user authored since the previous tag. `git add
+    # -A` is bounded by `.gitignore` so build artifacts, caches,
+    # logs, etc. stay out.
+    _run(["git", "add", "-A"])
     _run(["git", "commit", "-m", f"Release v{new_version}"])
     _run(["git", "tag", f"v{new_version}"])
     _run(["git", "push", "origin", "master"])

@@ -1,9 +1,17 @@
 name: Tests
 
-# Runs lint / type-check / pytest / coverage on every push to master
-# and on every PR so regressions are caught before they ship to PyPI
-# via publish.yml. Matrix covers the Python versions declared in
-# pyproject.toml (requires-python = ">=3.10").
+# Sweep #18 (2026-05-21): trimmed for faster iteration cycles.
+# Pre-sweep config ran a 4-Python matrix (3.10/3.11/3.12/3.13) +
+# a separate coverage job — ~28 min wall-clock per push, dominated
+# by serial pytest. The new shape runs lint + a SINGLE-Python-3.12
+# pytest with `-n auto` xdist parallelism on 2-core GitHub runners.
+# Expected wall-clock: ~6-8 min.
+#
+# Trade-off: we no longer matrix-test 3.10/3.11/3.13 on every push.
+# `pyproject.toml` declares ``requires-python = ">=3.10"`` so those
+# versions are still supported; ``release.py`` runs the full local
+# suite before tagging, and any version-specific breakage is caught
+# by the user's local pixi/uv environments before publish.
 
 on:
   push:
@@ -12,7 +20,7 @@ on:
     branches: [master]
 
 # Cancel an in-flight run on the same ref so a rapid push doesn't
-# queue duplicate hour-long matrices behind itself.
+# queue duplicate runs behind itself.
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -32,6 +40,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: ruff check
+        # release.py also runs this BEFORE pytest (sweep #16); the CI
+        # gate is the public confirmation rather than the only place
+        # lint runs.
         run: ruff check .
       - name: pyright
         # `[tool.pyright]` in pyproject.toml restricts the analysis to
@@ -52,19 +63,19 @@ jobs:
         run: pyright
 
   test:
-    name: pytest (Python ${{ matrix.python-version }})
+    # Single Python (3.12, the version `release.py` runs locally) +
+    # `-n auto` for xdist parallelism on the 2-core GitHub runner.
+    # GitHub's `ubuntu-latest` ships 2 vCPUs, so xdist cuts the
+    # ~16-min serial pytest down to ~7-8 min wall-clock.
+    name: pytest (Python 3.12)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.12'
           cache: pip
 
       - name: Install package + dev deps
@@ -73,43 +84,12 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run pytest
-        run: python -m pytest -q --tb=short
+        # `-n auto` lets pytest-xdist parallelise across all available
+        # CPUs. Tests are isolated by the autouse `_protect_user_data`
+        # fixture in tests/conftest.py so cross-worker collisions are
+        # impossible.
+        run: python -m pytest -n auto -q --tb=short
         env:
-          # Headless terminal so Textual's pilot doesn't try to detect a TTY.
+          # Headless terminal so Textual's pilot doesn't try to detect
+          # a TTY.
           TERM: dumb
-
-  coverage:
-    name: Coverage (Python 3.12)
-    runs-on: ubuntu-latest
-    # Coverage is informational; let the matrix tests gate merges
-    # independently of upload outcomes. Codecov is sometimes flaky.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-      - name: Install package + dev deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-      - name: Run coverage
-        # Single-process — coverage's combine step is fiddly under
-        # pytest-xdist and the 5-min single-process run is acceptable
-        # for the informational coverage job.
-        run: |
-          coverage run -m pytest -q --tb=short
-          coverage report --skip-covered --skip-empty | tail -40
-          coverage xml -o coverage.xml
-        env:
-          TERM: dumb
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: coverage.xml
-          flags: pytest
-          fail_ci_if_error: false
-          # Token-less upload works for public repos; if Codecov
-          # later requires it, set `CODECOV_TOKEN` in repo secrets
-          # and reference here.
