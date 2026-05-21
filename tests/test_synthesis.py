@@ -2087,6 +2087,98 @@ class TestSynthesisCloneFragmentFlow:
                 f"stack: {stack_types}"
             )
 
+    async def test_clone_prefills_direct_input_textarea(
+        self, isolated_library,
+    ):
+        """The complete synthesis sequence must land in the
+        Domesticator's #dom-direct-seq TextArea atomically — the
+        whole string in one TextArea.text write so the user can't
+        catch the prefill mid-paste."""
+        from textual.widgets import TextArea
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            # Use a sequence with a mix of bases so we can verify
+            # the full payload landed, not just a prefix.
+            full_seq = "ATGAAACCCGGGTTTAACCGGTTAACCGGTTAA"
+            ed.load(full_seq, [])
+            scr._dirty = True
+            orig_push = app.push_screen
+            def _stub_push(modal, callback=None):
+                if isinstance(modal, sc.NamePlasmidModal):
+                    if callback is not None:
+                        callback("prefill_test_fragment")
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _stub_push  # type: ignore[method-assign]
+            try:
+                scr.action_clone_fragment()
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            # Domesticator on top, with the full sequence in the
+            # direct-input TextArea.
+            assert isinstance(app.screen, sc.DomesticatorModal)
+            ta = app.screen.query_one("#dom-direct-seq", TextArea)
+            assert ta.text == full_seq, (
+                f"prefill seq mismatch: expected {full_seq!r}, "
+                f"got {ta.text!r}"
+            )
+
+    async def test_clone_prefill_self_clears_after_firing(
+        self, isolated_library,
+    ):
+        """The one-shot ``_clone_prefill_seq`` attr on PartsBinModal
+        clears after _new_part consumes it so a subsequent manual
+        'New Part' click doesn't re-prime the textarea with the same
+        synthesis fragment."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCATGC", [])
+            scr._dirty = True
+            orig_push = app.push_screen
+            def _stub_push(modal, callback=None):
+                if isinstance(modal, sc.NamePlasmidModal):
+                    if callback is not None:
+                        callback("self_clearing_test")
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _stub_push  # type: ignore[method-assign]
+            try:
+                scr.action_clone_fragment()
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            # Walk the screen stack to find the PartsBinModal under
+            # the Domesticator and verify its prefill attr is empty.
+            pb = next(
+                (s for s in app.screen_stack
+                 if isinstance(s, sc.PartsBinModal)),
+                None,
+            )
+            assert pb is not None, "PartsBinModal not in stack"
+            assert pb._clone_prefill_seq == "", (
+                f"prefill should self-clear after firing; "
+                f"still holds {pb._clone_prefill_seq!r}"
+            )
+
     async def test_clone_aborted_when_save_fails(self, isolated_library):
         # If the user cancels the NamePlasmidModal (callback fires
         # with an empty string), Clone Fragment must NOT proceed to

@@ -37370,7 +37370,8 @@ class PartsBinModal(Screen):
         "#btn-parts-export-fasta",
     )
 
-    def __init__(self, *, auto_trigger_new_part: bool = False) -> None:
+    def __init__(self, *, auto_trigger_new_part: bool = False,
+                 clone_prefill_seq: str = "") -> None:
         super().__init__()
         # Pre-built feature-library index for the "Feat Lib" column.
         # Re-derived only when `_features_generation` differs from the
@@ -37381,11 +37382,16 @@ class PartsBinModal(Screen):
         self._feat_lib_gen_seen: int = -1
         # Sweep #14 (2026-05-20) — Synthesis "Clone Fragment" entry
         # point. The Synthesis screen pushes ``PartsBinModal(
-        # auto_trigger_new_part=True)`` after auto-saving + loading
-        # its fragment as the canvas record; on_mount fires
-        # ``_new_part(None)`` after the first paint so the user
-        # lands directly in the Domesticator with no extra clicks.
+        # auto_trigger_new_part=True, clone_prefill_seq=seq)`` after
+        # auto-saving + loading its fragment as the canvas record;
+        # on_mount fires ``_new_part(None)`` after the first paint so
+        # the user lands directly in the Domesticator with no extra
+        # clicks. ``clone_prefill_seq`` carries the full fragment seq
+        # straight into the Domesticator's direct-input TextArea on
+        # the first auto-trigger; it self-clears after firing so a
+        # subsequent manual "New Part" click opens an empty form.
         self._auto_trigger_new_part: bool = bool(auto_trigger_new_part)
+        self._clone_prefill_seq: str = (clone_prefill_seq or "").upper()
         # Multi-select state for bulk save-to-collection / delete.
         # Set of row indices into `self._rows`. A non-empty set dims
         # the non-bulk action buttons so Save-to-Collection + Delete
@@ -38298,8 +38304,18 @@ class PartsBinModal(Screen):
                 on_cancelled=_on_cancelled,
             )
 
+        # Sweep #14 (2026-05-20): consume the one-shot Clone-Fragment
+        # prefill (set when this modal was pushed from the Synthesis
+        # screen). Self-clears so a subsequent manual "New Part" click
+        # opens a fresh form rather than re-priming with the same
+        # synthesis fragment.
+        prefill_seq = self._clone_prefill_seq
+        self._clone_prefill_seq = ""
         self.app.push_screen(
-            DomesticatorModal(seq, feats, current_plasmid_name=current_name),
+            DomesticatorModal(
+                seq, feats, current_plasmid_name=current_name,
+                prefill_direct_seq=prefill_seq,
+            ),
             callback=_on_result,
         )
 
@@ -48767,19 +48783,29 @@ class SynthesisScreen(Screen):
                 )
                 return
             self.app._apply_record(rec)
+            # Capture the full sequence from the saved record so the
+            # Domesticator's direct-input TextArea gets the COMPLETE
+            # fragment atomically (TextArea.text setter is one shot).
+            # Reading from the SeqRecord (not the editor) ensures we
+            # transfer exactly what landed in the library, byte-for-
+            # byte, including any normalisation _commit_save applied.
+            full_seq = str(rec.seq).upper()
             _log_event(
                 "synthesis.clone_fragment.handoff",
                 id=self._loaded_id,
-                bp=len(seq), n_feats=len(feats),
+                bp=len(full_seq), n_feats=len(feats),
             )
             # Close synthesis, then open Parts Bin in auto-trigger
-            # mode. ``call_after_refresh`` lets the dismiss settle
-            # before the push so the screen-stack transition stays
-            # legible.
+            # mode with the prefill seq. ``call_after_refresh`` lets
+            # the dismiss settle before the push so the screen-stack
+            # transition stays legible.
             self.dismiss(None)
             self.app.call_after_refresh(
                 lambda: self.app.push_screen(
-                    PartsBinModal(auto_trigger_new_part=True),
+                    PartsBinModal(
+                        auto_trigger_new_part=True,
+                        clone_prefill_seq=full_seq,
+                    ),
                 ),
             )
         def _continue(ok: bool) -> None:
@@ -49614,11 +49640,17 @@ class DomesticatorModal(ModalScreen):
     ]
 
     def __init__(self, template_seq: str, feats: list[dict],
-                 current_plasmid_name: str = ""):
+                 current_plasmid_name: str = "",
+                 *, prefill_direct_seq: str = ""):
         super().__init__()
         self._template = template_seq.upper()
         self._feats    = feats   # from PlasmidMap._feats (the *current* plasmid)
         self._design_result:  "dict | None" = None   # result of _design_gb_primers
+        # Sweep #14 (2026-05-20) — Synthesis "Clone Fragment" entry
+        # point lands the composed fragment's full DNA sequence
+        # directly into the direct-input TextArea on mount, so the
+        # user doesn't have to paste or re-pick anything.
+        self._prefill_direct_seq: str = (prefill_direct_seq or "").upper()
         # ── Source-picker state ────────────────────────────────────────────
         # Four sources for the part's DNA:
         #   "direct"  : user types/pastes into a TextArea
@@ -49846,6 +49878,25 @@ class DomesticatorModal(ModalScreen):
     def on_mount(self) -> None:
         self._update_oh_display()
         self._refresh_source_panels()
+        # Sweep #14 — atomically seed the direct-input TextArea from
+        # the Synthesis "Clone Fragment" handoff. TextArea.text setter
+        # writes the full string in one operation, so the transfer is
+        # all-or-nothing and can't leave a half-typed fragment.
+        if self._prefill_direct_seq:
+            try:
+                ta = self.query_one("#dom-direct-seq", TextArea)
+                ta.text = self._prefill_direct_seq
+            except NoMatches:
+                _log.warning(
+                    "Domesticator: prefill skipped — #dom-direct-seq "
+                    "not mounted",
+                )
+            else:
+                _log_event(
+                    "domesticator.prefill",
+                    bp=len(self._prefill_direct_seq),
+                    source="clone_fragment",
+                )
         # Seed codon table registry with the built-in E. coli K12 entry
         # (shared with Mutagenize — registry caches across modals).
         try:
