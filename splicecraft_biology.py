@@ -52,12 +52,18 @@ _PATTERN_CACHE_MAX = 256
 
 
 def _iupac_pattern(site: str) -> "re.Pattern[str]":
-    pat = _PATTERN_CACHE.get(site)
+    # Sweep #22: case-fold cache key. Patterns ARE always built from
+    # `site.upper()` internally, so two calls with `"gaattc"` and
+    # `"GAATTC"` produce identical regex objects but pre-fix occupied
+    # two separate slots — wasting one cap unit per mixed-case
+    # variant. Normalize to uppercase before lookup AND store.
+    key = site.upper()
+    pat = _PATTERN_CACHE.get(key)
     if pat is not None:
-        _PATTERN_CACHE.move_to_end(site)
+        _PATTERN_CACHE.move_to_end(key)
         return pat
-    pat = re.compile("".join(_IUPAC_RE.get(c, c) for c in site.upper()))
-    _PATTERN_CACHE[site] = pat
+    pat = re.compile("".join(_IUPAC_RE.get(c, c) for c in key))
+    _PATTERN_CACHE[key] = pat
     if len(_PATTERN_CACHE) > _PATTERN_CACHE_MAX:
         _PATTERN_CACHE.popitem(last=False)
     return pat

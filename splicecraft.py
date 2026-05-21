@@ -1421,6 +1421,43 @@ def _safe_save_json(path: Path, entries: list, label: str,
         _log.error(msg)
         raise OSError(msg)
 
+    # Sweep #22: ancestor-chain symlink walk, mirroring the defense
+    # `_check_agent_write_path` already had (sweep #10 invariant #50).
+    # Pre-sweep, `_safe_save_json` only checked the path itself —
+    # a symlink at any DEEPER ancestor (e.g. `~/.local` → `/etc`)
+    # could redirect every write under the data dir. Walking the
+    # ancestor chain via per-segment `is_symlink()` closes the gap.
+    # Errors mid-walk surface as OSError so the caller's notify path
+    # tells the user something concrete went wrong.
+    cur = path.parent
+    seen: set = set()
+    while True:
+        try:
+            if cur.is_symlink():
+                msg = (
+                    f"Refusing to save {label}: ancestor directory "
+                    f"is a symlink at {cur}. Move/remove the symlink "
+                    f"and rerun."
+                )
+                _log.error(msg)
+                raise OSError(msg)
+        except OSError as exc:
+            # Re-raise our own refusal as-is; wrap other stat errors
+            # (permission, ENOENT mid-walk) as a refusal too — we
+            # can't tell whether an ancestor is safe.
+            if "Refusing to save" in str(exc):
+                raise
+            msg = (
+                f"Refusing to save {label}: could not stat ancestor "
+                f"{cur}: {exc}"
+            )
+            _log.error(msg)
+            raise OSError(msg) from exc
+        if cur.parent == cur or str(cur) in seen:
+            break
+        seen.add(str(cur))
+        cur = cur.parent
+
     # Schema-version stamp: preserve the highest observed version for
     # this file. A file written by a newer SpliceCraft (recorded via
     # `_OBSERVED_SCHEMA_VERSIONS` from `_safe_load_json`) must stamp

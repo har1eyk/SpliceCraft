@@ -263,6 +263,15 @@ Each has at least one test in `tests/`. Touching `_scan_restriction_sites`, `_rc
     * **`action_add_feature` callback wrapped via `_guard_callback`.** Same risk on the "Annotate" path — AddFeatureModal captured selection `(start, end)` at T=0; applying those coords to a NEW record's bases would silently corrupt the annotation. Wrap-aware location math doesn't help when the underlying bases are entirely different DNA.
     * **`_guard_callback` is the canonical helper.** Lives at `PlasmidApp._guard_callback`; captures `_record_load_counter` at wrap time, refuses to fire the wrapped callback if the counter shifted (every `_apply_record` bumps it). Pre-sweep, only `action_edit_seq` used it; sweep #21 brings `_open_feature_editor` + `action_add_feature` to parity. `action_transfer_annotations` uses an inline counter check (lines 73066-73082) because its state spans two modal callbacks; same semantic.
     * **What was checked but NOT fixed (verified-safe):** PartEditModal already does identity-based lookup `(name, sequence)` on save and refuses with a friendly notify if the part identity has been removed/modified by another writer — better than counter-based since it handles in-place mutations too. GrammarEditorModal serializes through `_cache_lock` via `_save_custom_grammars`. Both safe.
+63. **Sweep #22 — load-bearing function audit + file-migration futureproofing (2026-05-21).** Four parallel deep audits (I/O atomicity, sequence primitives, concurrency/state, logging plumbing) covering 17 functions across the codebase's most-used helpers. Most verified clean; two real defects fixed, one minor polish. Plus a futureproofing pass to make sure files imported from previous SpliceCraft versions migrate correctly. `tests/test_sweep22.py` (20 cases).
+    * **`_safe_save_json` ancestor-symlink walk (HIGH).** Pre-sweep, only `path.is_symlink()` was checked. Sweep #10 (invariant #50) added the full ancestor-chain walk to `_check_agent_write_path` but didn't propagate to `_safe_save_json` — a symlink at ANY deeper ancestor (e.g. `~/.local` → `/etc`) could redirect every save under the data dir. Now mirrors the agent-side defense: walks every ancestor up to the filesystem root, refuses on any symlink hit, surfaces a friendly OSError naming the symlinked ancestor. Errors mid-walk also refuse — can't tell if it's safe.
+    * **`_iupac_pattern` case-fold cache key (LOW polish).** Cache keys preserved input case (`"GAATTC"` vs `"gaattc"` occupied separate slots) but the internal regex was always built from `site.upper()`. Two slots, identical regex. Now normalizes the key to uppercase on lookup AND store. Saves cache slots on mixed-case calls; one-line fix in `splicecraft_biology.py`.
+    * **File migration framework — test coverage (futureproofing).** `_CURRENT_SCHEMA_VERSION` + `_ENTRY_MIGRATIONS` + `_migrate_entries` + `_extract_entries` (invariant #36) have been in place since ~0.5.x but NEVER exercised in production because no migrations are registered. When the schema finally bumps from v1 to v2, the framework needs to work correctly. `TestMigrationFramework` (11 cases) covers every path: bare-list legacy → v0 migrated; envelope v1 → no-op; envelope future-version → loads with warning; multi-step chain (v0→v1→v2); missing intermediate migrator → no-op pass-through; failed migrator → entry preserved + warning; non-dict garbage → skipped; non-list input → empty list + warning; no-op when at current → fresh list returned. `TestLegacyFileRoundTrip` verifies a bare-list file loaded + re-saved comes back as the envelope format. `TestMigrationCoverageEveryLoadPath` white-box asserts every `_load_*` helper routes through `_safe_load_json` so the framework applies uniformly — a future load helper that bypasses it would silently skip migrations.
+    * **`.dna` packet XML size-cap (declined-by-design).** The Explore agent flagged that `_iter_commercialsaas_packets` payloads pass to `_safe_xml_parse` without per-packet caps. Verified: the upstream `load_genbank` size check at `_SAFE_LOAD_JSON_MAX_BYTES = 1 GB` bounds the entire `.dna` file. Billion-laughs requires a DTD which `_safe_xml_parse` rejects. The remaining risk (legit-but-large XML packet → memory pressure) is "user opens their own 1 GB file" — not a remote-attacker DoS. Declined as defense-in-depth not worth the complexity.
+    * **Audit category 1 — I/O atomicity verified clean otherwise:** backup ordering correct (write `.bak` + `.bak.<ts>` BEFORE new content lands), atomic write sequence intact (mkstemp → fsync → close → os.replace → fsync_parent_dir), no quadratic encode patterns in JSON serialise, `_safe_file_size_check` correctly rejects symlinks/FIFOs/devices via lstat, DOCTYPE/ENTITY defense in `_safe_xml_parse` is case-insensitive streaming prologue scan (handles whitespace + comment prefixes).
+    * **Audit category 2 — sequence primitives verified clean:** all invariants #1–#9 hold. `_rc` IUPAC complement covers all 15 codes via stdlib `str.translate`; `_scan_restriction_sites` palindromic-forward-only + wrap-boundary + recut-modulo math all correct; `_feat_bounds` handles canonical CompoundLocation wrap re-encoding (start=0, end=total signal); `_smallest_enclosing_feature` bisect on `_feats_starts_sorted` correct + wrap-feature fallback bounded.
+    * **Audit category 3 — concurrency verified clean:** `_apply_record` orders `_current_record =` BEFORE `_record_load_counter += 1` so a worker reading the counter sees the new record (not torn state); every full-record-swap site bumps the counter; `_cache_lock` (RLock) wraps save+mirror in a single critical section across all 13 `_save_*` helpers per sweep #10 invariant #50; `_LIVE_APP_REF` lifecycle clean (set in `on_mount` + `_agent_dispatch`, cleared in `finally`).
+    * **Audit category 4 — logging plumbing verified clean:** `_repr_for_log` catches `SeqRecord` / `Seq` / `MutableSeq` / `bytes` / `bytearray` via class-name match (no BioPython import); `_log_event` 200-char string truncation + 300-char nested-dict bail; `_action_log` and `_timed` both use `@functools.wraps` + `_stacklevel=3` correctly; `_log.propagate = False` blocks BioPython's child-logger output from inheriting our level. Sacred invariant #38 (sequence content never leaked) verified — no `_log_event` callsite passes raw sequence fields.
 
 ## Persistent user preferences
 
@@ -405,6 +414,82 @@ Use `grep -n "^class \|^def " splicecraft.py` for live map. Test files 1:1 named
 `/home/seb/proteoscope/scriptoscope.py` (~8,600 lines) — same author, same single-file convention. Patterns to crib if seq-panel renders blow 33 ms/frame: thread-local `Console` for `_text_to_content`; two-level render cache (`_seq_render_cache` + `_content_cache`, LRU via `OrderedDict.move_to_end`); `@lru_cache(1)` availability probes.
 
 User is undecided whether to merge SpliceCraft / ScriptoScope / MitoShift / RefHunter / molCalc into one Textual app with modes. Single-file convention keeps the option open.
+
+## Borrow before respinning
+
+When building a new feature, look at this map FIRST. Almost every category has a working sibling in-tree whose patterns + invariants are already debugged. Respinning from scratch re-discovers bug classes that earlier sweeps already fixed.
+
+**New modal:**
+* Subclass `ModalScreen[ReturnType]` (Textual base).
+* Hosts an `Input` / `TextArea`? → `_blocks_undo: bool = True` AFTER docstring (invariant #41).
+* Mutates `_current_record`? → wrap dismiss callback via `self._guard_callback(cb, "Label")` so a canvas reload mid-modal drops the edit (sweep #21).
+* Looks up an item by idx on dismiss? → use **identity-based lookup** like `PartEditModal._on_result` does with `(name, sequence)` tuple — refuses + notifies on miss. Better than counter-based for in-place mutations.
+* Double-click race? → `_dismissed: bool` flag + `_dismiss_once(payload)` helper, applied to every exit path (sweep #10 invariant #50).
+* Add a row to `tests/test_modal_boundaries.py::_MODAL_CASES` (must fit 160×48).
+
+**New persisted JSON file (cache + reload semantics):**
+1. `_<NAME>_FILE = _DATA_DIR / "<name>.json"` constant.
+2. `_<name>_cache: "list | dict | None" = None` module-level global.
+3. `_load_<name>()` returns `_typed_clone(_<name>_cache)` (invariant #17, deepcopy on read).
+4. `_save_<name>()` wraps `_safe_save_json` + cache reseat inside `with _cache_lock:` (invariant #41 — concurrency).
+5. Register cache name in `_MASTER_DELETE_CACHE_ATTRS` (invariant #50).
+6. Register file attr in `_USER_DATA_FILE_ATTRS` (invariant #39).
+7. Add the `(file_attr, cache_attr)` tuple to `tests/conftest.py::_protect_user_data::_DATA_FILES`.
+8. Add to `_check_data_files` launch-check.
+9. Add the attr name to `RestoreFromBackupModal._TARGETS` so the Restore-from-backup UI covers it (sweep #9 invariant #43).
+10. Settings keys → add to `_SETTINGS_SCHEMA` with explicit type tuple + default (invariant #43).
+
+**New save action:**
+* All writes go through `_safe_save_json` (invariant #7) — never raw `json.dump`.
+* On failure call `_notify_save_failure(app, label, exc)` — fires the `save.failed` structured event AND surfaces a user toast (sweep #5).
+* Agent endpoints use `_agent_save_or_500(save_fn, label)` for uniform 500 shape.
+* If the save has a downstream mirror (active collection, active project, etc.), the mirror call MUST live inside the `_cache_lock` block (sweep #10 invariant #50).
+
+**New `action_*` method:**
+* Decorate `@_action_log("app.<area>.<verb>")` for the user-intent event (invariant #42). Decorator AND body events can co-exist — intent vs outcome are different signals.
+* Destructive? Use a confirm modal with default-focus on `No` (mirror `LibraryDeleteConfirmModal`). Stray Enter should never delete.
+
+**New `@work` worker:**
+* `@work(thread=True, exclusive=True, group="<name>")` for heavy / cancellable ops.
+* Capture `entry_counter = self._record_load_counter` at entry; bail in `_apply` callback if it shifted (invariant #28).
+* `except Exception as exc / _log.exception("...")` — invariant #1's explicit carve-out for worker bodies.
+* `try / finally` to drop any "in-flight" sentinels so an exception can't wedge the worker permanently (sweep #5 example: `_settings_flush_running`).
+
+**New agent endpoint:**
+* `@_agent_endpoint("name", write=True/False)` — `_AGENT_HANDLERS` registry is auto-populated.
+* Write endpoints: route through `_agent_save_or_500`; check `_agent_dirty_guard(app, payload)` if the canvas dirty state matters.
+* Inputs use `_sanitize_label`, `_sanitize_bases`, `_sanitize_accession`, etc. — never trust raw payload values.
+* Idx-based payloads: capture `_record_load_counter`, check in `_apply` (invariant #28).
+* Listing endpoints with large payloads (library, search): hard-cap at endpoint-specific limit; `_AGENT_RESPONSE_MAX_BYTES = 50 MB` is the global backstop.
+* Add a row to `test_agent_api.py` covering happy + error paths.
+
+**New picker / DataTable:**
+* Same sort for display AND for cursor → idx resolution (invariant #33). Easiest: `key=` parameter on `add_row` (pre-empts the bug class — `PlasmidPickerModal` is the reference).
+* If using `cursor_row` int + sort, build explicit `_row_to_entry_idx` + `_entry_idx_to_row` maps.
+
+**New feature-list iteration:**
+* Use `_feat_bounds(feat, total) → (start, end, strand)` for wrap-aware extraction (sweep #5).
+* Use `_smallest_enclosing_feature(bp)` not O(N) `_feat_at` for bp-lookup (sweep #5).
+* `_feat_len(start, end, total)` for wrap-aware distance — naive `end - start` is wrong on origin-spanning features (invariant #8).
+
+**New HTTP fetch:**
+* `resp.read(MAX + 1)` + bail-if-exceeded — never `resp.read()` raw (invariant #20).
+* Existing caps: `_PYPI_MAX_RESPONSE_BYTES`, `_NCBI_MAX_RESPONSE_BYTES`, `_KAZUSA_MAX_RESPONSE_BYTES`, `_PLASMIDSAURUS_*_MAX_BYTES`.
+* Retry pattern: 1 try + 250 ms backoff (mirrors `_fetch_latest_pypi_version`, `fetch_genbank`).
+
+**New XML parsing:**
+* Route through `_safe_xml_parse` — rejects DOCTYPE / ENTITY (invariant #19). Includes NCBI responses AND `.dna` history packets.
+
+**New logging point:**
+* User actions: `@_action_log("app.area.verb")` decorator.
+* State changes: `_log_event("<noun>.<verb>", **fields)`.
+* Heavy ops: `@_timed("op.area.name", threshold_ms=50)` wrapper.
+* **SACRED: never log sequence content** — `_repr_for_log` truncates/summarises automatically (invariant #38). `seq.chunk_dump` and similar route through structured events that hash or length-only the payload.
+
+**New file-system traversal:**
+* `path.lstat()` + `stat.S_ISREG(st.st_mode)` — refuses symlinks outright (sweep #10 invariant #50).
+* `_safe_save_json` already covers symlink refusal for writes.
+* Bulk imports: walk via `path.iterdir()` not `os.walk(followlinks=True)`.
 
 ## For future agents
 
