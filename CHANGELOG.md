@@ -14,6 +14,12 @@
 
 ---
 
+## [0.9.16] — 2026-05-22
+
+_(auto-generated changelog — no notable commits found since the previous release)_
+
+---
+
 ## [0.9.15] — 2026-05-22
 
 _(auto-generated changelog — no notable commits found since the previous release)_

@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.15"
+__version__ = "0.9.16"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -1403,6 +1403,132 @@ def _diff_lost_entries(prev_entries: list, new_entries: list) -> list:
     return lost
 
 
+# ── Data-dir write authorisation (L2 chokepoint, 2026-05-22) ───────────────
+#
+# Caught failure: 2026-05-22 an ad-hoc verify probe at /tmp/sc_probe.py
+# `import splicecraft as sc; sc._save_collections([{"name": "Default", ...}])`
+# wrote directly to the user's real 160 MB `collections.json`. The data
+# was recoverable from `.bak` thanks to the four-layer safety net, but
+# the failure class — "any unsandboxed import can mutate user data via a
+# single function call" — was unacceptable.
+#
+# This module-level gate refuses every `_safe_save_json` write unless
+# the running process has explicitly opted in. The four sanctioned
+# callers flip the flag:
+#
+#   1. `PlasmidApp.main()` — the real app, after argv parsing.
+#   2. `conftest.py::_protect_user_data` — pytest fixture (which has
+#      already monkey-patched every `_*_FILE` attr to tmp_path).
+#   3. Agent HTTP server `serve_forever` — `--agent-api` flag.
+#   4. `_authorize_writes_for_sandbox(data_dir)` — explicit opt-in for
+#      verifier scripts; refuses unless `data_dir` is a tempdir.
+#
+# Probes that just `import splicecraft` + `_save_*` get a hard
+# `RuntimeError` instead of nuking user data. The CLAUDE.md sacred-
+# block at the top of the file documents the rule for future agents.
+
+_SAVES_AUTHORIZED: bool = False
+_SAVES_AUTHORIZED_REASON: str = ""
+
+# L3 catastrophic-shrink token. The shrink guard refuses writes that
+# would discard >90% of an existing-cached file's entries (base
+# population ≥10) unless this token is positive. Legitimate
+# catastrophic shrinks (`_restore_from_backup`, programmatic wipes)
+# arm the token via `_allow_catastrophic_shrink()` for the duration
+# of the save. Refcount semantics so nested re-entry is safe.
+_CATASTROPHIC_SHRINK_TOKEN: int = 0
+
+
+@contextmanager
+def _allow_catastrophic_shrink():
+    """Context manager that arms the L3 shrink guard's bypass token
+    for the duration of the `with` block. Legitimate large-shrink
+    paths (Restore-from-backup writing a tiny backup over a large
+    live file; programmatic data wipes that route through
+    `_safe_save_json` rather than `unlink`) wrap their save call:
+
+        with _allow_catastrophic_shrink():
+            _save_library(small_list)
+
+    Refcounted so nested calls (e.g. a Restore that triggers a
+    cache-mirror save during its own write) compose. The token
+    decrement runs in `finally` so an exception inside the block
+    can't leave the gate stuck open."""
+    global _CATASTROPHIC_SHRINK_TOKEN
+    _CATASTROPHIC_SHRINK_TOKEN += 1
+    try:
+        yield
+    finally:
+        _CATASTROPHIC_SHRINK_TOKEN -= 1
+
+
+def _authorize_writes(*, reason: str) -> None:
+    """Internal: flip the authorisation flag. Three legitimate callers
+    use this (main, conftest, agent server). Verifier scripts go
+    through `_authorize_writes_for_sandbox` so they pay for proof that
+    the data dir is sandboxed."""
+    global _SAVES_AUTHORIZED, _SAVES_AUTHORIZED_REASON
+    _SAVES_AUTHORIZED = True
+    _SAVES_AUTHORIZED_REASON = reason
+
+
+def _authorize_writes_for_sandbox(data_dir: Path) -> None:
+    """Public: verifier / probe entry point. Refuses unless `data_dir`
+    looks like a tempdir (path component starts with the OS tmp prefix,
+    or is under `/tmp`). Designed so a probe that forgot to set
+    `XDG_DATA_HOME` can't talk its way past the gate.
+
+    Usage from a sandboxed verifier:
+
+        import os, tempfile
+        os.environ["XDG_DATA_HOME"] = tempfile.mkdtemp(prefix="sc-")
+        import splicecraft as sc
+        assert "sc-" in str(sc._DATA_DIR)
+        sc._authorize_writes_for_sandbox(sc._DATA_DIR)
+        # ... now _save_* works against the tempdir ...
+    """
+    import tempfile as _tempfile
+    tmp_root = Path(_tempfile.gettempdir()).resolve()
+    dd = Path(data_dir).resolve()
+    try:
+        dd.relative_to(tmp_root)
+    except ValueError:
+        raise RuntimeError(
+            f"refusing to authorise writes against {dd!r}: not under "
+            f"{tmp_root!r}. Set XDG_DATA_HOME=$(mktemp -d) BEFORE "
+            f"`import splicecraft` so `_DATA_DIR` resolves to a tempdir."
+        )
+    _authorize_writes(reason=f"sandbox at {dd}")
+
+
+def _refuse_unauthorized_write(path: Path, label: str) -> None:
+    """Raise `RuntimeError` if the current process has not opted in
+    to data-dir writes via `_authorize_writes` /
+    `_authorize_writes_for_sandbox`. The message names the exact path
+    that was about to be written so the caller can see what would
+    have been clobbered.
+
+    Routed through `_safe_save_json`'s first line so every persisted-
+    file write (library / collections / primers / parts / features /
+    grammars / entry vectors / codon tables / experiments / gels /
+    protein motifs / settings) is gated. Pre-fix, an ad-hoc
+    `import splicecraft; sc._save_collections([])` was enough to nuke
+    160 MB of user data."""
+    if _SAVES_AUTHORIZED:
+        return
+    raise RuntimeError(
+        f"refusing to write {label!r} → {path}: data-dir writes are "
+        f"not authorised in this process. If you're running a verifier "
+        f"or probe, sandbox `XDG_DATA_HOME=$(mktemp -d)` BEFORE "
+        f"`import splicecraft` and call "
+        f"`splicecraft._authorize_writes_for_sandbox(splicecraft._DATA_DIR)`. "
+        f"See CLAUDE.md sacred block + "
+        f"`.claude/skills/verifier-splicecraft.md`. "
+        f"(Authorisation is set automatically by `main()`, the pytest "
+        f"`_protect_user_data` fixture, and the agent HTTP server.)"
+    )
+
+
 def _safe_save_json(path: Path, entries: list, label: str,
                     schema_version: "int | None" = None) -> None:
     """Atomically write `entries` as JSON to `path`, backing up first.
@@ -1425,6 +1551,14 @@ def _safe_save_json(path: Path, entries: list, label: str,
          legitimately deleted entries), but the dropped data is never
          silently destroyed.
 
+    **L2 write authorisation** (2026-05-22): first line refuses with
+    `RuntimeError` if the process has not flipped `_SAVES_AUTHORIZED`
+    via one of the four sanctioned callers (`main()`, pytest fixture,
+    agent server, sandboxed verifier). Caught failure: a probe that
+    `import`'d splicecraft from `/tmp/sc_probe.py` and called
+    `_save_collections([])` nuked the user's real 160 MB collections
+    file. The gate makes that scenario raise instead of write.
+
     Errors (disk full, RO mount, permission denied) are logged AND
     re-raised so callers can `notify` the user. Silent swallow used
     to desync UI state from disk — sacred invariant #7.
@@ -1439,6 +1573,7 @@ def _safe_save_json(path: Path, entries: list, label: str,
     subsequent atomic-write would overwrite the link target. Refuse
     up front so neither leak nor overwrite can happen.
     """
+    _refuse_unauthorized_write(path, label)
     import os
     import tempfile
 
@@ -1577,12 +1712,24 @@ def _safe_save_json(path: Path, entries: list, label: str,
         except OSError:
             _log.warning("Could not read prior content for %s", path)
 
-    # Step 2: shrink guard with spillover. Any shrink logs a warning;
-    # a *suspicious* shrink (>50% loss, base population >=5) ALSO
-    # spills the discarded entries to `lost_entries/` so the data
-    # never silently disappears. The threshold is tuned to flag
-    # accidental nukes while letting routine "delete a few plasmids"
-    # CRUD pass quietly.
+    # Step 2: shrink guard with spillover + L3 catastrophic-shrink
+    # refusal (2026-05-22).
+    #
+    # **Three tiers** as the loss ratio escalates:
+    #
+    #   * ANY shrink → log a warning.
+    #   * SUSPICIOUS shrink (>50% loss, base population >=5) → spill
+    #     the discarded entries to `lost_entries/` so data is never
+    #     silently destroyed. Save still proceeds (user may have
+    #     legitimately bulk-deleted).
+    #   * CATASTROPHIC shrink (>90% loss, base population >=10) →
+    #     **REFUSE the save** with `RuntimeError` unless wrapped in
+    #     `_allow_catastrophic_shrink()`. The 00:37 incident — running
+    #     app at startup writing 43 bytes over a 156 MB library — is
+    #     exactly this signature. Legitimate catastrophic shrinks
+    #     (`_restore_from_backup` restoring a tiny backup over a large
+    #     live file, hypothetical Master-Delete-via-save flows) opt in
+    #     via the context manager.
     if existing_count > 0 and len(entries) < existing_count:
         _log.warning(
             "SHRINK GUARD: %s is being overwritten with %d entries "
@@ -1592,6 +1739,8 @@ def _safe_save_json(path: Path, entries: list, label: str,
         )
         suspicious = (existing_count >= 5
                       and len(entries) < existing_count // 2)
+        catastrophic = (existing_count >= 10
+                        and len(entries) * 10 < existing_count)
         if suspicious and prev_entries is not None:
             lost = _diff_lost_entries(prev_entries, entries)
             spilled = _spill_lost_entries(path, lost, label)
@@ -1601,6 +1750,19 @@ def _safe_save_json(path: Path, entries: list, label: str,
                     "overwrite — recoverable on user request.",
                     len(lost), label, spilled,
                 )
+        if catastrophic and _CATASTROPHIC_SHRINK_TOKEN <= 0:
+            raise RuntimeError(
+                f"refusing to write {label!r}: catastrophic shrink "
+                f"({existing_count} → {len(entries)} entries, "
+                f"{100 * (existing_count - len(entries)) / existing_count:.1f}% loss). "
+                f"This signature matches the 2026-05-22 incident "
+                f"(running app at startup writing 43 bytes over a "
+                f"156 MB library). The discarded entries have been "
+                f"spilled to `lost_entries/` so nothing is lost. "
+                f"If this save is genuinely intentional (Restore-from-"
+                f"backup, programmatic data wipe), wrap the call in "
+                f"`with splicecraft._allow_catastrophic_shrink():`."
+            )
 
     # Step 3: atomic write — tempfile in same dir → os.replace.
     payload = {"_schema_version": schema_version, "entries": entries}
@@ -1983,7 +2145,13 @@ def _restore_from_backup(target_path: Path, source_path: Path,
             f"backup {source_path.name} is not a recognisable "
             f"{label} payload"
         )
-    _safe_save_json(target_path, entries, label)
+    # Restore can legitimately write a small backup over a large live
+    # file (e.g. user picks `library.json.bak.<old>` after a recent
+    # bulk add). Opt in to the L3 catastrophic-shrink bypass so the
+    # restore isn't blocked by the same guard that catches accidental
+    # wipes.
+    with _allow_catastrophic_shrink():
+        _safe_save_json(target_path, entries, label)
     return len(entries)
 
 
@@ -81493,6 +81661,13 @@ def main():
         # error() → exit(2). The default error path writes to stderr
         # already; just propagate the exit code.
         raise
+
+    # L2 chokepoint (2026-05-22): authorise the data-dir writes the
+    # real app needs. Done AFTER argv parsing so a `--version` /
+    # `--help` invocation (which exits before touching files) doesn't
+    # arm writes. Everything below — TUI launch, agent server, the
+    # `logs` / `update` subcommands — can save to `_DATA_DIR`.
+    _authorize_writes(reason="PlasmidApp.main()")
 
     skip_splash = parsed.skip_splash
     enable_agent_api = parsed.agent_api

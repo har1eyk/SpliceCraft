@@ -252,10 +252,14 @@ class TestListAndRestoreBackups:
 
     def test_lists_lost_entries_spillover(self, tmp_path):
         p = tmp_path / "lib.json"
-        # Trigger a suspicious shrink so the spillover lands.
+        # Trigger a suspicious shrink so the spillover lands. 20 → 1
+        # also triggers the L3 catastrophic-shrink refusal — bypass
+        # since the test scenario is "verify spillover lands AND is
+        # listed", not "verify L3 refusal".
         sc._safe_save_json(p, [{"id": str(i)} for i in range(20)],
                             "library")
-        sc._safe_save_json(p, [{"id": "0"}], "library")
+        with sc._allow_catastrophic_shrink():
+            sc._safe_save_json(p, [{"id": "0"}], "library")
         backups = sc._list_recoverable_backups(p)
         assert any(b["kind"] == "lost_entries" for b in backups)
 
@@ -323,7 +327,13 @@ class TestSafeSaveJsonShrinkSpillover:
             {"id": str(i), "name": f"p{i}"} for i in range(20)
         ], "library")
         # Drop to 1 entry — losing 19 is well past the 50% threshold.
-        sc._safe_save_json(p, [{"id": "0", "name": "p0"}], "library")
+        # 20 → 1 is also a 95% drop which trips the L3 catastrophic-
+        # shrink refusal (2026-05-22), so wrap in the explicit bypass
+        # the way `_restore_from_backup` does. This test is verifying
+        # the SPILL-AND-PROCEED tier 2 behaviour, not the tier 3
+        # refusal — `test_catastrophic_shrink_refused` covers L3.
+        with sc._allow_catastrophic_shrink():
+            sc._safe_save_json(p, [{"id": "0", "name": "p0"}], "library")
         spill_dir = tmp_path / "lost_entries"
         assert spill_dir.exists()
         spilled = list(spill_dir.glob("lib-*.json"))
@@ -364,6 +374,98 @@ class TestSafeSaveJsonShrinkSpillover:
         sc._safe_save_json(p, [{"id": "kept"}], "library")
         # Live file holds only the new state.
         assert json.loads(p.read_text())["entries"] == [{"id": "kept"}]
+
+
+class TestSafeSaveJsonCatastrophicShrinkRefusal:
+    """L3 of the data-safety net (added 2026-05-22 after the
+    `collections.json` 160 MB → 104 B incident). Any save that
+    would discard >90% of a populated file (base population ≥10)
+    raises ``RuntimeError`` instead of writing — unless the caller
+    explicitly opts in via the `_allow_catastrophic_shrink()`
+    context manager (used by `_restore_from_backup` and other
+    legitimate large-shrink paths). Tier 2 spillover still runs
+    BEFORE the refusal so the in-memory entries hit disk in
+    `lost_entries/` even when the write itself is refused."""
+
+    def test_catastrophic_shrink_refused(self, tmp_path):
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)],
+                            "library")
+        # 20 → 1 is 95% loss with base ≥ 10 → catastrophic.
+        with pytest.raises(RuntimeError, match="catastrophic shrink"):
+            sc._safe_save_json(p, [{"id": "0"}], "library")
+        # Live file unchanged (still 20 entries).
+        assert len(json.loads(p.read_text())["entries"]) == 20
+
+    def test_catastrophic_shrink_with_bypass_succeeds(self, tmp_path):
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)],
+                            "library")
+        with sc._allow_catastrophic_shrink():
+            sc._safe_save_json(p, [{"id": "0"}], "library")
+        # Live file now holds only the bypassed state.
+        assert json.loads(p.read_text())["entries"] == [{"id": "0"}]
+
+    def test_under_threshold_not_refused(self, tmp_path):
+        """A 50% shrink (10 → 5) is tier-2 suspicious but not tier-3
+        catastrophic — saves through normally."""
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(10)],
+                            "library")
+        sc._safe_save_json(p, [{"id": "0"}, {"id": "1"},
+                                  {"id": "2"}, {"id": "3"},
+                                  {"id": "4"}], "library")
+        # Still wrote the 5-entry state — only tier 3 refuses.
+        assert len(json.loads(p.read_text())["entries"]) == 5
+
+    def test_small_base_not_refused(self, tmp_path):
+        """Below 10 prior entries the L3 refusal is suppressed —
+        a fresh library shouldn't trip the guard on the first deep
+        prune."""
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(9)],
+                            "library")
+        sc._safe_save_json(p, [], "library")
+        # Empty save landed.
+        assert json.loads(p.read_text())["entries"] == []
+
+    def test_spill_still_lands_before_refusal(self, tmp_path):
+        """The lost_entries spill runs BEFORE the catastrophic refusal
+        check, so a tier-3 refusal still leaves the dropped data
+        recoverable from disk."""
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)],
+                            "library")
+        with pytest.raises(RuntimeError):
+            sc._safe_save_json(p, [{"id": "0"}], "library")
+        # Spillover file exists even though the live write was refused.
+        spill_dir = tmp_path / "lost_entries"
+        assert spill_dir.exists()
+        spilled = list(spill_dir.glob("lib-*.json"))
+        assert len(spilled) >= 1
+
+
+class TestSavesAuthorizedChokepoint:
+    """L2 of the data-safety net (added 2026-05-22). Every
+    `_safe_save_json` first checks `_SAVES_AUTHORIZED` and raises
+    if the process hasn't flipped it (via `main()`, the pytest
+    fixture, the agent server, or `_authorize_writes_for_sandbox`).
+    """
+
+    def test_unauthorized_save_refused(self, tmp_path, monkeypatch):
+        # Temporarily un-authorise (the autouse fixture flipped it
+        # True; flip back to False here to simulate an ad-hoc script
+        # that imported splicecraft without sandboxing).
+        monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", False)
+        with pytest.raises(RuntimeError, match="not authorised"):
+            sc._safe_save_json(tmp_path / "x.json", [], "test")
+
+    def test_authorize_for_sandbox_rejects_non_tempdir(self, tmp_path):
+        # Pretend the data dir is the user's real home — `_authorize_
+        # writes_for_sandbox` must refuse so a probe can't fake-sandbox.
+        import pathlib
+        with pytest.raises(RuntimeError, match="not under"):
+            sc._authorize_writes_for_sandbox(pathlib.Path.home() / ".local")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

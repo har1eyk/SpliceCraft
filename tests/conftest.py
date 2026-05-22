@@ -113,6 +113,17 @@ def _protect_user_data(tmp_path, monkeypatch):
                          str(tmp_path / "update-backups"))
     monkeypatch.setattr(sc, "_DATA_DIR", tmp_path)
 
+    # L2 chokepoint authorisation (2026-05-22). Every `_save_*` flows
+    # through `_safe_save_json` which now refuses unauthorised writes.
+    # The fixture has just monkey-patched every `_*_FILE` attr to
+    # `tmp_path`, so writes are safe. Use `monkeypatch.setattr` so the
+    # flag automatically resets to False on test teardown — function-
+    # scoped, so a subsequent test starts fresh and the gate cannot
+    # leak into a non-test that imports splicecraft post-pytest.
+    monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", True)
+    monkeypatch.setattr(sc, "_SAVES_AUTHORIZED_REASON",
+                          "pytest _protect_user_data")
+
     # Skip the launch splash for every test by default — the splash modal
     # blocks input until dismissed, which would break every `pilot.click`
     # / `app.action_*` call. Tests that exercise the splash explicitly

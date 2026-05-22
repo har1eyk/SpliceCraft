@@ -2,6 +2,25 @@
 
 Agent handoff. Read before touching the codebase.
 
+## ⚠ SACRED: data-dir safety (READ FIRST)
+
+The user's plasmid library + collections + primers + parts live in `~/.local/share/splicecraft/` (or `$XDG_DATA_HOME/splicecraft/`). **The data is the product.** A wrong write here destroys hours-to-years of user work. Three hard rules:
+
+1. **Never `import splicecraft` from an ad-hoc script (`/tmp/*.py`, REPL, probe) without first sandboxing `XDG_DATA_HOME`.** `_DATA_DIR` is computed at import time and won't budge afterwards. Sandbox by:
+   ```python
+   import os, tempfile; os.environ["XDG_DATA_HOME"] = tempfile.mkdtemp(prefix="sc-")
+   os.environ.setdefault("SPLICECRAFT_SKIP_LOCK", "1")
+   import splicecraft as sc
+   assert "sc-" in str(sc._DATA_DIR), f"unsandboxed: {sc._DATA_DIR}"
+   sc._authorize_writes_for_sandbox(sc._DATA_DIR)   # L2 chokepoint opt-in
+   ```
+2. **`_save_*` helpers are nuclear-coded.** Calling `_save_collections`, `_save_library`, `_save_primers`, `_save_parts_bin`, `_save_features`, `_save_grammars`, `_save_entry_vectors`, `_save_codon_tables`, `_save_protein_motifs`, `_save_experiments`, `_save_experiment_projects`, `_save_gels`, or `_safe_save_json` directly from outside the four sanctioned callers (`PlasmidApp.main()`, pytest `_protect_user_data` fixture, agent HTTP server, sandboxed verifier harness) raises `RuntimeError` since the L2 chokepoint landed — sandbox first or use the GUI.
+3. **Verifier scripts always go through `.claude/skills/verifier-splicecraft.md`.** It enforces the sandbox + authorization at the top. Don't roll your own.
+
+**Caught failure (2026-05-22):** an unsandboxed `/tmp/sc_probe.py` ran `_save_collections([{"name": "Default", "plasmids": []}])` for test setup. It wrote directly to the user's real 160 MB `collections.json`, rotating the previous good state to `.bak`. The four-layer safety net + lost-entries spillover recovered the data, but the lesson stands: there is NO "I'll be careful this once" version of writing to the data dir. Sandbox or refuse.
+
+---
+
 Bioinformatician + Claude. **Near-single-file architecture** — `splicecraft.py` (~65k lines) + extracted biology module `splicecraft_biology.py` + stdlib-only sidecar `splicecraft_cli.py`. Single-file constraint is intentional (greppable); biology extraction is the first deliberate exception (pure functions/constants, no `PlasmidApp` coupling). See `CONTRIBUTING.md` three-test rule.
 
 ## What is SpliceCraft?
