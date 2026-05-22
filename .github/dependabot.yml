@@ -1,0 +1,57 @@
+# Dependabot watches our two dependency surfaces and opens PRs when a
+# newer version of a tracked dep lands upstream. CI (test.yml) auto-
+# runs against each PR, so a passing green tick = the bump didn't
+# break us and can be merged with one click.
+#
+# Why two ecosystems:
+#   * `github-actions` — actions/checkout, actions/setup-python, and
+#     the pypa publish action all rev on their own cadence and
+#     deprecate older Node runtimes periodically (we last bumped
+#     v4→v6 on 2026-05-22 after a Node-20 deprecation warning).
+#     Without this entry we'd discover the next deprecation by
+#     watching a CI run go red.
+#   * `pip` — pyproject.toml floor pins for runtime + dev deps.
+#     Catches pyright/ruff/textual/biopython point-releases so
+#     we don't drift behind the IDE's resolved version (which
+#     surfaced as duplicated diagnostics-vs-CI mismatch before
+#     pyright>=1.1.409 landed).
+#
+# Schedule: weekly on Monday — frequent enough to catch issues
+# fast, infrequent enough that PRs don't pile up. Mid-week
+# releases still get caught in the next cycle; nothing urgent
+# is gated on this.
+#
+# `open-pull-requests-limit: 5` keeps the dashboard from
+# drowning; if more than 5 deps go stale at once, the older ones
+# wait. Major-version bumps land as separate PRs (so we can
+# inspect breaking changes individually); patch + minor bumps
+# group together to reduce review overhead.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "deps"

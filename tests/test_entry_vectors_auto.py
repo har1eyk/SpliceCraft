@@ -366,6 +366,225 @@ async def test_entry_vectors_modal_lists_all_gb_l0_roles():
 
 
 @pytest.mark.asyncio
+async def test_entry_vectors_modal_hint_uses_bound_vector_marker():
+    """When a vector is bound to a role, the Hint column must show
+    the antibiotic detected from the vector's gb_text — NOT the
+    role's canonical `_CONSTRUCTOR_BACKBONES["selection"]` default.
+
+    Regression (2026-05-22): a user binding an AmpR-bearing custom
+    α-vector to Alpha1 still saw "Spectinomycin" in the hint column
+    because `_refresh_table` rendered the convention default
+    unchanged. Detection-from-bound now overrides it.
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    from io import StringIO
+    from Bio import SeqIO
+    vec_rec = SeqRecord(Seq("ATGC" * 25), id="amp_alpha",
+                         name="amp_alpha")
+    vec_rec.annotations["molecule_type"] = "DNA"
+    vec_rec.annotations["topology"]      = "circular"
+    vec_rec.features.append(SeqFeature(
+        FeatureLocation(0, 30), type="CDS",
+        qualifiers={"label": ["AmpR"]},
+    ))
+    buf = StringIO()
+    SeqIO.write([vec_rec], buf, "genbank")
+    sc._set_entry_vector(
+        "gb_l0",
+        {"name": "amp_alpha", "size": 100, "gb_text": buf.getvalue()},
+        role="Alpha1",
+    )
+    app = sc.PlasmidApp()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        modal = sc.EntryVectorsModal("gb_l0")
+        app.push_screen(modal)
+        await pilot.pause()
+        await pilot.pause()
+        from textual.widgets import DataTable
+        t = modal.query_one("#ev-table", DataTable)
+        # Find the Alpha1 row and inspect its Hint cell.
+        alpha1_row = None
+        for row_key in t.rows:
+            if str(row_key.value) == "Alpha1":
+                alpha1_row = row_key
+                break
+        assert alpha1_row is not None, "Alpha1 row missing"
+        cells = t.get_row(alpha1_row)
+        # Hint is the third column. The rendered Text object stringifies
+        # to its plain content — substring-check for the detected marker.
+        hint_text = str(cells[2])
+        assert "Ampicillin" in hint_text, (
+            f"expected 'Ampicillin' in hint, got {hint_text!r}"
+        )
+        assert "Spectinomycin" not in hint_text, (
+            f"convention default leaked through: {hint_text!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_entry_vectors_modal_hint_omits_marker_when_unbound():
+    """An unbound role's hint must NOT carry a hardcoded antibiotic.
+    The 2026-05-22 overhaul removed `_CONSTRUCTOR_BACKBONES`'
+    "selection" defaults; an unbound row shows only the slot
+    descriptor so the user isn't misled into thinking the role
+    enforces a particular marker.
+    """
+    app = sc.PlasmidApp()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        modal = sc.EntryVectorsModal("gb_l0")
+        app.push_screen(modal)
+        await pilot.pause()
+        await pilot.pause()
+        from textual.widgets import DataTable
+        t = modal.query_one("#ev-table", DataTable)
+        alpha1_row = None
+        for row_key in t.rows:
+            if str(row_key.value) == "Alpha1":
+                alpha1_row = row_key
+                break
+        assert alpha1_row is not None
+        cells = t.get_row(alpha1_row)
+        hint_text = str(cells[2])
+        # No hardcoded antibiotic in the hint when unbound.
+        for forbidden in ("Spectinomycin", "Kanamycin", "Ampicillin"):
+            assert forbidden not in hint_text, (
+                f"hardcoded {forbidden!r} leaked into unbound hint: "
+                f"{hint_text!r}"
+            )
+        # The slot descriptor still surfaces so the user knows
+        # which role this row represents.
+        assert "slot" in hint_text.lower()
+
+
+class TestMarkerWarnings:
+    """`EntryVectorsModal._marker_warnings` enforces two rules from
+    the Golden Braid iteration protocol:
+
+      1. Intra-pair: slots within a family (α1/α2, Ω1/Ω2, …) must
+         share an antibiotic.
+      2. Cross-family: distinct families must use distinct
+         antibiotics, so each iteration cycle's bench selection
+         is unambiguous.
+
+    Partial bindings (fewer than 2 bound + detected per family,
+    or only one family bound) skip the corresponding check.
+    """
+
+    def test_no_warnings_when_consistent_alpha_amp_omega_kan(self):
+        family_markers = {
+            "Alpha": [("Alpha1", "Ampicillin"), ("Alpha2", "Ampicillin")],
+            "Omega": [("Omega1", "Kanamycin"), ("Omega2", "Kanamycin")],
+        }
+        assert sc.EntryVectorsModal._marker_warnings(family_markers) == []
+
+    def test_warns_on_alpha_pair_mismatch(self):
+        family_markers = {
+            "Alpha": [("Alpha1", "Ampicillin"), ("Alpha2", "Spectinomycin")],
+        }
+        warnings = sc.EntryVectorsModal._marker_warnings(family_markers)
+        assert len(warnings) == 1
+        assert "Alpha" in warnings[0]
+        assert "Ampicillin" in warnings[0]
+        assert "Spectinomycin" in warnings[0]
+        assert "pair mismatch" in warnings[0].lower()
+
+    def test_warns_on_omega_pair_mismatch(self):
+        family_markers = {
+            "Omega": [("Omega1", "Kanamycin"), ("Omega2", "Hygromycin")],
+        }
+        warnings = sc.EntryVectorsModal._marker_warnings(family_markers)
+        assert len(warnings) == 1
+        assert "Omega" in warnings[0]
+
+    def test_warns_on_alpha_omega_collision(self):
+        family_markers = {
+            "Alpha": [("Alpha1", "Spectinomycin"), ("Alpha2", "Spectinomycin")],
+            "Omega": [("Omega1", "Spectinomycin"), ("Omega2", "Spectinomycin")],
+        }
+        warnings = sc.EntryVectorsModal._marker_warnings(family_markers)
+        # No pair mismatch, but α and Ω share Spectinomycin.
+        assert len(warnings) == 1
+        assert "Spectinomycin" in warnings[0]
+        assert "Alpha" in warnings[0] and "Omega" in warnings[0]
+
+    def test_warns_on_pair_mismatch_and_collision_together(self):
+        family_markers = {
+            "Alpha": [("Alpha1", "Ampicillin"), ("Alpha2", "Kanamycin")],
+            "Omega": [("Omega1", "Kanamycin"), ("Omega2", "Kanamycin")],
+        }
+        warnings = sc.EntryVectorsModal._marker_warnings(family_markers)
+        # 1 pair mismatch (Alpha) + 1 collision (Kanamycin shared
+        # with Omega via Alpha2).
+        assert len(warnings) == 2
+
+    def test_no_warning_when_only_one_alpha_bound(self):
+        """Single bound role in a family can't be checked for
+        intra-pair mismatch — user is mid-config, not in error."""
+        family_markers = {
+            "Alpha": [("Alpha1", "Ampicillin")],
+        }
+        assert sc.EntryVectorsModal._marker_warnings(family_markers) == []
+
+    def test_no_warning_when_only_one_family_bound(self):
+        family_markers = {
+            "Alpha": [("Alpha1", "Ampicillin"), ("Alpha2", "Ampicillin")],
+        }
+        assert sc.EntryVectorsModal._marker_warnings(family_markers) == []
+
+    def test_empty_input_yields_no_warnings(self):
+        assert sc.EntryVectorsModal._marker_warnings({}) == []
+
+
+@pytest.mark.asyncio
+async def test_entry_vectors_modal_status_shows_pair_mismatch():
+    """End-to-end: binding two Alpha vectors with different markers
+    surfaces a pair-mismatch warning in the modal's status line."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    from io import StringIO
+    from Bio import SeqIO
+
+    def _gb_with(marker_label: str) -> str:
+        r = SeqRecord(Seq("ATGC" * 25), id="v", name="v")
+        r.annotations["molecule_type"] = "DNA"
+        r.annotations["topology"]      = "circular"
+        r.features.append(SeqFeature(
+            FeatureLocation(0, 30), type="CDS",
+            qualifiers={"label": [marker_label]},
+        ))
+        buf = StringIO()
+        SeqIO.write([r], buf, "genbank")
+        return buf.getvalue()
+
+    sc._set_entry_vector(
+        "gb_l0",
+        {"name": "amp_a1", "size": 100, "gb_text": _gb_with("AmpR")},
+        role="Alpha1",
+    )
+    sc._set_entry_vector(
+        "gb_l0",
+        {"name": "spec_a2", "size": 100, "gb_text": _gb_with("SpecR")},
+        role="Alpha2",
+    )
+    app = sc.PlasmidApp()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        modal = sc.EntryVectorsModal("gb_l0")
+        app.push_screen(modal)
+        await pilot.pause()
+        await pilot.pause()
+        from textual.widgets import Static
+        status = modal.query_one("#ev-status", Static)
+        text = str(status.render())
+        assert "pair mismatch" in text.lower()
+
+
+@pytest.mark.asyncio
 async def test_entry_vectors_modal_blocks_undo():
     """Modal sets `_blocks_undo = True` so app-level Ctrl+Z doesn't
     fire underneath while the user mutates persistent state."""

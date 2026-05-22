@@ -176,9 +176,22 @@ Full feature reference: [`docs/features.md`](docs/features.md).
   Collections → New Collection, SpliceCraft scans every plasmid,
   identifies acceptors (UPD / α1 / α2 / Ω1 / Ω2 for Golden Braid),
   and auto-binds them to their roles. Manual review + override via
-  Settings → Entry Vectors…. Configured acceptors flip TU
+  Settings → Entry Vectors. Configured acceptors flip TU
   classification from the lenient fallback to strict per-acceptor
   matching with explicit role labels.
+- **Vector-derived selection markers (no hardcoded antibiotics).**
+  Each TU / MOD save reads the bound entry vector's annotations and
+  stamps the assembled L1+ part with the actual antibiotic — a
+  custom α-vector carrying AmpR propagates *Ampicillin*, not the
+  canonical pDGB3-α *Spectinomycin* default (which has been removed
+  from `_CONSTRUCTOR_BACKBONES` entirely). The EntryVectorsModal
+  status line warns on (a) intra-pair mismatch — α1 ≠ α2 or
+  Ω1 ≠ Ω2 markers — and (b) cross-family collision — α and Ω
+  carry the same antibiotic, so iteration cycles wouldn't be
+  distinguishable by selection. A one-shot launch-time migration
+  re-detects markers on every existing parts-bin row whose stored
+  value was the historical Spec / Kan default; manually-edited
+  markers (Carb, Hyg, …) are preserved.
 - **Enzyme collections.** Manage named subsets of the master enzyme
   catalog (built-in NEB ∪ user-added customs) via
   Enzymes → Enzyme collections…. Two-pane layout: master list with

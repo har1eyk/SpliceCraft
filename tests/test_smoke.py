@@ -800,13 +800,15 @@ class TestDeleteFocusRouting:
         ])
 
     async def _await_row_count(self, app, target: int, pilot,
-                                  max_ticks: int = 20) -> "sc.DataTable":
+                                  max_ticks: int = 60) -> "sc.DataTable":
         """Poll the library DataTable for ``row_count == target``.
         Returns the table once it converges. Sweep #16 helper —
         Textual's message-bus dispatch of modal-dismiss callbacks
         can take more ticks than a single 50 ms pause provides in
         slower CI runners, and the delete UI updates run on that
-        bus. Common-case completes in <100 ms; cap at 1 s."""
+        bus. Common-case completes in <100 ms; cap raised to 3 s
+        (2026-05-22) after a pytest-xdist parallel run flaked at
+        the 20-tick / 1-second ceiling under load."""
         t: "sc.DataTable | None" = None
         for _ in range(max_ticks):
             await pilot.pause(0.05)

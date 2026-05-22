@@ -8199,9 +8199,11 @@ class TestPersistedAssemblyMetadata:
         assert e["oh3"]      == "CGCT"
         assert e["grammar"]  == "gb_l0"
         assert e["backbone"] == "alpha1_vec"
-        # Marker propagates from the GB Alpha1 role's selection
-        # antibiotic (Spectinomycin per `_CONSTRUCTOR_BACKBONES`).
-        assert e["marker"] == "Spectinomycin"
+        # Marker lands as "—" when the bound vector's gb_text carries
+        # no annotated antibiotic (featureless stub here). Post-2026-
+        # 05-22 the role's hardcoded default no longer applies —
+        # detection is the only source of truth.
+        assert e["marker"] == "—"
         # gb_text is the source of truth for L1+ chaining; must NOT
         # be empty so the next-cycle cloner can digest this plasmid.
         assert e["gb_text"]
@@ -8213,6 +8215,89 @@ class TestPersistedAssemblyMetadata:
         lib_entries = sc._load_library()
         assert len(lib_entries) == 1
         assert lib_entries[0]["name"] == "MyTU"
+
+    def test_clone_assembly_marker_detects_from_bound_vector(
+            self, isolated_library, isolated_parts_bin):
+        """When the bound entry vector carries an explicit antibiotic
+        annotation (e.g. an AmpR CDS), the assembled L1+ part's
+        ``marker`` must reflect that — NOT the role's hardcoded
+        convention default from ``_CONSTRUCTOR_BACKBONES``.
+
+        Regression: a user with custom α-vectors carrying AmpR (FFE
+        2/3-style) reported every TU assembled through Alpha1/Alpha2
+        was stamped ``"Spectinomycin"`` because the save path read
+        the role's canonical pDGB3 default instead of the bound
+        vector's annotations. See `_detect_selection_marker`
+        fallthrough in `_persist_assembly`.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from io import StringIO
+        from Bio import SeqIO
+        vec_rec = SeqRecord(Seq("ATGC" * 25), id="amp_alpha",
+                             name="amp_alpha")
+        vec_rec.annotations["molecule_type"] = "DNA"
+        vec_rec.annotations["topology"]      = "circular"
+        vec_rec.features.append(SeqFeature(
+            FeatureLocation(0, 30), type="CDS",
+            qualifiers={"label": ["AmpR"], "gene": ["bla"]},
+        ))
+        buf = StringIO()
+        SeqIO.write([vec_rec], buf, "genbank")
+        amp_gb_text = buf.getvalue()
+        # Sanity: detection must see AmpR before we test the save path.
+        assert sc._detect_selection_marker(amp_gb_text) == "Ampicillin"
+        rec = SeqRecord(Seq("AAAA" * 100), id="MyAmpTU", name="MyAmpTU")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "amp_alpha", "gb_text": amp_gb_text},
+            parts=[
+                {"name": "P", "oh5": "GGAG", "oh3": "TGAC", "level": 0},
+                {"name": "T", "oh5": "TGAC", "oh3": "CGCT", "level": 0},
+            ],
+            backbone_role="Alpha1",
+        )
+        bin_entries = sc._load_parts_bin()
+        assert len(bin_entries) == 1
+        # The fix: marker reflects vector's annotation, not the
+        # Alpha1 role's "Spectinomycin" convention default.
+        assert bin_entries[0]["marker"] == "Ampicillin"
+
+    def test_clone_assembly_marker_falls_back_to_dash_when_undetected(
+            self, isolated_library, isolated_parts_bin):
+        """When the bound entry vector has no recognizable antibiotic
+        annotation, ``marker`` lands as ``"—"`` — NOT a hardcoded
+        role default. The 2026-05-22 selection-marker overhaul
+        removed all hardcoded antibiotics from
+        ``_CONSTRUCTOR_BACKBONES``; the only source of truth is now
+        the vector's annotated features. A featureless vector means
+        the user must manually edit the saved part's marker.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("AAAA" * 100), id="MyTU", name="MyTU")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "bare_alpha",
+                           "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[
+                {"name": "P", "oh5": "GGAG", "oh3": "TGAC", "level": 0},
+                {"name": "T", "oh5": "TGAC", "oh3": "CGCT", "level": 0},
+            ],
+            backbone_role="Alpha1",
+        )
+        bin_entries = sc._load_parts_bin()
+        assert len(bin_entries) == 1
+        assert bin_entries[0]["marker"] == "—"
 
     def test_clone_assembly_disambiguates_id_collision(
             self, isolated_library, isolated_parts_bin):
@@ -8300,6 +8385,147 @@ class TestPersistedAssemblyMetadata:
         assert e["gb_text"]
         # Source-parts list captures the L2 MODs.
         assert e["source_parts"] == ["MOD_x", "MOD_y"]
+
+
+class TestMigratePartsBinMarkersFromVector:
+    """`_migrate_parts_bin_markers_from_vector` rescans every
+    parts-bin entry's `gb_text` and corrects the stored `marker`
+    when the historical role-default (Spectinomycin / Kanamycin)
+    doesn't match what the bound vector actually carries.
+
+    Backstory: pre-2026-05-22 the Constructor save path stamped
+    `marker` from `_CONSTRUCTOR_BACKBONES[gid][role]["selection"]`
+    regardless of the bound entry vector's annotation. Users
+    running custom α-vectors with AmpR (or any non-canonical
+    selection) accumulated bin rows labelled "Spectinomycin" /
+    "Kanamycin". This one-shot migration fixes those rows in
+    place without disturbing manually-edited markers.
+    """
+
+    @staticmethod
+    def _gb_with_marker(marker_label: str) -> str:
+        """Build a minimal valid GenBank string whose features carry
+        the requested marker label so `_detect_selection_marker`
+        returns the matching display name."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from io import StringIO
+        from Bio import SeqIO
+        rec = SeqRecord(Seq("ATGC" * 25), id="vec", name="vec")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, 30), type="CDS",
+            qualifiers={"label": [marker_label]},
+        ))
+        buf = StringIO()
+        SeqIO.write([rec], buf, "genbank")
+        return buf.getvalue()
+
+    def test_corrects_spec_default_for_amp_vector(
+            self, isolated_parts_bin):
+        amp_gb = self._gb_with_marker("AmpR")
+        sc._save_parts_bin([
+            {"name": "TU1", "marker": "Spectinomycin",
+             "gb_text": amp_gb, "level": 1},
+        ])
+        sc._migrate_parts_bin_markers_from_vector()
+        out = sc._load_parts_bin()
+        assert out[0]["marker"] == "Ampicillin"
+
+    def test_corrects_kan_default_for_amp_vector(
+            self, isolated_parts_bin):
+        amp_gb = self._gb_with_marker("AmpR")
+        sc._save_parts_bin([
+            {"name": "TU1", "marker": "Kanamycin",
+             "gb_text": amp_gb, "level": 1},
+        ])
+        sc._migrate_parts_bin_markers_from_vector()
+        out = sc._load_parts_bin()
+        assert out[0]["marker"] == "Ampicillin"
+
+    def test_preserves_correct_spec_marker(
+            self, isolated_parts_bin):
+        """Stored "Spectinomycin" + vector that actually has SmR →
+        detection returns "Spectinomycin", no change needed."""
+        spec_gb = self._gb_with_marker("SmR")
+        sc._save_parts_bin([
+            {"name": "TU1", "marker": "Spectinomycin",
+             "gb_text": spec_gb, "level": 1},
+        ])
+        sc._migrate_parts_bin_markers_from_vector()
+        out = sc._load_parts_bin()
+        assert out[0]["marker"] == "Spectinomycin"
+
+    def test_preserves_manually_edited_marker(
+            self, isolated_parts_bin):
+        """A custom marker like "Carbenicillin" must NOT be touched
+        even when detection would return something else — the user
+        set it deliberately."""
+        amp_gb = self._gb_with_marker("AmpR")
+        sc._save_parts_bin([
+            {"name": "TU1", "marker": "Carbenicillin",
+             "gb_text": amp_gb, "level": 1},
+        ])
+        sc._migrate_parts_bin_markers_from_vector()
+        out = sc._load_parts_bin()
+        assert out[0]["marker"] == "Carbenicillin"
+
+    def test_skips_empty_gb_text(self, isolated_parts_bin):
+        """Bin entries with no `gb_text` (L0 parts; legacy rows) can't
+        be re-detected — leave the stored marker alone."""
+        sc._save_parts_bin([
+            {"name": "L0", "marker": "Spectinomycin",
+             "gb_text": "", "level": 0},
+        ])
+        sc._migrate_parts_bin_markers_from_vector()
+        out = sc._load_parts_bin()
+        assert out[0]["marker"] == "Spectinomycin"
+
+    def test_skips_when_detection_returns_none(
+            self, isolated_parts_bin):
+        """Featureless gb_text → detection returns None → don't
+        overwrite the default with None. Preserves canonical pDGB3
+        vectors that lack explicit AmpR/KanR labels."""
+        sc._save_parts_bin([
+            {"name": "TU1", "marker": "Spectinomycin",
+             "gb_text": "LOCUS x 1 bp DNA\n//\n", "level": 1},
+        ])
+        sc._migrate_parts_bin_markers_from_vector()
+        out = sc._load_parts_bin()
+        assert out[0]["marker"] == "Spectinomycin"
+
+    def test_idempotent(self, isolated_parts_bin):
+        """Marker file blocks re-runs: a second invocation must NOT
+        rescan (verified by mutating the bin between runs and
+        confirming the post-marker state is preserved)."""
+        amp_gb = self._gb_with_marker("AmpR")
+        sc._save_parts_bin([
+            {"name": "TU1", "marker": "Spectinomycin",
+             "gb_text": amp_gb, "level": 1},
+        ])
+        sc._migrate_parts_bin_markers_from_vector()
+        # First run corrected the marker; flip it back to simulate
+        # the user re-running the migration. Second invocation must
+        # be a no-op (marker file already exists).
+        sc._save_parts_bin([
+            {"name": "TU1", "marker": "Spectinomycin",
+             "gb_text": amp_gb, "level": 1},
+        ])
+        sc._migrate_parts_bin_markers_from_vector()
+        out = sc._load_parts_bin()
+        # Second run skipped → "Spectinomycin" survives.
+        assert out[0]["marker"] == "Spectinomycin"
+
+    def test_marker_file_created_even_with_no_changes(
+            self, isolated_parts_bin):
+        """Empty bin / no-change runs still drop the marker file so
+        next launch skips the scan instead of re-running it."""
+        sc._save_parts_bin([])
+        sc._migrate_parts_bin_markers_from_vector()
+        marker_file = sc._PARTS_BIN_FILE.parent / ".markers_redetected"
+        assert marker_file.exists()
 
 
 class TestEverySaveIsAFullPlasmid:

@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.16"
+__version__ = "0.9.17"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -4377,7 +4377,7 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
 
     # ── Degenerate / IUPAC recognition sequences ───────────────────────────────
     "AccI":      ("GTMKAC",       2,  4),  # GT^MKAC / CAKM^TG       2-nt 5' overhang
-    "AclI":      ("AACGTT",       2,  4),  # AA^CGTT                 3' overhang
+    "AclI":      ("AACGTT",       2,  4),  # AA^CGTT / TTGC^AA       2-nt 5' overhang CG
     "AfeI":      ("AGCGCT",       3,  3),  # AGC^GCT                 blunt (Eco47III isoschizomer)
     "AflII":     ("CTTAAG",       1,  5),  # C^TTAAG                 MfeI-compatible ends
     "AflIII":    ("ACRYGT",       1,  5),  # A^CRYGT                 MluI-compatible ends
@@ -4788,6 +4788,87 @@ def _migrate_legacy_custom_enzyme_csv() -> None:
         name=legacy_name, n_enzymes=len(names),
         was_active=was_active,
     )
+
+
+def _migrate_parts_bin_markers_from_vector() -> None:
+    """One-shot: re-detect ``marker`` on parts_bin entries whose stored
+    value came from the pre-2026-05-22 Constructor save path's
+    hardcoded role default (Alpha=Spec, Omega=Kan).
+
+    Pre-fix the Constructor wrote ``marker`` from
+    ``_CONSTRUCTOR_BACKBONES[gid][role]["selection"]`` — a custom
+    Alpha vector carrying AmpR was silently stamped "Spectinomycin"
+    because the role default trumped the vector's actual annotation.
+
+    This walks `parts_bin.json` and updates entries that meet ALL of:
+
+      * Have a non-empty `gb_text` (the assembled plasmid)
+      * Carry one of the two historical role defaults
+        ("Spectinomycin" or "Kanamycin")
+      * `_detect_selection_marker(gb_text)` returns a DIFFERENT
+        marker than what's stored
+
+    Manually-edited markers ("Carbenicillin", "Hygromycin", …) are
+    NEVER overwritten — only the auto-saved role defaults get
+    re-evaluated. Idempotent via `.markers_redetected` so subsequent
+    launches skip cleanly. Save failure leaves the marker file
+    absent (so next launch retries) without disturbing the .bak.
+    """
+    # Marker lives next to parts_bin.json so the test fixture's
+    # `_PARTS_BIN_FILE` redirect carries it into tmp without
+    # touching the real data dir.
+    marker_file = _PARTS_BIN_FILE.parent / ".markers_redetected"
+    if marker_file.exists():
+        return
+    try:
+        bin_entries = _load_parts_bin()
+    except Exception:
+        _log.exception("parts_bin marker re-detect: load failed")
+        return
+    historical_defaults = {"Spectinomycin", "Kanamycin"}
+    changes: list[tuple[str, str, str]] = []
+    for part in bin_entries:
+        gb = str(part.get("gb_text") or "")
+        if not gb:
+            continue
+        current = str(part.get("marker") or "")
+        if current not in historical_defaults:
+            continue
+        detected = _detect_selection_marker(gb)
+        if not detected or detected == current:
+            continue
+        changes.append((str(part.get("name") or "?"), current, detected))
+        part["marker"] = detected
+    if changes:
+        try:
+            _save_parts_bin(bin_entries)
+        except Exception:
+            _log.exception(
+                "parts_bin marker re-detect: save failed; deferring "
+                "marker file write so next launch retries"
+            )
+            return
+        for name, old, new in changes:
+            _log_event(
+                "parts_bin.marker_redetect",
+                name=name, old_marker=old, new_marker=new,
+            )
+        _log_event(
+            "parts_bin.marker_redetect.summary",
+            updated=len(changes),
+            scanned=len(bin_entries),
+        )
+    try:
+        marker_file.parent.mkdir(parents=True, exist_ok=True)
+        marker_file.write_text(
+            f"redetected {len(changes)} of {len(bin_entries)} parts\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        _log.warning(
+            "parts_bin marker re-detect: marker file write failed: %r",
+            exc,
+        )
 
 
 _RESTR_PALETTE: list[str] = [
@@ -16543,7 +16624,7 @@ class LibraryPanel(Widget):
                         tail += f", … (+{n_fail - 3} more)"
                     summary = f"Imported {n_ok}, failed {n_fail}: {tail}"
                     self.app.notify(
-                        f"{summary}. Auto-detecting entry vectors…",
+                        f"{summary}. Auto-detecting entry vectors",
                         severity="warning", timeout=4, markup=False,
                     )
                     self._auto_bind_worker(list(entries), name)
@@ -24601,11 +24682,11 @@ class EnzymeCollectionsModal(ModalScreen):
     #ec-right-pane  { width: 1fr; padding-left: 1; }
     #ec-master-label { color: $accent; margin-bottom: 1; }
     #ec-search { margin-bottom: 1; }
-    #ec-master-table { height: 18; margin-bottom: 1; }
+    #ec-master-table { height: 1fr; margin-bottom: 1; }
     #ec-add-master { width: 100%; }
     #ec-list-mode, #ec-editor-mode { height: 100%; }
     #ec-list-label, #ec-editor-label { color: $accent; margin-bottom: 1; }
-    #ec-catalogs-table, #ec-current-table { height: 18; }
+    #ec-catalogs-table, #ec-current-table { height: 1fr; }
     #ec-editor-header { height: 3; margin-bottom: 1; }
     #ec-editor-header Button { margin-right: 1; }
     #ec-list-btns, #ec-list-btns2, #ec-editor-btns {
@@ -24621,7 +24702,7 @@ class EnzymeCollectionsModal(ModalScreen):
         color: $accent; margin-top: 1;
     }
     #ec-status { margin-top: 1; min-height: 1; }
-    #ec-btns { height: 3; margin-top: 1; }
+    #ec-btns { height: 3; }
     #ec-btns Button { margin-right: 1; }
     """
 
@@ -24688,7 +24769,7 @@ class EnzymeCollectionsModal(ModalScreen):
                                 zebra_stripes=True,
                             )
                             yield Button(
-                                "+ Add new enzyme…",
+                                "+ Add new enzyme",
                                 id="ec-add-master",
                             )
                         # RIGHT: two modes; we mount BOTH and toggle `display`
@@ -24708,8 +24789,8 @@ class EnzymeCollectionsModal(ModalScreen):
                                 with Horizontal(id="ec-list-btns"):
                                     yield Button("Open",      id="ec-open",
                                                  variant="primary")
-                                    yield Button("New…",      id="ec-new")
-                                    yield Button("Rename…",   id="ec-rename")
+                                    yield Button("New",       id="ec-new")
+                                    yield Button("Rename",    id="ec-rename")
                                 with Horizontal(id="ec-list-btns2"):
                                     yield Button("Duplicate", id="ec-duplicate")
                                     yield Button("Delete",    id="ec-delete",
@@ -25562,17 +25643,17 @@ class SettingsModal(ModalScreen):
             yield Static("Advanced", classes="set-group-label")
             with Horizontal(classes="set-row"):
                 yield Button(
-                    "Cloning grammars…", id="set-grammars",
+                    "Cloning grammars", id="set-grammars",
                 )
                 yield Button(
-                    "Entry Vectors…", id="set-entry-vectors",
+                    "Entry Vectors", id="set-entry-vectors",
                 )
             with Horizontal(classes="set-row"):
                 yield Button(
-                    "Enzyme collections…", id="set-enzyme-collections",
+                    "Enzyme collections", id="set-enzyme-collections",
                 )
                 yield Button(
-                    "Restore from backup…", id="set-restore",
+                    "Restore from backup", id="set-restore",
                 )
             yield Static("", id="set-status", markup=True)
             with Horizontal(id="set-btns"):
@@ -29433,7 +29514,7 @@ def _resolve_acceptor_role(
     Golden Braid binary assembly: the level-up enzyme is the INNER
     cutter for the α (L1) family; the primary enzyme is the INNER
     cutter for the Ω (L2) family. The outer pair encodes the
-    forward/reverse "1/2" suffix.
+    slot "1/2" suffix (GGAG/GTCA → slot 1, GTCA/CGCT → slot 2).
 
     Returns the role name (matching `_CONSTRUCTOR_BACKBONES`) or
     None for grammars whose acceptor layout we don't know.
@@ -38002,7 +38083,7 @@ class FeatureLibraryScreen(Screen):
                 yield Button("Edit",            id="btn-flib-edit")
                 yield Button("Rename",          id="btn-flib-rename")
                 yield Button("Duplicate",       id="btn-flib-dup")
-                yield Button("Remove",          id="btn-flib-remove",
+                yield Button("Delete",          id="btn-flib-remove",
                              variant="error")
                 yield Button("Color",           id="btn-flib-color")
                 yield Button("Cycle Strand",    id="btn-flib-strand")
@@ -38633,10 +38714,10 @@ class GrammarEditorModal(ModalScreen):
                         yield Static(self._entry_vector_summary(),
                                      id="ged-entry-info", markup=True)
                 with Horizontal(id="ged-entry-btns"):
-                    yield Button("Pick from library…",
+                    yield Button("Pick from library",
                                  id="btn-ged-entry-lib",
                                  disabled=self._create_mode)
-                    yield Button("Open file…",
+                    yield Button("Open file",
                                  id="btn-ged-entry-file",
                                  disabled=self._create_mode)
                     yield Button("Clear",
@@ -39612,10 +39693,14 @@ class EntryVectorsModal(ModalScreen):
                 hint = f"{note} · {sel}" if note else sel
             display = role_key
             # Pretty Greek letter display for the canonical pDGB3 roles.
-            if role_key == "Alpha1":  display = "α1 — L1 forward"
-            elif role_key == "Alpha2":  display = "α2 — L1 reverse"
-            elif role_key == "Omega1":  display = "Ω1 — L2 forward"
-            elif role_key == "Omega2":  display = "Ω2 — L2 reverse"
+            # The "1/2" suffix is a slot (overhang-pair) distinction,
+            # NOT a strand orientation — TUs cloned alone into α1 vs α2
+            # land in the same direction; the slot only affects relative
+            # orientation in multipartite Ω assemblies.
+            if role_key == "Alpha1":  display = "α1 — L1 slot 1"
+            elif role_key == "Alpha2":  display = "α2 — L1 slot 2"
+            elif role_key == "Omega1":  display = "Ω1 — L2 slot 1"
+            elif role_key == "Omega2":  display = "Ω2 — L2 slot 2"
             out.append((role_key, display, hint))
         return out
 
@@ -39641,7 +39726,7 @@ class EntryVectorsModal(ModalScreen):
             yield Static("", id="ev-status", markup=True)
             with Horizontal(id="ev-btns"):
                 yield Button(
-                    "Pick / Change…", id="btn-ev-pick",
+                    "Pick / Change", id="btn-ev-pick",
                     variant="primary",
                 )
                 yield Button("Clear row", id="btn-ev-clear")
@@ -39674,14 +39759,30 @@ class EntryVectorsModal(ModalScreen):
         t.clear()
         roles = self._roles_for_grammar(self._grammar_id)
         n_bound = 0
+        backbones = _CONSTRUCTOR_BACKBONES.get(self._grammar_id, {})
+        # `family_markers[family]` → list of (role_key, detected_marker)
+        # for every BOUND role with a detectable marker. Drives the
+        # intra-pair-mismatch + cross-family-collision warnings below.
+        family_markers: dict[str, list[tuple[str, str]]] = {}
         for role_key, display, hint in roles:
             ev = _get_entry_vector(self._grammar_id, role_key)
+            detected: "str | None" = None
             if ev:
                 n_bound += 1
                 name = ev.get("name") or "(unnamed)"
                 size = ev.get("size") or 0
                 vector_text = Text(
                     f"{name}  ·  {size:,} bp", style="bold green",
+                )
+                detected = _detect_selection_marker(
+                    str(ev.get("gb_text", "") or "")
+                )
+                note = (
+                    backbones.get(role_key, {}).get("note") or ""
+                ).strip()
+                marker_label = detected or "(no marker detected)"
+                hint = (
+                    f"{note} · {marker_label}" if note else marker_label
                 )
             else:
                 vector_text = Text("(not set)", style="dim italic")
@@ -39691,13 +39792,78 @@ class EntryVectorsModal(ModalScreen):
                 Text(hint, style="dim"),
                 key=role_key or "_upd_",
             )
+            # Bucket bound + detected entries by family prefix
+            # (Alpha1/Alpha2 → "Alpha", Omega1/Omega2 → "Omega",
+            # Acceptor1/Acceptor2 → "Acceptor"). The trailing digit
+            # is the slot index — strip it to get the family.
+            if role_key and detected:
+                fam_match = re.match(r"^(.*?)(\d+)$", role_key)
+                if fam_match:
+                    family = fam_match.group(1)
+                    family_markers.setdefault(family, []).append(
+                        (role_key, detected),
+                    )
         grammar_name = _all_grammars().get(
             self._grammar_id, {},
         ).get("name", self._grammar_id)
-        status.update(
+        warnings = self._marker_warnings(family_markers)
+        status_lines = [
             f"  [dim]{grammar_name}: {n_bound}/{len(roles)} "
             f"role(s) bound.[/dim]"
-        )
+        ]
+        for w in warnings:
+            status_lines.append(f"  [yellow]⚠ {w}[/yellow]")
+        status.update("\n".join(status_lines))
+
+    @staticmethod
+    def _marker_warnings(
+        family_markers: "dict[str, list[tuple[str, str]]]",
+    ) -> "list[str]":
+        """Return user-facing warnings for selection-marker
+        inconsistencies across the bound entry vectors.
+
+        Two rules, both per the Golden Braid iteration protocol:
+
+          1. **Intra-pair**: roles within a family (α1+α2, Ω1+Ω2,
+             Acceptor1+Acceptor2) must carry the SAME marker, since
+             the bench-side selection is per-iteration-level, not
+             per-slot.
+          2. **Cross-family**: distinct families (α vs Ω) MUST carry
+             DIFFERENT markers, otherwise the iteration cycle's
+             selection step can't tell which level just assembled.
+
+        Partial bindings (fewer than 2 bound + detected per family,
+        or only one family bound) skip the corresponding check —
+        the user is mid-config, not in a final inconsistent state.
+        """
+        warnings: list[str] = []
+        # Intra-family pair mismatch.
+        for family, members in family_markers.items():
+            if len(members) < 2:
+                continue
+            uniq = {m[1] for m in members}
+            if len(uniq) > 1:
+                detail = ", ".join(
+                    f"{rk}={mk}" for rk, mk in members
+                )
+                warnings.append(
+                    f"{family} pair mismatch ({detail}) — both slots "
+                    f"should carry the same antibiotic"
+                )
+        # Cross-family collision.
+        families = list(family_markers.keys())
+        for i, fam1 in enumerate(families):
+            for fam2 in families[i + 1:]:
+                m1 = {m[1] for m in family_markers[fam1]}
+                m2 = {m[1] for m in family_markers[fam2]}
+                shared = m1 & m2
+                for marker in sorted(shared):
+                    warnings.append(
+                        f"{fam1} and {fam2} both carry {marker} — "
+                        f"iteration cycles won't be distinguishable by "
+                        f"selection"
+                    )
+        return warnings
 
     def _selected_role(self) -> "str | None":
         try:
@@ -48030,11 +48196,11 @@ class ExperimentsScreen(Screen):
                               cursor_type="row",
                               zebra_stripes=True)
             with Horizontal(id="exp-attach-btns"):
-                yield Button("Attach…", id="btn-exp-attach-grid",
+                yield Button("Attach", id="btn-exp-attach-grid",
                               variant="primary")
                 yield Button("Insert into body",
                               id="btn-exp-insert-attach")
-                yield Button("Remove…", id="btn-exp-remove-attach",
+                yield Button("Delete", id="btn-exp-remove-attach",
                               variant="error")
 
     def on_mount(self) -> None:
@@ -54585,7 +54751,7 @@ class DomesticatorModal(ModalScreen):
                 with Horizontal(id="dom-vector-row"):
                     yield Static(self._entry_vector_summary(active_gid),
                                  id="dom-vector-info", markup=True)
-                    yield Button("Change…",
+                    yield Button("Change",
                                  id="btn-dom-vector-change",
                                  variant="default")
                 # ── Part name + type ──
@@ -57265,21 +57431,25 @@ _CONSTRUCTOR_GRAMMARS_FOR_TABS: list[tuple[str, str]] = [
 # can click a button to switch within a grammar's options.
 _CONSTRUCTOR_BACKBONES: dict[str, dict[str, dict]] = {
     "gb_l0": {
-        # Backbone roles are slots, not specific plasmids. Each
-        # binds to whatever plasmid the user picks via the
-        # Constructor's "Change…" button; the binding persists in
-        # `entry_vectors.json` keyed by (grammar_id, role). The
-        # selection-marker note is informational — it only tells
-        # the user what selection antibiotic the corresponding L1
-        # vector should carry.
-        "Alpha1": {"selection": "Spectinomycin", "note": "L1 alpha forward"},
-        "Alpha2": {"selection": "Spectinomycin", "note": "L1 alpha reverse"},
-        "Omega1": {"selection": "Kanamycin",     "note": "L1 omega forward"},
-        "Omega2": {"selection": "Kanamycin",     "note": "L1 omega reverse"},
+        # Backbone roles are slots, not specific plasmids. Each binds
+        # to whatever plasmid the user picks via EntryVectorsModal;
+        # the binding persists in `entry_vectors.json` keyed by
+        # (grammar_id, role). Selection markers are NOT hardcoded —
+        # they come from each bound vector's annotated features via
+        # `_detect_selection_marker`. The EntryVectorsModal warns when:
+        #   * Roles in a family pair carry different markers
+        #     (α1 ≠ α2, Ω1 ≠ Ω2 — the bench protocol assumes one
+        #     antibiotic per iteration level).
+        #   * Two families share a marker (e.g. α and Ω both carry
+        #     Spectinomycin — selection can't distinguish levels).
+        "Alpha1": {"note": "L1 alpha slot 1"},
+        "Alpha2": {"note": "L1 alpha slot 2"},
+        "Omega1": {"note": "L2 omega slot 1"},
+        "Omega2": {"note": "L2 omega slot 2"},
     },
     "moclo_plant": {
-        "Acceptor1": {"selection": "Kanamycin", "note": "MoClo L1 forward acceptor"},
-        "Acceptor2": {"selection": "Kanamycin", "note": "MoClo L1 reverse acceptor"},
+        "Acceptor1": {"note": "MoClo L1 acceptor slot 1"},
+        "Acceptor2": {"note": "MoClo L1 acceptor slot 2"},
     },
 }
 
@@ -58096,7 +58266,14 @@ class ConstructorModal(ModalScreen):
                     style="bold red",
                 )
             else:
-                bb_sel  = bb.get("selection", "")
+                # Mirror the save-path's detect-from-bound-vector logic
+                # so the banner's "(Vector, Spec selection)" hint matches
+                # the marker that actually lands on the saved L1+ part.
+                bb_sel = (
+                    _detect_selection_marker(
+                        str(bound.get("gb_text", "") or "")
+                    ) if isinstance(bound, dict) else None
+                ) or bb.get("selection", "")
                 bb_note = bb.get("note", "")
                 # The chain above leaves `bound` as a non-None dict here
                 # (the `not has_vector` branch already short-circuited
@@ -58330,7 +58507,7 @@ class ConstructorModal(ModalScreen):
         ran sync on the name-modal callback — a 10-part L2 MOD
         assembly into a 100 MB library could freeze for 5–15 s.
         """
-        self.app.notify("Assembling and saving…", timeout=4, markup=False)
+        self.app.notify("Assembling and saving", timeout=4, markup=False)
         entry_counter = getattr(self.app, "_record_load_counter", 0)
         self._save_to_library_worker(
             gid=gid, grammar=grammar, entry_vector=entry_vector,
@@ -58744,15 +58921,19 @@ class ConstructorModal(ModalScreen):
         # source for the next assembly cycle.
         target_level = source_level + 1
         target_label = _part_level_label(target_level)
-        # Selection marker propagates from the picked backbone role's
-        # spec (the L1/L2/Lx role determines which antibiotic the
-        # assembled vector confers). The user's role declaration in
-        # `_CONSTRUCTOR_BACKBONES` is the canonical source.
-        selection = (
-            _CONSTRUCTOR_BACKBONES.get(gid, {})
-            .get(backbone_role, {})
-            .get("selection", "")
+        # Selection marker comes from the actual antibiotic annotated
+        # in the bound entry vector's gb_text — never hardcoded by
+        # role. A vector with no recognizable AmpR/KanR/SpecR
+        # annotation lands a "—" placeholder so the user knows the
+        # part needs a manual marker edit. Matches the convention
+        # used by Domesticator/Load Parts (`_detect_selection_marker
+        # (gb_text) or "—"`).
+        detected = (
+            _detect_selection_marker(
+                str(entry_vector.get("gb_text", "") or ""),
+            ) if isinstance(entry_vector, dict) else None
         )
+        selection = detected or "—"
         # Compute the level-up overhangs by digesting the assembled
         # plasmid with the next-cycle's enzyme. These are the
         # overhangs the constructor's TU→MOD (etc.) palette + lane
@@ -59004,10 +59185,12 @@ class ConstructorModal(ModalScreen):
 
         Reads the per-role override from `entry_vectors.json`
         keyed by ``(gid, role)`` — what the user picked via the
-        Constructor's "Change…" button. With no role selected
-        (or no override set) the banner shows a "pick from
-        library" hint plus the role's expected selection marker
-        from `_CONSTRUCTOR_BACKBONES`.
+        Constructor's "Change" button. Bound vectors display
+        name + size + the marker detected from gb_text annotations.
+        Unbound roles show a "pick from library" hint; per the
+        2026-05-22 overhaul we no longer leak a hardcoded
+        antibiotic default — the selection marker is driven
+        entirely by the bound vector.
 
         Untrusted name / path strings go through `rich.markup.escape`
         so a vector named `pUC[18]` renders literally rather than
@@ -59023,17 +59206,18 @@ class ConstructorModal(ModalScreen):
         if isinstance(v, dict) and v.get("name"):
             size = int(v.get("size") or 0)
             nm   = _esc(str(v.get("name") or "?"))
-            return f"{prefix}[green]{nm}[/green]  ({size:,} bp)"
-        # No override yet — surface the role's selection marker
-        # so the user knows what L1 vector the role expects without
-        # naming any specific plasmid.
-        sel = ""
-        if role:
-            sel = str(_CONSTRUCTOR_BACKBONES.get(gid, {})
-                      .get(role, {}).get("selection") or "")
-        sel_part = f"  [dim]({_esc(sel)} selection)[/dim]" if sel else ""
-        return (prefix + "[dim](none — pick from library →)[/dim]"
-                + sel_part)
+            detected = _detect_selection_marker(
+                str(v.get("gb_text", "") or "")
+            )
+            marker_part = (
+                f"  [dim]({_esc(detected)} selection)[/dim]"
+                if detected else ""
+            )
+            return (
+                f"{prefix}[green]{nm}[/green]  ({size:,} bp)"
+                + marker_part
+            )
+        return prefix + "[dim](none — pick from library →)[/dim]"
 
 
     def _pick_acceptor_for_role(
@@ -66052,7 +66236,7 @@ class LoadPartSourceModal(ModalScreen):
                             zebra_stripes=True)
             yield Static("", id="loadpart-status", markup=True)
             with Horizontal(id="loadpart-btns"):
-                yield Button("Open file…", id="btn-loadpart-file")
+                yield Button("Open file", id="btn-loadpart-file")
                 yield Button("Load Selected", id="btn-loadpart-ok",
                              variant="primary",
                              # Disabled until the first refresh confirms
@@ -67853,7 +68037,7 @@ class MasterDeleteModal(ModalScreen):
                     variant="default",
                 )
                 yield Button(
-                    "Delete… (disabled)", id="btn-md-delete",
+                    "Delete (disabled)", id="btn-md-delete",
                     variant="error", disabled=True,
                 )
 
@@ -67880,14 +68064,14 @@ class MasterDeleteModal(ModalScreen):
             return
         if event.value == self._REQUIRED_INPUT:
             btn.disabled = False
-            btn.label = "Delete…"
+            btn.label = "Delete"
             status.update(
                 "[bold green]✓ Match — Delete button enabled.[/bold green] "
                 "[dim](next stage has a 3 s cool-down)[/dim]"
             )
         else:
             btn.disabled = True
-            btn.label = "Delete… (disabled)"
+            btn.label = "Delete (disabled)"
             if event.value == "":
                 status.update(
                     "[dim]Delete button stays disabled until "
@@ -67925,7 +68109,7 @@ class MasterDeleteModal(ModalScreen):
             try:
                 btn = self.query_one("#btn-md-delete", Button)
                 btn.disabled = True
-                btn.label = "Delete… (disabled)"
+                btn.label = "Delete (disabled)"
             except NoMatches:
                 pass
             try:
@@ -69935,7 +70119,7 @@ def _h_load_file(app, payload):
             record = load_genbank(str(path))
     except (ValueError, OSError) as exc:
         return ({"error": f"parse failed: {exc}"}, 400)
-    record._tui_source = str(path)
+    record._tui_source = str(path)  # type: ignore[attr-defined]
 
     def _apply():
         guard = _agent_dirty_guard(app, payload)
@@ -69954,7 +70138,7 @@ def _h_load_file(app, payload):
         "ok":         True,
         "name":       record.name,
         "id":         record.id,
-        "length":     len(record.seq),
+        "length":     len(record.seq) if record.seq is not None else 0,
         "n_features": sum(1 for f in record.features if f.type != "source"),
         "size_bytes": path.stat().st_size,
     }
@@ -77750,6 +77934,10 @@ SpeciesPickerModal { align: center middle; }
             _migrate_legacy_custom_enzyme_csv()
         except Exception:
             _log.exception("legacy custom-enzyme CSV migration failed")
+        try:
+            _migrate_parts_bin_markers_from_vector()
+        except Exception:
+            _log.exception("parts_bin marker re-detect migration failed")
         self._check_crash_recovery()
         # Migration to the collection-driven model already ran in compose
         # (so child panels see the correct active collection on mount).

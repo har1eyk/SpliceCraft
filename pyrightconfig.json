@@ -1,0 +1,15 @@
+{
+  "include": [
+    "splicecraft.py",
+    "splicecraft_biology.py",
+    "splicecraft_cli.py"
+  ],
+  "exclude": [
+    "tests/**",
+    "build/**",
+    "dist/**",
+    "**/__pycache__/**",
+    ".venv/**",
+    "venv/**"
+  ]
+}

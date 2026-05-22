@@ -14,6 +14,103 @@
 
 ---
 
+## [0.9.17] — 2026-05-22 — Vector-derived selection markers · entry-vector consistency warnings · CI deps refresh
+
+### Selection markers (no hardcoded antibiotics)
+- `_CONSTRUCTOR_BACKBONES` no longer carries hardcoded `selection`
+  fields. Every TU / MOD save runs `_detect_selection_marker` on the
+  bound entry vector's `gb_text` so a custom α-vector carrying AmpR
+  propagates *Ampicillin* (not the historical pDGB3-α *Spectinomycin*
+  default). Detection fallback is `"—"`, never an antibiotic name.
+- Constructor "Will assemble into" validation banner + the entry-vector
+  summary banner in the Constructor footer now show the detected
+  marker for the bound vector.
+- `EntryVectorsModal` status line surfaces two warning families:
+  intra-pair mismatch (α1 ≠ α2 or Ω1 ≠ Ω2) and cross-family
+  collision (α and Ω share an antibiotic). Partial bindings skip
+  the corresponding check.
+- One-shot launch migration `_migrate_parts_bin_markers_from_vector`
+  re-detects markers on every existing parts-bin row whose stored
+  value is the historical *Spectinomycin* / *Kanamycin* default;
+  manually-edited markers are preserved. Idempotent via the
+  `.markers_redetected` marker file.
+
+### EntryVectorsModal labels
+- Role display swapped from misleading forward/reverse to slot:
+  `α1 — L1 slot 1`, `α2 — L1 slot 2`, `Ω1 — L2 slot 1`,
+  `Ω2 — L2 slot 2`. The 1/2 suffix is a slot (overhang-pair)
+  distinction, not a strand orientation — a TU cloned alone lands
+  in the same direction in either α-vector. Also fixed a long-
+  standing bug in the `_CONSTRUCTOR_BACKBONES` notes where Omega
+  acceptors were labelled "L1 omega" instead of L2.
+
+### UI polish
+- EnzymeCollectionsModal: data tables now flex (`height: 1fr`)
+  instead of being pinned at 18 rows, so the Add / Open / Delete
+  buttons never get clipped on shorter terminals. Dropped the
+  redundant `margin-top` on the Close-button row so it no longer
+  butts against the dialog's bottom border.
+- Removed `…` from every button label (Settings, EntryVectorsModal,
+  EnzymeCollectionsModal, Parts Bin picker, Domesticator entry-vector
+  picker, Constructor backbone change, Experiments attach/remove,
+  master Delete, "+ Add new enzyme"). Progress notifications
+  ("Assembling and saving", "Auto-detecting entry vectors") also
+  lost their trailing ellipses.
+- Feature Library and Experiments attachment buttons renamed
+  "Remove" → "Delete" — they actually delete the row / `unlink()`
+  the file, so the semantic now matches. Enzyme-collection editor's
+  `← Remove` (transfer-list pair with `Add →`) keeps its name —
+  it unlinks an enzyme from a collection without deleting it.
+
+### Audit
+- Verified all 201 `_NEB_ENZYMES` recognition sites + cut positions
+  against REBASE/NEB canonical data. Fixed one comment-only error
+  on `AclI` (cut pattern produces a 2-nt 5' overhang, not a 3'
+  overhang as the comment claimed).
+
+### CI + dependencies
+- Bumped `actions/checkout` v4 → v6 and `actions/setup-python` v5 →
+  v6 in both `test.yml` and `publish.yml` — clears the Node-20
+  deprecation warning that will become a hard error in September
+  2026.
+- Bumped `pyright>=1.1.408` → `>=1.1.409` to match the latest
+  pyright launcher version and silence the "new version available"
+  nudge on every CI run.
+- Refreshed every other floor pin to the version CI was already
+  resolving to (hatchling 1.29, textual 8.2.7, Pillow 12.2.0,
+  pyspellchecker 0.9.0, rich-pixels 3.0.1, hypothesis 6.152.9,
+  ruff 0.15.14, coverage 7.14.0).
+- Added `.github/dependabot.yml` — weekly Monday scans of
+  `github-actions` + `pip` ecosystems. New action / pyright /
+  ruff / textual releases land as PRs that CI auto-validates.
+- Added `pyrightconfig.json` at workspace root mirroring the
+  `[tool.pyright]` section in `pyproject.toml`, so IDE pyright
+  integrations that don't read the pyproject section pick up
+  the `tests/**` exclusion.
+
+### Hardening
+- Fixed two pyright errors in the agent-API `/load-file` handler
+  that were blocking the CI Lint job: `_tui_source` attribute
+  access now matches the established `# type: ignore[attr-defined]`
+  pattern; `len(record.seq)` narrows via `is not None` to handle
+  the BioPython stub's `Optional[Seq]` annotation.
+
+### Tests
+- `TestPersistedAssemblyMetadata`: two new tests confirming the
+  save-path detects from bound vector + falls back to `"—"` when
+  no marker is detectable.
+- `TestMigratePartsBinMarkersFromVector`: eight new tests covering
+  every combination of the migration's input space (detected
+  Amp vs stored Spec, manual marker preservation, missing
+  gb_text, idempotency, marker file creation on no-op runs).
+- `TestMarkerWarnings`: eight new unit tests for the EntryVectorsModal
+  warning logic — intra-pair mismatch, cross-family collision, both
+  together, partial bindings, empty input.
+- Two new e2e EntryVectorsModal tests for the hint column and
+  pair-mismatch status surfacing.
+
+---
+
 ## [0.9.16] — 2026-05-22
 
 _(auto-generated changelog — no notable commits found since the previous release)_
