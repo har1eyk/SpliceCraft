@@ -14,6 +14,12 @@
 
 ---
 
+## [0.9.18] — 2026-05-22
+
+_(auto-generated changelog — no notable commits found since the previous release)_
+
+---
+
 ## [0.9.17] — 2026-05-22 — Vector-derived selection markers · entry-vector consistency warnings · CI deps refresh
 
 ### Selection markers (no hardcoded antibiotics)
