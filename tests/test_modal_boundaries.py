@@ -255,6 +255,7 @@ _MODAL_CASES = [
     ("BlastModal",                   lambda: sc.BlastModal()),
     ("PlasmidsaurusAlignModal",      lambda: sc.PlasmidsaurusAlignModal()),
     ("MultiAlignPickerModal",        lambda: sc.MultiAlignPickerModal()),
+    ("AlignmentManagerModal",        lambda: sc.AlignmentManagerModal([])),
     ("PartsBinPickerModal",          lambda: sc.PartsBinPickerModal()),
     ("ExperimentProjectsPickerModal", lambda: sc.ExperimentProjectsPickerModal()),
     ("ActionsPickerModal",            lambda: sc.ActionsPickerModal()),
@@ -412,6 +413,66 @@ class TestModalBoundaries:
             modal = factory()
             app.push_screen(modal)
             await _check_modal(app, pilot, modal, term_w, term_h)
+
+
+class TestButtonsFitInsideDialogContent:
+    """Regression guard 2026-05-23: a modal whose button-bar container
+    uses `padding-top: 1` on a fixed `height: 3` only leaves 2 rows for
+    the actual buttons, which need 3 (top border + label + bottom
+    border). The bottom border bled into the dialog's padding-bottom
+    and rendered as cropped.
+
+    The fix swapped to `margin-top: 1` so the gap is allocated OUTSIDE
+    the fixed-height container, preserving the 3-row budget for the
+    button widget. This test pins both fixed modals — register every
+    Button on the modal and assert its bottom row sits within the
+    dialog's content area (excludes the dialog's own padding+border).
+    """
+
+    @pytest.mark.parametrize("label,factory", [
+        ("AlignmentManagerModal",
+         lambda: sc.AlignmentManagerModal([])),
+        ("MultiAlignPickerModal",
+         lambda: sc.MultiAlignPickerModal()),
+    ])
+    async def test_button_bottom_fits_dialog_content(
+            self, label, factory, tiny_record, isolated_library):
+        from textual.widgets import Button
+        from textual.containers import Vertical
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = factory()
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # The modal's dialog is the only top-level Vertical with an
+            # id (both modals follow the `#…-dlg` convention).
+            dialog = next(
+                (v for v in modal.query(Vertical)
+                 if v.id and v.id.endswith("-dlg")),
+                None,
+            )
+            assert dialog is not None, (
+                f"{label}: could not locate dialog Vertical container"
+            )
+            # Dialog content area = dialog region minus border (1 each
+            # side) and padding (1 each side via `padding: 1 2`).
+            dlg_r = dialog.region
+            content_bottom = dlg_r.y + dlg_r.height - 1 - 2  # border-bottom + padding-bottom
+            for btn in modal.query(Button):
+                br = btn.region
+                btn_bottom = br.y + br.height - 1
+                assert btn_bottom <= content_bottom, (
+                    f"{label}: Button#{btn.id!r} bottom y={btn_bottom} "
+                    f"overflows dialog content area (ends at y="
+                    f"{content_bottom}). The button-bar container "
+                    f"likely uses padding-top inside fixed height; "
+                    f"swap to margin-top so the buttons keep their "
+                    f"full row budget."
+                )
 
 
 class TestAddFeatureModalRegressionGuards:

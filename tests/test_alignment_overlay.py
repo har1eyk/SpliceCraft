@@ -165,6 +165,153 @@ class TestAlignmentToTargetLetters:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# _alignment_to_query_segments — query-axis mirror of the target helper
+# ═══════════════════════════════════════════════════════════════════════════════
+# Drives the Alt+A / diff-plasmid overlay flow where the currently-loaded
+# plasmid is the **query** (first arg to `_pairwise_align`) and segments
+# must land at query bp positions so bars line up on the open record's
+# linear map.
+
+class TestAlignmentToQuerySegments:
+    def test_all_match(self):
+        assert sc._alignment_to_query_segments("ATGC", "ATGC") == [
+            (0, 4, "match"),
+        ]
+
+    def test_all_mismatch(self):
+        assert sc._alignment_to_query_segments("TTTT", "AAAA") == [
+            (0, 4, "mismatch"),
+        ]
+
+    def test_match_mismatch_match(self):
+        assert sc._alignment_to_query_segments("ATGC", "ATCC") == [
+            (0, 2, "match"),
+            (2, 3, "mismatch"),
+            (3, 4, "match"),
+        ]
+
+    def test_target_deletion_makes_gap_segment(self):
+        # Symmetric to the target helper's `test_query_deletion_makes_gap_segment`:
+        # target has a 2-bp deletion vs the query — those query
+        # positions get classified as "gap" because the target has no
+        # base aligned to them.
+        assert sc._alignment_to_query_segments("ATCCGC", "AT--GC") == [
+            (0, 2, "match"),
+            (2, 4, "gap"),
+            (4, 6, "match"),
+        ]
+
+    def test_query_gap_invisible_at_query_resolution(self):
+        # Insertion in target relative to query — consumes zero query
+        # columns; surrounding state continues unbroken.
+        assert sc._alignment_to_query_segments("AT--GC", "ATXXGC") == [
+            (0, 4, "match"),
+        ]
+
+    def test_query_gap_then_state_change(self):
+        assert sc._alignment_to_query_segments("AT-C", "ATXG") == [
+            (0, 2, "match"),
+            (2, 3, "mismatch"),
+        ]
+
+    def test_q_start_offset(self):
+        assert sc._alignment_to_query_segments("ATGC", "ATGC", q_start=100) == [
+            (100, 104, "match"),
+        ]
+
+    def test_case_insensitive(self):
+        assert sc._alignment_to_query_segments("atgc", "ATGC") == [
+            (0, 4, "match"),
+        ]
+
+    def test_empty(self):
+        assert sc._alignment_to_query_segments("", "") == []
+
+    def test_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="differ in length"):
+            sc._alignment_to_query_segments("ATGC", "ATG")
+
+    def test_complex_mixed_states(self):
+        # Mirror of the target helper's complex case: M M MM M gap M
+        # using query-axis perspective. Query "ATCCAG" vs target
+        # "ATGC-G" — at query position 4 the target has a gap, so
+        # the query gets a single "gap" column there.
+        assert sc._alignment_to_query_segments("ATCCAG", "ATGC-G") == [
+            (0, 2, "match"),
+            (2, 3, "mismatch"),
+            (3, 4, "match"),
+            (4, 5, "gap"),
+            (5, 6, "match"),
+        ]
+
+    def test_consecutive_runs_coalesce(self):
+        result = sc._alignment_to_query_segments("AAAA", "AAAA")
+        assert len(result) == 1
+        assert result[0] == (0, 4, "match")
+
+    def test_all_gap(self):
+        assert sc._alignment_to_query_segments("ATGC", "----") == [
+            (0, 4, "gap"),
+        ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _alignment_to_query_letters
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAlignmentToQueryLetters:
+    def test_all_match(self):
+        # Per-query-bp dict — letter at each position is the TARGET
+        # base (mirror of the target-axis helper, which stores the
+        # query base).
+        assert sc._alignment_to_query_letters("ATGC", "ATGC") == {
+            0: ("A", "match"),
+            1: ("T", "match"),
+            2: ("G", "match"),
+            3: ("C", "match"),
+        }
+
+    def test_mismatch_letter_is_target_base(self):
+        letters = sc._alignment_to_query_letters("ATGT", "ATGC")
+        assert letters[3] == ("C", "mismatch")
+
+    def test_gap_letter_is_dash(self):
+        # Query has a base at col 2, target has a gap — query position
+        # records target letter "-" with state "gap".
+        letters = sc._alignment_to_query_letters("ATCG", "AT-G")
+        assert letters[2] == ("-", "gap")
+
+    def test_query_gap_skipped(self):
+        # Insertion in target — query has gap at col 1, that column
+        # never enters the per-query dict.
+        letters = sc._alignment_to_query_letters("A-TG", "ATXG")
+        assert letters == {
+            0: ("A", "match"),
+            1: ("X", "mismatch"),
+            2: ("G", "match"),
+        }
+
+    def test_q_start_offset(self):
+        assert sc._alignment_to_query_letters("AT", "AT", q_start=50) == {
+            50: ("A", "match"),
+            51: ("T", "match"),
+        }
+
+    def test_case_insensitive(self):
+        letters = sc._alignment_to_query_letters("atgc", "ATGC")
+        for pos in range(4):
+            _, state = letters[pos]
+            assert state == "match"
+
+    def test_empty(self):
+        assert sc._alignment_to_query_letters("", "") == {}
+
+    def test_length_mismatch_raises(self):
+        with pytest.raises(ValueError, match="differ in length"):
+            sc._alignment_to_query_letters("AT", "ATG")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Cross-check: segments and letters agree on state
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -192,6 +339,31 @@ class TestSegmenterLetterConsistency:
             ]
             assert len(matching) == 1, (
                 f"t_pos={t_pos} state={state!r} not covered by any "
+                f"matching segment in {segs!r}"
+            )
+
+
+class TestQuerySegmenterLetterConsistency:
+    """Symmetric guard for the query-axis helpers."""
+
+    @pytest.mark.parametrize("aq,at", [
+        ("ATGC",       "ATGC"),
+        ("ATGT",       "ATGC"),
+        ("ATCCGC",     "AT--GC"),
+        ("AT-C",       "ATXG"),
+        ("ATCCAG",     "ATGC-G"),
+        ("ATGC",       "----"),
+        ("ATCGATCG",   "ATCGTTCG"),
+    ])
+    def test_consistency(self, aq, at):
+        segs = sc._alignment_to_query_segments(aq, at)
+        letters = sc._alignment_to_query_letters(aq, at)
+        for q_pos, (_letter, state) in letters.items():
+            matching = [
+                s for s in segs if s[0] <= q_pos < s[1] and s[2] == state
+            ]
+            assert len(matching) == 1, (
+                f"q_pos={q_pos} state={state!r} not covered by any "
                 f"matching segment in {segs!r}"
             )
 
@@ -292,6 +464,645 @@ class TestAlignmentLifecycle:
             entry = app._alignments[0]
             assert entry["segments"] == [(0, 4, "match")]
             assert entry["t_lo"] == 0 and entry["t_hi"] == 4
+            # Default axis is "target" (Plasmidsaurus convention).
+            assert entry["axis"] == "target"
+
+
+class TestAlignmentPersistenceRoundTrip:
+    """User-feature 2026-05-23: alignments survive a record swap by
+    living on the library entry. Hydrate restores the visible ones
+    on the next `_apply_record`.
+
+    Test contract: register an alignment against library entry A,
+    flush, load entry B, load entry A again → the original alignment
+    is back on the band with all fields intact (segments, axis,
+    target_label, target_record's sequence).
+    """
+
+    @staticmethod
+    def _make_library_record(seq: str, rid: str, name: str = None):
+        """Build a minimal library entry dict that includes a real
+        record + gb_text + size."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq(seq), id=rid, name=name or rid,
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        return rec, {
+            "id":      rid,
+            "name":    name or rid,
+            "size":    len(seq),
+            "gb_text": sc._record_to_gb_text(rec),
+        }
+
+    async def test_alignment_survives_record_swap_and_back(
+            self, isolated_library):
+        # Library has two entries: A (200 bp), B (300 bp). Set up
+        # the active collection BEFORE creating the app, otherwise
+        # `_ensure_default_collection` + `_restore_library_from_active_collection`
+        # will rebuild "Main Collection" from whatever's already in
+        # the active collection (which may be empty in this isolated
+        # tmp tree) and wipe our seeded library.
+        rec_a, entry_a = self._make_library_record("A" * 200, "A_PLASMID")
+        rec_b, entry_b = self._make_library_record("C" * 300, "B_PLASMID")
+        sc._save_collections([{
+            "name":        sc._DEFAULT_COLLECTION_NAME,
+            "description": "test collection",
+            "plasmids":    [entry_a, entry_b],
+            "saved":       "2026-05-23",
+        }])
+        sc._set_active_collection_name(sc._DEFAULT_COLLECTION_NAME)
+        sc._save_library([entry_a, entry_b])
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app._apply_record(rec_a)
+            await pilot.pause(0.05)
+
+            # Register an alignment of A against B-as-target.
+            seq_a = str(rec_a.seq)
+            seq_b = str(rec_b.seq)
+            app._register_alignment(
+                name="A vs B",
+                query_label="A_PLASMID",
+                target_label="B_PLASMID",
+                target_record=rec_b,
+                result={"aligned_q": seq_a[:200], "aligned_t": seq_b[:200]},
+                axis="query",
+            )
+            assert len(app._alignments) == 1
+            app._flush_active_alignments()
+
+            # Verify it landed on A's library entry.
+            entries = sc._load_library()
+            a_entry = next(
+                (e for e in entries if e.get("id") == "A_PLASMID"), None,
+            )
+            assert a_entry is not None, (
+                f"A_PLASMID missing from library after flush; entries="
+                f"{[e.get('id') for e in entries]!r}"
+            )
+            stored = a_entry.get("alignments") or []
+            assert len(stored) == 1
+            assert stored[0]["target_label"] == "B_PLASMID"
+            assert stored[0]["visible"] is True
+            assert "target_gb_text" in stored[0]
+            assert "target_seq_hash" in stored[0]
+            stored_id_before = stored[0]["id"]
+
+            # Swap to B → band is cleared (clear_undo=True).
+            app._apply_record(rec_b)
+            await pilot.pause(0.05)
+            assert app._alignments == [], (
+                "switching records must drop the in-memory band"
+            )
+
+            # Swap back to A → hydrate restores the alignment.
+            app._apply_record(rec_a)
+            await pilot.pause(0.05)
+            assert len(app._alignments) == 1, (
+                f"hydrate must restore the stored alignment; got "
+                f"{len(app._alignments)} alignments"
+            )
+            restored = app._alignments[0]
+            # Original storage metadata stamped on the restored entry
+            # so the next flush round-trips losslessly.
+            assert restored["_stored_id"] == stored_id_before
+            assert restored["_stored_visible"] is True
+            assert restored["target_label"] == "B_PLASMID"
+            assert restored["axis"] == "query"
+            # And the target record's sequence round-tripped via gb_text.
+            assert str(restored["target_record"].seq) == seq_b
+
+    async def test_flush_no_op_when_record_not_in_library(
+            self, isolated_library, tiny_record):
+        """Loading a record that isn't in the library (file open, demo)
+        means there's no library entry to persist onto. Flush must
+        silently no-op rather than raising."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)  # not in library
+            await pilot.pause(0.05)
+            seq = str(tiny_record.seq)
+            app._register_alignment(
+                name="r1", query_label="q", target_label="t",
+                target_record=tiny_record,
+                result={"aligned_q": seq, "aligned_t": seq},
+            )
+            # Must not raise.
+            app._flush_active_alignments()
+
+    async def test_flush_preserves_hidden_stored_alignments(
+            self, isolated_library):
+        """Footgun guard 2026-05-23: `_flush_active_alignments` used
+        to overwrite the stored list with `self._alignments` — which
+        only ever contains *visible* alignments after hydrate. So any
+        `visible: False` stored entry would silently vanish the first
+        time the user registered a new alignment (the flush would
+        write [old visible, new alignment] and drop the hidden ones).
+
+        Test contract: seed the library entry with both a visible and
+        a hidden stored alignment. Load → hydrate restores only the
+        visible one to `self._alignments`. Register a new alignment
+        and flush. Re-read the stored list: must contain all three
+        entries — the hidden one preserved untouched.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec_a, entry_a = self._make_library_record("A" * 200, "A_HIDDEN_KEEP")
+        rec_b = SeqRecord(
+            Seq("T" * 200), id="B", name="B",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        entry_a["alignments"] = [
+            {
+                "id":              "vis-id",
+                "label":           "visible alignment",
+                "query_label":     "q",
+                "target_label":    "t",
+                "target_id":       "B",
+                "target_gb_text":  sc._record_to_gb_text(rec_b),
+                "target_seq_hash": sc._alignment_target_hash("T" * 200),
+                "axis":            "query",
+                "result":          {"aligned_q": "A" * 200,
+                                    "aligned_t": "T" * 200},
+                "visible":         True,
+                "added":           "2026-05-23",
+                "source":          "manual",
+            },
+            {
+                "id":              "hidden-id",
+                "label":           "hidden alignment",
+                "query_label":     "q",
+                "target_label":    "t",
+                "target_id":       "B",
+                "target_gb_text":  sc._record_to_gb_text(rec_b),
+                "target_seq_hash": sc._alignment_target_hash("T" * 200),
+                "axis":            "query",
+                "result":          {"aligned_q": "A" * 200,
+                                    "aligned_t": "T" * 200},
+                "visible":         False,
+                "added":           "2026-05-22",
+                "source":          "manual",
+            },
+        ]
+        sc._save_collections([{
+            "name":        sc._DEFAULT_COLLECTION_NAME,
+            "description": "test",
+            "plasmids":    [entry_a],
+            "saved":       "2026-05-23",
+        }])
+        sc._set_active_collection_name(sc._DEFAULT_COLLECTION_NAME)
+        sc._save_library([entry_a])
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app._apply_record(rec_a)
+            await pilot.pause(0.05)
+            # Hydrate restored visible only.
+            assert len(app._alignments) == 1
+            assert app._alignments[0]["_stored_id"] == "vis-id"
+
+            # Register a fresh alignment and flush.
+            app._register_alignment(
+                name="new alignment",
+                query_label="q",
+                target_label="t",
+                target_record=rec_b,
+                result={"aligned_q": "A" * 200, "aligned_t": "T" * 200},
+                axis="query",
+            )
+            app._flush_active_alignments()
+
+            # The stored list MUST contain all three — hidden preserved.
+            entries = sc._load_library()
+            a_entry = next(
+                (e for e in entries if e.get("id") == "A_HIDDEN_KEEP"),
+                None,
+            )
+            assert a_entry is not None
+            stored = a_entry.get("alignments") or []
+            ids = [e.get("id") for e in stored]
+            assert "vis-id" in ids, (
+                f"visible stored entry was dropped from {ids!r}"
+            )
+            assert "hidden-id" in ids, (
+                f"HIDDEN stored entry was wiped by the flush — "
+                f"flush must merge with existing storage, not replace. "
+                f"got {ids!r}"
+            )
+            # The hidden entry's visible field must still be False
+            # (we didn't accidentally re-visible it).
+            hidden = next(e for e in stored if e["id"] == "hidden-id")
+            assert hidden["visible"] is False
+            # And the fresh one is appended with visible=True.
+            fresh = next(
+                e for e in stored
+                if e["id"] not in ("vis-id", "hidden-id")
+            )
+            assert fresh["visible"] is True
+            assert fresh["label"] == "new alignment"
+
+    async def test_hydrate_skips_invisible_stored_alignments(
+            self, isolated_library):
+        """Stored alignments with `visible: False` must NOT land on
+        the band — they exist for the manager modal but stay hidden
+        until toggled. The visibility-toggle UI lives in chunk 2;
+        this test pins down the hydrate-side filter so toggle-off
+        actually hides on the next load."""
+        rec_a, entry_a = self._make_library_record("A" * 100, "A_HIDDEN")
+        # Pre-seed the library entry with an invisible alignment.
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec_b = SeqRecord(
+            Seq("T" * 100), id="B", name="B",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        entry_a["alignments"] = [{
+            "id":              "fixed-id",
+            "label":           "hidden alignment",
+            "query_label":     "q",
+            "target_label":    "t",
+            "target_id":       "B",
+            "target_gb_text":  sc._record_to_gb_text(rec_b),
+            "target_seq_hash": sc._alignment_target_hash("T" * 100),
+            "axis":            "query",
+            "result":          {"aligned_q": "A" * 100, "aligned_t": "T" * 100},
+            "visible":         False,
+            "added":           "2026-05-23",
+            "source":          "manual",
+        }]
+        sc._save_library([entry_a])
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app._apply_record(rec_a)
+            await pilot.pause(0.05)
+            assert app._alignments == [], (
+                "invisible stored alignments must not appear on the band"
+            )
+
+
+class TestAlignmentManagerModal:
+    """Manager modal (Alt+L) — listing, toggling, and deleting
+    stored alignments for the active plasmid."""
+
+    @staticmethod
+    def _make_stored(label: str, id_: str = "", *,
+                      visible: bool = True, source: str = "manual") -> dict:
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("T" * 100), id="T_TARGET", name="T_TARGET",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        return {
+            "id":              id_ or f"id-{label}",
+            "label":           label,
+            "query_label":     "Q",
+            "target_label":    "T",
+            "target_id":       "T_TARGET",
+            "target_gb_text":  sc._record_to_gb_text(rec),
+            "target_seq_hash": sc._alignment_target_hash("T" * 100),
+            "axis":            "query",
+            "result":          {"aligned_q": "A" * 100,
+                                "aligned_t": "T" * 100,
+                                "identity_pct": 12.3},
+            "visible":         visible,
+            "added":           "2026-05-23",
+            "source":          source,
+        }
+
+    async def test_modal_lists_all_stored_with_visibility_glyphs(
+            self, tiny_record, isolated_library):
+        """All stored entries appear in the table — visible AND hidden,
+        with distinct glyphs in column 0."""
+        stored = [
+            self._make_stored("vis_one", "id1", visible=True),
+            self._make_stored("hidden_one", "id2", visible=False),
+            self._make_stored("vis_two", "id3", visible=True),
+        ]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored, plasmid_label="P")
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from textual.widgets import DataTable
+            t = modal.query_one("#alnmgr-table", DataTable)
+            assert t.row_count == 3
+            # Modal's own copy is independent of caller's list.
+            assert modal._alignments is not stored
+            assert [a["label"] for a in modal._alignments] == [
+                "vis_one", "hidden_one", "vis_two",
+            ]
+
+    async def test_toggle_visible_flips_in_place(
+            self, tiny_record, isolated_library):
+        """Space (action_toggle_visible) flips the cursor row's
+        `visible` field without reordering rows."""
+        stored = [
+            self._make_stored("a", visible=True),
+            self._make_stored("b", visible=True),
+        ]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from textual.widgets import DataTable
+            t = modal.query_one("#alnmgr-table", DataTable)
+            t.move_cursor(row=1)
+            modal.action_toggle_visible()
+            assert modal._alignments[0]["visible"] is True
+            assert modal._alignments[1]["visible"] is False
+            # Cursor stays on row 1.
+            assert t.cursor_row == 1
+
+    async def test_delete_removes_cursor_row(
+            self, tiny_record, isolated_library):
+        stored = [
+            self._make_stored("keep1"),
+            self._make_stored("remove_me"),
+            self._make_stored("keep2"),
+        ]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from textual.widgets import DataTable
+            t = modal.query_one("#alnmgr-table", DataTable)
+            t.move_cursor(row=1)
+            modal.action_delete_selected()
+            assert [a["label"] for a in modal._alignments] == [
+                "keep1", "keep2",
+            ]
+            from textual.widgets import DataTable
+            assert modal.query_one("#alnmgr-table", DataTable).row_count == 2
+
+    async def test_hide_all_and_show_all_bulk(
+            self, tiny_record, isolated_library):
+        stored = [
+            self._make_stored("a", visible=True),
+            self._make_stored("b", visible=False),
+            self._make_stored("c", visible=True),
+        ]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Trigger via direct button press handler.
+            modal._hide_all(None)
+            assert all(not a["visible"] for a in modal._alignments)
+            modal._show_all(None)
+            assert all(a["visible"] for a in modal._alignments)
+
+    async def test_save_returns_modified_list_cancel_returns_none(
+            self, tiny_record, isolated_library):
+        stored = [self._make_stored("alpha")]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        captured = []
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Save path: dismiss with the (modified) list.
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal, callback=lambda r: captured.append(("save", r)))
+            await pilot.pause()
+            modal.action_toggle_visible()
+            modal._save_and_close(None)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert captured[-1][0] == "save"
+            assert captured[-1][1] is not None
+            assert captured[-1][1][0]["visible"] is False  # toggled
+            captured.clear()
+            # Cancel path: dismiss with None even after edits.
+            modal2 = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal2, callback=lambda r: captured.append(("cancel", r)))
+            await pilot.pause()
+            modal2._cancel_btn(None)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert captured[-1] == ("cancel", None)
+
+
+class TestAlignmentSurvivesZoomAndPan:
+    """Regression guards for the user-reported "the alignment disappears
+    when I zoom or pan" complaint. The intended behaviour:
+
+      * Linear-map zoom (+/-) changes the bp/col ratio and the visible
+        bp window but MUST NOT clear `self._alignments`.
+      * Linear-map pan (arrow keys → `_linear_pan`) shifts the offset
+        but MUST NOT clear or reshape alignments; bars stay anchored
+        to their bp positions and slide on screen along with the rail.
+    """
+
+    async def test_zoom_in_does_not_clear_alignments(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            n = len(tiny_record.seq)
+            # Whole-record alignment (covers every bp).
+            seq = str(tiny_record.seq)
+            app._register_alignment(
+                name="self",
+                query_label="self", target_label="self",
+                target_record=tiny_record,
+                result={"aligned_q": seq, "aligned_t": seq},
+            )
+            assert len(app._alignments) == 1
+            entry_before = app._alignments[0]
+            for _ in range(5):
+                pm.action_linear_zoom_in()
+                await pilot.pause()
+            # Still registered; identity preserved (same dict, not a
+            # fresh copy that lost the cached letters / segments).
+            assert len(app._alignments) == 1
+            assert app._alignments[0] is entry_before
+            assert app._alignments[0]["t_lo"] == 0
+            assert app._alignments[0]["t_hi"] == n
+
+    async def test_zoom_out_does_not_clear_alignments(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            pm._linear_zoom = 4.0  # start zoomed in
+            seq = str(tiny_record.seq)
+            app._register_alignment(
+                name="self",
+                query_label="self", target_label="self",
+                target_record=tiny_record,
+                result={"aligned_q": seq, "aligned_t": seq},
+            )
+            assert len(app._alignments) == 1
+            entry_before = app._alignments[0]
+            for _ in range(5):
+                pm.action_linear_zoom_out()
+                await pilot.pause()
+            assert len(app._alignments) == 1
+            assert app._alignments[0] is entry_before
+
+    async def test_pan_does_not_clear_alignments(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            pm._linear_zoom = 4.0  # zoomed in so pan is meaningful
+            seq = str(tiny_record.seq)
+            app._register_alignment(
+                name="self",
+                query_label="self", target_label="self",
+                target_record=tiny_record,
+                result={"aligned_q": seq, "aligned_t": seq},
+            )
+            entry_before = app._alignments[0]
+            # Right then left — should land back at the same offset
+            # without disturbing the alignment overlay.
+            for _ in range(5):
+                pm.action_rotate_cw()  # `_linear_pan(+1)` in linear mode
+                await pilot.pause()
+            for _ in range(5):
+                pm.action_rotate_ccw()
+                await pilot.pause()
+            assert len(app._alignments) == 1
+            assert app._alignments[0] is entry_before
+
+
+class TestRegisterAlignmentAxis:
+    """`_register_alignment` accepts an `axis` parameter that selects
+    which side of the alignment plays the role of the currently-loaded
+    plasmid (= the render axis along which overlay bars are positioned).
+
+    `axis="target"` is the Plasmidsaurus / sequencing-pile flow
+    (segments in target coords). `axis="query"` is the Alt+A /
+    diff-plasmid flow (segments in query coords) — without this,
+    overlay bars on the open plasmid's linear map land at the picked
+    plasmid's bp positions instead of the open plasmid's, which is
+    wrong whenever the pairwise alignment isn't a perfect 1:1.
+    """
+
+    async def test_axis_query_uses_query_coord_segments(
+            self, tiny_record, isolated_library):
+        """The discriminating case: query "ATCCGC" vs target "AT--GC"
+        produces different segments in the two coord systems.
+
+          * Target axis: the target has a 2-col gap (insertion in query)
+            so the surrounding match state continues unbroken at target
+            resolution → ``[(0, 4, "match")]``.
+          * Query axis: the target has 2 fewer bases than the query, so
+            those query positions get classified as gap → ``[(0, 2,
+            "match"), (2, 4, "gap"), (4, 6, "match")]``.
+        """
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._register_alignment(
+                name="alt-a",
+                query_label="open-plasmid",
+                target_label="picked",
+                target_record=tiny_record,
+                result={
+                    "aligned_q": "ATCCGC",
+                    "aligned_t": "AT--GC",
+                },
+                axis="query",
+            )
+            assert len(app._alignments) == 1
+            entry = app._alignments[0]
+            assert entry["axis"] == "query"
+            assert entry["segments"] == [
+                (0, 2, "match"),
+                (2, 4, "gap"),
+                (4, 6, "match"),
+            ]
+            # render-axis bounds — bars draw across the full query
+            # span (0..6), NOT the target span (0..4).
+            assert entry["t_lo"] == 0 and entry["t_hi"] == 6
+
+    async def test_axis_target_default_unchanged(
+            self, tiny_record, isolated_library):
+        """Regression guard: the existing Plasmidsaurus flow doesn't
+        pass `axis`, so it must keep getting target-axis segments. The
+        same gapped pair as above, registered without `axis`, collapses
+        the target gap into the surrounding match (target-resolution).
+        """
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._register_alignment(
+                name="plasmidsaurus",
+                query_label="read",
+                target_label="open-plasmid",
+                target_record=tiny_record,
+                result={
+                    "aligned_q": "ATCCGC",
+                    "aligned_t": "AT--GC",
+                },
+            )
+            entry = app._alignments[0]
+            assert entry["axis"] == "target"
+            assert entry["segments"] == [(0, 4, "match")]
+
+    async def test_invalid_axis_raises(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            with pytest.raises(ValueError, match="axis must be"):
+                app._register_alignment(
+                    name="bad", query_label="q", target_label="t",
+                    target_record=tiny_record,
+                    result={"aligned_q": "AT", "aligned_t": "AT"},
+                    axis="sideways",
+                )
 
 
 
@@ -1173,6 +1984,282 @@ class TestAlignmentBandCenterline:
             # Must not raise.
             pm.refresh()
             await pilot.pause(0.05)
+
+    async def test_first_paint_after_register_includes_band(
+            self, tiny_record, isolated_library):
+        """Regression guard (2026-05-22): the PlasmidMap render cache
+        previously keyed on (zoom, offset, features, map_mode, …) but
+        NOT on `_alignments`, so registering an alignment via
+        `set_alignments` invalidated the widget (refresh()) without
+        invalidating the draw cache — the cached pre-registration text
+        was returned and the user saw bars only after some other
+        tracked attribute changed (e.g. a zoom press flipped
+        `_linear_zoom` and forced a fresh paint).
+
+        Test contract: render the linear view BEFORE registering an
+        alignment, then again AFTER, with no zoom / pan / feature
+        change in between. The two paints must differ — the second
+        carries the alignment band, the first doesn't. If the cache
+        key regresses, both calls return the same cached object.
+        """
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            # Force a paint before any alignment so the cache is hot.
+            paint_before = pm.render()
+            text_before = str(paint_before)
+            # Register an alignment. The render path is supposed to
+            # invalidate its cache and paint a band.
+            app._register_alignment(
+                name="r1", query_label="q", target_label="t",
+                target_record=tiny_record,
+                result={"aligned_q": "ATGC", "aligned_t": "ATGC"},
+            )
+            paint_after = pm.render()
+            text_after = str(paint_after)
+            # The two Rich Texts must compare unequal — same widget
+            # size + viewport, but the band landed in the second.
+            assert text_before != text_after, (
+                "PlasmidMap.render() returned a stale cached paint after "
+                "an alignment was registered; the draw-cache key needs "
+                "to include alignment state."
+            )
+
+    async def test_letter_mode_renders_adjacent_letters_no_gaps(
+            self, tiny_record, isolated_library):
+        """Regression guard (2026-05-22): at letter-mode zoom the band
+        must render alignment letters as adjacent characters
+        (`ATGCATGC…`) with no blank gutters between them. The zoom is
+        capped at `col_per_bp == 1.0` via `_max_useful_linear_zoom`,
+        so the renderer never enters the "letters spread across N
+        cols with blank gaps" regime that the user found awkward.
+
+        Test contract: with a record longer than the usable width
+        (so the cap is > 1.0 and actually reachable via zoom-in),
+        push `_linear_zoom` to the cap, confirm a contiguous run of
+        ATGC appears in the band row.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # 500 bp ATGC-repeat — longer than the test's usable_w (~96)
+        # so the zoom cap lands at col_per_bp == 1.0 (zoom > 1.0).
+        rec = SeqRecord(
+            Seq("ATGC" * 125), id="t500", name="t500",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(rec)
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            seq = str(rec.seq)
+            app._register_alignment(
+                name="self", query_label="self",
+                target_label="self", target_record=rec,
+                result={"aligned_q": seq, "aligned_t": seq},
+            )
+            # Push the zoom to its useful cap (one col per bp).
+            cap = pm._max_useful_linear_zoom()
+            assert cap > 1.0, (
+                "test setup error: record must be longer than "
+                "usable_w so the cap lands above min zoom"
+            )
+            pm._linear_zoom = cap
+            pm._linear_offset_bp = 0
+            text = pm.render()
+            plain = str(text)
+            rows = plain.split("\n")
+            # Locate the band row by the substring of the alignment's
+            # sequence — at col_per_bp == 1.0 the letters land at
+            # adjacent columns, so `"ATGCATGC"` appears verbatim.
+            band_row = next(
+                (r for r in rows if "ATGCATGC" in r),
+                "",
+            )
+            assert band_row, (
+                f"expected contiguous letter run in band row at "
+                f"col_per_bp=1.0; got rows={rows!r}"
+            )
+
+    async def test_letter_row_has_no_internal_spaces_at_cap(
+            self, tiny_record, isolated_library):
+        """Regression guard (2026-05-23): at the zoom cap (col_per_bp
+        == 1.0) the band's letter row must be a contiguous run of
+        bases — no internal spaces between letters.
+
+        Pre-fix the `bp_to_col` formula used float math
+        (`int((bp - view_s) / visible_bp * usable_w)`). At
+        `usable_w == visible_bp`, `1/N*N` is `0.9999999999999999` in
+        IEEE 754, so `int()` truncated to 0 and bps 0 and 1 collided
+        on the same column. The dropped column rendered as a default
+        background cell — visible as "splits" in the letter row.
+
+        Using integer math (`(bp - view_s) * usable_w // visible_bp`)
+        gives the same result without precision loss; every bp in
+        the visible window now maps to a distinct column when
+        `usable_w == visible_bp`.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Use a sequence whose length exceeds usable_w so the cap is
+        # above min zoom and reachable. 500 bp self-alignment hits
+        # one big "match" segment that should paint every bp.
+        rec = SeqRecord(
+            Seq("ATGC" * 125), id="t500", name="t500",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(rec)
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            seq = str(rec.seq)
+            app._register_alignment(
+                name="self", query_label="self",
+                target_label="self", target_record=rec,
+                result={"aligned_q": seq, "aligned_t": seq},
+            )
+            pm._linear_zoom = pm._max_useful_linear_zoom()
+            pm._linear_offset_bp = 0
+            text = pm.render()
+            plain = str(text)
+            rows = plain.split("\n")
+            # Find the alignment band row: skip the header (row 0)
+            # and pick the row with the most ACGT density.
+            band_row = next(
+                (r for r in rows[1:]
+                 if sum(1 for c in r.strip() if c in "ACGTacgt") > 50),
+                "",
+            )
+            assert band_row, (
+                f"could not locate band row; rows={rows!r}"
+            )
+            stripped = band_row.strip()
+            internal_spaces = sum(1 for c in stripped if c == " ")
+            assert internal_spaces == 0, (
+                f"band row has {internal_spaces} internal spaces at "
+                f"the zoom cap; bp_to_col float precision is causing "
+                f"adjacent bps to collide on the same col. "
+                f"row={stripped!r}"
+            )
+
+    async def test_zoom_in_caps_at_one_col_per_bp(
+            self, tiny_record, isolated_library):
+        """User feedback 2026-05-22: stop zooming the moment letters
+        are one column apart — going further "A T G C" with gutters
+        is not useful. `action_linear_zoom_in` must clamp at the
+        zoom level where `col_per_bp == 1.0`. Repeated zoom-in
+        presses past that should be no-ops.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("A" * 200), id="t200", name="t200",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(rec)
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            cap = pm._max_useful_linear_zoom()
+            # Zoom in many times — should plateau at the cap.
+            for _ in range(30):
+                pm.action_linear_zoom_in()
+                await pilot.pause()
+            assert pm._linear_zoom <= cap + 1e-6, (
+                f"action_linear_zoom_in must clamp at "
+                f"_max_useful_linear_zoom={cap}; got "
+                f"_linear_zoom={pm._linear_zoom}"
+            )
+            # And once at the cap, another press doesn't push past.
+            pm._linear_zoom = cap
+            pm.action_linear_zoom_in()
+            assert pm._linear_zoom <= cap + 1e-6, (
+                f"once at cap, zoom-in must be a no-op; got "
+                f"_linear_zoom={pm._linear_zoom}"
+            )
+
+
+    async def test_alignment_selection_clears_on_detail_dismiss(
+            self, tiny_record, isolated_library):
+        """Regression guard (2026-05-22): clicking an alignment bar
+        sets `_selected_align_idx`, which the renderer turns into
+        `style="reverse"` on the bar glyphs. Reverse on a full-block
+        "█" inverts fg/bg → the bars read as the terminal's default
+        foreground (gray on a dark terminal) instead of their
+        blue/red/gray scheme. If the selection isn't cleared when the
+        detail screen dismisses, the user comes back to all-gray bars.
+
+        Test contract: register an alignment, set the selection
+        manually (proxy for the click), simulate a close of the
+        detail screen by pushing + dismissing AlignmentScreen with
+        the same callback the click path uses. After dismiss,
+        `_selected_align_idx` must be back to -1.
+        """
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            app._register_alignment(
+                name="r1", query_label="q", target_label="t",
+                target_record=tiny_record,
+                result={"aligned_q": "ATGC", "aligned_t": "ATGC"},
+            )
+            ai = 0
+            pm._selected_align_idx = ai
+            assert pm._selected_align_idx == ai
+
+            # Mirror the on_click → push_screen(..., callback=) flow
+            # without the click event itself. The callback below is
+            # the one the production code installs.
+            def _clear_align_selection(
+                _result=None, _selected_ai=ai, _pm=pm,
+            ):
+                if _pm._selected_align_idx == _selected_ai:
+                    _pm._selected_align_idx = -1
+                    _pm.refresh()
+
+            screen = sc.AlignmentScreen(
+                query_label="q", target_label="t",
+                target_record=tiny_record,
+                result={"aligned_q": "ATGC", "aligned_t": "ATGC",
+                        "q_len": 4, "t_len": 4, "score": 8.0,
+                        "identity_pct": 100.0, "n_matches": 4,
+                        "n_mismatches": 0, "n_gaps": 0,
+                        "mode": "global"},
+            )
+            app.push_screen(screen, callback=_clear_align_selection)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Trigger the dismiss path the Esc / q binding takes.
+            screen.action_close()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert pm._selected_align_idx == -1, (
+                "AlignmentScreen.action_close() must fire the "
+                "push_screen callback so the lane selection drops; "
+                "got _selected_align_idx="
+                f"{pm._selected_align_idx}."
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

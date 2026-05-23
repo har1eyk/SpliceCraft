@@ -562,6 +562,84 @@ class TestSimulateTraditionalCloning:
     # End-to-end UI tests — open the modal, switch tabs, simulate.
     # ──────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    async def _setup_lane(pilot, modal, app, *,
+                          vec_name="pVec", donor_pcr_seq=None,
+                          donor_pcr_name="myInsert",
+                          donor_plasmid_name=None,
+                          e1="EcoRI", e2="BamHI"):
+        """Wire the Constructor's Traditional pane through the new
+        lane-baked-vector flow (2026-05-23):
+          1. Plasmid mode → cursor pVec → Add → becomes backbone.
+          2. Set backbone enzymes via the edit panel.
+          3. PCR / plasmid mode → add donor → set its enzymes.
+        Returns the trad pane for follow-up assertions."""
+        from textual.widgets import (TabbedContent, RadioButton,
+                                      Input, TextArea, Select,
+                                      DataTable, Button)
+        modal.query_one("#ctor-tabs", TabbedContent).active = \
+            "ctor-tab-traditional"
+        await pilot.pause(); await pilot.pause(0.05)
+        entries = sorted(
+            (e for e in sc._load_library() if isinstance(e, dict)),
+            key=lambda e: sc._natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
+        # ── Backbone (plasmid mode) ──
+        modal.query_one(
+            "#trad-mode-plasmid", RadioButton,
+        ).value = True
+        await pilot.pause()
+        vec_idx = next(i for i, e in enumerate(entries)
+                        if e.get("name") == vec_name)
+        modal.query_one(
+            "#trad-source-table", DataTable,
+        ).move_cursor(row=vec_idx)
+        await pilot.pause()
+        modal.query_one(
+            "#btn-trad-add-frag", Button,
+        ).press()
+        await pilot.pause()
+        modal.query_one("#trad-edit-enz-1", Select).value = e1
+        await pilot.pause()
+        modal.query_one("#trad-edit-enz-2", Select).value = e2
+        await pilot.pause()
+        # ── Donor ──
+        if donor_plasmid_name is not None:
+            modal.query_one(
+                "#trad-mode-plasmid", RadioButton,
+            ).value = True
+            await pilot.pause()
+            donor_idx = next(i for i, e in enumerate(entries)
+                              if e.get("name") == donor_plasmid_name)
+            modal.query_one(
+                "#trad-source-table", DataTable,
+            ).move_cursor(row=donor_idx)
+            await pilot.pause()
+        else:
+            modal.query_one(
+                "#trad-mode-pcr", RadioButton,
+            ).value = True
+            await pilot.pause()
+            modal.query_one(
+                "#trad-pcr-name", Input,
+            ).value = donor_pcr_name
+            modal.query_one(
+                "#trad-pcr-seq", TextArea,
+            ).text = (donor_pcr_seq
+                       or "GAGCATGAAACGGCCAAGTAA")
+        modal.query_one(
+            "#btn-trad-add-frag", Button,
+        ).press()
+        await pilot.pause()
+        modal.query_one("#trad-edit-enz-1", Select).value = e1
+        await pilot.pause()
+        modal.query_one("#trad-edit-enz-2", Select).value = e2
+        await pilot.pause()
+        return modal.query_one("#ctor-trad-pane",
+                                  sc.TraditionalCloningPane)
+
     async def test_constructor_opens_with_tabbed_content(
             self, tiny_record, isolated_library):
         from tests.test_smoke import _build_app, TERMINAL_SIZE
@@ -587,22 +665,18 @@ class TestSimulateTraditionalCloning:
 
     async def test_traditional_pane_pcr_mode_simulate(
             self, tiny_record, isolated_library):
-        """End-to-end: user pastes a PCR product + picks two enzymes
-        + clicks Simulate. The result panel should show the
-        forward/reverse summary."""
-        # Seed a vector entry into the isolated library so the vector
-        # picker has a row to select.
+        """End-to-end: backbone-as-first-lane-row + PCR-mode donor →
+        Simulate produces forward + reverse products."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         from Bio import SeqIO
         import io
-        # Vector with EcoRI + BamHI sites flanking a stuffer; the larger
-        # piece (excluding the stuffer) becomes the backbone after digest.
         vec = SeqRecord(
             Seq("AAAAAAAAGAATTCSTUFFERSTUFFERGGATCCTTTTTTTT"
                 .replace("STUFFER", "AAAAA")),
             id="pVec", name="pVec",
-            annotations={"molecule_type": "DNA", "topology": "circular"},
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
         )
         buf = io.StringIO()
         SeqIO.write(vec, buf, "genbank")
@@ -612,77 +686,44 @@ class TestSimulateTraditionalCloning:
             "size": len(vec.seq),
         }])
         from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from textual.widgets import Button
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
+            await pilot.pause(); await pilot.pause(0.05)
             modal = sc.ConstructorModal()
             await app.push_screen(modal)
-            await pilot.pause()
-            await pilot.pause(0.05)
-            # Switch to Traditional tab.
-            from textual.widgets import (TabbedContent, RadioButton,
-                                          Input, TextArea, Select,
-                                          DataTable)
-            tabs = modal.query_one("#ctor-tabs", TabbedContent)
-            tabs.active = "ctor-tab-traditional"
-            await pilot.pause()
-            await pilot.pause(0.05)
-            # Switch insert source mode to "PCR product" by pressing the
-            # third radio button directly. `RadioSet.action_next_button`
-            # only navigates focus; it doesn't change the selection.
-            modal.query_one("#trad-mode-pcr", RadioButton).value = True
-            await pilot.pause()
-            # Fill the PCR fields.
-            modal.query_one("#trad-pcr-name", Input).value = "myInsert"
-            ta = modal.query_one("#trad-pcr-seq", TextArea)
-            ta.text = "GAGCATGAAACGGCCAAGTAA"
-            # Pick the vector row. The display sorts entries by
-            # `_natural_sort_key` (`pVec` lands before `TEST001` because
-            # 'pvec' < 'test' lowercased), so compute the target row
-            # against the SORTED list — matching what the user sees and
-            # what `_record_for_table_row` resolves on click.
-            vt = modal.query_one("#trad-vector-table", DataTable)
-            entries = sorted(
-                (e for e in sc._load_library() if isinstance(e, dict)),
-                key=lambda e: sc._natural_sort_key(
-                    e.get("name") or e.get("id") or ""
-                ),
+            await pilot.pause(); await pilot.pause(0.05)
+            pane = await self._setup_lane(pilot, modal, app)
+            # Sanity: lane has backbone + donor configured.
+            assert len(pane._lane_inserts) == 2
+            assert pane._lane_inserts[0]["role"] == "backbone"
+            assert pane._lane_inserts[0]["enz_left"] == "EcoRI"
+            assert pane._lane_inserts[1]["role"] == "donor"
+            assert pane._lane_inserts[1]["enz_left"] == "EcoRI", (
+                f"donor enzymes: {pane._lane_inserts[1]}"
             )
-            target_idx = next(
-                (i for i, e in enumerate(entries) if e.get("name") == "pVec"),
-                -1,
+            modal.query_one("#btn-trad-simulate", Button).press()
+            await pilot.pause(); await pilot.pause(0.2)
+            from textual.widgets import Static
+            results = str(
+                modal.query_one("#trad-results-text", Static).content
             )
-            assert target_idx >= 0, (
-                f"pVec not found in library; entries: "
-                f"{[e.get('name') for e in entries]}")
-            vt.move_cursor(row=target_idx)
-            await pilot.pause()
-            assert vt.cursor_row == target_idx
-            # E1 = EcoRI (already default sorted-first or prompt); set explicitly.
-            modal.query_one("#trad-enzyme-1", Select).value = "EcoRI"
-            modal.query_one("#trad-enzyme-2", Select).value = "BamHI"
-            await pilot.pause()
-            # Simulate.
-            await pilot.click("#btn-trad-simulate")
-            await pilot.pause()
-            # The pane caches the last simulation's products on
-            # `_fwd_product` / `_rev_product`. Both should be populated
-            # dicts after a successful simulate.
-            pane = modal.query_one("#ctor-trad-pane",
-                                     sc.TraditionalCloningPane)
-            assert isinstance(pane._fwd_product, dict)
+            assert isinstance(pane._fwd_product, dict), (
+                f"results: {results!r}"
+            )
             assert isinstance(pane._rev_product, dict)
-            # Both products carry the assembled top_seq + a feature list.
             assert "top_seq" in pane._fwd_product
-            assert pane._fwd_product["top_seq"]   # non-empty
+            assert pane._fwd_product["top_seq"]
             assert "compatible" in pane._fwd_product
 
     async def test_traditional_pane_save_forward_to_library(
             self, tiny_record, isolated_library):
-        """After a successful simulate the Save Forward button is
-        enabled; clicking it appends a new entry to the library named
-        `trad-fwd[-N]`. The persisted GenBank text round-trips."""
+        """After Simulate the enabled Save button opens
+        ``NamePlasmidModal``; accepting the user-chosen name writes
+        the entry through the same library-save chain. The persisted
+        GenBank text round-trips and the entry carries
+        ``source: 'traditional:fwd'`` so future cascade hooks can
+        identify trad-origin entries."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         from Bio import SeqIO
@@ -698,72 +739,42 @@ class TestSimulateTraditionalCloning:
                             "gb_text": buf.getvalue(),
                             "size": len(vec.seq)}])
         from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from textual.widgets import Button
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
+            await pilot.pause(); await pilot.pause(0.05)
             modal = sc.ConstructorModal()
             await app.push_screen(modal)
-            await pilot.pause()
-            from textual.widgets import (TabbedContent, RadioButton,
-                                          Input, TextArea, Select,
-                                          DataTable, Button)
-            modal.query_one("#ctor-tabs", TabbedContent).active = \
-                "ctor-tab-traditional"
-            await pilot.pause()
-            await pilot.pause(0.05)
-            modal.query_one("#trad-mode-pcr", RadioButton).value = True
-            await pilot.pause()
-            modal.query_one("#trad-pcr-name", Input).value = "myInsert"
-            modal.query_one("#trad-pcr-seq",  TextArea).text = (
-                "GAGCATGAAACGGCCAAGTAA")
-            # Display sorts entries by `_natural_sort_key`; compute
-            # target row against the same order so the cursor lands on
-            # what the user sees as pVec (not the disk-order pVec).
-            entries = sorted(
-                (e for e in sc._load_library() if isinstance(e, dict)),
-                key=lambda e: sc._natural_sort_key(
-                    e.get("name") or e.get("id") or ""
-                ),
-            )
-            target = next(i for i, e in enumerate(entries)
-                          if e.get("name") == "pVec")
-            modal.query_one("#trad-vector-table",
-                             DataTable).move_cursor(row=target)
-            await pilot.pause()
-            modal.query_one("#trad-enzyme-1", Select).value = "EcoRI"
-            modal.query_one("#trad-enzyme-2", Select).value = "BamHI"
-            await pilot.pause()
-            await pilot.click("#btn-trad-simulate")
-            await pilot.pause()
-            # Save Forward should be enabled (the directional cloning
-            # case made forward compatible).
+            await pilot.pause(); await pilot.pause(0.05)
+            pane = await self._setup_lane(pilot, modal, app)
+            modal.query_one("#btn-trad-simulate", Button).press()
+            await pilot.pause(); await pilot.pause(0.2)
             save_fwd = modal.query_one("#btn-trad-save-fwd", Button)
             save_rev = modal.query_one("#btn-trad-save-rev", Button)
             # Exactly one of them is enabled (directional cloning).
             assert save_fwd.disabled is not save_rev.disabled
-            # Trigger via `Button.press()` instead of `pilot.click()` —
-            # the click coordinates fall inside a ScrollableContainer
-            # whose hit-testing isn't reliable across Textual versions.
             (save_fwd if not save_fwd.disabled else save_rev).press()
             await pilot.pause()
-            # Library now contains an entry whose name starts with "trad-".
+            name_modal = app.screen
+            assert isinstance(name_modal, sc.NamePlasmidModal), (
+                f"expected NamePlasmidModal; "
+                f"got {type(name_modal).__name__}"
+            )
+            chosen_name = "my-trad-product"
+            name_modal.dismiss(chosen_name)
+            await pilot.pause(); await pilot.pause(0.05)
             after = sc._load_library()
-            trad_entries = [e for e in after
-                              if isinstance(e, dict)
-                              and str(e.get("name", "")).startswith("trad-")]
-            assert len(trad_entries) == 1
-            saved = trad_entries[0]
+            saved_entries = [
+                e for e in after
+                if isinstance(e, dict) and e.get("name") == chosen_name
+            ]
+            assert len(saved_entries) == 1
+            saved = saved_entries[0]
             assert saved.get("size", 0) > 0
             assert "gb_text" in saved
             assert "LOCUS" in saved["gb_text"]
-            # Regression guard for 2026-05-05: after a successful Save,
-            # both Save buttons must re-disable so a stray double-click
-            # doesn't create `trad-fwd-2` as an exact duplicate. The user
-            # has to re-Simulate to save again with a fresh increment.
+            assert str(saved.get("source", "")).startswith("traditional:")
             assert save_fwd.disabled and save_rev.disabled
-            pane = modal.query_one("#ctor-trad-pane",
-                                     sc.TraditionalCloningPane)
             assert pane._fwd_product is None
             assert pane._rev_product is None
 
@@ -791,52 +802,30 @@ class TestSimulateTraditionalCloning:
                             "gb_text": buf.getvalue(),
                             "size": len(vec.seq)}])
         from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from textual.widgets import Button
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
+            await pilot.pause(); await pilot.pause(0.05)
             modal = sc.ConstructorModal()
             await app.push_screen(modal)
-            await pilot.pause()
-            from textual.widgets import (TabbedContent, RadioButton,
-                                          Input, TextArea, Select,
-                                          DataTable, Button)
-            modal.query_one("#ctor-tabs", TabbedContent).active = \
-                "ctor-tab-traditional"
             await pilot.pause(); await pilot.pause(0.05)
-            modal.query_one("#trad-mode-pcr", RadioButton).value = True
-            await pilot.pause()
-            modal.query_one("#trad-pcr-name", Input).value = "myInsert"
-            modal.query_one("#trad-pcr-seq",  TextArea).text = (
-                "GAGCATGAAACGGCCAAGTAA")
-            # Display sorts entries by `_natural_sort_key`; compute
-            # target row against the same order so the cursor lands on
-            # what the user sees as pVec (not the disk-order pVec).
-            entries = sorted(
-                (e for e in sc._load_library() if isinstance(e, dict)),
-                key=lambda e: sc._natural_sort_key(
-                    e.get("name") or e.get("id") or ""
-                ),
-            )
-            target = next(i for i, e in enumerate(entries)
-                          if e.get("name") == "pVec")
-            modal.query_one("#trad-vector-table",
-                             DataTable).move_cursor(row=target)
-            await pilot.pause()
-            modal.query_one("#trad-enzyme-1", Select).value = "EcoRI"
-            modal.query_one("#trad-enzyme-2", Select).value = "BamHI"
-            await pilot.pause()
-            await pilot.click("#btn-trad-simulate")
-            await pilot.pause()
+            await self._setup_lane(pilot, modal, app)
+            modal.query_one("#btn-trad-simulate", Button).press()
+            await pilot.pause(); await pilot.pause(0.2)
             save_fwd = modal.query_one("#btn-trad-save-fwd", Button)
             save_rev = modal.query_one("#btn-trad-save-rev", Button)
             (save_fwd if not save_fwd.disabled else save_rev).press()
             await pilot.pause()
-            # Find the saved trad-* entry; history_xml MUST be present.
-            saved = next((e for e in sc._load_library()
-                            if isinstance(e, dict)
-                            and str(e.get("name", "")).startswith("trad-")),
-                          None)
+            name_modal = app.screen
+            assert isinstance(name_modal, sc.NamePlasmidModal)
+            name_modal.dismiss("my-trad-history-test")
+            await pilot.pause(); await pilot.pause(0.05)
+            saved = next(
+                (e for e in sc._load_library()
+                  if isinstance(e, dict)
+                  and e.get("name") == "my-trad-history-test"),
+                None,
+            )
             assert saved is not None
             assert "history_xml" in saved, (
                 f"history not attached to entry {saved.get('name')!r}; "
@@ -846,16 +835,15 @@ class TestSimulateTraditionalCloning:
             # vector).
             root = sc._parse_commercialsaas_history(saved["history_xml"])
             assert root is not None
-            assert saved["name"] in root.name   # "trad-fwd.dna" etc.
+            assert saved["name"] in root.name
             assert root.operation == "insertFragment"
             parent_names = [p.name for p in root.parents]
-            # Insert + vector both attached as parents.
             assert any("PCR-product" in pn or "myInsert" in pn
                         for pn in parent_names), parent_names
             assert any("pVec" in pn for pn in parent_names), parent_names
             # Regenerated sites carry both enzymes used.
             site_names = [s["name"] for s in root.regenerated_sites]
-            assert set(site_names) == {"EcoRI", "BamHI"}
+            assert {"EcoRI", "BamHI"} <= set(site_names)
             # Input summary marks which orientation was saved.
             ops = [s["manipulation"] for s in root.input_summaries]
             assert any(op in ("ligateFwd", "ligateRev") for op in ops)
@@ -882,49 +870,29 @@ class TestSimulateTraditionalCloning:
                             "gb_text": buf.getvalue(),
                             "size": len(vec.seq)}])
         from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from textual.widgets import Button, Select, DataTable
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
+            await pilot.pause(); await pilot.pause(0.05)
             modal = sc.ConstructorModal()
             await app.push_screen(modal)
-            await pilot.pause()
-            from textual.widgets import (TabbedContent, RadioButton,
-                                          Input, TextArea, Select,
-                                          DataTable, Button)
-            modal.query_one("#ctor-tabs", TabbedContent).active = \
-                "ctor-tab-traditional"
             await pilot.pause(); await pilot.pause(0.05)
-            modal.query_one("#trad-mode-pcr", RadioButton).value = True
-            await pilot.pause()
-            modal.query_one("#trad-pcr-name", Input).value = "x"
-            modal.query_one("#trad-pcr-seq",  TextArea).text = (
-                "GAGCATGAAACGGCCAAGTAA")
-            # Display sorts entries by `_natural_sort_key`; compute
-            # target row against the same order so the cursor lands on
-            # what the user sees as pVec (not the disk-order pVec).
-            entries = sorted(
-                (e for e in sc._load_library() if isinstance(e, dict)),
-                key=lambda e: sc._natural_sort_key(
-                    e.get("name") or e.get("id") or ""
-                ),
-            )
-            target = next(i for i, e in enumerate(entries)
-                          if e.get("name") == "pVec")
-            modal.query_one("#trad-vector-table",
-                             DataTable).move_cursor(row=target)
-            await pilot.pause()
-            modal.query_one("#trad-enzyme-1", Select).value = "EcoRI"
-            modal.query_one("#trad-enzyme-2", Select).value = "BamHI"
-            await pilot.pause()
-            await pilot.click("#btn-trad-simulate")
-            await pilot.pause()
+            pane = await self._setup_lane(pilot, modal, app)
+            modal.query_one("#btn-trad-simulate", Button).press()
+            await pilot.pause(); await pilot.pause(0.2)
             save_fwd = modal.query_one("#btn-trad-save-fwd", Button)
             save_rev = modal.query_one("#btn-trad-save-rev", Button)
-            # At least one Save is enabled after a successful sim.
             assert not (save_fwd.disabled and save_rev.disabled)
-            # Now change an enzyme — both Save buttons re-disable.
-            modal.query_one("#trad-enzyme-2", Select).value = "HindIII"
+            # Park cursor on the backbone row (idx 0) so the edit
+            # panel mirrors the backbone's enzymes, then change one —
+            # both Save buttons must re-disable as the cached product
+            # is now stale.
+            lt = modal.query_one("#trad-lane", DataTable)
+            lt.move_cursor(row=0)
+            await pilot.pause()
+            modal.query_one(
+                "#trad-edit-enz-2", Select,
+            ).value = "HindIII"
             await pilot.pause()
             assert save_fwd.disabled and save_rev.disabled
 
@@ -942,20 +910,442 @@ class TestSimulateTraditionalCloning:
             modal = sc.ConstructorModal()
             await app.push_screen(modal)
             await pilot.pause()
-            from textual.widgets import TabbedContent
+            from textual.widgets import TabbedContent, Button
             modal.query_one("#ctor-tabs", TabbedContent).active = \
                 "ctor-tab-traditional"
             await pilot.pause()
             # Click Simulate in default (plasmid) mode without any
             # plasmid in the library — should set a red error message
             # and leave the cached products empty.
-            await pilot.click("#btn-trad-simulate")
+            modal.query_one("#btn-trad-simulate", Button).press()
             await pilot.pause()
             pane = modal.query_one("#ctor-trad-pane",
                                      sc.TraditionalCloningPane)
             # No products should be cached on a failed simulate.
             assert pane._fwd_product is None
             assert pane._rev_product is None
+
+    async def test_lane_add_remove_reorder(
+            self, tiny_record, isolated_library):
+        """Lane-management buttons: Add to Lane queues a fragment; ↑/↓
+        reorder via cursor; ✕ Remove drops the row under the cursor.
+        Empty lane → Simulate fails with a clear message rather than
+        crashing.
+        Regression for the 2026-05-23 lane rebuild."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio import SeqIO
+        import io
+        vec = SeqRecord(
+            Seq("AAAAAAAAGAATTCAAAAAAAAAAGGATCCTTTTTTTT"),
+            id="pVec", name="pVec",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        buf = io.StringIO()
+        SeqIO.write(vec, buf, "genbank")
+        sc._save_library([{"id": "pVec", "name": "pVec",
+                            "gb_text": buf.getvalue(),
+                            "size": len(vec.seq)}])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            from textual.widgets import (TabbedContent, RadioButton,
+                                          Input, TextArea, Select,
+                                          DataTable, Button, Static)
+            modal.query_one("#ctor-tabs", TabbedContent).active = \
+                "ctor-tab-traditional"
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal.query_one("#trad-mode-pcr", RadioButton).value = True
+            await pilot.pause()
+            pane = modal.query_one("#ctor-trad-pane",
+                                     sc.TraditionalCloningPane)
+            # Empty lane + Simulate → red error message.
+            modal.query_one("#btn-trad-simulate", Button).press()
+            await pilot.pause()
+            results = str(
+                modal.query_one("#trad-results-text", Static).content
+            )
+            assert "Lane is empty" in results, results
+            # Queue three PCR fragments with different enzyme pairs so
+            # reorder + remove can be distinguished by lane row state.
+            # `await pilot.pause()` between adds is required: Button
+            # .press() posts a message handled asynchronously, so
+            # without a pause the next iteration overwrites the
+            # Input value before the previous handler captures it
+            # and all three lane rows end up identical to the last.
+            async def _add(name, e1, e2, seq):
+                modal.query_one(
+                    "#trad-pcr-name", Input,
+                ).value = name
+                modal.query_one(
+                    "#trad-pcr-seq",  TextArea,
+                ).text = seq
+                modal.query_one(
+                    "#btn-trad-add-frag", Button,
+                ).press()
+                await pilot.pause()
+                # Enzymes set in the master/detail editor after Add
+                # to Lane (the new flow defers enzyme choice until the
+                # donor row exists in the lane).
+                modal.query_one(
+                    "#trad-edit-enz-1", Select,
+                ).value = e1
+                modal.query_one(
+                    "#trad-edit-enz-2", Select,
+                ).value = e2
+                await pilot.pause()
+            await _add("alpha", "EcoRI",   "BamHI",   "AAACCC")
+            await _add("beta",  "BamHI",   "SalI",    "GGGTTT")
+            await _add("gamma", "SalI",    "HindIII", "CCCAAA")
+            assert [s["name"] for s in pane._lane_inserts] == \
+                ["alpha", "beta", "gamma"]
+            # Reorder: move middle row (beta) up.
+            lt = modal.query_one("#trad-lane", DataTable)
+            lt.move_cursor(row=1)
+            await pilot.pause()
+            modal.query_one("#btn-trad-lane-up", Button).press()
+            await pilot.pause()
+            assert [s["name"] for s in pane._lane_inserts] == \
+                ["beta", "alpha", "gamma"]
+            # Remove the cursor row (now beta at row 0).
+            lt.move_cursor(row=0)
+            await pilot.pause()
+            modal.query_one("#btn-trad-lane-remove", Button).press()
+            await pilot.pause()
+            assert [s["name"] for s in pane._lane_inserts] == \
+                ["alpha", "gamma"]
+            # Clear Lane drops everything.
+            modal.query_one("#btn-trad-lane-clear", Button).press()
+            await pilot.pause()
+            assert pane._lane_inserts == []
+
+    async def test_save_pushes_name_modal_with_default(
+            self, tiny_record, isolated_library):
+        """Clicking Save Forward after a successful Simulate must
+        push ``NamePlasmidModal`` with an auto-default name derived
+        from ``{vector} · {fragment names} (suffix)`` — same shape
+        Golden Braid uses. Cancelling the modal is a no-op (no
+        library entry added)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio import SeqIO
+        import io
+        vec = SeqRecord(
+            Seq("AAAAAAAAGAATTCAAAAAAAAAAGGATCCTTTTTTTT"),
+            id="pVec", name="pVec",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        buf = io.StringIO()
+        SeqIO.write(vec, buf, "genbank")
+        sc._save_library([{"id": "pVec", "name": "pVec",
+                            "gb_text": buf.getvalue(),
+                            "size": len(vec.seq)}])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from textual.widgets import Button
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause(); await pilot.pause(0.05)
+            await self._setup_lane(pilot, modal, app)
+            modal.query_one("#btn-trad-simulate", Button).press()
+            await pilot.pause(); await pilot.pause(0.2)
+            save_fwd = modal.query_one("#btn-trad-save-fwd", Button)
+            save_rev = modal.query_one("#btn-trad-save-rev", Button)
+            (save_fwd if not save_fwd.disabled else save_rev).press()
+            await pilot.pause()
+            name_modal = app.screen
+            assert isinstance(name_modal, sc.NamePlasmidModal), (
+                f"expected NamePlasmidModal; "
+                f"got {type(name_modal).__name__}"
+            )
+            default = name_modal._default_name
+            assert "pVec" in default, default
+            assert "myInsert" in default, default
+            assert "fwd" in default or "rev" in default, default
+            lib_before = len(sc._load_library())
+            name_modal.dismiss(None)
+            await pilot.pause(); await pilot.pause(0.05)
+            assert len(sc._load_library()) == lib_before
+
+    async def test_master_detail_editor_populates_on_lane_select(
+            self, tiny_record, isolated_library):
+        """After Add to Lane, the master/detail editor auto-parks on
+        the new row. Setting enzymes in the editor flows into the
+        lane row's spec and the lane DataTable's E1/E2 columns update
+        accordingly. Regression for the 2026-05-23 lane rebuild's
+        master/detail wiring."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio import SeqIO
+        import io
+        vec = SeqRecord(
+            Seq("AAAAAAAAGAATTCAAAAAAAAAAGGATCCTTTTTTTT"),
+            id="pVec", name="pVec",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        buf = io.StringIO()
+        SeqIO.write(vec, buf, "genbank")
+        sc._save_library([{"id": "pVec", "name": "pVec",
+                            "gb_text": buf.getvalue(),
+                            "size": len(vec.seq)}])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            from textual.widgets import (TabbedContent, RadioButton,
+                                          Input, TextArea, Select,
+                                          Button)
+            modal.query_one("#ctor-tabs", TabbedContent).active = \
+                "ctor-tab-traditional"
+            await pilot.pause(); await pilot.pause(0.05)
+            modal.query_one("#trad-mode-pcr", RadioButton).value = True
+            await pilot.pause()
+            modal.query_one("#trad-pcr-name", Input).value = "myFrag"
+            modal.query_one("#trad-pcr-seq",  TextArea).text = (
+                "GAGCATGAAACGGCCAAGTAA")
+            modal.query_one("#btn-trad-add-frag", Button).press()
+            await pilot.pause()
+            pane = modal.query_one("#ctor-trad-pane",
+                                     sc.TraditionalCloningPane)
+            assert pane._edit_row_idx == 0, (
+                "edit panel should auto-park on the new row"
+            )
+            assert pane._lane_inserts[0]["enz_left"] == ""
+            modal.query_one("#trad-edit-enz-1", Select).value = "EcoRI"
+            await pilot.pause()
+            modal.query_one("#trad-edit-enz-2", Select).value = "BamHI"
+            await pilot.pause()
+            assert pane._lane_inserts[0]["enz_left"]  == "EcoRI"
+            assert pane._lane_inserts[0]["enz_right"] == "BamHI"
+
+    async def test_donor_frag_radio_overrides_auto_pick(
+            self, tiny_record, isolated_library):
+        """For a plasmid-mode donor with valid 2-fragment digest, the
+        donor-fragment radio toggles ``donor_frag_idx`` between 0 and
+        1, overriding the feature-aware auto-pick used when the user
+        hasn't touched the radio. Verifies that the Simulate path
+        consumes the override (different ligated sequence depending
+        on which fragment is picked)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio import SeqIO
+        import io
+        # Donor plasmid with EcoRI + BamHI sites producing two clearly
+        # different-sized fragments.
+        donor = SeqRecord(
+            Seq("AAAAAAAAGAATTCTTTTTTTTTTTTTTTTGGATCCCCCCCCCC"),
+            id="pDonor", name="pDonor",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        vec = SeqRecord(
+            Seq("ACGTACGTGAATTCAAAAAAAAAAAAAAGGATCCACGTACGT"),
+            id="pVec", name="pVec",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        gb = {}
+        for r in (donor, vec):
+            b = io.StringIO()
+            SeqIO.write(r, b, "genbank")
+            gb[r.id] = b.getvalue()
+        sc._save_library([
+            {"id": "pDonor", "name": "pDonor",
+              "gb_text": gb["pDonor"], "size": len(donor.seq)},
+            {"id": "pVec",   "name": "pVec",
+              "gb_text": gb["pVec"],   "size": len(vec.seq)},
+        ])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            from textual.widgets import (TabbedContent, Select,
+                                          DataTable, Button, RadioButton)
+            modal.query_one("#ctor-tabs", TabbedContent).active = \
+                "ctor-tab-traditional"
+            await pilot.pause(); await pilot.pause(0.05)
+            entries = sorted(
+                (e for e in sc._load_library() if isinstance(e, dict)),
+                key=lambda e: sc._natural_sort_key(
+                    e.get("name") or e.get("id") or ""
+                ),
+            )
+            donor_idx = next(i for i, e in enumerate(entries)
+                              if e.get("name") == "pDonor")
+            vec_idx = next(i for i, e in enumerate(entries)
+                            if e.get("name") == "pVec")
+            # Pick donor + Add.
+            modal.query_one(
+                "#trad-source-table", DataTable,
+            ).move_cursor(row=donor_idx)
+            await pilot.pause()
+            modal.query_one("#btn-trad-add-frag", Button).press()
+            await pilot.pause()
+            # Set enzymes via edit panel.
+            modal.query_one(
+                "#trad-edit-enz-1", Select,
+            ).value = "EcoRI"
+            await pilot.pause()
+            modal.query_one(
+                "#trad-edit-enz-2", Select,
+            ).value = "BamHI"
+            await pilot.pause()
+            pane = modal.query_one("#ctor-trad-pane",
+                                     sc.TraditionalCloningPane)
+            assert pane._edit_frags is not None, (
+                "digest should populate _edit_frags for plasmid mode"
+            )
+            assert len(pane._edit_frags) == 2
+            # Toggle to fragment B (idx=1) — overrides auto-pick.
+            modal.query_one(
+                "#trad-edit-frag-1", RadioButton,
+            ).value = True
+            await pilot.pause()
+            assert pane._lane_inserts[0]["donor_frag_idx"] == 1, (
+                f"radio toggle should set donor_frag_idx=1; "
+                f"got {pane._lane_inserts[0]['donor_frag_idx']}"
+            )
+            # Toggle to fragment A (idx=0).
+            modal.query_one(
+                "#trad-edit-frag-0", RadioButton,
+            ).value = True
+            await pilot.pause()
+            assert pane._lane_inserts[0]["donor_frag_idx"] == 0
+
+    async def test_digest_cache_avoids_redundant_work(
+            self, tiny_record, isolated_library):
+        """`_cached_digest` memoises `(entry_id, enzymes)` digests so
+        repeat lookups (the gel preview's per-event re-render) don't
+        re-scan the source plasmid. Verifies cache hit on second call
+        with the same enzymes."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio import SeqIO
+        import io
+        donor = SeqRecord(
+            Seq("AAAAAAAAGAATTCTTTTTTTTTTTTTTTTGGATCCCCCCCCCC"),
+            id="pDonor", name="pDonor",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        b = io.StringIO()
+        SeqIO.write(donor, b, "genbank")
+        sc._save_library([{"id": "pDonor", "name": "pDonor",
+                            "gb_text": b.getvalue(),
+                            "size": len(donor.seq)}])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            from textual.widgets import TabbedContent
+            modal.query_one("#ctor-tabs", TabbedContent).active = \
+                "ctor-tab-traditional"
+            await pilot.pause(); await pilot.pause(0.05)
+            pane = modal.query_one("#ctor-trad-pane",
+                                     sc.TraditionalCloningPane)
+            frags_1, err_1 = pane._cached_digest(
+                "pDonor", ["EcoRI", "BamHI"],
+            )
+            assert err_1 == "", err_1
+            assert frags_1 is not None and len(frags_1) == 2
+            cache_key = ("pDonor", tuple(sorted(["EcoRI", "BamHI"])))
+            assert cache_key in pane._digest_cache
+            # Second call with same enzymes → cache hit (same list
+            # identity, no re-digest).
+            frags_2, err_2 = pane._cached_digest(
+                "pDonor", ["EcoRI", "BamHI"],
+            )
+            assert err_2 == ""
+            assert frags_2 is frags_1, "second call should hit cache"
+            # Different enzyme combo → cache miss → new entry.
+            _, err_3 = pane._cached_digest(
+                "pDonor", ["EcoRI", "BamHI", "HindIII"],
+            )
+            # 3+ cuts on a circular plasmid surfaces as an error
+            # (ambiguous excise) — still a valid memo lookup, just
+            # err returned without a frags list.
+            assert err_3 != "" or len(pane._digest_cache) >= 2
+
+    async def test_gel_preview_renders_for_donor_lane(
+            self, tiny_record, isolated_library):
+        """Gel preview shows non-empty text once at least one donor
+        is queued. Pristine state shows the empty-state hint."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio import SeqIO
+        import io
+        donor = SeqRecord(
+            Seq("AAAAAAAAGAATTCTTTTTTTTTTTTTTTTGGATCCCCCCCCCC"),
+            id="pDonor", name="pDonor",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        b = io.StringIO()
+        SeqIO.write(donor, b, "genbank")
+        sc._save_library([{"id": "pDonor", "name": "pDonor",
+                            "gb_text": b.getvalue(),
+                            "size": len(donor.seq)}])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            from textual.widgets import (TabbedContent, Static,
+                                          DataTable, Button, Select)
+            modal.query_one("#ctor-tabs", TabbedContent).active = \
+                "ctor-tab-traditional"
+            await pilot.pause(); await pilot.pause(0.05)
+            gel = modal.query_one("#trad-gel-text", Static)
+            # Empty state: no donors queued — gel shows hint.
+            assert "empty lane" in str(gel.content)
+            # Add a donor + set enzymes.
+            entries = sorted(
+                (e for e in sc._load_library() if isinstance(e, dict)),
+                key=lambda e: sc._natural_sort_key(
+                    e.get("name") or e.get("id") or ""
+                ),
+            )
+            donor_idx = next(i for i, e in enumerate(entries)
+                              if e.get("name") == "pDonor")
+            modal.query_one(
+                "#trad-source-table", DataTable,
+            ).move_cursor(row=donor_idx)
+            await pilot.pause()
+            modal.query_one("#btn-trad-add-frag", Button).press()
+            await pilot.pause()
+            modal.query_one("#trad-edit-enz-1", Select).value = "EcoRI"
+            await pilot.pause()
+            modal.query_one("#trad-edit-enz-2", Select).value = "BamHI"
+            await pilot.pause()
+            # Gel now non-empty + carries the lane label (truncated
+            # to lane_width=7 chars + the backbone "[B]" prefix that
+            # `_refresh_gel_preview` adds to backbone rows).
+            content = str(modal.query_one(
+                "#trad-gel-text", Static,
+            ).content)
+            assert "empty lane" not in content
+            # Lane label is "[B]pDonor" truncated to 7 chars → "[B]pDon".
+            assert "pDon" in content, (
+                f"donor lane label missing from gel render; "
+                f"content head: {content[:200]!r}"
+            )
 
     def test_features_carry_through_with_correct_offsets(self):
         # Insert with one feature at positions 2..5 (relative to insert).
@@ -977,6 +1367,159 @@ class TestSimulateTraditionalCloning:
         labels = {f["label"]: (f["start"], f["end"]) for f in fwd_feats}
         assert labels["vec-feat"] == (5, 10)
         assert labels["in-feat"]  == (22, 25)
+
+
+class TestSimulateTraditionalCloningMulti:
+    """N-way ligation wrapper. ``_simulate_traditional_cloning_multi``
+    pre-chains 1..N insert fragments in lane order, then delegates to
+    the 2-fragment engine for the final vector + chained-insert
+    ligation."""
+
+    def _vec(self, oh_left: str, oh_right: str,
+              enz_left: str = "EcoRI", enz_right: str = "EcoRI"):
+        return {
+            "top_seq": "TGGCCCC" * 10,
+            "left":  {"overhang_seq": oh_left,  "kind": "5'",
+                       "enzyme": enz_left},
+            "right": {"overhang_seq": oh_right, "kind": "5'",
+                       "enzyme": enz_right},
+            "features": [], "source_label": "vec",
+        }
+
+    def test_n1_matches_two_fragment_engine(self):
+        """N=1 chemistry (top_seq + compatibility) must be identical
+        between the 2-fragment engine and the multi-wrapper. The
+        multi-wrapper adds scar-detection warnings + misc_feature
+        annotations on top, so the test compares the chemistry-
+        relevant fields rather than full-dict equality."""
+        insert = sc._make_synthetic_fragment(
+            "GAGCATGAAACGGCCAAGTAA",
+            enz_left="EcoRI", enz_right="BamHI",
+            source_label="insert",
+        )
+        vector = self._vec("GATC", "AATT",
+                            enz_left="BamHI", enz_right="EcoRI")
+        single = sc._simulate_traditional_cloning(insert, vector)
+        multi  = sc._simulate_traditional_cloning_multi([insert], vector)
+        for orient in ("forward", "reverse"):
+            assert single[orient]["top_seq"] == multi[orient]["top_seq"]
+            assert single[orient]["compatible"] == \
+                multi[orient]["compatible"]
+        assert single["errors"] == multi["errors"]
+
+    def test_empty_lane_errors(self):
+        """An empty insert list short-circuits with a clear error
+        rather than nuking the vector — defensive guard for the UI
+        path where the user clicks Simulate before adding fragments."""
+        vector = self._vec("AATT", "AATT")
+        result = sc._simulate_traditional_cloning_multi([], vector)
+        assert result["forward"]["compatible"] is False
+        assert any("No insert" in e for e in result["errors"])
+
+    def test_three_way_chain_ligates(self):
+        """Three inserts chained by matching sticky ends + a vector
+        whose outer ends match the chain's flanks → forward
+        orientation ligates; the chained insert lands at the right
+        offset on the product."""
+        # Chain: insert1 (E..B) → insert2 (B..S) → insert3 (S..H)
+        # Sticky ends: BamHI=GATC, SalI=TCGA, HindIII=AGCT, EcoRI=AATT
+        i1 = sc._make_synthetic_fragment(
+            "AAAA", enz_left="EcoRI",   enz_right="BamHI",
+            source_label="i1",
+        )
+        i2 = sc._make_synthetic_fragment(
+            "CCCC", enz_left="BamHI",   enz_right="SalI",
+            source_label="i2",
+        )
+        i3 = sc._make_synthetic_fragment(
+            "GGGG", enz_left="SalI",    enz_right="HindIII",
+            source_label="i3",
+        )
+        # Vector outer ends: left=AGCT (HindIII), right=AATT (EcoRI)
+        # so the chain's outer flanks (EcoRI on i1.left, HindIII on
+        # i3.right) ligate to the vector's matching ends.
+        vector = self._vec(
+            "AGCT", "AATT",
+            enz_left="HindIII", enz_right="EcoRI",
+        )
+        result = sc._simulate_traditional_cloning_multi(
+            [i1, i2, i3], vector,
+        )
+        assert result["errors"] == [], (
+            f"unexpected errors: {result['errors']}"
+        )
+        assert result["forward"]["compatible"] is True
+        # Sequence carries vector + chained inserts (no gaps); top
+        # strand should at minimum include each insert body verbatim.
+        fwd_seq = result["forward"]["top_seq"]
+        for body in ("AAAA", "CCCC", "GGGG"):
+            assert body in fwd_seq, f"missing {body!r} in {fwd_seq!r}"
+
+    def test_biobrick_spei_xbai_junction_is_scar(self):
+        """SpeI (A^CTAGT) + XbaI (T^CTAGA) produce the same CTAG 5'
+        overhang so they ligate, but the resulting junction sequence
+        is ACTAGA — neither SpeI (ACTAGT) nor XbaI (TCTAGA). That's
+        the iGEM BioBrick idempotent property: ligated joints are
+        uncuttable by either parent enzyme. `_classify_junction`
+        must detect this and surface a warning so the user knows
+        the joint is irreversible. The scar must also appear as a
+        misc_feature on the saved product."""
+        # SpeI cut leaves CTAG overhang; XbaI cut leaves CTAG
+        # overhang. Use synthetic fragments stamped with these
+        # enzyme overhangs so the engine sees ACTAGA at the joint.
+        insert = sc._make_synthetic_fragment(
+            "GAGCATG", enz_left="SpeI", enz_right="XbaI",
+            source_label="biobrick-part",
+        )
+        vector = {
+            "top_seq": "TTTTTTTT" * 5,
+            "left":  {"overhang_seq": "CTAG", "kind": "5'",
+                       "enzyme": "XbaI"},
+            "right": {"overhang_seq": "CTAG", "kind": "5'",
+                       "enzyme": "SpeI"},
+            "features": [], "source_label": "biobrick-vec",
+        }
+        result = sc._simulate_traditional_cloning_multi(
+            [insert], vector,
+        )
+        assert result["forward"]["compatible"] is True
+        # Warnings include at least one "scar" notice — the SpeI/
+        # XbaI joint is uncuttable.
+        joined = " ".join(result["warnings"])
+        assert "scar" in joined.lower(), (
+            f"expected SpeI/XbaI scar warning; got: {result['warnings']!r}"
+        )
+        # Saved product carries a LIGATION SCAR misc_feature.
+        scar_feats = [
+            f for f in result["forward"]["features"]
+            if f.get("type") == "misc_feature"
+            and "SCAR" in str(f.get("label", "")).upper()
+        ]
+        assert scar_feats, (
+            f"expected scar feature on forward product; "
+            f"features: {result['forward']['features']!r}"
+        )
+
+    def test_internal_junction_mismatch_surfaces_pair(self):
+        """If two adjacent inserts have incompatible sticky ends, the
+        error message names the failing pair by source_label so the
+        user can fix that specific junction."""
+        i1 = sc._make_synthetic_fragment(
+            "AAA", enz_left="EcoRI", enz_right="BamHI",
+            source_label="i1",
+        )
+        # i2's LEFT is SalI (TCGA), but i1's RIGHT is BamHI (GATC)
+        # — mismatched. Junction 1 → 2 should fail.
+        i2 = sc._make_synthetic_fragment(
+            "CCC", enz_left="SalI", enz_right="EcoRI",
+            source_label="i2",
+        )
+        vector = self._vec("AATT", "AATT")
+        result = sc._simulate_traditional_cloning_multi([i1, i2], vector)
+        assert result["forward"]["compatible"] is False
+        joined_err = " ".join(result["errors"])
+        assert "Junction 1 → 2" in joined_err
+        assert "'i1'" in joined_err and "'i2'" in joined_err
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -114,6 +114,75 @@ class TestAppBootstrap:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Canvas combine — styled-space preservation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCanvasCombineStyledSpaces:
+    """Regression guard for 2026-05-22: `_BrailleCanvas.combine` used to
+    fold every space cell of the text canvas into the blank-run, which
+    silently dropped the cell's style. The user-visible symptom was
+    feature bars with embedded labels (e.g. "transit peptide") showing
+    a black gap at every inner space — the label space was painted
+    `"bold black on color(46)"` but rendered as a default-bg cell after
+    combine() stripped the style.
+
+    Test contract: paint a row of green `█` blocks, overlay a label
+    that contains an inner space using "bold black on color(46)"
+    style, run `combine()`. The resulting Rich `Text` must carry a
+    span covering the space column, and the span's style must include
+    the green background.
+    """
+
+    def test_inner_label_space_keeps_background(self):
+        # 25 cells: 5 green blocks, "transit peptide" (15 chars,
+        # internal space at index 7), 5 more green blocks.
+        canvas = sc._Canvas(25, 1)
+        bc = sc._BrailleCanvas(25, 1)
+        green = "color(46)"
+        for col in range(5):
+            canvas.put(col, 0, "█", green)
+        canvas.put_text(5, 0, "transit peptide",
+                         f"bold black on {green}")
+        for col in range(20, 25):
+            canvas.put(col, 0, "█", green)
+        text = bc.combine(canvas)
+        assert text.plain == "█████transit peptide█████"
+        # Inner space sits at col (5 + 7) = 12.
+        space_spans = [s for s in text.spans if s.start <= 12 < s.end]
+        assert space_spans, (
+            "label inner space at col 12 must carry a span — without "
+            "one it renders as a default-bg cell (visible as a black "
+            "gap inside the feature bar)."
+        )
+        # And the span must keep the green background.
+        styles = [str(s.style) for s in space_spans]
+        assert any("color(46)" in st for st in styles), (
+            f"label inner-space span must include the green bg "
+            f"(`on color(46)`), got: {styles!r}"
+        )
+
+    def test_unstyled_space_still_folds_into_blank_run(self):
+        # Sanity: spaces with NO style still collapse into the blank-
+        # run (efficient append path). Tests the post-fix guard
+        # `if tc_ch == " " and not tc_st and not bc_bits_row[col]`.
+        canvas = sc._Canvas(10, 1)
+        bc = sc._BrailleCanvas(10, 1)
+        canvas.put(0, 0, "A", "")
+        # Cells 1..9 stay as default-init spaces with no style.
+        canvas.put(9, 0, "B", "")
+        text = bc.combine(canvas)
+        assert text.plain == "A        B"
+        # No span for the middle blank run — it's emitted as a plain
+        # un-styled `" " * n` chunk by the blank-run fast path.
+        middle_spans = [s for s in text.spans
+                        if 1 <= s.start < 9 or 1 < s.end <= 9]
+        assert not middle_spans, (
+            f"unstyled space cells should not produce spans; got "
+            f"{middle_spans!r}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Map/sequence resize handle (PR #8 from Harley King — har1eyk)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -596,6 +665,183 @@ class TestLibraryRename:
             assert any(
                 e["id"] == tiny_record.id and e["name"] == original_name
                 for e in entries
+            )
+
+    async def test_rename_cascades_to_parts_bin(
+        self, tiny_record, isolated_library, isolated_parts_bin
+    ):
+        """When a library plasmid is renamed, any parts-bin entry that
+        mirrors it (by name + grammar) must follow the rename. Without
+        the cascade, the bin entry keeps the OLD plasmid name, the
+        library-delete cascade — which matches on (name, grammar) —
+        misses it, and the part is orphaned forever once the user
+        deletes the plasmid. Regression for the rename → delete gap
+        the user hit in 2026-05-23."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Seed a parts-bin row mirroring tiny_record under its
+            # original name (mimics what `_persist_assembly` would
+            # have written when the user first saved this plasmid as
+            # an assembly result).
+            old_name = tiny_record.name
+            sc._save_parts_bin([{
+                "name": old_name, "grammar": "gb_l0", "level": 1,
+                "type": "TU", "position": "B", "sequence": "ATGC",
+                "oh5": "", "oh3": "",
+            }])
+            # Tag the library entry's source so the cascade matches
+            # by (name, grammar) and not the legacy name-only path.
+            entries = sc._load_library()
+            for e in entries:
+                if e["id"] == tiny_record.id:
+                    e["source"] = "constructor:gb_l0:vector"
+                    break
+            sc._save_library(entries)
+
+            new_name = "renamed mirror entry"
+            app._rename_library_entry(tiny_record.id, new_name)
+            # Cache update is sync; let the worker land too.
+            await pilot.pause(0.2)
+            bin_entries = sc._load_parts_bin()
+            assert len(bin_entries) == 1
+            assert bin_entries[0]["name"] == new_name, (
+                f"parts-bin row should follow the rename; "
+                f"got {bin_entries[0]['name']!r}"
+            )
+
+    async def test_rename_cascade_skips_other_grammars(
+        self, tiny_record, isolated_library, isolated_parts_bin
+    ):
+        """A parts-bin entry with the same name but a different grammar
+        is a DIFFERENT part (parts are unique per grammar). Cascade
+        must leave it alone — only the (name, source-grammar) match
+        gets renamed."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            old_name = tiny_record.name
+            sc._save_parts_bin([
+                {"name": old_name, "grammar": "gb_l0", "level": 1,
+                 "type": "TU", "position": "B", "sequence": "ATGC",
+                 "oh5": "", "oh3": ""},
+                {"name": old_name, "grammar": "moclo", "level": 0,
+                 "type": "L0", "position": "PROM", "sequence": "TTTG",
+                 "oh5": "", "oh3": ""},
+            ])
+            entries = sc._load_library()
+            for e in entries:
+                if e["id"] == tiny_record.id:
+                    e["source"] = "constructor:gb_l0:vector"
+                    break
+            sc._save_library(entries)
+            new_name = "gb-only renamed"
+            app._rename_library_entry(tiny_record.id, new_name)
+            await pilot.pause(0.2)
+            bin_entries = sc._load_parts_bin()
+            by_grammar = {b["grammar"]: b["name"] for b in bin_entries}
+            assert by_grammar["gb_l0"] == new_name
+            assert by_grammar["moclo"] == old_name, (
+                "moclo-grammar row should NOT be renamed by a "
+                "gb_l0 cascade"
+            )
+
+    async def test_rename_to_whitespace_name_keeps_gb_text_fresh(
+        self, tiny_record, isolated_library
+    ):
+        """A display name with whitespace + '+' (e.g. 'MAV 33 MOD CDS+RUBY')
+        must succeed and update gb_text. Pre-fix the SeqIO writer raised
+        ValueError("Invalid whitespace in '...' for LOCUS line"); the
+        exception was swallowed, leaving gb_text stale while e['name']
+        was already updated. The fix sanitises rec.name to a LOCUS-safe
+        form (whitespace + non-[A-Za-z0-9_-] → '_') for the gb_text
+        write while e['name'] keeps the user's original."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            new_name = "MAV 33 MOD CDS+RUBY"
+            app._rename_library_entry(tiny_record.id, new_name)
+            await pilot.pause(0.05)
+            entries = sc._load_library()
+            match = [e for e in entries if e["id"] == tiny_record.id]
+            assert len(match) == 1
+            # Display name keeps the user's original (whitespace + '+')
+            assert match[0]["name"] == new_name
+            # gb_text now parses without raising; LOCUS carries the
+            # sanitised form, NOT the old (pre-rename) LOCUS name.
+            reloaded = sc._gb_text_to_record(match[0]["gb_text"])
+            assert reloaded.name == "MAV_33_MOD_CDS_RUBY", (
+                f"expected sanitised LOCUS name on rec; got {reloaded.name!r}"
+            )
+            # Belt-and-braces: the LOCUS line in raw text should also
+            # carry the sanitised form (pre-fix it would be the OLD
+            # LOCUS name from before the failed re-serialize).
+            locus_line = match[0]["gb_text"].split("\n", 1)[0]
+            assert "MAV_33_MOD_CDS_RUBY" in locus_line, (
+                f"LOCUS line stale after rename: {locus_line!r}"
+            )
+
+
+class TestNamePlasmidModalDupWarning:
+    """`NamePlasmidModal._existing_ids` previously mapped case-folded
+    id → id, so the dup-warning's id-conflict path surfaced the bare
+    sanitised id (e.g. 'MAV_34'). After a rename, e['id'] is the OLD
+    sanitised name (immutable by design) while e['name'] is the new
+    display label — surfacing the id confused users into thinking the
+    warning referenced a phantom old plasmid. The map now points to
+    e['name'] (falling back to id when name is empty), and the warning
+    text shows both the colliding sanitised id and the existing
+    entry's display name for context."""
+
+    async def test_existing_ids_maps_to_display_name(
+        self, tiny_record, isolated_library
+    ):
+        from splicecraft import NamePlasmidModal
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Rename so e['name'] diverges from e['id']
+            app._rename_library_entry(tiny_record.id, "Renamed Display Label")
+            await pilot.pause(0.05)
+            modal = NamePlasmidModal("brand-new-name")
+            assert tiny_record.id.casefold() in modal._existing_ids
+            # The map's value is the DISPLAY name, not the bare id
+            assert modal._existing_ids[tiny_record.id.casefold()] == \
+                "Renamed Display Label"
+
+    async def test_id_conflict_warning_surfaces_display_name(
+        self, tiny_record, isolated_library
+    ):
+        """When the typed name sanitises to a colliding id, the status
+        line must reference the existing entry's display name (not the
+        bare id) so the user recognises what they're colliding with."""
+        from splicecraft import NamePlasmidModal
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._rename_library_entry(tiny_record.id, "Renamed Display Label")
+            await pilot.pause(0.05)
+            modal = NamePlasmidModal("placeholder")
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Type a name that sanitises to the existing id
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            # tiny_record.id like 'pACYC184' — re-using as the typed
+            # value should trip the id-conflict path (display name
+            # 'Renamed Display Label' is unrelated to the typed string).
+            inp.value = tiny_record.id
+            modal._refresh_dup_state(inp.value)
+            await pilot.pause(0.05)
+            status = modal.query_one("#nameplasmid-status", sc.Static)
+            status_text = str(status.content)
+            assert "Renamed Display Label" in status_text, (
+                f"warning should name the display label; got {status_text!r}"
             )
 
 
@@ -7208,7 +7454,9 @@ class TestShiftClickFeatureExtend:
         assert feat_at_bp[29] == "wrapCDS"   # tail arc end
 
         # Smoke: _body_text should run without exceptions on a wrap target.
-        out = scr._body_text()
+        # Post-2026-05-22: _body_text takes an explicit chunk width
+        # (used by the resize handler) — pass a representative value.
+        out = scr._body_text(60)
         assert out is not None
         assert "wrapCDS" not in str(out) or True  # rendering may abbreviate
 

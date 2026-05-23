@@ -229,6 +229,99 @@ class TestStartupAutoLoad:
             assert app._current_record is None
             app.exit()
 
+    async def test_oversized_first_entry_is_skipped(self):
+        """Size guard (2026-05-22): a natural-sort-first entry above
+        `_AUTOLOAD_MAX_BP` must NOT auto-load — it'd block cold start
+        for multiple seconds on chloroplast / mitochondrial / BAC-
+        sized records. User can still pick the row manually.
+
+        Test contract: synthesise a stub entry with `size` over the cap
+        but a small placeholder `gb_text`. If the guard didn't fire the
+        parse would succeed and `_current_record` would be set; the
+        guard must keep the canvas blank.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from io import StringIO
+        from Bio import SeqIO
+        # Build a tiny SeqRecord but advertise a huge `size` so the
+        # natural-sort comparator picks it up and the size guard fires
+        # without paying the cost of a real 100+ kb GenBank parse.
+        rec = SeqRecord(Seq("A" * 100), id="HUGE", name="HUGE",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        buf = StringIO()
+        SeqIO.write(rec, buf, "genbank")
+        sc._save_library([{
+            "id":      "HUGE",
+            "name":    "HUGE",
+            # 1 bp over the cap — guard must still fire.
+            "size":    sc.PlasmidApp._AUTOLOAD_MAX_BP + 1,
+            "gb_text": buf.getvalue(),
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.3)
+            assert app._current_record is None, (
+                "size-guarded entry must not auto-load; expected blank "
+                f"canvas, got {getattr(app._current_record, 'id', '?')!r}"
+            )
+            app.exit()
+
+    async def test_oversized_skip_picks_smaller_neighbor_only_if_listed_first(
+            self):
+        """The guard does NOT walk past an oversized first entry to
+        the next sort-position. If the user's natural-sort-first row
+        is oversized, the canvas stays blank — they explicitly chose
+        the sort order by naming. Walking past would surprise users
+        who expect the panel and canvas to share a row.
+
+        Test: library has HUGE (over cap, natural-sort first) and
+        AAA (small, natural-sort second). Canvas must stay blank.
+        AAA gets loaded only when the user clicks it.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from io import StringIO
+        from Bio import SeqIO
+        recs = []
+        entries = []
+        for name, n in (("HUGE", 100), ("AAA", 50)):
+            rec = SeqRecord(Seq("A" * n), id=name, name=name,
+                            annotations={"molecule_type": "DNA",
+                                         "topology": "circular"})
+            recs.append(rec)
+            buf = StringIO()
+            SeqIO.write(rec, buf, "genbank")
+            # Advertise HUGE as oversized, AAA as in-bounds.
+            size = (sc.PlasmidApp._AUTOLOAD_MAX_BP + 1 if name == "HUGE"
+                    else n)
+            entries.append({
+                "id": name, "name": name, "size": size,
+                "gb_text": buf.getvalue(),
+            })
+        # AAA is natural-sort first ('A' < 'H'). HUGE is second.
+        # Swap so the GUARDED entry is at sort position 1: natural
+        # sort puts 'AAA' first, so HUGE doesn't trigger the guard.
+        # Instead test the OPPOSITE: rename AAA to ZZZ so HUGE sorts
+        # first.
+        for entry in entries:
+            if entry["name"] == "AAA":
+                entry["name"] = "ZZZ"
+                entry["id"]   = "ZZZ"
+        sc._save_library(entries)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.3)
+            # HUGE sorts first ('H' < 'Z'), guard fires, canvas blank.
+            assert app._current_record is None, (
+                "guard must not walk past an oversized first entry; "
+                f"got {getattr(app._current_record, 'id', '?')!r}"
+            )
+            app.exit()
+
 
 # ── Main Collection migration ─────────────────────────────────────────────────
 

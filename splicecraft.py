@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.18"
+__version__ = "0.9.19"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -809,6 +809,7 @@ from textual.widgets import (  # noqa: E402
 # time, all only needed by the `?` Help modal. Imported lazily inside
 # `HelpModal.compose` instead so the cold-launch path stays lean.
 from rich.text import Text  # noqa: E402
+from rich.cells import cell_len as _cell_len  # noqa: E402
 
 # ── Feature appearance ─────────────────────────────────────────────────────────
 
@@ -4291,6 +4292,25 @@ def _restore_library_from_active_collection() -> None:
 #   SmaI   CCC^GGG / GGG^CCC  → fwd=3, rev=3  (blunt)
 #   BsaI   GGTCTC(1/5)        → recognition=6bp, fwd=6+1=7, rev=6+5=11
 #
+# Lane palette — distinct colors for the traditional cloning lane
+# rows. The same color is used for the name cell in the lane
+# DataTable and the body of the corresponding T-piece in the
+# puzzle view, so the user can visually link a row to its piece.
+# 8-entry cycle is enough for typical lanes (1 backbone + up to ~7
+# donors); longer lanes wrap. Chosen for high terminal contrast
+# (skip dim browns/greys) and broad colorblind distinguishability.
+_LANE_PALETTE: list[str] = [
+    "#5fafff",   # blue
+    "#ff8787",   # coral
+    "#5fff87",   # green
+    "#ffaf5f",   # orange
+    "#af87ff",   # purple
+    "#ffff5f",   # yellow
+    "#5fffff",   # cyan
+    "#ff5fff",   # magenta
+]
+
+
 _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
 
     # ── Common Type IIP — 6-bp palindromic cutters ─────────────────────────────
@@ -5949,6 +5969,298 @@ def _simulate_traditional_cloning(insert_frag: dict,
     }
 
 
+def _classify_junction(left_enz: str, right_enz: str,
+                          context_top: str,
+                          *, context_left_offset: int = 6) -> dict:
+    """Classify a ligation junction by checking whether the parent
+    enzymes can still re-cut the joint sequence.
+
+    ``context_top`` is the ~12 bp window straddling the junction
+    (default 6 bp on each side; `context_left_offset` says how many
+    bases of `context_top` are upstream of the cut). Returns:
+
+      {
+        "scar":         bool,    # True when NEITHER parent enzyme
+                                 # recognises the joint — irreversible
+                                 # (BioBrick-style idempotent assembly:
+                                 # SpeI A/CTAGT + XbaI T/CTAGA → ACTAGA,
+                                 # neither cuttable).
+        "re_cuttable":  list[str],  # parent enzyme names whose
+                                    # recognition site IS still
+                                    # present at the junction.
+        "label":        str,     # human-readable badge for warnings /
+                                 # feature annotations.
+      }
+
+    Generic to all enzymes (palindromic + asymmetric + Type IIS):
+    matches each parent enzyme's recognition site (via IUPAC pattern
+    + reverse-complement) against the junction context window, so
+    BamHI/BamHI (re-cuttable), BamHI/BglII (scar), and
+    BsaI-Type-IIS junctions all classify correctly.
+    """
+    enzymes = []
+    if left_enz:
+        enzymes.append(left_enz)
+    if right_enz and right_enz != left_enz:
+        enzymes.append(right_enz)
+    catalog = _all_enzymes()
+    re_cuttable: list[str] = []
+    ctx = context_top.upper()
+    for ename in enzymes:
+        spec = catalog.get(ename)
+        if spec is None:
+            continue
+        site = spec[0].upper()
+        if not site:
+            continue
+        pat = _iupac_pattern(site)
+        if pat.search(ctx):
+            re_cuttable.append(ename)
+            continue
+        # Check the reverse complement too — asymmetric / Type IIS
+        # enzymes can bind either strand and re-cut from the other
+        # side. Palindromic sites are their own RC so a double-match
+        # is fine.
+        rc_pat = _iupac_pattern(_rc(site))
+        if rc_pat.search(ctx):
+            re_cuttable.append(ename)
+    if re_cuttable:
+        return {
+            "scar":        False,
+            "re_cuttable": re_cuttable,
+            "label":       (f"{'/'.join(re_cuttable)} "
+                              f"re-cuttable junction"),
+        }
+    # No parent enzyme site survives → idempotent scar.
+    pair = f"{left_enz}/{right_enz}" if left_enz != right_enz else left_enz
+    return {
+        "scar":        True,
+        "re_cuttable": [],
+        "label":       f"{pair} scar (uncuttable by parent enzymes)",
+    }
+
+
+@_timed("op.simulate_traditional_cloning_multi")
+def _simulate_traditional_cloning_multi(insert_frags: list[dict],
+                                          vector_frag: dict) -> dict:
+    """N-way version of `_simulate_traditional_cloning`. Pre-chains
+    ``insert_frags`` in lane order — each adjacent pair must have
+    matching sticky ends — then delegates to the 2-fragment engine
+    for the final vector + chained-insert ligation. For N=1 this is
+    bit-identical to calling the 2-fragment engine directly.
+
+    Forward = inserts in lane order; Reverse = the entire chain RC'd
+    (the 2-fragment engine handles the flip). Per-junction error
+    messages name the failing pair by its ``source_label`` so the
+    user can diagnose which sticky-end pair didn't match.
+
+    Returns the same shape as `_simulate_traditional_cloning`:
+    ``{"forward": {...}, "reverse": {...}, "warnings": [...],
+       "errors": [...]}``.
+    """
+    if not insert_frags:
+        empty = {"top_seq": vector_frag.get("top_seq", ""),
+                 "features": [], "compatible": False}
+        return {
+            "forward":  empty,
+            "reverse":  empty,
+            "warnings": [],
+            "errors":   ["No insert fragments queued for ligation."],
+        }
+    if len(insert_frags) == 1:
+        result = _simulate_traditional_cloning(insert_frags[0],
+                                                 vector_frag)
+        _annotate_scars_on_product(result, insert_frags, vector_frag)
+        return result
+    chained = insert_frags[0]
+    # Record junction info as we chain so the scar annotator below
+    # can locate each junction in the final product.
+    junction_info: list[dict] = []
+    for i in range(1, len(insert_frags)):
+        left_enz_at_junc  = chained["right"].get("enzyme") or ""
+        right_enz_at_junc = insert_frags[i]["left"].get("enzyme") or ""
+        junction_pos = len(chained["top_seq"])  # bp position in chain
+        nxt = _ligate_fragments(chained, insert_frags[i])
+        if nxt is None:
+            a_label = chained.get("source_label") or f"fragment {i}"
+            b_label = (insert_frags[i].get("source_label")
+                        or f"fragment {i + 1}")
+            empty = {"top_seq": "", "features": [], "compatible": False}
+            return {
+                "forward":  empty,
+                "reverse":  empty,
+                "warnings": [],
+                "errors": [
+                    f"Junction {i} → {i + 1}: sticky ends incompatible "
+                    f"between {a_label!r} (3' end) and {b_label!r} "
+                    f"(5' end). Check that adjacent fragments share an "
+                    f"enzyme at the matching cut."
+                ],
+            }
+        junction_info.append({
+            "label":       f"insert {i} ↔ insert {i + 1}",
+            "left_enz":    left_enz_at_junc,
+            "right_enz":   right_enz_at_junc,
+            "pos_in_chain": junction_pos,
+        })
+        chained = nxt
+    result = _simulate_traditional_cloning(chained, vector_frag)
+    _annotate_scars_on_product(result, insert_frags, vector_frag,
+                                  internal_junctions=junction_info)
+    return result
+
+
+def _annotate_scars_on_product(
+    result: dict,
+    insert_frags: list[dict],
+    vector_frag: dict,
+    *,
+    internal_junctions: "list[dict] | None" = None,
+) -> None:
+    """Walk every ligation junction in the simulated product and
+    emit (a) a warning per junction describing whether it's
+    re-cuttable or an idempotent scar (BioBrick-style), and (b) a
+    ``misc_feature`` at the junction position labelled with the
+    same. The annotations land on BOTH the forward and reverse
+    orientation products so the user's saved plasmid carries the
+    scar info regardless of which orientation they keep.
+
+    ``internal_junctions`` is a list of ``{label, left_enz,
+    right_enz, pos_in_chain}`` for the N-1 insert↔insert junctions
+    when N inserts were chained pre-vector-ligation. The vector↔
+    chain junctions are computed here from the parent frags'
+    end-enzyme metadata. Mutates `result["warnings"]` and
+    `result["forward"/"reverse"]["features"]` in place."""
+    warnings: list[str] = result.setdefault("warnings", [])
+    # Chained-insert sequence (everything except the vector).
+    chain_top = "".join(f.get("top_seq", "") for f in insert_frags)
+    chain_len = len(chain_top)
+    vec_len   = len(vector_frag.get("top_seq", ""))
+    # Per-orientation junctions are built lazily inside
+    # `_build_orient_junctions(reverse, total)` below — forward and
+    # reverse need different position math (the close-junction wraps
+    # at the product's actual length, not at `vec_len + chain_len`).
+    _ = chain_len  # kept for future re-use; no longer needed here
+
+    def _build_orient_junctions(reverse: bool,
+                                   total: int) -> list[dict]:
+        """Per-orientation junction list. In REVERSE the insert chain
+        is RC'd, so each chain end uses the OPPOSITE end's enzyme
+        (RC swaps left↔right metadata). Positions also need
+        re-derivation: the close lives at the product's wrap point
+        (total), not at `vec_len + forward_chain_len`."""
+        out: list[dict] = []
+        if not reverse:
+            # Forward = original layout.
+            out.append({
+                "label":     "vector ↔ insert 1",
+                "left_enz":  vector_frag["right"].get("enzyme") or "",
+                "right_enz": insert_frags[0]["left"].get("enzyme") or "",
+                "pos":       vec_len,
+            })
+            for j in internal_junctions or []:
+                out.append({
+                    "label":     j["label"],
+                    "left_enz":  j["left_enz"],
+                    "right_enz": j["right_enz"],
+                    "pos":       vec_len + j["pos_in_chain"],
+                })
+            out.append({
+                "label":     f"insert {len(insert_frags)} ↔ vector",
+                "left_enz":  insert_frags[-1]["right"].get("enzyme") or "",
+                "right_enz": vector_frag["left"].get("enzyme") or "",
+                "pos":       total,
+            })
+            return out
+        # Reverse — chain order is REVERSED (insert N comes first,
+        # insert 1 last) and each insert's left/right enzymes swap.
+        n_inserts = len(insert_frags)
+        # vec.right ↔ RC(chain_first).left = chain_first was
+        # insert_frags[-1] (reversed order), so its left after RC
+        # corresponds to original right.
+        first_in_rc_chain = insert_frags[-1]
+        out.append({
+            "label":     f"vector ↔ insert {n_inserts}",
+            "left_enz":  vector_frag["right"].get("enzyme") or "",
+            "right_enz": first_in_rc_chain["right"].get("enzyme") or "",
+            "pos":       vec_len,
+        })
+        # Internal junctions (only when N > 1): the chain runs in
+        # reverse order, and each insert-to-insert junction uses the
+        # RC'd ends. For an internal junction `insert i ↔ insert
+        # i+1` in forward, the reverse equivalent is `insert (n - i)
+        # ↔ insert (n - i - 1)` with swapped enzymes.
+        if internal_junctions:
+            # Walk forward chain junctions backwards.
+            for jf in reversed(internal_junctions):
+                out.append({
+                    "label":     jf["label"] + " (reverse)",
+                    # Enzymes swap because chain is RC'd
+                    "left_enz":  jf["right_enz"],
+                    "right_enz": jf["left_enz"],
+                    "pos":       vec_len + (sum(
+                        len(f.get("top_seq", ""))
+                        for f in insert_frags
+                    ) - jf["pos_in_chain"]),
+                })
+        # Closing junction (chain last → vec). chain_last was
+        # insert_frags[0] in original order.
+        last_in_rc_chain = insert_frags[0]
+        out.append({
+            "label":     "insert 1 ↔ vector",
+            "left_enz":  last_in_rc_chain["left"].get("enzyme") or "",
+            "right_enz": vector_frag["left"].get("enzyme") or "",
+            "pos":       total,
+        })
+        return out
+
+    def _annotate_orient(prod: dict, *, reverse: bool) -> None:
+        if not prod.get("compatible", False):
+            return
+        top = prod.get("top_seq", "")
+        if not top:
+            return
+        feats = prod.setdefault("features", [])
+        total = len(top)
+        for j in _build_orient_junctions(reverse, total):
+            pos = j["pos"]
+            # Circular wrap window — the closing junction sits at
+            # `pos = total`. The context must straddle the linear-
+            # string boundary or the regenerated parent recognition
+            # site disappears.
+            if pos >= total or pos == 0:
+                pre = top[max(0, total - 6):total]
+                post = top[:min(6, total)]
+                context = pre + post
+                ctx_left_offset = len(pre)
+            else:
+                window_l = max(0, pos - 6)
+                window_r = min(total, pos + 6)
+                context = top[window_l:window_r]
+                ctx_left_offset = pos - window_l
+            cls = _classify_junction(
+                j["left_enz"], j["right_enz"], context,
+                context_left_offset=ctx_left_offset,
+            )
+            warnings.append(f"Junction {j['label']}: {cls['label']}")
+            anchor = 0 if pos >= total else pos
+            feat_s = max(0, anchor - 2)
+            feat_e = min(total, anchor + 2)
+            if feat_e > feat_s:
+                feats.append({
+                    "start":  feat_s,
+                    "end":    feat_e,
+                    "strand": 1,
+                    "type":   "misc_feature",
+                    "label":  ("LIGATION SCAR: " + cls["label"]
+                                  if cls["scar"]
+                                  else cls["label"]),
+                })
+
+    _annotate_orient(result.get("forward", {}), reverse=False)
+    _annotate_orient(result.get("reverse", {}), reverse=True)
+
+
 # ── Gibson assembly ───────────────────────────────────────────────────────────
 #
 # Gibson chemistry: 5' exonuclease chews back the 5' end of each fragment,
@@ -6556,31 +6868,118 @@ def _rc_fragment(frag: dict) -> dict:
     swapped ends are themselves reverse-complemented (the strand that
     sticks out is now the other strand). 5' overhangs stay 5' (the
     "5'-protruding" geometry is preserved across the flip — only the
-    bases change)."""
+    bases change).
+
+    Convention-aware ``top_seq`` reconstruction (fix for the
+    EcoRI+KpnI reverse-orientation scar-detection bug, 2026-05-23):
+    excised fragments include overhang bases in ``top_seq`` at ends
+    where the overhang is on the TOP strand (5' at left, 3' at
+    right); synthetic fragments do not. After RC, the strand the
+    overhang sits on flips, so the included/excluded bases must move
+    accordingly — naive ``_rc(top_seq)`` produces junk at the
+    junction for excise-convention fragments. The heuristic below
+    detects per-end whether the convention is excise (overhang bases
+    present in top_seq) by comparing the prefix/suffix of top_seq to
+    the overhang_seq, and rebuilds the new top with the right
+    strand-side overhang inclusion."""
     n = len(frag["top_seq"])
+    top = frag["top_seq"]
+    left  = frag["left"]
+    right = frag["right"]
+    left_oh  = left.get("overhang_seq", "") or ""
+    right_oh = right.get("overhang_seq", "") or ""
+    left_kind  = left.get("kind", "")
+    right_kind = right.get("kind", "")
+    # Convention detection: excise fragments include overhang bases
+    # in top_seq at ends where the overhang is on the top strand
+    # (5' at left OR 3' at right). Synthetic fragments
+    # (`_make_synthetic_fragment`) never include them. Heuristic:
+    # if top_seq's prefix/suffix matches the overhang at any on-top
+    # end, the fragment is excise; otherwise synthetic. When neither
+    # end is on-top (3' at left + 5' at right), heuristic can't
+    # tell — default to excise (the common case from
+    # `_excise_fragment_pair`).
+    # Per-end positive checks: top_seq prefix/suffix matches the
+    # overhang where the overhang sits on the TOP strand. A match is
+    # a strong excise indicator; an end that COULD be on-top but
+    # doesn't match is a strong synthetic indicator.
+    can_check_left  = (left_kind == "5'" and bool(left_oh))
+    can_check_right = (right_kind == "3'" and bool(right_oh))
+    excise_match_left  = (can_check_left
+        and top[:len(left_oh)].upper() == left_oh.upper())
+    excise_match_right = (can_check_right
+        and top[n - len(right_oh):].upper() == right_oh.upper())
+    synth_match_left  = can_check_left  and not excise_match_left
+    synth_match_right = can_check_right and not excise_match_right
+    if excise_match_left or excise_match_right:
+        is_excise = True
+    elif synth_match_left or synth_match_right:
+        is_excise = False
+    else:
+        # No on-top ends exist (both 3'-at-left or 5'-at-right) —
+        # can't detect from top_seq. Default to excise (the common
+        # case for `_excise_fragment_pair` output).
+        is_excise = True
+    if not is_excise:
+        # Synthetic convention — preserve the pre-fix behaviour
+        # (naive RC of top_seq, swap ends, no overhang-side
+        # adjustment). The synthetic ligation path has its own
+        # quirks but that's a separate bug.
+        new_top = _rc(top)
+        left_strip = 0
+        right_strip = 0
+        new_left_extra_len = 0
+        new_right_extra_len = 0
+    else:
+        left_strip = len(left_oh) if excise_match_left else 0
+        right_strip = len(right_oh) if excise_match_right else 0
+        core_top = top[left_strip:n - right_strip] if right_strip else \
+                   top[left_strip:]
+        rc_core = _rc(core_top)
+        # After RC, old.right (overhang on bot if 5') contributes
+        # bases at new.left's top — prepend RC'd overhang. Old.left
+        # (overhang on bot if 3') contributes at new.right's top —
+        # append RC'd overhang.
+        new_left_extra = (_rc(right_oh)
+            if right_kind == "5'" and right_oh and right_strip == 0
+            else "")
+        new_right_extra = (_rc(left_oh)
+            if left_kind == "3'" and left_oh and left_strip == 0
+            else "")
+        new_top = new_left_extra + rc_core + new_right_extra
+        new_left_extra_len = len(new_left_extra)
+        new_right_extra_len = len(new_right_extra)
     new_left  = {
-        "overhang_seq": _rc(frag["right"]["overhang_seq"])
-                        if frag["right"]["overhang_seq"] else "",
-        "kind":         frag["right"]["kind"],
-        "enzyme":       frag["right"]["enzyme"],
+        "overhang_seq": _rc(right_oh) if right_oh else "",
+        "kind":         right_kind,
+        "enzyme":       right.get("enzyme", ""),
     }
     new_right = {
-        "overhang_seq": _rc(frag["left"]["overhang_seq"])
-                        if frag["left"]["overhang_seq"] else "",
-        "kind":         frag["left"]["kind"],
-        "enzyme":       frag["left"]["enzyme"],
+        "overhang_seq": _rc(left_oh) if left_oh else "",
+        "kind":         left_kind,
+        "enzyme":       left.get("enzyme", ""),
     }
+    # Feature coords flip relative to the OLD top, then translate
+    # into the new top's frame via the strip/extra adjustments.
+    new_n = len(new_top)
+    _ = new_right_extra_len  # avoid unused-variable lint
     flipped_feats: list[dict] = []
     for f in frag["features"]:
         fs = int(f.get("start", 0))
         fe = int(f.get("end",   0))
+        # Map old end → new start, old start → new end. Clamp to
+        # the new top's length so out-of-range features (those in
+        # the stripped-off old overhang region) collapse to a valid
+        # zero-length slice rather than negative coords.
+        new_start_raw = (n - fe) - left_strip + new_left_extra_len
+        new_end_raw   = (n - fs) - left_strip + new_left_extra_len
         new_f = dict(f)
-        new_f["start"]  = max(0, n - fe)
-        new_f["end"]    = max(0, n - fs)
+        new_f["start"]  = max(0, min(new_n, new_start_raw))
+        new_f["end"]    = max(0, min(new_n, new_end_raw))
         new_f["strand"] = -int(f.get("strand", 1) or 0) or 0
         flipped_feats.append(new_f)
     return {
-        "top_seq":      _rc(frag["top_seq"]),
+        "top_seq":      new_top,
         "left":         new_left,
         "right":        new_right,
         "features":     flipped_feats,
@@ -11317,6 +11716,232 @@ def _alignment_to_target_letters(
     return out
 
 
+def _alignment_to_query_segments(
+    aligned_q: str, aligned_t: str, q_start: int = 0,
+) -> "list[tuple[int, int, str]]":
+    """Query-axis mirror of `_alignment_to_target_segments`.
+
+    Collapses a pairwise alignment into per-state runs in *query*
+    coordinates — the data the linear-map alignment overlay paints
+    when the **query** plays the role of the currently-loaded plasmid
+    (Alt+A / diff-plasmid flow, where the user picks a library entry
+    to align against the open record). Bars land at query bp positions
+    so the overlay highlights regions of the open plasmid that match
+    the picked plasmid, even when the alignment isn't 1:1.
+
+    Walks the two gapped strings in lockstep. **Query position advances
+    only on ``q != '-'``**, so columns where the query gaps (insertions
+    in the target) consume zero query bp and so don't appear as their
+    own segment — they fold into the surrounding state at query
+    resolution. Symmetric to the target-axis helper's treatment of
+    target gaps.
+
+    Per-query-column state:
+        match     — both bases non-gap, ``q == t`` (case-insensitive)
+        mismatch  — both bases non-gap, ``q != t``
+        gap       — ``t == '-'``, ``q != '-'`` (insertion in the query,
+                    i.e. the open plasmid has bp the picked plasmid
+                    doesn't)
+
+    Returns ``[(q_pos, q_end, state)]`` ascending, half-open query
+    ranges. ``q_start`` shifts the returned positions (use it when
+    the alignment is local with a non-zero query offset).
+    """
+    if len(aligned_q) != len(aligned_t):
+        raise ValueError(
+            f"aligned strings differ in length: q={len(aligned_q)} "
+            f"vs t={len(aligned_t)}"
+        )
+    segs: "list[tuple[int, int, str]]" = []
+    q_pos = q_start
+    cur_state: "str | None" = None
+    cur_start = q_pos
+    for q, t in zip(aligned_q.upper(), aligned_t.upper()):
+        if q == "-":
+            continue
+        if t == "-":
+            state = "gap"
+        elif q == t:
+            state = "match"
+        else:
+            state = "mismatch"
+        if state != cur_state:
+            if cur_state is not None:
+                segs.append((cur_start, q_pos, cur_state))
+            cur_state = state
+            cur_start = q_pos
+        q_pos += 1
+    if cur_state is not None:
+        segs.append((cur_start, q_pos, cur_state))
+    return segs
+
+
+def _alignment_to_query_letters(
+    aligned_q: str, aligned_t: str, q_start: int = 0,
+) -> "dict[int, tuple[str, str]]":
+    """Per-query-bp ``(target_letter, state)`` map — query-axis mirror
+    of `_alignment_to_target_letters`. Drives the letter-mode overlay
+    when the query plays the role of the currently-loaded plasmid:
+    each query bp displays the picked plasmid's base at that position
+    (``'-'`` when the picked plasmid has a gap there), tinted by
+    match / mismatch / gap state.
+    """
+    if len(aligned_q) != len(aligned_t):
+        raise ValueError(
+            f"aligned strings differ in length: q={len(aligned_q)} "
+            f"vs t={len(aligned_t)}"
+        )
+    out: "dict[int, tuple[str, str]]" = {}
+    q_pos = q_start
+    for q, t in zip(aligned_q.upper(), aligned_t.upper()):
+        if q == "-":
+            continue
+        if t == "-":
+            state = "gap"
+        elif q == t:
+            state = "match"
+        else:
+            state = "mismatch"
+        out[q_pos] = (t, state)
+        q_pos += 1
+    return out
+
+
+# ── Alignment persistence (per-plasmid stored alignments) ──────────────────────
+#
+# Stored alignments live on the library entry dict as a list under the
+# `alignments` key. Each stored dict is JSON-serialisable — the target
+# is serialised as `target_gb_text` (GenBank text) so the alignment is
+# self-contained even when the original library target gets renamed or
+# deleted. `target_seq_hash` lets the hydrate path detect when a target
+# has changed sequence after the alignment was saved (banner the user
+# in the manager modal).
+#
+# Stored schema (per alignment dict):
+#   id              str    — stable uuid, identifies this stored alignment
+#   label           str    — display name (defaults to target_label)
+#   query_label     str
+#   target_label    str
+#   target_id       str    — source library id, or "" for ad-hoc (sequencing
+#                            reads, manually-pasted records)
+#   target_gb_text  str    — GenBank serialisation of the target record;
+#                            self-contained so the drill-in still renders if
+#                            the source library entry is gone
+#   target_seq_hash str    — sha256 hex of target seq at save time, for
+#                            stale-target detection on hydrate
+#   axis            "target"|"query"
+#   result          dict   — the `_pairwise_align` output verbatim
+#   visible         bool   — toggle for the band overlay
+#   added           str    — ISO date the alignment was saved
+#   source          str    — "library", "sequencing", "manual" — used by
+#                            the manager modal for bulk filtering
+
+def _alignment_target_hash(target_seq: str) -> str:
+    """Stable SHA256 hex of the target sequence. Used by the hydrate
+    path to detect when a stored alignment's target has been edited
+    after the alignment was saved (sequences differ → render with a
+    stale-warning banner)."""
+    import hashlib
+    return hashlib.sha256(
+        target_seq.upper().encode("ascii", "replace"),
+    ).hexdigest()
+
+
+def _serialize_alignment_for_storage(
+    in_memory_entry: dict,
+    *, source: str = "manual",
+) -> "dict | None":
+    """Convert an in-memory alignment entry (the dict returned by
+    `_register_alignment`) into a JSON-serialisable storage dict.
+
+    Returns None when the entry is missing a target record or the
+    GenBank serialisation fails — caller skips silently in that
+    case (the live entry stays on the band; just doesn't persist).
+    """
+    import uuid as _uuid
+    target_record = in_memory_entry.get("target_record")
+    if target_record is None:
+        return None
+    try:
+        target_gb_text = _record_to_gb_text(target_record)
+    except Exception:
+        _log.exception(
+            "alignment serialize: gb_text conversion failed for %r",
+            in_memory_entry.get("name", "?"),
+        )
+        return None
+    try:
+        target_seq = str(target_record.seq)
+    except Exception:
+        target_seq = ""
+    target_id = ""
+    try:
+        target_id = str(getattr(target_record, "id", "") or "")
+    except Exception:
+        pass
+    # `result` from `_pairwise_align` is already plain dict of
+    # str/int/float (no SeqRecord refs), so a shallow copy is enough.
+    result_dict = dict(in_memory_entry.get("result") or {})
+    # Storage metadata (id, visible, added, source) — preserved on
+    # round-trip via the `_stored_*` markers the hydrate path stamps
+    # onto each in-memory entry. Missing markers → fresh entry, mint
+    # a new id and default visible=True.
+    return {
+        "id":              in_memory_entry.get("_stored_id") or _uuid.uuid4().hex,
+        "label":           (
+            in_memory_entry.get("_stored_label")
+            or in_memory_entry.get("name")
+            or in_memory_entry.get("target_label")
+            or "alignment"
+        ),
+        "query_label":     in_memory_entry.get("query_label", ""),
+        "target_label":    in_memory_entry.get("target_label", ""),
+        "target_id":       target_id,
+        "target_gb_text":  target_gb_text,
+        "target_seq_hash": _alignment_target_hash(target_seq),
+        "axis":            in_memory_entry.get("axis", "target"),
+        "result":          result_dict,
+        "visible":         bool(in_memory_entry.get("_stored_visible", True)),
+        "added":           in_memory_entry.get("_stored_added") or _date.today().isoformat(),
+        "source":          in_memory_entry.get("_stored_source", source),
+    }
+
+
+def _deserialize_stored_alignment_args(
+    stored: dict,
+) -> "dict | None":
+    """Parse a stored alignment dict into the kwargs needed by
+    `_register_alignment`. The `target_gb_text` field is round-tripped
+    back into a SeqRecord; everything else is passed through.
+
+    Returns None when the stored entry is malformed (no gb_text, or
+    the gb_text fails to parse) — caller skips with a log entry.
+    """
+    gb_text = stored.get("target_gb_text", "")
+    if not gb_text:
+        _log.warning(
+            "alignment hydrate: stored entry %r has no target_gb_text; "
+            "skipping", stored.get("label", "?"),
+        )
+        return None
+    try:
+        target_record = _gb_text_to_record(gb_text)
+    except Exception:
+        _log.exception(
+            "alignment hydrate: gb_text parse failed for %r",
+            stored.get("label", "?"),
+        )
+        return None
+    return {
+        "name":          stored.get("label", "alignment"),
+        "query_label":   stored.get("query_label", ""),
+        "target_label":  stored.get("target_label", ""),
+        "target_record": target_record,
+        "result":        stored.get("result") or {},
+        "axis":          stored.get("axis", "target"),
+    }
+
+
 # ── GenBank export (NCBI-compliant normalization + atomic write) ──────────────
 #
 # Biopython's SeqIO.write produces compliant GenBank output when annotations
@@ -12219,6 +12844,14 @@ class _BrailleCanvas:
         Non-space cells from *text_canvas* are drawn on top;
         braille pixels fill the rest.
         Consecutive blank cells are batched into a single append call.
+
+        A space cell that carries a style (e.g. the inner space of a
+        feature-bar label painted ``"bold black on color(46)"``) is
+        treated as styled content, NOT folded into the blank-run —
+        otherwise the cell's background colour is stripped and the
+        label space renders as a default-bg cell (visible as a black
+        gap inside the green bar). Regression guard for the 2026-05-22
+        "transit peptide bar has black gaps" report.
         """
         result = Text(no_wrap=True, overflow="crop")
         rows   = min(self.rows, text_canvas.h)
@@ -12235,19 +12868,32 @@ class _BrailleCanvas:
             bc_colors_row = bc_colors[row]
             for col in range(cols):
                 tc_ch = tc_row[col]
-                if tc_ch == " " and not bc_bits_row[col]:
+                tc_st = tcs_row[col]
+                # Truly blank cell — space char, no style, no braille
+                # — folds into the blank-run for efficient append.
+                if tc_ch == " " and not tc_st and not bc_bits_row[col]:
                     blank_run += 1
-                else:
-                    if blank_run:
-                        result.append(" " * blank_run)
-                        blank_run = 0
-                    if tc_ch != " ":
-                        st = tcs_row[col]
-                        result.append(tc_ch, style=st) if st else result.append(tc_ch)
+                    continue
+                if blank_run:
+                    result.append(" " * blank_run)
+                    blank_run = 0
+                if tc_ch != " " or tc_st:
+                    # Non-space char, OR a styled space — emit from
+                    # text_canvas so the style (and any background
+                    # colour it carries) is preserved.
+                    if tc_st:
+                        result.append(tc_ch, style=tc_st)
                     else:
-                        ch = _BRAILLE_LUT[bc_bits_row[col]]
-                        c  = bc_colors_row[col]
-                        result.append(ch, style=c) if c != " " else result.append(ch)
+                        result.append(tc_ch)
+                else:
+                    # Unstyled space with braille pixels underneath —
+                    # render the braille glyph.
+                    ch = _BRAILLE_LUT[bc_bits_row[col]]
+                    c  = bc_colors_row[col]
+                    if c != " ":
+                        result.append(ch, style=c)
+                    else:
+                        result.append(ch)
             if blank_run:
                 result.append(" " * blank_run)
             if row < rows - 1:
@@ -12883,12 +13529,41 @@ class PlasmidMap(Widget):
     # everything-at-once strip.
     _LINEAR_LARGE_BP        = 100_000
     _LINEAR_LARGE_TARGET_BP = 50_000
+    # Margin sizes used by `_draw_linear_flag` — kept here so the
+    # `_max_useful_linear_zoom` cap can compute the same `usable_w`
+    # the renderer uses without crossing the public/private boundary.
+    _LINEAR_MARGIN_L = 5
+    _LINEAR_MARGIN_R = 2
+
+    def _max_useful_linear_zoom(self) -> float:
+        """Largest zoom value that still makes visual sense — at this
+        zoom, ``col_per_bp == 1.0`` and each bp gets exactly one
+        terminal column. Zooming further would just spread the
+        alignment letters apart with blank gutters (user feedback
+        2026-05-22: "stop the zoom depth the moment the letters are
+        single characters apart … zooming further like A T G C isn't
+        necessary"). Floors at ``_LINEAR_MIN_ZOOM`` so a record short
+        enough to be fully visible already (total <= usable_w) doesn't
+        produce a sub-unity cap.
+        """
+        if not self._total:
+            return self._LINEAR_MAX_ZOOM
+        w = getattr(self.size, "width", 0) or 0
+        usable_w = max(1, w - self._LINEAR_MARGIN_L - self._LINEAR_MARGIN_R)
+        return max(
+            self._LINEAR_MIN_ZOOM,
+            min(self._LINEAR_MAX_ZOOM, self._total / usable_w),
+        )
 
     def action_linear_zoom_in(self) -> None:
         if self._map_mode != "linear" or not self._total:
             return
         new = min(self._LINEAR_MAX_ZOOM,
                    self._linear_zoom * self._LINEAR_ZOOM_STEP)
+        # Cap zoom at the one-col-per-bp threshold so the renderer
+        # always paints letters at adjacent columns (no awkward
+        # spacing). User feedback 2026-05-22.
+        new = min(new, self._max_useful_linear_zoom())
         self._set_linear_zoom(new, anchor_center=True)
 
     def action_linear_zoom_out(self) -> None:
@@ -13222,13 +13897,33 @@ class PlasmidMap(Widget):
                     except Exception:
                         pass
                     return
+                # Drop the lane highlight when the detail view closes:
+                # `style="reverse"` on the bar's "█" glyph inverts fg/bg,
+                # which on a dark terminal renders the selected bars as
+                # the default foreground colour (gray-ish) instead of
+                # the original blue/red/gray scheme. Without this hook
+                # the selection persists across the modal dismiss and
+                # the user comes back to all-gray bars (regression
+                # report 2026-05-22). Guard on the captured `ai` so a
+                # mid-modal click on a different lane (impossible right
+                # now since the modal covers the map, but cheap to be
+                # defensive) doesn't get its fresh selection wiped.
+                def _clear_align_selection(
+                    _result=None, _selected_ai=ai,
+                ):
+                    if self._selected_align_idx == _selected_ai:
+                        self._selected_align_idx = -1
+                        self.refresh()
                 try:
-                    self.app.push_screen(AlignmentScreen(
-                        query_label=align.get("query_label", "query"),
-                        target_label=align.get("target_label", "target"),
-                        target_record=target_record,
-                        result=result,
-                    ))
+                    self.app.push_screen(
+                        AlignmentScreen(
+                            query_label=align.get("query_label", "query"),
+                            target_label=align.get("target_label", "target"),
+                            target_record=target_record,
+                            result=result,
+                        ),
+                        callback=_clear_align_selection,
+                    )
                 except Exception:
                     _log.exception(
                         "alignment lane click: push_screen failed"
@@ -13318,10 +14013,18 @@ class PlasmidMap(Widget):
         w, h = self.size.width, self.size.height
         if w < 30 or h < 14:
             return Text(f"  Window too small ({w}×{h})", style="dim red")
+        # Alignment overlay state is part of what the linear renderer
+        # paints — without including it in the cache key, a freshly
+        # registered alignment would return the pre-registration cached
+        # text (the bars only appear after some other tracked attribute
+        # changes, e.g. a zoom). `id(self._alignments)` flips because
+        # `set_alignments` always rebuilds the list; the selected-row
+        # index gates the reverse-video highlight on the selected lane.
         key = (w, h, self.origin_bp, self.selected_idx, self._aspect,
                id(self._feats), id(self._restr_feats), self._map_mode,
                self._show_connectors, self.record.name,
-               self._linear_zoom, self._linear_offset_bp, self._linear_layout)
+               self._linear_zoom, self._linear_offset_bp, self._linear_layout,
+               id(self._alignments), self._selected_align_idx)
         if self._draw_cache and self._draw_cache[0] == key:
             return self._draw_cache[1]
         result = self._draw_linear(w, h) if self._map_mode == "linear" else self._draw(w, h)
@@ -13723,9 +14426,18 @@ class PlasmidMap(Widget):
         visible_bp = max(1, view_e - view_s)
 
         def bp_to_col(bp: int) -> int:
-            return margin_l + int(
-                (bp - view_s) / visible_bp * usable_w
-            )
+            # Integer math, NOT `int((bp - view_s) / visible_bp * usable_w)`:
+            # at `col_per_bp == 1.0` (the letter-mode zoom cap), the float
+            # form computes e.g. `1/107*107 == 0.9999999999999999` which
+            # `int()` truncates to 0, making bps 0 and 1 collide on the
+            # same column. That left every ~Nth column unpainted in the
+            # alignment band's letter row (user-visible as "splits"
+            # between bases — report 2026-05-23). `(bp - view_s) *
+            # usable_w // visible_bp` uses integer arithmetic throughout,
+            # so consecutive bps land on consecutive columns whenever
+            # `usable_w == visible_bp` (the cap case) and the truncation
+            # at fractional col_per_bp matches the float form.
+            return margin_l + (bp - view_s) * usable_w // visible_bp
 
         # ── Rail ──
         for cx in range(margin_l, margin_l + usable_w + 1):
@@ -14085,13 +14797,26 @@ class PlasmidMap(Widget):
             base_style  = "reverse" if is_selected else ""
 
             # Lazy-build per-bp letter dict on first letter-mode draw.
+            # Dispatch on the alignment's render axis: target-axis
+            # entries (Plasmidsaurus / sequencing pile) carry the
+            # query letter at each target bp; query-axis entries
+            # (Alt+A / diff-plasmid) carry the target letter at each
+            # query bp. Either way the rendered letter is the "other
+            # side" of the alignment at the current plasmid's bp.
             letters = align.get("letters")
             if letter_mode and letters is None:
-                letters = _alignment_to_target_letters(
-                    align.get("aligned_q", ""),
-                    align.get("aligned_t", ""),
-                    align.get("t_start", 0),
-                )
+                if align.get("axis") == "query":
+                    letters = _alignment_to_query_letters(
+                        align.get("aligned_q", ""),
+                        align.get("aligned_t", ""),
+                        align.get("t_start", 0),
+                    )
+                else:
+                    letters = _alignment_to_target_letters(
+                        align.get("aligned_q", ""),
+                        align.get("aligned_t", ""),
+                        align.get("t_start", 0),
+                    )
                 align["letters"] = letters
 
             # Walk segments and paint each visible chunk.
@@ -14110,6 +14835,14 @@ class PlasmidMap(Widget):
                     color = "color(240)"
                     glyph = "░"
                 if letter_mode and letters:
+                    # At letter mode we cap `col_per_bp` to 1.0 (one
+                    # col per bp) via `action_linear_zoom_in`, so
+                    # `bp_to_col(bp)` produces tight, adjacent letter
+                    # positions with no blank gutters and no
+                    # alternating 4-5-col gaps. Painting only letter
+                    # cells (no colored fill between them, per user
+                    # request 2026-05-22 — fill reads as noisy on top
+                    # of the feature bar).
                     letter_style = (
                         f"{base_style} bold {color}".strip()
                     )
@@ -26588,6 +27321,80 @@ def _simulate_primed_amplicon(
     return left_tail + oh5 + insert + oh3 + right_tail
 
 
+def _amplicon_from_stored_primers(
+    fwd: str, rev: str, sequence: str,
+    oh5: str, part_type: str,
+) -> "str | None":
+    """Reconstruct a PCR amplicon top strand from a part's stored primers
+    + template sequence.
+
+        amplicon = fwd_primer + sequence[after_fwd_binding : before_rev_binding]
+                  + rc(rev_primer)
+
+    Returns None when the primers don't bind cleanly to the sequence
+    (no contiguous ≥5 bp overlap at either edge), so the caller can
+    fall back to the canonical `_simulate_primed_amplicon` formula.
+
+    Handles the AATG-CDS skip: the fwd primer's binding region may sit
+    at ``sequence[0:Lf]`` (classifier-imported parts whose body already
+    excludes the original ATG) or at ``sequence[fwd_skip:fwd_skip+Lf]``
+    (Domesticator-saved parts whose body includes the original ATG that
+    the AATG overhang re-introduces). Tries both start positions and
+    picks the longer match — gives the user the EXACT amplicon their
+    primers would produce on the bench, with the correct length for
+    either storage convention.
+    """
+    if not (fwd and rev and sequence):
+        return None
+
+    fwd_skip = _atg_offset_for_part(oh5, part_type)
+    # Find where fwd primer binds on the top strand of `sequence`: the
+    # longest 3' suffix of `fwd` matching a contiguous slice of `sequence`.
+    #
+    # Try the AATG-skip start position first (Domesticator-saved
+    # convention: sequence carries the original ATG that the overhang
+    # encodes). Accept the match only if it's a plausible primer-binding
+    # length (≥15 bp — Domesticator targets 18–25 bp at Tm ~60°C). That
+    # threshold avoids the AATG ↔ ATG coincidence: at start=0 the
+    # apparent overlap is exactly `fwd_skip` bp longer because the
+    # overhang's "ATG" tail matches the sequence's "ATG" prefix, but
+    # that's an artifact, not a real binding. Falling through to
+    # start=0 for classifier-imported parts (sequence already excludes
+    # the AATG-encoded ATG) or non-AATG parts (fwd_skip=0).
+    fwd_start, Lf = -1, 0
+    if 0 < fwd_skip < len(sequence):
+        max_k = min(len(fwd), len(sequence) - fwd_skip)
+        for k in range(max_k, 4, -1):
+            if fwd.endswith(sequence[fwd_skip : fwd_skip + k]):
+                if k >= 15:
+                    fwd_start, Lf = fwd_skip, k
+                break
+    if fwd_start < 0:
+        max_k = min(len(fwd), len(sequence))
+        for k in range(max_k, 4, -1):
+            if fwd.endswith(sequence[:k]):
+                fwd_start, Lf = 0, k
+                break
+    if Lf == 0 or fwd_start < 0:
+        return None
+
+    # Find where rev primer binds: `rc(rev)` prefix matches `sequence`'s 3' end.
+    rev_rc = _rc(rev)
+    Lr = 0
+    for k in range(min(len(rev_rc), len(sequence)), 4, -1):
+        if rev_rc.startswith(sequence[-k:]):
+            Lr = k
+            break
+    if Lr == 0:
+        return None
+
+    body_start = fwd_start + Lf
+    body_end = len(sequence) - Lr
+    if body_start > body_end:
+        return None
+    return fwd + sequence[body_start:body_end] + rev_rc
+
+
 def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str) -> str:
     """Simulated cloned circular plasmid, linearised at the 5' overhang.
 
@@ -33806,9 +34613,13 @@ class FeatureEditModal(ModalScreen):
     #featedit-pos-row { height: 1; margin-top: 1; }
     #featedit-pos-row Label { width: auto; margin-right: 1; }
     #featedit-pos { width: 1fr; color: $text-muted; }
-    #featedit-row1 { height: auto; }
-    #featedit-type-col   { width: 1fr; }
-    #featedit-strand-col { width: 1fr; }
+    /* Pin row + cols to a fixed height; without this the cols' default
+       `1fr` makes them swallow the body's leftover space and creates a
+       ~20-row void between Strand and the Color row. Matches the sister
+       AddFeatureModal's #addfeat-row1 pattern. */
+    #featedit-row1       { height: 6; }
+    #featedit-type-col   { width: 1fr; height: 6; }
+    #featedit-strand-col { width: 1fr; height: 6; }
     #featedit-color-row  { height: auto; margin-top: 1; }
     #featedit-color-row Label { width: auto; margin-right: 1; }
     #featedit-color-swatch { width: auto; padding: 0 1; }
@@ -41823,42 +42634,84 @@ class PartsBinModal(Screen):
 
     @on(Button.Pressed, "#btn-parts-copy-primed")
     def _copy_primed(self, _) -> None:
-        """Copy the full PCR amplicon (insert + primer tails = pad + Esp3I
-        + spacer + oh5 + insert + oh3 + rc(spacer+Esp3I+pad)).
+        """Copy the PCR amplicon the user would actually run with the
+        part's stored primers + template sequence.
 
-        Older saved parts may predate the simulator, so recompute on the
-        fly if `primed_seq` is missing. Parts created before the Esp3I
-        switch (v0.3.2) still carry their original BsaI-primed sequence
-        in `primed_seq` — the fallback only fires when that field is
-        absent, at which point the current L0 enzyme (Esp3I) is used."""
+        Prefers reconstruction from the stored `fwd_primer` / `rev_primer`
+        / `sequence` fields via `_amplicon_from_stored_primers` — that
+        gives the EXACT amplicon their primers would produce, including
+        any silent mutations baked into the primer tails and the correct
+        fwd_skip for AATG-CDS parts (where the AATG overhang encodes the
+        start codon and the primer binds at codon 2, not the original
+        ATG). Pre-fix this used `r.get("primed_seq") or
+        _simulate_primed_amplicon(...)`, which produced the canonical
+        formula — fine for vanilla parts but 3 bp too long for AATG-CDS
+        parts that store the original ATG in `sequence`.
+
+        Falls back to the canonical simulation when primers aren't
+        stored or don't bind cleanly to the template (legacy parts
+        from before the Domesticator stored primers, manually-entered
+        parts where the user blanked the primer fields, etc.). Uses
+        the part's stored grammar so a copy of an old MoClo part uses
+        BsaI tails even after the user has flipped the active grammar
+        to GB; legacy parts (no grammar field) fall back to gb_l0.
+
+        Mirrors the Copy Cloned fix pattern: prefer the most accurate
+        stored representation, with a deterministic canonical fallback.
+        """
         r = self._selected_user_row()
         if r is None:
             return
-        # Use the part's stored grammar so a copy of an old MoClo part
-        # uses BsaI tails even after the user has flipped the active
-        # grammar to GB; legacy parts (no grammar field) fall back to
-        # gb_l0 which preserves v0.3.x behaviour.
-        part_grammar = _all_grammars().get(
-            r.get("grammar", "gb_l0"), _BUILTIN_GRAMMARS["gb_l0"],
+        seq = _amplicon_from_stored_primers(
+            r.get("fwd_primer", ""), r.get("rev_primer", ""),
+            r["sequence"], r.get("oh5", ""), r.get("type", ""),
         )
-        seq = r.get("primed_seq") or _simulate_primed_amplicon(
-            r["sequence"], r.get("oh5", ""), r.get("oh3", ""),
-            grammar=part_grammar,
-        )
+        if seq is None:
+            part_grammar = _all_grammars().get(
+                r.get("grammar", "gb_l0"), _BUILTIN_GRAMMARS["gb_l0"],
+            )
+            seq = _simulate_primed_amplicon(
+                r["sequence"], r.get("oh5", ""), r.get("oh3", ""),
+                grammar=part_grammar,
+            )
         self._copy_and_notify(seq, "primed amplicon", f"{len(seq)} bp")
 
     @on(Button.Pressed, "#btn-parts-copy-cloned")
     def _copy_cloned(self, _) -> None:
-        """Copy the simulated cloned plasmid (insert ligated into pUPD2
-        backbone stub, linearised at the 5' overhang)."""
+        """Copy the cloned plasmid sequence — the same sequence that
+        lands in the plasmid library when this part is saved.
+
+        Routes through `_part_to_cloned_seqrecord` so the result goes
+        through the full tiered cloning model (tier-1 IIS digest into
+        the configured entry vector → tier-2 overhang splice → tier-3
+        stub-backbone fallback). The old code called
+        `_simulate_cloned_plasmid` directly, which always produced the
+        420-bp stub form — for any part whose grammar has a real entry
+        vector configured (e.g. pUPD2-shaped GB L0 parts) that
+        disagreed with the library entry's size by ~1300 bp.
+        """
         r = self._selected_user_row()
         if r is None:
             return
-        seq = r.get("cloned_seq") or _simulate_cloned_plasmid(
-            r["sequence"], r.get("oh5", ""), r.get("oh3", ""),
-        )
+        try:
+            rec = _part_to_cloned_seqrecord(r)
+            seq = str(rec.seq)
+        except Exception as exc:
+            # `_part_to_cloned_seqrecord` raises ValueError for parts
+            # with no sequence; BioPython parsing can also fail on a
+            # malformed gb_text. Fall back to the stub form so the
+            # button stays useful (matches the pre-fix behaviour),
+            # but log the cause for post-mortem.
+            _log.warning(
+                "Copy Cloned: falling back to stub backbone for %r: %s",
+                r.get("name"), exc,
+            )
+            seq = _simulate_cloned_plasmid(
+                r.get("sequence", "") or "",
+                r.get("oh5", ""), r.get("oh3", ""),
+            )
         self._copy_and_notify(
-            seq, "cloned plasmid", f"{len(seq)} bp circular (linearised at 5′ OH)",
+            seq, "cloned plasmid", f"{len(seq)} bp circular",
         )
 
     @on(Button.Pressed, "#btn-parts-edit")
@@ -46096,6 +46949,19 @@ class SequencingScreen(Screen):
                     target_record=rotated_target_record,
                     result=result,
                 )
+                # Persist the read alignment onto the open plasmid's
+                # library entry so re-loading the plasmid restores the
+                # band. Tagged source="sequencing" so the manager modal
+                # can mass-delete a sequencing batch later. Skipped
+                # silently when the active record isn't in the library.
+                aligns = getattr(self.app, "_alignments", None)
+                if aligns:
+                    aligns[-1]["_stored_source"] = "sequencing"
+                flush = getattr(
+                    self.app, "_flush_active_alignments", None,
+                )
+                if callable(flush):
+                    flush()
             except Exception:
                 _log.exception(
                     "PlasmidsaurusAlignModal: _register_alignment failed"
@@ -54122,7 +54988,10 @@ class AlignmentScreen(Screen):
     #aln-hint   { height: 1; margin-top: 1; color: $text-muted; }
     """
 
-    # Width of one alignment row segment before wrapping.
+    # Fallback / minimum row width — used on the first render before
+    # the layout pass has measured the body widget, and as a floor so
+    # a degenerately narrow terminal doesn't produce zero-width chunks
+    # (which would infinite-loop the chunk walker).
     _CHUNK_W = 60
 
     def __init__(self, query_label: str, target_label: str,
@@ -54132,6 +55001,11 @@ class AlignmentScreen(Screen):
         self._target_label = target_label
         self._target_rec   = target_record
         self._result       = result
+        # Last chunk width applied to the body Static. Tracked so the
+        # resize handler can skip redundant re-renders when the body's
+        # available width hasn't actually changed (e.g. a resize that
+        # only changed terminal HEIGHT).
+        self._last_chunk_w: int = 0
 
     def compose(self) -> ComposeResult:
         # Lazy-import Markdown — see HelpModal.compose for rationale.
@@ -54140,13 +55014,72 @@ class AlignmentScreen(Screen):
             yield Static(" Pairwise alignment ", id="aln-title")
             yield _Markdown(self._summary_md(), id="aln-summary")
             with VerticalScroll(id="aln-body"):
-                yield Static(self._body_text(), id="aln-body-content")
+                # First render uses a terminal-derived estimate of the
+                # body's inner width so the initial paint is already
+                # close to right. `on_mount` + `on_resize` refine with
+                # the real measured width once layout has settled.
+                yield Static(
+                    self._body_text(self._estimate_chunk_w()),
+                    id="aln-body-content",
+                )
             yield Static(
                 "[dim]Press q or Esc to close. Mismatches tinted "
                 "[red]red[/]; gaps shown as ─. Annotation lane shows "
                 "which target features each column falls into.[/dim]",
                 id="aln-hint", markup=True,
             )
+
+    def on_mount(self) -> None:
+        # Once layout has measured the body widget, re-render with the
+        # actual available width. `call_after_refresh` ensures the
+        # measurement is taken after the first layout pass — calling
+        # straight from on_mount would see a still-zero content_size.
+        self.call_after_refresh(self._refresh_body_width)
+
+    def on_resize(self, event=None) -> None:
+        # Terminal resize → body width changes → re-render at the new
+        # chunk width so the alignment rows keep spanning the full
+        # available area.
+        self.call_after_refresh(self._refresh_body_width)
+
+    def _estimate_chunk_w(self) -> int:
+        """Pre-layout estimate of the body's inner width.
+
+        Used for the very first render before widgets have been measured.
+        Derived from the terminal width and the known CSS overhead:
+        ``#aln-box`` is ``width: 98%`` with ``padding: 1 2`` (4 cols),
+        and ``#aln-body`` carries a 1-col border on each side (2 cols).
+        Subtract 1 more for the vertical scrollbar that appears once the
+        alignment body overflows. The estimate is approximate; `on_mount`
+        and `on_resize` correct it once the actual size is available.
+        """
+        try:
+            screen_w = self.app.size.width
+        except Exception:
+            screen_w = 80
+        est = int(screen_w * 0.98) - 4 - 2 - 1
+        return max(self._CHUNK_W, est)
+
+    def _refresh_body_width(self) -> None:
+        """Re-render the alignment body using the measured inner width
+        of `#aln-body`. Skips when the width hasn't changed since the
+        last paint so resize events that only changed height (e.g. a
+        terminal-height bump) don't pay for a full re-render."""
+        try:
+            body = self.query_one("#aln-body", VerticalScroll)
+            content = self.query_one("#aln-body-content", Static)
+        except NoMatches:
+            return
+        # `content_size` excludes the border but includes the scrollbar
+        # gutter when one is shown — exactly what the body Static can
+        # actually draw into. Floor at 20 cols so a sub-baseline terminal
+        # doesn't yield a zero-width chunk (which would infinite-loop the
+        # walker in `_body_text`).
+        chunk_w = max(20, body.content_size.width)
+        if chunk_w == self._last_chunk_w:
+            return
+        self._last_chunk_w = chunk_w
+        content.update(self._body_text(chunk_w))
 
     def _summary_md(self) -> str:
         r = self._result
@@ -54174,10 +55107,14 @@ class AlignmentScreen(Screen):
             f"**Gaps**: {r['n_gaps']:,}"
         )
 
-    def _body_text(self) -> Text:
+    def _body_text(self, chunk_w: int) -> Text:
         """Render the alignment body as Rich Text. Three rows per
         chunk: target features lane, target bases, match track,
-        query bases. Mismatches red, gaps dim."""
+        query bases. Mismatches red, gaps dim.
+
+        ``chunk_w`` is the number of alignment columns per row segment;
+        callers pass the body widget's measured inner width so the rows
+        span the full modal width regardless of terminal size."""
         r       = self._result
         aq      = r["aligned_q"]
         at      = r["aligned_t"]
@@ -54228,10 +55165,12 @@ class AlignmentScreen(Screen):
             for i in range(s, min(e, len(feat_at_bp))):
                 if not feat_at_bp[i]:   # smallest wins → first writer
                     feat_at_bp[i] = label
-        # Render in chunks.
+        # Render in chunks. `chunk_w` comes from the caller (measured
+        # body width or pre-layout estimate) so each row spans the full
+        # available area on any terminal size.
         out = Text(no_wrap=True, overflow="crop")
-        for chunk_s in range(0, n, self._CHUNK_W):
-            chunk_e = min(chunk_s + self._CHUNK_W, n)
+        for chunk_s in range(0, n, chunk_w):
+            chunk_e = min(chunk_s + chunk_w, n)
             # Coordinate header: target bp at chunk start.
             tbp_s = next(
                 (col_to_t_bp[i] for i in range(chunk_s, chunk_e)
@@ -54297,7 +55236,13 @@ class AlignmentScreen(Screen):
 
     @_action_log("app.alignment.close")
     def action_close(self) -> None:
-        self.app.pop_screen()
+        # `dismiss(None)` (not `pop_screen()`) so any callback the caller
+        # registered with `push_screen(..., callback=...)` reliably fires
+        # on close — the PlasmidMap relies on this to drop the "selected"
+        # lane highlight when the user returns from the detail view
+        # (otherwise the reverse-styled bars read as gray-on-default
+        # instead of their original blue/red/gray scheme).
+        self.dismiss(None)
 
 
 # ── Multi-target alignment picker ─────────────────────────────────────────────
@@ -54353,7 +55298,13 @@ class MultiAlignPickerModal(ModalScreen):
     #mam-help { color: $text-muted; padding: 0 1; margin-top: 1; }
     #mam-table { height: 1fr; margin-top: 1; }
     #mam-status { color: $text-muted; padding: 0 1; }
-    #mam-btns { height: 3; align: right middle; padding-top: 1; }
+    /* `margin-top` adds breathing room ABOVE the container so the
+       inner h=3 budget stays available for the buttons themselves.
+       The old `padding-top: 1` ate one of those three rows, leaving
+       only 2 for the h=3 button widget — its bottom border bled into
+       the dialog's padding-bottom and got clipped (user report
+       2026-05-23: "buttons cut off at the bottom"). */
+    #mam-btns { height: 3; align: right middle; margin-top: 1; }
     """
 
     _CHECK_ON  = "[bold green]✓[/]"
@@ -54481,6 +55432,270 @@ class MultiAlignPickerModal(ModalScreen):
         self.dismiss(None)
 
     def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Alignment manager modal ───────────────────────────────────────────────────
+#
+# `AlignmentManagerModal` is the user-facing surface for the per-plasmid
+# stored alignments introduced in 2026-05-23. Lists every stored
+# alignment (visible + hidden), supports per-row visibility toggle and
+# delete, plus bulk Hide / Show / Delete actions. Dismiss returns the
+# updated list to the caller, which writes it back to the library entry
+# and re-hydrates the band.
+
+class AlignmentManagerModal(ModalScreen):
+    """Modal for managing the active plasmid's stored alignments.
+
+    Bindings:
+        Esc / q    — cancel without saving
+        Space      — toggle visibility on the cursor row
+        Enter      — push AlignmentScreen for the cursor row
+        Delete     — remove the cursor row from storage
+        Tab        — focus next
+
+    Dismiss payload:
+        ``None``        — cancelled (Esc / Cancel button); caller skips save.
+        ``list[dict]``  — updated stored alignment list (may include hidden
+                          entries); caller writes to the active library entry
+                          and re-hydrates the band.
+    """
+
+    _blocks_undo = False
+
+    BINDINGS = [
+        Binding("escape", "cancel",          "Cancel"),
+        Binding("q",      "cancel",          "Cancel", show=False),
+        Binding("space",  "toggle_visible",  "Toggle"),
+        Binding("enter",  "open_detail",     "View"),
+        Binding("delete", "delete_selected", "Remove"),
+        Binding("tab",    "app.focus_next",  "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    AlignmentManagerModal { align: center middle; }
+    #alnmgr-dlg {
+        width: 100; max-width: 95%;
+        height: 90%; max-height: 32; min-height: 16;
+        background: $surface;
+        border: heavy $primary;
+        padding: 1 2;
+    }
+    #alnmgr-title {
+        text-align: center;
+        background: $primary-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
+    #alnmgr-help { color: $text-muted; padding: 0 1; margin-top: 1; }
+    #alnmgr-table { height: 1fr; margin-top: 1; }
+    #alnmgr-status { color: $text-muted; padding: 0 1; }
+    /* Same pattern as #mam-btns — `margin-top` not `padding-top` so
+       the buttons keep their full h=3 row budget. Otherwise the
+       button bottom border bleeds into the dialog's padding-bottom
+       and clips (user report 2026-05-23). */
+    #alnmgr-btns { height: 3; align: right middle; margin-top: 1; }
+    """
+
+    _CHECK_ON  = "[bold green]✓[/]"
+    _CHECK_OFF = "[dim]·[/]"
+
+    def __init__(self, alignments: "list[dict]",
+                 plasmid_label: str = "") -> None:
+        super().__init__()
+        # Defensive copy — modal mutates its own list, dismiss returns
+        # the modified version. Cancel returns None so the caller knows
+        # to drop these changes.
+        self._alignments: list[dict] = [dict(a) for a in alignments]
+        self._plasmid_label = plasmid_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="alnmgr-dlg"):
+            title = " Alignment Manager "
+            if self._plasmid_label:
+                title += f"— {self._plasmid_label} "
+            yield Static(title, id="alnmgr-title")
+            yield Static(
+                "Space toggles visibility · Enter opens detail · "
+                "Delete removes · Esc cancels (no save)",
+                id="alnmgr-help", markup=False,
+            )
+            yield DataTable(id="alnmgr-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="alnmgr-status")
+            with Horizontal(id="alnmgr-btns"):
+                yield Button("Hide All", id="btn-alnmgr-hide-all")
+                yield Button("Show All", id="btn-alnmgr-show-all")
+                yield Button("Delete All", id="btn-alnmgr-delete-all",
+                             variant="error")
+                yield Button("Save & Close", id="btn-alnmgr-save",
+                             variant="primary")
+                yield Button("Cancel", id="btn-alnmgr-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#alnmgr-table", DataTable)
+        t.add_columns("", "Label", "Target", "Identity",
+                       "Source", "Added")
+        self._repopulate()
+        if self._alignments:
+            t.move_cursor(row=0)
+        t.focus()
+        self._refresh_status()
+
+    def _repopulate(self) -> None:
+        """Rebuild the table from `self._alignments`. Called after
+        any mutation (toggle / delete / bulk action) so the displayed
+        rows stay in sync with the in-memory list."""
+        t = self.query_one("#alnmgr-table", DataTable)
+        prev_cursor = t.cursor_row if t.row_count else 0
+        t.clear()
+        for a in self._alignments:
+            visible = bool(a.get("visible", True))
+            mark = self._CHECK_ON if visible else self._CHECK_OFF
+            ident = (a.get("result") or {}).get("identity_pct", 0.0)
+            t.add_row(
+                Text.from_markup(mark),
+                Text((a.get("label") or "?")[:28],
+                     style="bold" if visible else "dim"),
+                Text((a.get("target_label") or "?")[:28],
+                     style="" if visible else "dim"),
+                Text(f"{ident:.1f}%",
+                     style="" if visible else "dim"),
+                Text(a.get("source") or "manual",
+                     style="dim italic"),
+                Text(a.get("added") or "",
+                     style="dim"),
+            )
+        # Restore cursor position if still in range.
+        if self._alignments:
+            row = max(0, min(prev_cursor, len(self._alignments) - 1))
+            try:
+                t.move_cursor(row=row)
+            except Exception:
+                pass
+
+    def _refresh_status(self) -> None:
+        visible_count = sum(
+            1 for a in self._alignments if a.get("visible", True)
+        )
+        hidden_count = len(self._alignments) - visible_count
+        try:
+            self.query_one("#alnmgr-status", Static).update(
+                f"{len(self._alignments)} stored "
+                f"({visible_count} visible, {hidden_count} hidden)"
+            )
+        except NoMatches:
+            pass
+
+    def _cursor_idx(self) -> int:
+        try:
+            t = self.query_one("#alnmgr-table", DataTable)
+        except NoMatches:
+            return -1
+        row = t.cursor_row
+        if row is None or row < 0 or row >= len(self._alignments):
+            return -1
+        return row
+
+    # ── Bindings ────────────────────────────────────────────────────────────
+
+    def action_toggle_visible(self) -> None:
+        idx = self._cursor_idx()
+        if idx < 0:
+            return
+        self._alignments[idx]["visible"] = not self._alignments[idx].get(
+            "visible", True,
+        )
+        self._repopulate()
+        self._refresh_status()
+
+    def action_delete_selected(self) -> None:
+        idx = self._cursor_idx()
+        if idx < 0:
+            return
+        # Single Delete press removes the entry — no confirm modal. The
+        # change isn't committed until Save & Close, so a slip can be
+        # undone by hitting Cancel instead. (Bulk Delete All warns
+        # explicitly via the button label + error variant.)
+        removed = self._alignments.pop(idx)
+        _log.info(
+            "AlignmentManagerModal: removed stored alignment %r",
+            removed.get("label", "?"),
+        )
+        self._repopulate()
+        self._refresh_status()
+
+    def action_open_detail(self) -> None:
+        idx = self._cursor_idx()
+        if idx < 0:
+            return
+        stored = self._alignments[idx]
+        args = _deserialize_stored_alignment_args(stored)
+        if args is None:
+            try:
+                self.app.notify(
+                    "Could not open detail view — stored target failed "
+                    "to parse. The alignment may need to be re-run.",
+                    severity="error", timeout=5,
+                )
+            except Exception:
+                pass
+            return
+        # Push the detail view as a sibling screen. Doesn't dismiss
+        # this modal so the user returns here when they close the
+        # detail screen.
+        try:
+            self.app.push_screen(AlignmentScreen(
+                query_label=args.get("query_label", "query"),
+                target_label=args.get("target_label", "target"),
+                target_record=args.get("target_record"),
+                result=args.get("result") or {},
+            ))
+        except Exception:
+            _log.exception(
+                "AlignmentManagerModal: push_screen AlignmentScreen failed"
+            )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    # ── Bulk buttons ────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-alnmgr-hide-all")
+    def _hide_all(self, _) -> None:
+        for a in self._alignments:
+            a["visible"] = False
+        self._repopulate()
+        self._refresh_status()
+
+    @on(Button.Pressed, "#btn-alnmgr-show-all")
+    def _show_all(self, _) -> None:
+        for a in self._alignments:
+            a["visible"] = True
+        self._repopulate()
+        self._refresh_status()
+
+    @on(Button.Pressed, "#btn-alnmgr-delete-all")
+    def _delete_all(self, _) -> None:
+        # Wipe ALL stored alignments. Destructive but recoverable until
+        # the user presses Save & Close — Cancel still backs out.
+        n = len(self._alignments)
+        if not n:
+            return
+        self._alignments = []
+        _log.info(
+            "AlignmentManagerModal: deleted %d stored alignment(s) "
+            "(pending save)", n,
+        )
+        self._repopulate()
+        self._refresh_status()
+
+    @on(Button.Pressed, "#btn-alnmgr-save")
+    def _save_and_close(self, _) -> None:
+        self.dismiss(list(self._alignments))
+
+    @on(Button.Pressed, "#btn-alnmgr-cancel")
+    def _cancel_btn(self, _) -> None:
         self.dismiss(None)
 
 
@@ -55491,26 +56706,50 @@ class DomesticatorModal(ModalScreen):
 class TraditionalCloningPane(Vertical):
     """Body of the Constructor's "Traditional" tab.
 
-    Workflow: pick an insert source (one of three modes), pick a
-    destination vector, pick one or two enzymes, click Simulate.
-    The simulator (module-level `_simulate_traditional_cloning`)
-    returns both possible orientations of the ligated product; the
-    pane renders both with feature counts + warnings, and exposes a
-    "Save to library" button per orientation.
+    Lane-based workflow (rebuilt 2026-05-23):
 
-    Insert-source modes:
-        plasmid  — digest a library plasmid with the chosen enzymes;
-                   the smaller resulting fragment is taken as the
-                   insert (skip if both fragments are similar size —
-                   user should re-pick).
-        feature  — pick a plasmid + feature; the feature's bases get
-                   stamped with canonical sticky ends from the chosen
-                   enzymes (PCR-with-tails model).
-        pcr      — pasted DNA gets the same canonical-overhang
-                   treatment.
+      1. Pick an insert source via the mode picker (plasmid / feature /
+         PCR) → set per-fragment enzymes → "Add to Lane".
+      2. Repeat (a) to queue 1..N fragments; reorder via ↑/↓; remove
+         via ✕.
+      3. Pick the destination vector + its enzymes (often the same as
+         the flanking fragments' enzymes).
+      4. Simulate → N-way ligation chains the lane in order then joins
+         the vector. Both orientations (Forward = lane order; Reverse =
+         entire chain RC'd) render with compatibility + warnings.
+      5. Save Forward / Save Reverse pushes ``NamePlasmidModal`` for
+         naming with the same dup-check the Golden Braid Constructor
+         uses. Library write only — no parts-bin mirror (trad cloning
+         seldom produces modular L0/TU parts; the user should use the
+         GB/MoClo tabs for those workflows).
+
+    Insert-source modes (per fragment):
+        plasmid — digest a library plasmid with the fragment's enzymes;
+                  the released-insert fragment is picked via the same
+                  feature-aware helper Golden Braid uses.
+        feature — feature's bases stamped with canonical sticky ends
+                  from the chosen enzymes (PCR-with-tails model).
+        pcr     — pasted DNA gets the same canonical-overhang treatment.
+
+    Lane invariants:
+      * Each fragment carries its own ``enz_left`` / ``enz_right`` so
+        a 3-way ligation can mix BamHI/SalI/HindIII junctions.
+      * Vector enzymes are independent from fragment enzymes — the
+        user can flank the lane with a vector cut by EcoRI/HindIII
+        even if no internal fragment uses either.
+      * Adjacent-fragment sticky-end compatibility is checked by the
+        engine at Simulate time, not lane-build time — the lane is a
+        plan; the simulator is the validator.
     """
 
     DEFAULT_CSS = ""
+
+    # Soft caps on the per-pane caches. Hit when a user browses the
+    # source DataTable a lot OR sets a wide variety of enzyme combos
+    # across many lane rows — well above realistic per-session use,
+    # but caps prevent unbounded growth on a long-running session.
+    _RECORD_CACHE_MAX = 32      # parsed SeqRecords kept in memory
+    _DIGEST_CACHE_MAX = 64      # cached (entry_id, enzymes) digests
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -55519,12 +56758,81 @@ class TraditionalCloningPane(Vertical):
         self._rev_product: "dict | None" = None
         # Cache parsed library entries so we don't re-parse the GenBank
         # text on every dropdown rebuild. Key: entry_id → SeqRecord.
+        # FIFO-bounded to ``_RECORD_CACHE_MAX`` so a long-running
+        # session with many library picks doesn't balloon memory; the
+        # oldest entry is evicted when the cap is hit. Realistic
+        # sessions touch a handful of plasmids — the cap is a safety
+        # net, not a tight bound.
         self._record_cache: "dict[str, SeqRecord]" = {}
+        # Digest memoisation — `_refresh_gel_preview` would otherwise
+        # re-digest every queued donor on every cursor move / enzyme
+        # change. Keyed by ``(entry_id, sorted_enzymes_tuple)`` so a
+        # row with stable enzymes hits the cache after the first
+        # digest. Bounded the same way `_record_cache` is.
+        self._digest_cache: "dict[tuple, list[dict]]" = {}
+        # Lane state (2026-05-23 rebuild). Each entry:
+        #   {"name", "mode", "source_entry_id", "source_label",
+        #    "enz_left", "enz_right",
+        #    "donor_frag_idx" (plasmid mode — 0/1 picks which of the
+        #      2 digest fragments is the donor; -1 means "use the
+        #      feature-aware auto-pick"),
+        #    "feat_idx" (feature mode),
+        #    "pcr_seq" / "pcr_name" (pcr mode)}
+        self._lane_inserts: list[dict] = []
+        # Master/detail editor state — index of the lane row whose
+        # controls are currently mirrored in the edit panel. -1 means
+        # no row selected (hint Static visible). Updated on cursor
+        # moves via `_on_lane_cursor_moved`.
+        self._edit_row_idx: int = -1
+        # Two-fragment cache for the currently-edited row's digest
+        # result, so the donor radio shows accurate bp sizes without
+        # re-digesting on every selection. Keyed by
+        # (entry_id, enz_left, enz_right). None when no valid digest.
+        self._edit_frags: "list[dict] | None" = None
+        # Debounce token for live edit-panel re-digests so a burst of
+        # enzyme changes coalesces to one digest run.
+        self._edit_digest_token: int = 0
+        # Re-entry guard: programmatic mutations of the edit-panel
+        # Select / RadioSet widgets fire Changed events that would
+        # otherwise re-trigger `_on_edit_enzyme_changed` →
+        # `_refresh_lane` → `RowHighlighted` → `_refresh_edit_panel`
+        # in an infinite loop. Handlers skip when this is True;
+        # `_refresh_edit_panel` / `_refresh_lane` set it for the
+        # duration of their programmatic widget writes.
+        self._suppress_edit_events: bool = False
+        # Mutation token — bumped on any lane / enzyme / role /
+        # fragment-pick change. The Simulate worker captures the
+        # token at dispatch; if it differs when the result lands,
+        # the worker drops the result. Guards against a stale
+        # Simulate result clobbering the user's in-progress edits
+        # (e.g. they click Simulate, then change a fragment radio
+        # while the worker is still digesting — the worker's
+        # result is now stale relative to the new lane state).
+        self._lane_mutation_token: int = 0
+        # Gel-highlight state: (lane_row_idx, band_idx_within_lane).
+        # The corresponding band paints bright green; every other
+        # band dims. Recomputed on cursor moves through the lane
+        # AND on every donor-fragment radio toggle so the gel
+        # always reflects the user's most recent choice (never
+        # stale). ``None`` clears the highlight (all bands neutral).
+        self._highlight_band: "tuple[int, int] | None" = None
+        # Gel click-target state — snapshotted on each
+        # `_refresh_gel_preview` so the click handler can reverse-
+        # map (x, y) → (lane_row_idx, band_idx) without recomputing
+        # the digest. `_gel_has_ladder` shifts the gel-column → lane-
+        # row offset (ladder is always column 0 when present).
+        self._gel_lane_bands: "list[list[tuple[int, str]]]" = []
+        self._gel_has_ladder: bool = False
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        # Insert-source mode picker
+        opts = [(name, name) for name in sorted(_NEB_ENZYMES.keys())]
+        # Insert-source mode picker — stays horizontal at the top so
+        # the user reads "which mode" before scanning the source
+        # picker below. Drives `_apply_mode_visibility` to show /
+        # hide the feature select + PCR inputs inside the palette
+        # column.
         with Horizontal(id="trad-mode-row"):
             yield Static("Insert source:", id="trad-mode-label")
             yield RadioSet(
@@ -55534,43 +56842,134 @@ class TraditionalCloningPane(Vertical):
                 RadioButton("PCR product",    id="trad-mode-pcr"),
                 id="trad-mode-set",
             )
-        # Mode-specific source picker host
-        with Vertical(id="trad-source-host"):
-            yield Static(" Insert plasmid (digest with chosen enzymes) ",
-                          id="trad-source-hdr")
-            yield DataTable(id="trad-source-table",
-                              cursor_type="row", zebra_stripes=True)
-            with Horizontal(id="trad-feature-row"):
-                yield Static("Feature:", classes="trad-inline-label")
-                yield Select([("(pick a plasmid first)", "")],
-                              id="trad-feature-select", allow_blank=True,
-                              prompt="Feature")
-            with Vertical(id="trad-pcr-rows"):
-                yield Input(placeholder="PCR product name (e.g., myFragment)",
-                              id="trad-pcr-name")
-                yield TextArea(id="trad-pcr-seq")
-        # Vector picker
-        with Vertical(id="trad-vector-row"):
-            yield Static(" Destination vector (digested with same enzymes) ",
-                          id="trad-vector-hdr")
-            yield DataTable(id="trad-vector-table",
-                              cursor_type="row", zebra_stripes=True)
-        # Enzyme picker + action buttons share a row so the results
-        # panel below has room to actually show its multi-line output.
-        # Pre-2026-05-10 the enzyme row + action row each occupied 4
-        # rows (h=3 + 1 margin), eating 8 rows that the results panel
-        # needed.
-        with Horizontal(id="trad-enzyme-row"):
-            yield Static("Enzymes:", id="trad-enzyme-label")
-            opts = [(name, name) for name in sorted(_NEB_ENZYMES.keys())]
-            yield Select(opts, id="trad-enzyme-1", prompt="E1",
-                          allow_blank=False, value=opts[0][1])
-            yield Select([("(single digest)", "")] + opts,
-                          id="trad-enzyme-2", prompt="E2 (optional)",
-                          allow_blank=True)
+        # Tryptych (2026-05-23): three columns laid out left-to-right
+        # mirror the wet-lab workflow.
+        #   • LEFT — active-collection list + mode-specific source
+        #     inputs (feature / PCR fields) + "→ Add donor" button.
+        #   • MIDDLE — assembly lane DataTable + reorder buttons +
+        #     master/detail editor for the cursor-selected row.
+        #   • RIGHT — persistent gel simulation that paints in real
+        #     time as the lane / enzymes change.
+        # Vector picker + Simulate / Save rows live full-width below
+        # the tryptych so the action buttons are always reachable
+        # regardless of how many donors the user queues.
+        with Horizontal(id="trad-tryptych", classes="trad-tryptych"):
+            with Vertical(id="trad-source-host",
+                            classes="trad-tryp-col-source"):
+                yield Static(" Active collection ",
+                              id="trad-source-hdr",
+                              classes="trad-section-hdr")
+                yield DataTable(id="trad-source-table",
+                                  cursor_type="row",
+                                  zebra_stripes=True,
+                                  classes="trad-source-table")
+                with Horizontal(id="trad-feature-row"):
+                    yield Static("Feature:",
+                                  classes="trad-inline-label")
+                    yield Select([("(pick a plasmid first)", "")],
+                                  id="trad-feature-select",
+                                  allow_blank=True, prompt="Feature")
+                with Vertical(id="trad-pcr-rows"):
+                    yield Input(
+                        placeholder="PCR product name (e.g., myFragment)",
+                        id="trad-pcr-name",
+                    )
+                    yield TextArea(id="trad-pcr-seq")
+                yield Button("Add Plasmid",
+                               id="btn-trad-add-frag",
+                               variant="primary",
+                               classes="trad-add-btn")
+            with Vertical(id="trad-lane-host",
+                            classes="trad-tryp-col-lane"):
+                yield Static(" Assembly Lane (ligation order) ",
+                              id="trad-lane-hdr",
+                              classes="trad-section-hdr")
+                yield DataTable(id="trad-lane",
+                                  cursor_type="row",
+                                  zebra_stripes=True,
+                                  classes="trad-lane")
+                with Horizontal(id="trad-lane-btns"):
+                    yield Button("↑",          id="btn-trad-lane-up")
+                    yield Button("↓",          id="btn-trad-lane-down")
+                    yield Button("↕",          id="btn-trad-lane-flip")
+                    yield Button("✕",          id="btn-trad-lane-remove",
+                                   variant="error")
+                    yield Button("Clear",
+                                   id="btn-trad-lane-clear")
+                # Lane health status — always visible. Shows ✓ when
+                # the lane is ready (exactly 1 backbone + ≥1 donor)
+                # or a coloured warning when the user has 0 / >1
+                # backbones or no donors yet. Pre-flight signal for
+                # whether Simulate will succeed without having to
+                # click it.
+                yield Static("", id="trad-lane-status",
+                              classes="trad-lane-status", markup=True)
+                with Vertical(id="trad-edit-host"):
+                    yield Static(" Edit selected donor ",
+                                  id="trad-edit-hdr",
+                                  classes="trad-section-hdr")
+                    yield Static(
+                        "[dim]Pick a lane row to configure its "
+                        "enzymes + donor fragment.[/]",
+                        id="trad-edit-hint", markup=True,
+                    )
+                    with Horizontal(id="trad-edit-enzyme-row"):
+                        yield Static("Enzymes:",
+                                      id="trad-edit-enzyme-label")
+                        yield Select(opts, id="trad-edit-enz-1",
+                                      prompt="E1", allow_blank=True)
+                        yield Select(
+                            [("(single digest)", "")] + opts,
+                            id="trad-edit-enz-2",
+                            prompt="E2 (optional)",
+                            allow_blank=True,
+                        )
+                    with Horizontal(id="trad-edit-role-row"):
+                        yield Static("Role:",
+                                      id="trad-edit-role-label")
+                        yield RadioSet(
+                            RadioButton("Donor", value=True,
+                                          id="trad-edit-role-donor"),
+                            RadioButton("Backbone",
+                                          id="trad-edit-role-backbone"),
+                            id="trad-edit-role-set",
+                        )
+                    with Horizontal(id="trad-edit-frag-row"):
+                        yield Static("Donor fragment:",
+                                      id="trad-edit-frag-label")
+                        yield RadioSet(
+                            RadioButton("(no digest yet)",
+                                          value=True,
+                                          id="trad-edit-frag-0"),
+                            RadioButton("",
+                                          id="trad-edit-frag-1"),
+                            id="trad-edit-frag-set",
+                        )
+            with Vertical(id="trad-gel-host",
+                            classes="trad-tryp-col-gel"):
+                yield Static(" Gel ", id="trad-gel-hdr",
+                              classes="trad-section-hdr")
+                yield Static("", id="trad-gel-text", markup=False)
+        # Vector picking lives INSIDE the lane (2026-05-23): each
+        # lane row carries a ``role`` of ``donor`` or ``backbone``
+        # so one collection list + one lane is enough — no extra
+        # destination-vector picker at the bottom. Exactly one
+        # backbone row + ≥1 donor row required at Simulate time
+        # (validated by `_on_simulate`).
+        # Simulate sits in its own row so the results panel below has
+        # room. Clear (full reset) is also here.
+        with Horizontal(id="trad-action-row"):
             yield Button("Simulate", id="btn-trad-simulate",
                           variant="primary")
             yield Button("Clear",    id="btn-trad-clear")
+        # ── Puzzle-piece view (2026-05-23) ─────────────────────
+        # Sits between the action row and the simulate-results
+        # text below. Centered horizontally via `text-align:
+        # center` (set in the puzzle CSS rule). To revert: delete
+        # this Static + its CSS rule + the `_refresh_puzzle_view`
+        # method + all `_refresh_puzzle_view()` call sites.
+        yield Static("", id="trad-puzzle-view",
+                      classes="trad-puzzle-view", markup=False)
         # Results panel — the multi-line simulation output.
         with Vertical(id="trad-results"):
             yield Static(
@@ -55594,6 +56993,24 @@ class TraditionalCloningPane(Vertical):
         # Hide / show mode-specific widgets based on the default mode.
         self._populate_library_tables()
         self._apply_mode_visibility()
+        try:
+            lt = self.query_one("#trad-lane", DataTable)
+        except NoMatches:
+            return
+        # Lane columns: #, role, name, source, enzymes, fragment.
+        # "Role" reads "donor" or "backbone" — exactly one row must
+        # be backbone for Simulate to run (the destination vector is
+        # baked into the lane in the 2026-05-23 tryptych rebuild).
+        # "Frag" reads "auto" until the user picks a specific
+        # fragment in the edit panel below, or "A/B" once picked.
+        lt.add_columns(
+            "#", "Role", "Name", "Source", "E1", "E2", "Frag",
+        )
+        self._refresh_lane()
+        # Edit panel starts empty (no row selected).
+        self._refresh_edit_panel()
+        # Gel preview starts empty (no donors queued).
+        self._refresh_gel_preview()
 
     def _populate_library_tables(self) -> None:
         """Fill both DataTables with the user's library entries.
@@ -55610,7 +57027,7 @@ class TraditionalCloningPane(Vertical):
                 e.get("name") or e.get("id") or ""
             ),
         )
-        for table_id in ("#trad-source-table", "#trad-vector-table"):
+        for table_id in ("#trad-source-table",):
             try:
                 t = self.query_one(table_id, DataTable)
             except NoMatches:
@@ -55660,15 +57077,6 @@ class TraditionalCloningPane(Vertical):
     # the Save buttons would still be enabled and could persist a
     # stale product to the library after the user has obviously
     # moved on. Re-Simulate is required after any input change.
-    @on(Select.Changed, "#trad-enzyme-1")
-    @on(Select.Changed, "#trad-enzyme-2")
-    def _on_enzyme_changed(self, _: Select.Changed) -> None:
-        self._invalidate_results()
-
-    @on(DataTable.RowSelected, "#trad-vector-table")
-    def _on_vector_selected(self, _: DataTable.RowSelected) -> None:
-        self._invalidate_results()
-
     @on(Input.Changed, "#trad-pcr-name")
     def _on_pcr_name_changed(self, _: Input.Changed) -> None:
         self._invalidate_results()
@@ -55714,11 +57122,13 @@ class TraditionalCloningPane(Vertical):
         feat_select.set_options(opts)
 
     def _invalidate_results(self) -> None:
-        """Drop the cached simulation product and re-disable Save
-        buttons so the user can't persist a stale result after
-        changing inputs. Idempotent — safe to call multiple times."""
+        """Drop the cached simulation product, re-disable Save
+        buttons, and bump the mutation token so any in-flight
+        Simulate worker drops its result on landing. Idempotent —
+        safe to call multiple times."""
         self._fwd_product = None
         self._rev_product = None
+        self._lane_mutation_token += 1
         for bid in ("#btn-trad-save-fwd", "#btn-trad-save-rev"):
             try:
                 self.query_one(bid, Button).disabled = True
@@ -55766,13 +57176,18 @@ class TraditionalCloningPane(Vertical):
         self._record_cache[eid] = rec
         return rec
 
-    def _selected_enzymes(self) -> list[str]:
+    def _selected_enzymes_for(self, e1_id: str, e2_id: str) -> list[str]:
+        """Read a pair of enzyme Select dropdowns and return the
+        deduped, validated list (1 or 2 names from ``_NEB_ENZYMES``).
+        Shared between the per-fragment enzyme row (used at "Add to
+        Lane" time) and the vector enzyme row (used at Simulate
+        time). Single-digest case → 1-element list."""
         try:
-            e1 = str(self.query_one("#trad-enzyme-1", Select).value or "")
+            e1 = str(self.query_one(e1_id, Select).value or "")
         except (NoMatches, AttributeError):
             e1 = ""
         try:
-            e2_raw = self.query_one("#trad-enzyme-2", Select).value
+            e2_raw = self.query_one(e2_id, Select).value
             e2 = str(e2_raw or "") if e2_raw is not Select.BLANK else ""
         except (NoMatches, AttributeError):
             e2 = ""
@@ -55783,6 +57198,1724 @@ class TraditionalCloningPane(Vertical):
             out.append(e2)
         return out
 
+    def _selected_edit_enzymes(self) -> list[str]:
+        """Per-row enzymes from the master/detail edit panel — what
+        the selected lane row will be digested with at Simulate
+        time. Falls back to the lane spec's stored enz_left/enz_right
+        when the user hasn't touched the edit panel for this row."""
+        return self._selected_enzymes_for(
+            "#trad-edit-enz-1", "#trad-edit-enz-2",
+        )
+
+    # Back-compat shim: agent endpoints / history helpers that need
+    # "the enzymes that joined the product" call `_selected_enzymes`.
+    # Post-2026-05-23 rebuild "the enzymes" is the per-lane union of
+    # (enz_left, enz_right) across every queued donor PLUS the
+    # backbone row's enzymes — so the regenerated-site annotations
+    # cover both sides of every junction. The backbone is now baked
+    # into the lane (no separate vector picker), so this single loop
+    # covers both donor and backbone enzymes.
+    def _selected_enzymes(self) -> list[str]:
+        union: list[str] = []
+        for spec in self._lane_inserts:
+            for k in ("enz_left", "enz_right"):
+                e = str(spec.get(k) or "")
+                if e and e not in union and e in _NEB_ENZYMES:
+                    union.append(e)
+        return union
+
+    # ── Lane management ──────────────────────────────────────────────────────
+
+    def _refresh_lane(self, restore_cursor: int = -1) -> None:
+        """Re-render the lane DataTable from ``self._lane_inserts``.
+        Cursor row is restored to ``restore_cursor`` (or kept on the
+        current row when -1). Frag column shows "A" / "B" once the
+        user picks a fragment in the edit panel, "auto" for plasmid
+        rows where they haven't touched the picker, and "—" for
+        PCR / feature rows (single synthesised fragment, no choice
+        to make)."""
+        try:
+            lt = self.query_one("#trad-lane", DataTable)
+        except NoMatches:
+            return
+        keep = lt.cursor_row if restore_cursor < 0 else restore_cursor
+        # `lt.clear()` AND `lt.add_row(...)` both fire synthetic
+        # RowHighlighted events as the cursor relocates; without
+        # wrapping the entire body in `prevent`, those events drain
+        # AFTER our explicit `move_cursor` and clobber the caller's
+        # restore (cursor flips back to row 0, edit panel mis-parks).
+        with self.prevent(DataTable.RowHighlighted):
+            self._refresh_lane_body(lt, keep)
+
+    def _refresh_lane_body(self, lt: DataTable, keep: int) -> None:
+        lt.clear()
+        for i, spec in enumerate(self._lane_inserts, start=1):
+            e1 = str(spec.get("enz_left") or "—")
+            e2 = str(spec.get("enz_right") or "")
+            mode = spec.get("mode", "plasmid")
+            if mode == "plasmid":
+                frag_idx = spec.get("donor_frag_idx", -1)
+                if frag_idx == 0:
+                    frag_label = "A"
+                elif frag_idx == 1:
+                    frag_label = "B"
+                else:
+                    frag_label = "auto"
+            else:
+                frag_label = "—"
+            role = str(spec.get("role") or "donor")
+            # Colour-coded so the user can scan a crowded lane and
+            # see at a glance which row is the destination vector
+            # (bold cyan "backbone") vs the inserts (lime green
+            # "donor"). Backbone vs donor must be mutually
+            # exclusive; the lane status label below warns when
+            # more than one row is marked backbone.
+            role_text = (Text("backbone", style="bold cyan")
+                          if role == "backbone"
+                          else Text("donor", style="bold #9ef000"))
+            # ↕ glyph in the name cell when the user has flipped
+            # this row's orientation. The fragment's RC is what
+            # gets ligated at Simulate time.
+            name_str = str(spec.get("name") or "?")
+            if spec.get("flipped"):
+                name_str = "↕ " + name_str
+            # Per-lane color stripe — same hex as the row's T-piece
+            # body in the puzzle view (`_LANE_PALETTE` cycling by
+            # row index). Lets the user visually link a lane row
+            # to its puzzle piece without reading names.
+            lane_color = self._lane_color(i - 1)
+            lt.add_row(
+                Text(str(i), style=f"bold {lane_color}"),
+                role_text,
+                Text(name_str, no_wrap=True,
+                     overflow="ellipsis",
+                     style=f"bold {lane_color}"),
+                Text(str(spec.get("source_label") or ""), style="dim",
+                     no_wrap=True, overflow="ellipsis"),
+                e1,
+                e2 if e2 and e2 != e1 else "—",
+                frag_label,
+            )
+        if 0 <= keep < len(self._lane_inserts):
+            # The outer `_refresh_lane` wraps this in `prevent
+            # (DataTable.RowHighlighted)` so neither `clear()` /
+            # `add_row()` / `move_cursor()` here leak a synthetic
+            # highlight event that would re-park `_edit_row_idx` to
+            # row 0 after the caller's intended restore.
+            try:
+                lt.move_cursor(row=keep)
+            except Exception:
+                _log.debug("trad-lane: cursor restore failed")
+        # Lane summary readout — paints green when the lane is
+        # ready, yellow / red for warnings (e.g. two backbones).
+        self._refresh_lane_status()
+
+    def _refresh_lane_status(self) -> None:
+        """Paint the lane health label under the lane DataTable.
+
+        Counts donor / backbone rows and surfaces:
+          * green ✓ when exactly 1 backbone + ≥1 donor (Simulate
+            will be able to run);
+          * yellow ⚠ when the lane is just empty / has no backbone
+            / has no donors (user needs to add more rows);
+          * RED ⚠ when MORE THAN ONE row is marked backbone —
+            this is an invalid state the role-radio handler
+            auto-corrects on the next role toggle, but if it
+            somehow slips through (data-load, agent payload),
+            the user sees the issue clearly.
+        """
+        try:
+            status = self.query_one("#trad-lane-status", Static)
+        except NoMatches:
+            return
+        n_backbone = sum(1 for s in self._lane_inserts
+                          if s.get("role") == "backbone")
+        n_donor    = sum(1 for s in self._lane_inserts
+                          if s.get("role") != "backbone")
+        try:
+            if not self._lane_inserts:
+                status.update(
+                    "[dim]Empty lane — add plasmid donors + a "
+                    "backbone.[/]"
+                )
+                return
+            if n_backbone > 1:
+                status.update(
+                    f"[bold red]⚠ {n_backbone} backbones in lane — "
+                    f"only ONE row can be the backbone. Toggle "
+                    f"the extras to Donor in the edit panel.[/]"
+                )
+                return
+            if n_backbone == 0:
+                status.update(
+                    "[yellow]⚠ No backbone — mark one plasmid row "
+                    "as Backbone in the edit panel.[/]"
+                )
+                return
+            if n_donor == 0:
+                status.update(
+                    "[yellow]⚠ No donor rows — add at least one "
+                    "donor plasmid / PCR / feature.[/]"
+                )
+                return
+            status.update(
+                f"[bold green]✓ Ready: {n_donor} donor"
+                f"{'s' if n_donor != 1 else ''} + 1 backbone.[/]"
+            )
+        finally:
+            # Puzzle-piece view always reflects the current lane,
+            # regardless of which status branch fired. Easy to
+            # revert: delete this `try/finally` wrapper + the call.
+            self._refresh_puzzle_view()
+
+    # ── Puzzle-piece view (Tetris-T, 2026-05-23) ────────────────────────
+    # 3-row T-piece per fragment in the bottom results panel:
+    #   row 0 = TOP-strand overhang arms at left/right corners
+    #   row 1 = colored body with fragment name + ds-DNA core
+    #   row 2 = BOT-strand overhang arms at left/right corners
+    # Each fragment uses its lane row's color (from `_LANE_PALETTE`).
+    # When the user flips a fragment (↕ button), the arms swap to
+    # the opposite strand so the T renders upside-down. Between
+    # fragments, the middle row carries a junction marker (✓ green
+    # = compatible overhangs / ✗ red = incompatible). The closing
+    # junction back to the backbone is marked ↺ at the end.
+    # To revert: delete this section + the `_refresh_puzzle_view()`
+    # call sites + the `#trad-puzzle-view` widget in `compose` +
+    # the `.trad-puzzle-view` CSS rule + the `_LANE_PALETTE` const.
+    # Lane row coloring (name cell) also uses `_LANE_PALETTE` —
+    # delete those uses in `_refresh_lane_body` for full revert.
+
+    def _fragment_for_spec(self, spec: dict) -> "dict | None":
+        """Return the FRAGMENT dict for a spec (or None if not
+        configured / digest failed). Honors the user's
+        ``donor_frag_idx`` pick AND the ``flipped`` state — flipped
+        returns the RC'd fragment. This is the canonical source for
+        any rendering that needs both strand sequences."""
+        enzymes: list[str] = []
+        for k in ("enz_left", "enz_right"):
+            e = str(spec.get(k) or "")
+            if e and e in _NEB_ENZYMES and e not in enzymes:
+                enzymes.append(e)
+        if not enzymes:
+            return None
+        mode = spec.get("mode", "plasmid")
+        frag: "dict | None" = None
+        if mode == "plasmid":
+            frags, _ = self._cached_digest(
+                spec.get("source_entry_id", ""), enzymes,
+            )
+            if frags is None or len(frags) != 2:
+                return None
+            _raw = spec.get("donor_frag_idx", -1)
+            chosen_idx = -1 if _raw is None else int(_raw)
+            if chosen_idx not in (0, 1):
+                if spec.get("role") == "backbone":
+                    auto = _pick_backbone_fragment(frags) or frags[0]
+                else:
+                    auto = _pick_insert_fragment(frags) or frags[0]
+                try:
+                    chosen_idx = frags.index(auto)
+                except ValueError:
+                    chosen_idx = 0
+            frag = frags[chosen_idx]
+        elif mode in ("pcr", "feature"):
+            try:
+                frag = _make_synthetic_fragment(
+                    "X" * 6,
+                    enz_left=enzymes[0],
+                    enz_right=enzymes[1] if len(enzymes) > 1 else enzymes[0],
+                    source_label="",
+                )
+            except Exception:
+                return None
+        if frag is None:
+            return None
+        if spec.get("flipped"):
+            frag = _rc_fragment(frag)
+        return frag
+
+    @staticmethod
+    def _end_strand_bases(frag: dict, side: str
+                              ) -> "tuple[str, str]":
+        """Compute (top_5char, bot_5char) edge bases for a fragment
+        end. The 5-char window straddles the cut: 1 paired base in
+        the dsDNA core + 4 overhang bases on whichever strand has
+        the overhang. The recessed strand at that end is rendered
+        as 4 spaces (showing the "jagged edge" left by the enzyme
+        cutting one strand longer than the other).
+
+        For blunt ends both strands have the same 5-char window
+        (the 5 bases of the recognition site terminal on each
+        strand, no spaces). For sticky ends, one strand has the
+        overhang bases, the other shows spaces in the overhang
+        region.
+
+        Both returned strings are the SAME width (= max(overhang_len
+        + 1, 1)) so the caller can render them as paired rows."""
+        end = frag.get(side, {})
+        oh = str(end.get("overhang_seq", "") or "")
+        kind = end.get("kind", "")
+        top_seq = frag.get("top_seq", "")
+        if not top_seq or kind == "linear":
+            return ("", "")
+        if not oh and kind == "blunt":
+            # Blunt cut: both strands end at the same position.
+            # Show 5 chars from each strand at the appropriate end.
+            top_bases = top_seq[:5] if side == "left" else top_seq[-5:]
+            bot_bases = top_bases.translate(_IUPAC_COMP)
+            return (top_bases, bot_bases)
+        if not oh:
+            return ("", "")
+        ovh_len = len(oh)
+        # Find the paired base on top adjacent to the overhang.
+        # Convention: when overhang is on TOP at an end, top_seq
+        # INCLUDES the overhang bases. When overhang is on BOT,
+        # top_seq is recessed (doesn't include them).
+        # Single-char complement: use the translation table.
+        def _comp(c: str) -> str:
+            return c.translate(_IUPAC_COMP) if c else "?"
+        if side == "left":
+            if kind == "5'":
+                # Top has overhang at start. top_seq = ovh + paired + body
+                paired_top = (top_seq[ovh_len]
+                                 if len(top_seq) > ovh_len else "?")
+                paired_bot = _comp(paired_top)
+                top_bases = oh + paired_top
+                bot_bases = " " * ovh_len + paired_bot
+            elif kind == "3'":
+                # Bot has overhang at start. top_seq = paired + body
+                paired_top = top_seq[0] if top_seq else "?"
+                paired_bot = _comp(paired_top)
+                # Bot bases read 3'→5' L-to-R = complement of top-
+                # canonical overhang seq (NOT reverse-complement).
+                bot_overhang = oh.translate(_IUPAC_COMP)
+                top_bases = " " * ovh_len + paired_top
+                bot_bases = bot_overhang + paired_bot
+            else:
+                return ("", "")
+        else:  # right
+            if kind == "3'":
+                # Top has overhang at end. top_seq = body + paired + ovh
+                paired_top = (top_seq[-(ovh_len + 1)]
+                                 if len(top_seq) > ovh_len else "?")
+                paired_bot = _comp(paired_top)
+                top_bases = paired_top + oh
+                bot_bases = paired_bot + " " * ovh_len
+            elif kind == "5'":
+                # Bot has overhang at end. top_seq = body + paired
+                paired_top = top_seq[-1] if top_seq else "?"
+                paired_bot = _comp(paired_top)
+                bot_overhang = oh.translate(_IUPAC_COMP)
+                top_bases = paired_top + " " * ovh_len
+                bot_bases = paired_bot + bot_overhang
+            else:
+                return ("", "")
+        return (top_bases, bot_bases)
+
+    def _arms_for_spec(self, spec: dict) -> "dict[str, str]":
+        """Return arm strings at each of the four corners of the
+        fragment's T-piece. Keys: ``lt`` (left-top), ``lb`` (left-
+        bot), ``rt`` (right-top), ``rb`` (right-bot). Empty string
+        = no overhang at that corner. Accounts for the spec's
+        ``flipped`` state: flip swaps left↔right and moves each
+        arm to the opposite strand (and RC's the overhang bases,
+        relevant for non-palindromic ends like Type IIS scars)."""
+        enzymes: list[str] = []
+        for k in ("enz_left", "enz_right"):
+            e = str(spec.get(k) or "")
+            if e and e in _NEB_ENZYMES and e not in enzymes:
+                enzymes.append(e)
+        empty = {"lt": "", "lb": "", "rt": "", "rb": ""}
+        if not enzymes:
+            return empty
+        mode = spec.get("mode", "plasmid")
+        frag: "dict | None" = None
+        if mode == "plasmid":
+            frags, _ = self._cached_digest(
+                spec.get("source_entry_id", ""), enzymes,
+            )
+            if frags is None or len(frags) != 2:
+                return empty
+            _raw = spec.get("donor_frag_idx", -1)
+            chosen_idx = -1 if _raw is None else int(_raw)
+            if chosen_idx not in (0, 1):
+                if spec.get("role") == "backbone":
+                    auto = _pick_backbone_fragment(frags) or frags[0]
+                else:
+                    auto = _pick_insert_fragment(frags) or frags[0]
+                try:
+                    chosen_idx = frags.index(auto)
+                except ValueError:
+                    chosen_idx = 0
+            frag = frags[chosen_idx]
+        elif mode in ("pcr", "feature"):
+            try:
+                frag = _make_synthetic_fragment(
+                    "X" * 6,
+                    enz_left=enzymes[0],
+                    enz_right=enzymes[1] if len(enzymes) > 1 else enzymes[0],
+                    source_label="",
+                )
+            except Exception:
+                return empty
+        if frag is None:
+            return empty
+        def _end_arms(end: dict, side: str) -> "tuple[str, str]":
+            oh = str(end.get("overhang_seq", "") or "")
+            kind = end.get("kind", "")
+            if not oh:
+                return ("", "")
+            if side == "left":
+                # 5' at left → top strand (top extends past bot)
+                # 3' at left → bot strand (bot extends past top)
+                return (oh, "") if kind == "5'" else (
+                       ("", oh) if kind == "3'" else ("", ""))
+            # right
+            # 3' at right → top strand; 5' at right → bot strand
+            return (oh, "") if kind == "3'" else (
+                   ("", oh) if kind == "5'" else ("", ""))
+        lt, lb = _end_arms(frag["left"],  "left")
+        rt, rb = _end_arms(frag["right"], "right")
+        if spec.get("flipped"):
+            # Flip swaps left↔right AND strand assignments. So:
+            #   new_lt = RC(old_rb), new_lb = RC(old_rt)
+            #   new_rt = RC(old_lb), new_rb = RC(old_lt)
+            # RC is identity for palindromes (AATT, GATC, GTAC) but
+            # matters for asymmetric overhangs (Type IIS scars).
+            lt, lb, rt, rb = _rc(rb), _rc(rt), _rc(lb), _rc(lt)
+        return {"lt": lt, "lb": lb, "rt": rt, "rb": rb}
+
+    def _lane_color(self, lane_row_idx: int) -> str:
+        """Pick a hex color for a lane row idx, cycling through
+        `_LANE_PALETTE`. The lane DataTable's name cell + this
+        row's T-piece body share the color so the user can visually
+        link the puzzle piece to its lane row."""
+        if not _LANE_PALETTE:
+            return "white"
+        return _LANE_PALETTE[lane_row_idx % len(_LANE_PALETTE)]
+
+    @staticmethod
+    def _junction_mates(my_arms: dict, next_arms: dict) -> bool:
+        """True when this fragment's RIGHT overhang chemically mates
+        with the next fragment's LEFT overhang. Sticky-end ligation
+        requires the overhangs to sit on OPPOSITE strands (one top,
+        one bot) with matching top-canonical seqs — same-strand
+        adjacency would mean both fragments stick their overhangs
+        into the same gap, which is biologically impossible."""
+        # my right-top ↔ their left-bot
+        if my_arms["rt"] and next_arms["lb"] and \
+                my_arms["rt"].upper() == next_arms["lb"].upper():
+            return True
+        # my right-bot ↔ their left-top
+        if my_arms["rb"] and next_arms["lt"] and \
+                my_arms["rb"].upper() == next_arms["lt"].upper():
+            return True
+        return False
+
+    def _refresh_puzzle_view(self) -> None:
+        """Render the lane as a feature-bar + DNA-strand diagram in
+        the bottom results panel.
+
+        Per fragment, 3 rows:
+            row 0 — TOP strand: overhang bases (if overhang sits on
+                    top at this end) or spaces (recessed = enzyme
+                    cut into the strand)
+            row 1 — FEATURE BAR: colored block with fragment name,
+                    same color as that fragment's overhang bases
+            row 2 — BOT strand: overhang bases (if overhang sits on
+                    bot at this end) or spaces (recessed)
+
+        Adjacent fragments are placed touching: when overhangs mate
+        chemically (opposite strands, matching seqs), the colored
+        bases of one fragment sit right next to the colored bases of
+        the next — visually interlocking. When they don't mate, a
+        ⚠ symbol sits between them on the bar row. A closed-plasmid
+        ✓ badge appears at the end when every junction (including
+        the wrap-around back to the backbone) mates correctly."""
+        try:
+            view = self.query_one("#trad-puzzle-view", Static)
+        except NoMatches:
+            return
+        if not self._lane_inserts:
+            view.update(
+                Text("(add fragments above to see the puzzle)",
+                     style="dim italic"),
+            )
+            return
+        # Chain order: backbone first, then donors in lane order.
+        # Closing junction is from last donor right ↔ backbone left.
+        lane_with_idx = list(enumerate(self._lane_inserts))
+        backbone = next(((i, s) for i, s in lane_with_idx
+                          if s.get("role") == "backbone"), None)
+        donors   = [(i, s) for i, s in lane_with_idx
+                     if s.get("role") != "backbone"]
+        # Layout: backbone right edge (left bookend) | insert1 |
+        # insert2 | ... | insertN | backbone left edge (right
+        # bookend). Each fragment is a fixed-width feature bar with
+        # actual top/bot strand bases at the cut sites. Mating
+        # junctions overlap the 4-char overhang region (one
+        # fragment's overhang bases sit in the recessed gap of the
+        # other, visibly interlocking). Non-mating junctions get a
+        # gap with a ⚠ marker.
+        top_row, bot_row = Text(), Text()
+        if backbone is None:
+            top_row.append("(no backbone — mark one lane row as "
+                              "Backbone in the edit panel)",
+                              style="dim italic yellow")
+            bot_row.append("")
+            final = Text()
+            final.append_text(top_row)
+            final.append("\n")
+            final.append_text(bot_row)
+            view.update(final)
+            return
+        bb_orig_idx, bb_spec = backbone
+        bb_color = self._lane_color(bb_orig_idx)
+        bb_frag = self._fragment_for_spec(bb_spec)
+        if bb_frag is None:
+            top_row.append("(backbone not configured — set enzymes "
+                              "in the edit panel)",
+                              style="dim italic yellow")
+            final = Text()
+            final.append_text(top_row)
+            view.update(final)
+            return
+        bb_right = self._end_strand_bases(bb_frag, "right")
+        bb_left  = self._end_strand_bases(bb_frag, "left")
+        body_w = 16        # fixed body width — same length per piece
+        all_mate = True
+
+        def render_edge(top_chars, bot_chars, color):
+            """Render an edge (5-char top + 5-char bot) in a color.
+            Spaces in the strand stay as transparent spaces (no
+            style needed — they're the recessed area / jagged
+            edge)."""
+            for c in top_chars:
+                if c == " ":
+                    top_row.append(" ")
+                else:
+                    top_row.append(c, style=f"bold {color}")
+            for c in bot_chars:
+                if c == " ":
+                    bot_row.append(" ")
+                else:
+                    bot_row.append(c, style=f"bold {color}")
+
+        def render_body(name, color):
+            """Render a fixed-width feature bar with name centered."""
+            label = (name or "?")[:body_w].center(body_w)
+            top_row.append(label, style=f"bold black on {color}")
+            bot_row.append(" " * body_w,
+                              style=f"bold black on {color}")
+
+        def render_mating_overlap(prev_top, prev_bot, prev_color,
+                                       next_top, next_bot, next_color):
+            """Overlap the 4-char overhang region of two mating
+            edges. Result: 6 chars wide (1 paired_prev + 4 overlap
+            + 1 paired_next). Each base picks up its source
+            fragment's color so the user sees the interlock."""
+            ovh = max(len(prev_top), len(next_top)) - 1
+            # Position 0: prev's paired base
+            if prev_top:
+                top_row.append(prev_top[0], style=f"bold {prev_color}")
+                bot_row.append(prev_bot[0], style=f"bold {prev_color}")
+            # Positions 1..ovh: overlap region — non-space wins
+            for i in range(ovh):
+                pt = prev_top[1 + i] if 1 + i < len(prev_top) else " "
+                pb = prev_bot[1 + i] if 1 + i < len(prev_bot) else " "
+                nt = next_top[i]     if i     < len(next_top) else " "
+                nb = next_bot[i]     if i     < len(next_bot) else " "
+                top_row.append(pt if pt != " " else nt,
+                    style=f"bold {prev_color if pt != ' ' else next_color}")
+                bot_row.append(pb if pb != " " else nb,
+                    style=f"bold {prev_color if pb != ' ' else next_color}")
+            # Last position: next's paired base
+            if next_top:
+                top_row.append(next_top[-1], style=f"bold {next_color}")
+                bot_row.append(next_bot[-1], style=f"bold {next_color}")
+
+        def render_gap(prev_top, prev_bot, prev_color,
+                            next_top, next_bot, next_color):
+            """Non-mating junction — render both edges separated by a
+            ⚠ marker. Pad bot to MATCH the cell width of the top
+            marker (the ⚠ glyph is ambiguous-width Unicode — many
+            terminals render it as 2 cells. If we naively padded
+            bot with `len()` spaces we'd drift by 1 cell every
+            non-mating junction and the strands wouldn't align)."""
+            render_edge(prev_top, prev_bot, prev_color)
+            marker = " ⚠ "
+            top_row.append(marker, style="bold red")
+            bot_row.append(" " * _cell_len(marker))
+            render_edge(next_top, next_bot, next_color)
+
+        # ─── Left bookend: backbone body chunk. Same rendering
+        # style as insert feature bars (colored block via
+        # ``bold black on COLOR`` background fill) so the backbone
+        # bar is visually identical to the insert bars.
+        BB_CHUNK_W = 5
+        top_row.append(" " * BB_CHUNK_W,
+                          style=f"bold black on {bb_color}")
+        bot_row.append(" " * BB_CHUNK_W,
+                          style=f"bold black on {bb_color}")
+
+        # ─── Each insert + junction with previous (starting with bb)
+        prev_color   = bb_color
+        prev_right_top, prev_right_bot = bb_right
+        # Track whether we've actually rendered the "prev right" yet
+        # (we delay rendering until the next junction decides whether
+        # to overlap or gap).
+        for orig_idx, spec in donors:
+            ins_frag = self._fragment_for_spec(spec)
+            if ins_frag is None:
+                # Render prev's right edge so it doesn't disappear,
+                # then a placeholder for this unconfigured insert.
+                render_edge(prev_right_top, prev_right_bot, prev_color)
+                top_row.append(" (?) ", style="dim red")
+                bot_row.append("     ")
+                continue
+            ins_color    = self._lane_color(orig_idx)
+            ins_left     = self._end_strand_bases(ins_frag, "left")
+            ins_right    = self._end_strand_bases(ins_frag, "right")
+            # Mating check via strand bases (chemistry the engine uses).
+            mates      = (self._can_mate_strand_bases(
+                              prev_right_top, prev_right_bot,
+                              ins_left[0],    ins_left[1]))
+            if mates:
+                render_mating_overlap(
+                    prev_right_top, prev_right_bot, prev_color,
+                    ins_left[0],    ins_left[1],    ins_color,
+                )
+            else:
+                all_mate = False
+                render_gap(
+                    prev_right_top, prev_right_bot, prev_color,
+                    ins_left[0],    ins_left[1],    ins_color,
+                )
+            # Insert body
+            render_body(spec.get("name") or "?", ins_color)
+            # Save for next iteration
+            prev_color   = ins_color
+            prev_right_top, prev_right_bot = ins_right
+
+        # ─── Closing junction: last insert's right ↔ backbone's left
+        mates_close = self._can_mate_strand_bases(
+            prev_right_top, prev_right_bot,
+            bb_left[0],     bb_left[1],
+        )
+        if mates_close:
+            render_mating_overlap(
+                prev_right_top, prev_right_bot, prev_color,
+                bb_left[0],     bb_left[1],     bb_color,
+            )
+        else:
+            all_mate = False
+            render_gap(
+                prev_right_top, prev_right_bot, prev_color,
+                bb_left[0],     bb_left[1],     bb_color,
+            )
+        # ─── Right bookend: backbone body chunk (same style as the
+        # left bookend and the insert feature bars).
+        top_row.append(" " * BB_CHUNK_W,
+                          style=f"bold black on {bb_color}")
+        bot_row.append(" " * BB_CHUNK_W,
+                          style=f"bold black on {bb_color}")
+        # ─── Plasmid-closed indicator. MUST pad bot_row with the
+        # same cell count as the status text we append to top_row
+        # — otherwise text-align: center on the Static centers
+        # each line independently and the wider top (with status
+        # text) shifts left relative to the narrower bot,
+        # misaligning the strand bars. Use `_cell_len` because the
+        # status text contains ambiguous-width Unicode (✓, ✗, ⚠,
+        # ≥) that may render as 1 or 2 cells depending on terminal.
+        status_text = ""
+        status_style = ""
+        if not donors:
+            status_text  = "   (add ≥1 donor to close the assembly)"
+            status_style = "dim italic yellow"
+        elif all_mate:
+            status_text  = "   ✓ CLOSED PLASMID"
+            status_style = "bold reverse green"
+        else:
+            status_text  = "   ✗ open assembly — fix ⚠ junction(s)"
+            status_style = "bold red"
+        if status_text:
+            top_row.append(status_text, style=status_style)
+            bot_row.append(" " * _cell_len(status_text))
+        # ─── Color legend row (3rd line) ────────────────────────
+        # Maps each lane row's color to its name + role so the
+        # user can connect the puzzle pieces to the lane DataTable
+        # above. Backbone first, then donors in lane order.
+        legend = Text()
+        bb_name = str(bb_spec.get("name") or "?")
+        legend.append("██", style=f"bold {bb_color}")
+        legend.append(f" {bb_name} (backbone)   ",
+                          style=f"bold {bb_color}")
+        for orig_idx, spec in donors:
+            d_color = self._lane_color(orig_idx)
+            d_name  = str(spec.get("name") or "?")
+            legend.append("██", style=f"bold {d_color}")
+            legend.append(f" {d_name}   ",
+                              style=f"bold {d_color}")
+        # Legend ABOVE the puzzle pieces, with a blank row between
+        # for visual breathing room. Order: legend → blank → top
+        # strand → bot strand.
+        final = Text()
+        final.append_text(legend)
+        final.append("\n")
+        final.append("\n")        # blank separator row
+        final.append_text(top_row)
+        final.append("\n")
+        final.append_text(bot_row)
+        view.update(final)
+
+    @staticmethod
+    def _can_mate_strand_bases(prev_top: str, prev_bot: str,
+                                  next_top: str, next_bot: str) -> bool:
+        """Check chemistry compatibility between two edge-base
+        sets. Mating: one side's overhang is on TOP and the
+        other's on BOT (opposite strands), AND the bases are
+        Watson-Crick complementary at every overhang position.
+
+        The 5-char edges have a paired base at one end and 4
+        overhang bases at the other (or all-spaces if no overhang).
+        Spaces represent the recessed area (jagged edge) — the
+        opposite strand's overhang fills these positions when
+        ligating."""
+        if not prev_top or not next_top:
+            return False
+        if len(prev_top) != len(next_top):
+            return False
+        # Overhang region: positions 1..4 of prev (right edge),
+        # positions 0..3 of next (left edge).
+        ovh = len(prev_top) - 1
+        prev_ovh_top = prev_top[1:]   # 4 chars (or spaces)
+        prev_ovh_bot = prev_bot[1:]   # 4 chars (or spaces)
+        next_ovh_top = next_top[:ovh] # 4 chars (or spaces)
+        next_ovh_bot = next_bot[:ovh] # 4 chars (or spaces)
+        # Identify which strand carries each side's overhang.
+        prev_top_has = any(c != " " for c in prev_ovh_top)
+        prev_bot_has = any(c != " " for c in prev_ovh_bot)
+        next_top_has = any(c != " " for c in next_ovh_top)
+        next_bot_has = any(c != " " for c in next_ovh_bot)
+        def _comp(c: str) -> str:
+            return c.translate(_IUPAC_COMP) if c else ""
+        # Opposite-strand check.
+        if prev_top_has and next_bot_has and not (
+                prev_bot_has or next_top_has):
+            # prev's top overhang pairs with next's bot overhang.
+            # At each position, prev_top[i+1] should be the
+            # Watson-Crick complement of next_bot[i].
+            return all(
+                _comp(p) == n
+                for p, n in zip(prev_ovh_top, next_ovh_bot)
+                if p != " " and n != " "
+            ) and not any(
+                (p != " ") != (n != " ")
+                for p, n in zip(prev_ovh_top, next_ovh_bot)
+            )
+        if prev_bot_has and next_top_has and not (
+                prev_top_has or next_bot_has):
+            return all(
+                _comp(n) == p
+                for p, n in zip(prev_ovh_bot, next_ovh_top)
+                if p != " " and n != " "
+            ) and not any(
+                (p != " ") != (n != " ")
+                for p, n in zip(prev_ovh_bot, next_ovh_top)
+            )
+        return False
+
+    # ── End puzzle-piece view ───────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-trad-add-frag")
+    def _on_add_fragment(self, _: Button.Pressed) -> None:
+        """Park the picked source as a new (unconfigured) donor row
+        in the lane. Enzymes + fragment choice are set later via the
+        master/detail editor — this only captures the source. Refuses
+        with a notification when the source isn't valid (no plasmid
+        picked / empty PCR seq)."""
+        spec: "dict | None" = None
+        if self._mode == "plasmid":
+            try:
+                t = self.query_one("#trad-source-table", DataTable)
+            except NoMatches:
+                return
+            entry = self._library_entry_for_row(t.cursor_row)
+            if entry is None:
+                self.app.notify(
+                    "Pick a source plasmid first.",
+                    severity="warning",
+                )
+                return
+            spec = {
+                "name": (str(entry.get("name") or entry.get("id") or "?")
+                          [:40]),
+                "mode": "plasmid",
+                "source_entry_id": str(entry.get("id") or ""),
+                "source_label":    str(entry.get("name") or
+                                         entry.get("id") or "?"),
+                "enz_left":  "",
+                "enz_right": "",
+                # -1 = "auto-pick via _pick_insert_fragment"; user can
+                # override to 0 or 1 in the master/detail editor.
+                "donor_frag_idx": -1,
+            }
+        elif self._mode == "feature":
+            try:
+                t   = self.query_one("#trad-source-table", DataTable)
+                sel = self.query_one("#trad-feature-select", Select)
+            except NoMatches:
+                return
+            entry = self._library_entry_for_row(t.cursor_row)
+            if entry is None:
+                self.app.notify(
+                    "Pick a source plasmid first.",
+                    severity="warning",
+                )
+                return
+            if sel.value is Select.BLANK or not sel.value:
+                self.app.notify("Pick a feature.", severity="warning")
+                return
+            try:
+                feat_idx = int(str(sel.value))
+            except (TypeError, ValueError):
+                self.app.notify("Bad feature selection.",
+                                  severity="warning")
+                return
+            # Label the lane row with the feature's label so the user
+            # can tell which feature of the source plasmid this row
+            # carries (multi-feature plasmid case).
+            rec = self._record_for_table_row(
+                t.cursor_row, "#trad-source-table",
+            )
+            feat_label = "feature"
+            if rec is not None:
+                feats_iter = [
+                    f for f in rec.features if f.type != "source"
+                ]
+                if 0 <= feat_idx < len(feats_iter):
+                    feat_label = str(
+                        (feats_iter[feat_idx].qualifiers.get("label")
+                          or ["feature"])[0]
+                    )
+            spec = {
+                "name": feat_label[:40],
+                "mode": "feature",
+                "source_entry_id": str(entry.get("id") or ""),
+                "source_label": (
+                    f"{entry.get('name') or entry.get('id') or '?'}"
+                    f" / {feat_label}"
+                )[:60],
+                "enz_left":  "",
+                "enz_right": "",
+                "feat_idx":  feat_idx,
+            }
+        elif self._mode == "pcr":
+            try:
+                name_in = self.query_one(
+                    "#trad-pcr-name", Input,
+                ).value.strip()
+                seq_ta = self.query_one("#trad-pcr-seq", TextArea)
+            except NoMatches:
+                return
+            cleaned = "".join(
+                ch for ch in (seq_ta.text or "").upper()
+                if ch in "ACGTRYWSMKBDHVN"
+            )
+            if not cleaned:
+                self.app.notify(
+                    "Paste DNA bases (ACGT/IUPAC) into the sequence box.",
+                    severity="warning",
+                )
+                return
+            spec = {
+                "name": (name_in or "PCR-product")[:40],
+                "mode": "pcr",
+                "source_entry_id": "",
+                "source_label":    "(PCR)",
+                "enz_left":  "",
+                "enz_right": "",
+                "pcr_name":  name_in or "PCR-product",
+                "pcr_seq":   cleaned,
+            }
+        if spec is None:
+            return
+        # Default role: if the lane has no backbone yet, this new row
+        # becomes the backbone (covers the common case where the user
+        # adds the destination vector first). Otherwise it's a donor.
+        # PCR / feature rows cannot be backbones — the backbone digest
+        # picks the BACKBONE fragment of a 2-fragment digest, which
+        # only makes sense for plasmid mode (synthesised PCR /
+        # feature fragments are single-fragment by construction).
+        has_backbone = any(
+            s.get("role") == "backbone" for s in self._lane_inserts
+        )
+        if not has_backbone and spec.get("mode") == "plasmid":
+            spec["role"] = "backbone"
+        else:
+            spec["role"] = "donor"
+        self._lane_inserts.append(spec)
+        self._invalidate_results()
+        self._refresh_lane(restore_cursor=len(self._lane_inserts) - 1)
+        # Newly-added row becomes the editing target — auto-park the
+        # edit panel on it so the user can immediately set enzymes
+        # without an extra click.
+        self._edit_row_idx = len(self._lane_inserts) - 1
+        self._refresh_edit_panel()
+        self._refresh_gel_preview()
+
+    @on(Button.Pressed, "#btn-trad-lane-up")
+    def _on_lane_up(self, _: Button.Pressed) -> None:
+        try:
+            lt = self.query_one("#trad-lane", DataTable)
+        except NoMatches:
+            return
+        i = lt.cursor_row
+        if i <= 0 or i >= len(self._lane_inserts):
+            return
+        self._lane_inserts[i - 1], self._lane_inserts[i] = \
+            self._lane_inserts[i], self._lane_inserts[i - 1]
+        self._invalidate_results()
+        self._edit_row_idx = i - 1
+        self._refresh_lane(restore_cursor=i - 1)
+        self._refresh_edit_panel()
+        self._refresh_gel_preview()
+
+    @on(Button.Pressed, "#btn-trad-lane-down")
+    def _on_lane_down(self, _: Button.Pressed) -> None:
+        try:
+            lt = self.query_one("#trad-lane", DataTable)
+        except NoMatches:
+            return
+        i = lt.cursor_row
+        if i < 0 or i >= len(self._lane_inserts) - 1:
+            return
+        self._lane_inserts[i + 1], self._lane_inserts[i] = \
+            self._lane_inserts[i], self._lane_inserts[i + 1]
+        self._invalidate_results()
+        self._edit_row_idx = i + 1
+        self._refresh_lane(restore_cursor=i + 1)
+        self._refresh_edit_panel()
+        self._refresh_gel_preview()
+
+    @on(Button.Pressed, "#btn-trad-lane-flip")
+    def _on_lane_flip(self, _: Button.Pressed) -> None:
+        """Toggle the cursor lane row's ``flipped`` flag. At Simulate
+        time a flipped DONOR fragment is reverse-complemented before
+        chaining — gives the user a one-click way to fix a donor
+        that ligates only when facing the other direction (SnapGene-
+        style "↕ flip" arrow). For backbones the flip is redundant
+        with the Save Forward / Save Reverse split (flipping the
+        backbone is geometrically equivalent to picking the Reverse
+        orientation), so it's refused with a notification."""
+        try:
+            lt = self.query_one("#trad-lane", DataTable)
+        except NoMatches:
+            return
+        i = lt.cursor_row
+        if i < 0 or i >= len(self._lane_inserts):
+            return
+        spec = self._lane_inserts[i]
+        if spec.get("role") == "backbone":
+            self.app.notify(
+                "Backbones can't be flipped — use Save Reverse for "
+                "the flipped orientation of the whole construct.",
+                severity="warning",
+            )
+            return
+        spec["flipped"] = not bool(spec.get("flipped", False))
+        self._invalidate_results()
+        self._refresh_lane(restore_cursor=i)
+        self._refresh_edit_panel()
+        self._refresh_gel_preview()
+
+    @on(Button.Pressed, "#btn-trad-lane-remove")
+    def _on_lane_remove(self, _: Button.Pressed) -> None:
+        try:
+            lt = self.query_one("#trad-lane", DataTable)
+        except NoMatches:
+            return
+        i = lt.cursor_row
+        if i < 0 or i >= len(self._lane_inserts):
+            return
+        del self._lane_inserts[i]
+        self._invalidate_results()
+        # After removal, parking on `i` keeps the cursor on the next
+        # row down (or the new last row when we deleted the bottom).
+        new_cursor = min(i, len(self._lane_inserts) - 1)
+        self._edit_row_idx = new_cursor if new_cursor >= 0 else -1
+        self._refresh_lane(restore_cursor=new_cursor)
+        self._refresh_edit_panel()
+        self._refresh_gel_preview()
+
+    @on(Button.Pressed, "#btn-trad-lane-clear")
+    def _on_lane_clear(self, _: Button.Pressed) -> None:
+        if not self._lane_inserts:
+            return
+        self._lane_inserts.clear()
+        self._invalidate_results()
+        self._edit_row_idx = -1
+        self._refresh_lane()
+        self._refresh_edit_panel()
+        self._refresh_gel_preview()
+
+    @on(DataTable.RowHighlighted, "#trad-lane")
+    def _on_lane_row_highlighted(
+        self, event: DataTable.RowHighlighted,
+    ) -> None:
+        """Cursor moved through the lane DataTable — point the
+        master/detail editor at the new row. ``RowHighlighted`` fires
+        on arrow-key navigation AND mouse-click row selection, so the
+        edit panel stays in sync with whichever row the user is on
+        without an explicit "Edit" action.
+
+        Re-entry guarded: ``_refresh_lane``'s programmatic
+        ``move_cursor`` fires the same event, but we already know
+        which row is selected and don't want to re-trigger the edit
+        panel refresh that triggered the move in the first place."""
+        if self._suppress_edit_events:
+            return
+        row_idx = event.cursor_row
+        if row_idx < 0 or row_idx >= len(self._lane_inserts):
+            self._edit_row_idx = -1
+        else:
+            self._edit_row_idx = row_idx
+        self._refresh_edit_panel()
+        # Cursor moved → repaint gel so the highlight follows the
+        # new row's chosen fragment band (or clears when no row
+        # selected). "Reset on clicking away" per UX spec.
+        self._refresh_gel_preview()
+
+    def _library_entry_for_row(self, row_idx: int) -> "dict | None":
+        """Same natural-sort + bounds-check pattern as
+        `_record_for_table_row` but returns the LIBRARY ENTRY dict
+        (id/name/gb_text/size) instead of a parsed SeqRecord — the
+        lane spec stores the entry id so re-resolving at Simulate
+        time can re-read the gb_text even if the library has
+        mutated."""
+        if row_idx < 0:
+            return None
+        entries = sorted(
+            (e for e in _load_library() if isinstance(e, dict)),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
+        if row_idx >= len(entries):
+            return None
+        return entries[row_idx]
+
+    # ── Master/detail edit panel ─────────────────────────────────────────────
+
+    def _refresh_edit_panel(self) -> None:
+        """Populate the edit panel for ``self._edit_row_idx``. Shows
+        the row's stored enzymes in the dropdowns + (for plasmid mode)
+        the fragment radio toggled to the row's ``donor_frag_idx``.
+        When no row is selected, shows the hint Static and clears the
+        controls. Idempotent — safe to call after any lane mutation.
+
+        Re-entry guarded: programmatic Select / RadioSet writes here
+        would otherwise fire Changed events that route back into
+        `_on_edit_enzyme_changed` / `_on_donor_radio_changed` and
+        loop. `_suppress_edit_events` is set for the duration of the
+        widget writes; the handlers check it on entry and skip."""
+        try:
+            hint   = self.query_one("#trad-edit-hint",     Static)
+            ez_row = self.query_one("#trad-edit-enzyme-row", Horizontal)
+            fr_row = self.query_one("#trad-edit-frag-row", Horizontal)
+            role_row = self.query_one("#trad-edit-role-row",
+                                         Horizontal)
+            sel_1  = self.query_one("#trad-edit-enz-1",    Select)
+            sel_2  = self.query_one("#trad-edit-enz-2",    Select)
+            role_donor = self.query_one(
+                "#trad-edit-role-donor", RadioButton,
+            )
+            role_backbone = self.query_one(
+                "#trad-edit-role-backbone", RadioButton,
+            )
+        except NoMatches:
+            return
+        if not (0 <= self._edit_row_idx < len(self._lane_inserts)):
+            hint.display     = True
+            ez_row.display   = False
+            fr_row.display   = False
+            role_row.display = False
+            self._edit_frags = None
+            return
+        spec = self._lane_inserts[self._edit_row_idx]
+        hint.display     = False
+        ez_row.display   = True
+        role_row.display = True
+        # Role radio reflects the row's current designation. Backbone
+        # is only valid for plasmid mode (PCR / feature can't be a
+        # backbone — they're synthesised inserts), so the radio is
+        # only writable for plasmid rows. For other modes the row is
+        # forced to "donor" + the backbone option is greyed out.
+        is_plasmid = (spec.get("mode") == "plasmid")
+        if not is_plasmid and spec.get("role") == "backbone":
+            spec["role"] = "donor"
+        role = spec.get("role") or "donor"
+        want_backbone = (role == "backbone")
+        # RadioSet enforces mutual exclusivity ONLY when it processes
+        # a RadioButton's transition from False→True — setting both
+        # buttons via `.value = ...` independently (even under
+        # `prevent(RadioSet.Changed)`) leaves both with the `-on`
+        # class and ambiguous selection. The reliable pattern is:
+        # find the radio that currently differs from its target, set
+        # the SINGLE target-on button via `.value = True` with
+        # `prevent` (suppresses our re-entry handler), and let
+        # RadioSet's internal mutex toggle the other off
+        # automatically. Equal-state short-circuit avoids redundant
+        # writes that would fire spurious events.
+        target_btn = role_backbone if want_backbone else role_donor
+        if not target_btn.value:
+            with self.prevent(RadioSet.Changed):
+                target_btn.value = True
+        role_backbone.disabled = (not is_plasmid)
+        # Enzyme selects mirror spec state. Use `.clear()` to reset
+        # to no-selection — `Select.BLANK` is a *bool* (False) and
+        # the value-setter rejects it as "not in options", silently
+        # leaving the previous row's enzyme stale (the test would
+        # then set the SAME enzyme and no Select.Changed fires).
+        # `.clear()` properly drops to `Select.NULL` (the actual
+        # no-selection sentinel).
+        e1 = str(spec.get("enz_left") or "")
+        e2 = str(spec.get("enz_right") or "")
+        with self.prevent(Select.Changed):
+            if e1 in _NEB_ENZYMES:
+                sel_1.value = e1
+            else:
+                sel_1.clear()
+            if e2 and e2 != e1 and e2 in _NEB_ENZYMES:
+                sel_2.value = e2
+            else:
+                sel_2.clear()
+        # Fragment radio applies to ANY plasmid-mode row regardless
+        # of role — donors pick which digest fragment is the insert;
+        # backbones pick which is the destination vector backbone.
+        # PCR / feature rows synthesise a single fragment so the
+        # picker is hidden for them.
+        if not is_plasmid:
+            fr_row.display = False
+            self._edit_frags = None
+            return
+        fr_row.display = True
+        self._recompute_edit_frags(spec)
+
+    def _recompute_edit_frags(self, spec: dict) -> None:
+        """Run a digest of the spec's source plasmid with its current
+        enzymes, populate the donor radio with the two fragment
+        sizes, and pre-toggle the radio to ``donor_frag_idx`` (or to
+        the feature-aware auto-pick when -1).
+
+        Failures (unknown enzyme, no cuts, ≠2 fragments) blank out
+        the radio labels with a hint — UI never crashes. Stores the
+        two-fragment list on ``self._edit_frags`` so the donor radio
+        handler can read the picked fragment's size for the lane
+        summary without re-digesting."""
+        try:
+            r0 = self.query_one("#trad-edit-frag-0", RadioButton)
+            r1 = self.query_one("#trad-edit-frag-1", RadioButton)
+        except NoMatches:
+            return
+        self._edit_frags = None
+        enzymes = []
+        for k in ("enz_left", "enz_right"):
+            e = str(spec.get(k) or "")
+            if e and e in _NEB_ENZYMES and e not in enzymes:
+                enzymes.append(e)
+        if not enzymes:
+            r0.label = "(set enzymes first)"
+            r1.label = ""
+            return
+        frags, err_msg = self._cached_digest(
+            spec.get("source_entry_id", ""), enzymes,
+        )
+        if frags is None:
+            r0.label = f"({err_msg or 'digest failed'})"
+            r1.label = ""
+            return
+        if len(frags) != 2:
+            r0.label = (f"(need exactly 2 fragments; "
+                          f"got {len(frags)})")
+            r1.label = ""
+            return
+        self._edit_frags = frags
+        # Compact labels so the two radios fit inside the narrow
+        # middle column without truncating. "★" marks the
+        # feature-aware "likely donor" (no rep_origin / antibiotic-
+        # resistance annotations on it) so the user still sees the
+        # auto-pick hint without spending the horizontal budget on
+        # "(likely donor)".
+        likely = _pick_insert_fragment(frags) or frags[0]
+        likely_idx = frags.index(likely)
+        def _label(idx: int) -> str:
+            bp = len(frags[idx].get("top_seq", ""))
+            star = " ★" if idx == likely_idx else ""
+            return f"{'A' if idx == 0 else 'B'}: {bp:,} bp{star}"
+        r0.label = _label(0)
+        r1.label = _label(1)
+        # Default selection: user's explicit pick if set (0/1),
+        # else the auto-pick (-1 → likely_idx).
+        chosen_idx = spec.get("donor_frag_idx", -1)
+        if chosen_idx not in (0, 1):
+            chosen_idx = likely_idx
+        # Mutex pattern that works (same as the role radio): set
+        # ONLY the target button to True, let RadioSet's internal
+        # mutex toggle the other one off. The prior approach of
+        # setting both `.value` directly (False on one, True on
+        # other) under `prevent(RadioSet.Changed)` left both with
+        # `-on` because the internal mutex relies on event
+        # propagation that `prevent` suppressed for the False set.
+        target_btn = r0 if chosen_idx == 0 else r1
+        other_btn  = r1 if chosen_idx == 0 else r0
+        # Recovery clear: if BOTH happen to be on (the regression we
+        # just fixed), explicit-clear the other first so the mutex
+        # state is consistent.
+        if target_btn.value and other_btn.value:
+            with self.prevent(RadioSet.Changed):
+                other_btn.value = False
+        elif not target_btn.value:
+            with self.prevent(RadioSet.Changed):
+                target_btn.value = True
+
+    @on(Select.Changed, "#trad-edit-enz-1")
+    @on(Select.Changed, "#trad-edit-enz-2")
+    def _on_edit_enzyme_changed(self, _: Select.Changed) -> None:
+        """Live update the selected lane row's enzymes when the user
+        tweaks the edit panel dropdowns. Re-runs the digest preview
+        (via `_recompute_edit_frags`), updates the lane DataTable, and
+        re-renders the gel preview. Invalidates any cached Simulate
+        product (the lane geometry just changed)."""
+        # Re-entry guard — programmatic Select writes from
+        # `_refresh_edit_panel` fire this event too; skip them or we
+        # loop on every cursor move.
+        if self._suppress_edit_events:
+            return
+        if not (0 <= self._edit_row_idx < len(self._lane_inserts)):
+            return
+        enzymes = self._selected_edit_enzymes()
+        spec = self._lane_inserts[self._edit_row_idx]
+        spec["enz_left"]  = enzymes[0] if enzymes else ""
+        spec["enz_right"] = (enzymes[1] if len(enzymes) > 1
+                                 else (enzymes[0] if enzymes else ""))
+        # Enzymes changed → previous fragment pick may no longer be
+        # valid. Reset to "auto" so the digest preview picks
+        # accurately for the new enzyme combo.
+        spec["donor_frag_idx"] = -1
+        self._invalidate_results()
+        self._refresh_lane(restore_cursor=self._edit_row_idx)
+        if spec.get("mode") == "plasmid":
+            self._recompute_edit_frags(spec)
+        self._refresh_gel_preview()
+
+    @on(RadioSet.Changed, "#trad-edit-role-set")
+    def _on_role_radio_changed(self, event: RadioSet.Changed) -> None:
+        """User toggled the selected lane row's role between donor
+        and backbone. Backbones are exclusive — toggling a row to
+        backbone demotes any previously-marked backbone to donor so
+        the single-backbone invariant always holds. The Simulate
+        validator (`_on_simulate`) still gates on this, but
+        maintaining it at edit-time keeps the lane state honest."""
+        if self._suppress_edit_events:
+            return
+        if not (0 <= self._edit_row_idx < len(self._lane_inserts)):
+            return
+        rb = event.pressed
+        if rb is None or rb.id is None:
+            return
+        if rb.id.endswith("role-backbone"):
+            new_role = "backbone"
+        elif rb.id.endswith("role-donor"):
+            new_role = "donor"
+        else:
+            return
+        spec = self._lane_inserts[self._edit_row_idx]
+        if spec.get("role") == new_role:
+            return
+        # Only plasmid mode rows can be backbones (PCR / feature
+        # synthesise a single fragment with no backbone half).
+        if new_role == "backbone" and spec.get("mode") != "plasmid":
+            self.app.notify(
+                "Only library plasmids can act as the backbone — "
+                "PCR / feature inserts stay as donors.",
+                severity="warning",
+            )
+            # Don't mutate; bounce the radio back via a refresh.
+            self._refresh_edit_panel()
+            return
+        if new_role == "backbone":
+            # Demote any other backbone to donor.
+            for i, s in enumerate(self._lane_inserts):
+                if i != self._edit_row_idx and s.get("role") == "backbone":
+                    s["role"] = "donor"
+        spec["role"] = new_role
+        self._invalidate_results()
+        self._refresh_lane(restore_cursor=self._edit_row_idx)
+        # Frag radio visibility depends on role — refresh panel too.
+        self._refresh_edit_panel()
+        self._refresh_gel_preview()
+
+    @on(RadioSet.Changed, "#trad-edit-frag-set")
+    def _on_donor_radio_changed(self, event: RadioSet.Changed) -> None:
+        """User toggled which digest fragment is the donor for the
+        selected lane row. Mirrors the choice into the lane spec's
+        ``donor_frag_idx`` so Simulate picks the right fragment."""
+        if self._suppress_edit_events:
+            return
+        if not (0 <= self._edit_row_idx < len(self._lane_inserts)):
+            return
+        rb = event.pressed
+        if rb is None or rb.id is None:
+            return
+        if rb.id.endswith("frag-0"):
+            picked = 0
+        elif rb.id.endswith("frag-1"):
+            picked = 1
+        else:
+            return
+        spec = self._lane_inserts[self._edit_row_idx]
+        if spec.get("mode") != "plasmid":
+            return
+        if spec.get("donor_frag_idx") == picked:
+            return
+        spec["donor_frag_idx"] = picked
+        self._invalidate_results()
+        self._refresh_lane(restore_cursor=self._edit_row_idx)
+        self._refresh_gel_preview()
+
+    # ── Gel preview ──────────────────────────────────────────────────────────
+
+    @on(Click)
+    def _on_any_click(self, event: Click) -> None:
+        """Catch-all click router — selector-based `@on(Click,
+        '#trad-gel-text')` was unreliable for the gel Static (clicks
+        on Static widgets don't always match an ID selector — they
+        propagate up but `event.control` ends up pointing at the
+        deepest hit widget which may be a Rich Text segment rather
+        than the Static itself). Filter manually by walking
+        ancestors of the click target and dispatching when the gel
+        Static is in the chain. Other clicks are left alone so
+        DataTable / Button / RadioSet handlers still fire."""
+        target = getattr(event, "control", None) or getattr(
+            event, "widget", None,
+        )
+        if target is None:
+            return
+        node = target
+        while node is not None:
+            if getattr(node, "id", None) == "trad-gel-text":
+                # Translate event coords from the click target's
+                # widget-local to the Static's content area. When
+                # event was actually on a child of the Static, x/y
+                # are zero-relative to the child; for our Static
+                # (no children) they're already widget-relative.
+                self._handle_gel_click(event.x, event.y)
+                return
+            node = getattr(node, "parent", None)
+
+    def _handle_gel_click(self, x: int, y: int) -> None:
+        """Click a band on the gel → focus the corresponding lane
+        row + select the radio for that fragment. Coordinates come
+        in widget-local; the `_paint_gel` layout is fixed (label_col
+        + n_lanes * (lane_width + space)), so we reverse-map x → gel
+        column and y → body row, then scan the snapshotted
+        ``_gel_lane_bands`` for the band sitting at that body row.
+        Misses (label gutter, header / dye-front rows, empty cells,
+        ladder column) silently ignore — clicking dead pixels
+        shouldn't change state."""
+        _log.info("trad-gel click: x=%s y=%s n_lanes=%s has_ladder=%s",
+                   x, y, len(self._gel_lane_bands),
+                   self._gel_has_ladder)
+        # Layout constants must mirror `_paint_gel`:
+        label_col   = 7   # bp-label column on the left
+        lane_width  = 7   # glyph cells per lane
+        lane_pitch  = lane_width + 1    # +1 for the trailing space
+        header_rows = 3   # lane numbers + names + wells
+        body_height = 18
+        # Strip the Static's 1-cell horizontal padding so widget x
+        # aligns with `_paint_gel`'s output column.
+        x -= 1
+        if x < label_col:
+            _log.info("trad-gel click → ladder gutter, ignore")
+            return
+        if y < header_rows or y >= header_rows + body_height:
+            _log.info("trad-gel click → header/dye-front, ignore")
+            return
+        gel_lane = (x - label_col) // lane_pitch
+        body_row = y - header_rows
+        if not (0 <= gel_lane < len(self._gel_lane_bands)):
+            _log.info("trad-gel click → gel_lane=%s out of range "
+                       "(n_lanes=%s)",
+                       gel_lane, len(self._gel_lane_bands))
+            return
+        if self._gel_has_ladder and gel_lane == 0:
+            _log.info("trad-gel click → ladder lane, ignore")
+            return
+        lane_row_idx = gel_lane - (1 if self._gel_has_ladder else 0)
+        if not (0 <= lane_row_idx < len(self._lane_inserts)):
+            _log.info("trad-gel click → lane_row_idx=%s out of "
+                       "range (n_inserts=%s)",
+                       lane_row_idx, len(self._lane_inserts))
+            return
+        bands = self._gel_lane_bands[gel_lane]
+        # Map each band to its body row and pick the CLOSEST one to
+        # the click — exact-row match misses when a band rounds to
+        # row N±1, leaving the user with a dead click on what looks
+        # like a band. Tolerance of 2 rows mirrors the gel's visual
+        # band thickness on small terminals. Snap-to-nearest also
+        # handles "clicked between two bands" reasonably (picks the
+        # closer one rather than no-op).
+        clicked_band_idx = -1
+        best_dist = 99
+        band_rows: list[int] = []
+        for bi, (bp, form) in enumerate(bands):
+            mob = _agarose_mobility(bp, 1.0, dna_form=form)
+            row = max(0, min(body_height - 1,
+                                int(round(mob * (body_height - 1)))))
+            band_rows.append(row)
+            d = abs(row - body_row)
+            if d < best_dist:
+                best_dist = d
+                clicked_band_idx = bi
+        _log.info("trad-gel click → gel_lane=%s body_row=%s "
+                   "lane_row=%s bands=%s best_idx=%s best_dist=%s",
+                   gel_lane, body_row, lane_row_idx,
+                   band_rows, clicked_band_idx, best_dist)
+        # Cap tolerance — clicking the dye-front area or far below
+        # the lowest band shouldn't accidentally pick band 0.
+        if clicked_band_idx < 0 or best_dist > 2:
+            _log.info("trad-gel click → no band within tolerance "
+                       "(best_dist=%s)", best_dist)
+            return
+        _log.info("trad-gel click → picked band %s for lane_row=%s "
+                   "(spec name=%s mode=%s)",
+                   clicked_band_idx, lane_row_idx,
+                   self._lane_inserts[lane_row_idx].get("name"),
+                   self._lane_inserts[lane_row_idx].get("mode"))
+        # Focus that lane row in the DataTable (fires the
+        # RowHighlighted handler which auto-parks the edit panel +
+        # repaints the gel with the new highlight).
+        try:
+            lt = self.query_one("#trad-lane", DataTable)
+        except NoMatches:
+            return
+        spec = self._lane_inserts[lane_row_idx]
+        # For PCR / feature rows there's only one synthesised
+        # fragment; there's no radio choice to mirror. For plasmid
+        # mode, mirror the band index onto the spec's frag pick so
+        # the radio toggles and the simulate path uses the same
+        # fragment as the click.
+        if spec.get("mode") == "plasmid":
+            spec["donor_frag_idx"] = clicked_band_idx
+            self._invalidate_results()
+        # Moving the cursor fires `_on_lane_row_highlighted` which
+        # refreshes the edit panel (radio mirrors spec) and gel
+        # (highlight follows). Update `_edit_row_idx` first so the
+        # RowHighlighted handler sees the right value if it's
+        # suppressed by some other guard.
+        self._edit_row_idx = lane_row_idx
+        try:
+            lt.move_cursor(row=lane_row_idx)
+        except Exception:
+            _log.debug("trad-gel: cursor move failed")
+        # Refresh regardless — `move_cursor` may not fire the event
+        # if cursor was already on this row.
+        self._refresh_lane(restore_cursor=lane_row_idx)
+        self._refresh_edit_panel()
+        self._refresh_gel_preview()
+
+    def _compute_highlight_band(self) -> "tuple[int, int] | None":
+        """Return ``(lane_row_idx, band_idx_within_lane)`` for the
+        user's current pick at the cursor row, or ``None`` when no
+        row is selected / no fragment is resolvable. The gel paints
+        the corresponding band bright green and dims every other
+        band. Lane-row index here is BEFORE the ladder offset —
+        `_refresh_gel_preview` adds the offset before passing to
+        `_paint_gel`."""
+        if not (0 <= self._edit_row_idx < len(self._lane_inserts)):
+            return None
+        spec = self._lane_inserts[self._edit_row_idx]
+        mode = spec.get("mode", "plasmid")
+        if mode != "plasmid":
+            # PCR / feature lanes have exactly one synthesised band.
+            return (self._edit_row_idx, 0)
+        enzymes: list[str] = []
+        for k in ("enz_left", "enz_right"):
+            e = str(spec.get(k) or "")
+            if e and e in _NEB_ENZYMES and e not in enzymes:
+                enzymes.append(e)
+        if not enzymes:
+            return None
+        frags, _ = self._cached_digest(
+            spec.get("source_entry_id", ""), enzymes,
+        )
+        if frags is None or len(frags) != 2:
+            return None
+        # NOTE: don't use the `int(x or -1)` pattern — Python's truth
+        # eval treats 0 as falsy, silently flipping the user's "pick
+        # fragment A" (idx 0) to -1 (auto). This is a real bug
+        # because the auto-pick often returns the OTHER fragment.
+        _raw = spec.get("donor_frag_idx", -1)
+        chosen = -1 if _raw is None else int(_raw)
+        if chosen in (0, 1):
+            return (self._edit_row_idx, chosen)
+        # Auto-pick depends on role: donors pick the released
+        # insert, backbones pick the bacterial backbone.
+        if spec.get("role") == "backbone":
+            auto = _pick_backbone_fragment(frags) or frags[0]
+        else:
+            auto = _pick_insert_fragment(frags) or frags[0]
+        try:
+            return (self._edit_row_idx, frags.index(auto))
+        except ValueError:
+            return (self._edit_row_idx, 0)
+
+    def _refresh_gel_preview(self) -> None:
+        """Re-render the gel preview Static. One lane per donor /
+        backbone row in `_lane_inserts` + a ladder lane on the left.
+        The backbone reads as just another lane on the gel — same
+        plasmid the bench would load — so the user can compare
+        backbone band size to donor band size at a glance.
+
+        Highlight (set by `_compute_highlight_band` from the cursor
+        row's spec) paints one specific band bright green and dims
+        every other band — surfaces the current pick visually on the
+        gel without forcing the user to read the Frag column."""
+        try:
+            gel_static = self.query_one("#trad-gel-text", Static)
+        except NoMatches:
+            return
+        if not self._lane_inserts:
+            gel_static.update(
+                Text("(empty lane — add a donor or backbone to see "
+                     "the digest gel)", style="dim italic"),
+            )
+            return
+        lane_specs: list[dict] = []
+        lane_bands: list[list[tuple[int, str]]] = []
+        # Ladder lane first so it's the leftmost column with the bp
+        # ticks. Use the standard 1kb ladder — same default the
+        # standalone gel simulator picks.
+        ladder_name = _LADDER_NAMES[0] if _LADDER_NAMES else ""
+        if ladder_name:
+            lane_specs.append({"source": "ladder",
+                                "detail": ladder_name,
+                                "name": "Ladder"})
+            lane_bands.append([(bp, "linear")
+                                 for bp in _GEL_LADDERS[ladder_name]])
+        # One lane per lane-row (backbone rows render with a "[B]"
+        # prefix so the user can pick the backbone band visually).
+        for i, spec in enumerate(self._lane_inserts, start=1):
+            name = str(spec.get("name") or f"Lane {i}")
+            if spec.get("role") == "backbone":
+                name = f"[B]{name}"
+            lane_specs.append({
+                "source": "plasmid",   # placeholder — bands hand-computed
+                "detail": "",
+                "name":   name,
+            })
+            lane_bands.append(self._donor_lane_bands(spec))
+        # Compute the highlight cell from the cursor row's chosen
+        # fragment. The lane-row idx is BEFORE the ladder offset —
+        # add 1 to convert to gel-column idx if the ladder is the
+        # leftmost column.
+        self._highlight_band = self._compute_highlight_band()
+        gel_highlight: "tuple[int, int] | None" = None
+        if self._highlight_band is not None:
+            ladder_offset = 1 if ladder_name else 0
+            gel_highlight = (
+                self._highlight_band[0] + ladder_offset,
+                self._highlight_band[1],
+            )
+        # Snapshot for click reverse-mapping.
+        self._gel_lane_bands = lane_bands
+        self._gel_has_ladder = bool(ladder_name)
+        gel_text = self._paint_gel(
+            lane_specs, lane_bands,
+            ladder_lane_idx=0 if ladder_name else -1,
+            highlight=gel_highlight,
+        )
+        gel_static.update(gel_text)
+
+    def _donor_lane_bands(self, spec: dict) -> list[tuple[int, str]]:
+        """Compute (bp, form) bands for a donor lane spec. For
+        plasmid mode: digest the source plasmid with the spec's
+        enzymes (memoised via `_cached_digest`). For PCR / feature:
+        single linear band at the synthesised fragment's length.
+        Returns [] when the spec isn't ready (no enzymes set / source
+        plasmid gone) — the gel paints an empty column."""
+        mode = spec.get("mode", "plasmid")
+        enzymes = []
+        for k in ("enz_left", "enz_right"):
+            e = str(spec.get(k) or "")
+            if e and e in _NEB_ENZYMES and e not in enzymes:
+                enzymes.append(e)
+        if mode == "plasmid":
+            if not enzymes:
+                return []
+            frags, _ = self._cached_digest(
+                spec.get("source_entry_id", ""), enzymes,
+            )
+            if frags is None:
+                return []
+            return [(len(f.get("top_seq", "")), "linear") for f in frags]
+        if mode == "feature":
+            rec = self._record_for_entry_id(
+                spec.get("source_entry_id", ""),
+            )
+            if rec is None:
+                return []
+            feats_iter = [
+                f for f in rec.features if f.type != "source"
+            ]
+            feat_idx = int(spec.get("feat_idx", 0) or 0)
+            if not (0 <= feat_idx < len(feats_iter)):
+                return []
+            feat = feats_iter[feat_idx]
+            bounds = _feat_bounds(feat, _seq_len(rec))
+            if bounds is None:
+                return []
+            s, e, _strand = bounds
+            seq_slice = _slice_circular(str(rec.seq), s, e)
+            bp = len(seq_slice)
+            return [(bp, "linear")] if bp > 0 else []
+        if mode == "pcr":
+            pcr_seq = str(spec.get("pcr_seq") or "")
+            bp = len(pcr_seq)
+            return [(bp, "linear")] if bp > 0 else []
+        return []
+
+    def _paint_gel(self, lane_specs: list[dict],
+                      lane_bands: list[list[tuple[int, str]]],
+                      *, ladder_lane_idx: int,
+                      highlight: "tuple[int, int] | None" = None,
+                      ) -> Text:
+        """Render the lane bands as a Rich Text gel — mirrors
+        `_render_gel_image` but takes pre-computed per-lane bands
+        (each donor lane runs its own digest) rather than digesting
+        a single template across every lane.
+
+        ``highlight`` is ``(lane_idx, band_idx_within_lane)`` — the
+        targeted band paints bright green and every other band dims
+        to ``grey50`` so the user sees at a glance which fragment is
+        the current pick. ``None`` leaves all bands at normal
+        brightness."""
+        rt = Text()
+        n_lanes = len(lane_specs)
+        if n_lanes == 0:
+            return rt
+        height     = 18
+        lane_width = 7
+        label_col  = 7
+        agarose_pct = 1.0   # standard 1% agarose
+        band_grid: dict[tuple[int, int], int] = {}
+        band_faint: set[tuple[int, int]] = set()
+        ladder_rows: dict[int, int] = {}
+        # Resolve the highlighted (row, lane_idx) cell — the band
+        # whose (bp, form) sits at `highlight[1]` in lane
+        # `highlight[0]` maps to a specific row index via the same
+        # agarose mobility curve.
+        highlight_cell: "tuple[int, int] | None" = None
+        if highlight is not None:
+            hl_lane, hl_band = highlight
+            if 0 <= hl_lane < len(lane_bands):
+                bands_in_lane = lane_bands[hl_lane]
+                if 0 <= hl_band < len(bands_in_lane):
+                    bp_h, form_h = bands_in_lane[hl_band]
+                    mob_h = _agarose_mobility(
+                        bp_h, agarose_pct, dna_form=form_h,
+                    )
+                    row_h = max(0, min(height - 1,
+                                          int(round(
+                                              mob_h * (height - 1),
+                                          ))))
+                    highlight_cell = (row_h, hl_lane)
+        for li, bands in enumerate(lane_bands):
+            for bp, form in bands:
+                mob = _agarose_mobility(bp, agarose_pct, dna_form=form)
+                row_float = mob * (height - 1)
+                row = max(0, min(height - 1, int(round(row_float))))
+                band_grid[(row, li)] = band_grid.get((row, li), 0) + 1
+                if li == ladder_lane_idx:
+                    ladder_rows[row] = max(
+                        ladder_rows.get(row, 0), bp,
+                    )
+                # No anti-alias band on row±1 — `band_faint` logic
+                # used to splash a secondary dim band when the
+                # mobility fell between two text rows, but users
+                # counted those as extra real bands. A clean
+                # digest with N cuts should show exactly N bands.
+        # Header row: lane numbers.
+        head = " " * label_col
+        for li in range(n_lanes):
+            head += f"{li + 1:^{lane_width}} "
+        rt.append(head.rstrip() + "\n", style="bold white")
+        # Names row.
+        names = " " * label_col
+        for li in range(n_lanes):
+            label = (lane_specs[li].get("name") or "")[:lane_width]
+            names += f"{label:^{lane_width}} "
+        rt.append(names.rstrip() + "\n", style="cyan")
+        # Wells row.
+        wells = " " * label_col
+        for li in range(n_lanes):
+            wells += "█" * lane_width + " "
+        rt.append(wells.rstrip() + "\n", style="grey50")
+        # Body rows — per-cell styled when highlight is active so
+        # the chosen band reads bright green and every other band
+        # dims out.
+        any_highlight = (highlight_cell is not None)
+        for row in range(height):
+            if row in ladder_rows:
+                bp = ladder_rows[row]
+                label = (f"{bp / 1000:>4.1f}k" if bp >= 1000
+                          else f"{bp:>5}")
+                line_left = f"{label} ".ljust(label_col)
+            else:
+                line_left = " " * label_col
+            rt.append(
+                line_left,
+                style=("bright_white"
+                          if line_left.strip() else "white"),
+            )
+            for li in range(n_lanes):
+                count = band_grid.get((row, li), 0)
+                if count == 0:
+                    if (row, li) in band_faint:
+                        glyph = "─" * lane_width
+                    else:
+                        glyph = " " * lane_width
+                elif count == 1:
+                    glyph = "━" * lane_width
+                elif count == 2:
+                    glyph = "▆" * lane_width
+                else:
+                    glyph = "█" * lane_width
+                # Choose colour: green highlight beats the dim, dim
+                # beats normal, normal is bright_white. Empty cells
+                # (no band, no faint) stay neutral regardless of
+                # highlight so the dim doesn't paint a wall of grey
+                # across blank columns.
+                has_glyph = glyph.strip() != ""
+                if has_glyph and highlight_cell is not None \
+                        and (row, li) == highlight_cell:
+                    style = "bold #9ef000"      # lime green
+                elif has_glyph and any_highlight:
+                    style = "grey42"            # dimmed
+                elif has_glyph:
+                    style = "bright_white"
+                else:
+                    style = "white"
+                rt.append(glyph + " ", style=style)
+            rt.append("\n")
+        # Dye-front row.
+        front = " " * label_col
+        for li in range(n_lanes):
+            front += "░" * lane_width + " "
+        rt.append(front.rstrip(), style="dim cyan")
+        return rt
+
     # ── Simulate ─────────────────────────────────────────────────────────────
 
     @on(Button.Pressed, "#btn-trad-simulate")
@@ -55791,96 +58924,246 @@ class TraditionalCloningPane(Vertical):
             results = self.query_one("#trad-results-text", Static)
         except NoMatches:
             return
-        enzymes = self._selected_enzymes()
-        if not enzymes:
-            results.update("[red]Pick at least one enzyme.[/]")
+        # Stale-cache guard (2026-05-23): bust the per-pane record /
+        # digest caches before resolving the lane. Within a single
+        # constructor session the underlying library can't normally
+        # mutate (the modal blocks the library panel), but an agent
+        # endpoint could rename / delete / edit a plasmid mid-
+        # session. Re-reading library state at Simulate time keeps
+        # the worker honest about "what the user is cloning right
+        # now" rather than what was true when they queued the row.
+        self._record_cache.clear()
+        self._digest_cache.clear()
+        if not self._lane_inserts:
+            results.update(
+                "[red]Lane is empty — add donors + a backbone first.[/]"
+            )
             return
-        # Capture all UI state on the UI thread so the worker can run
-        # as a pure function of its inputs — no `query_one` /
-        # `widget.update` calls racing UI mutations from inside the
-        # worker.
-        inputs, err = self._collect_simulate_inputs(enzymes)
+        backbones = [s for s in self._lane_inserts
+                      if s.get("role") == "backbone"]
+        donors    = [s for s in self._lane_inserts
+                      if s.get("role") != "backbone"]
+        if len(backbones) != 1:
+            results.update(
+                f"[red]Need exactly 1 backbone in the lane "
+                f"(found {len(backbones)}). Toggle a row's role to "
+                f"'Backbone' in the edit panel.[/]"
+            )
+            return
+        if not donors:
+            results.update(
+                "[red]Need at least 1 donor row. Add another lane row "
+                "and leave it as 'Donor'.[/]"
+            )
+            return
+        backbone = backbones[0]
+        backbone_enz: list[str] = []
+        for k in ("enz_left", "enz_right"):
+            e = str(backbone.get(k) or "")
+            if e and e in _NEB_ENZYMES and e not in backbone_enz:
+                backbone_enz.append(e)
+        if not backbone_enz:
+            results.update(
+                "[red]Backbone row has no enzymes set — pick a pair "
+                "in the edit panel.[/]"
+            )
+            return
+        inputs, err = self._collect_simulate_inputs(donors, backbone,
+                                                       backbone_enz)
         if err is not None:
             results.update(f"[red]{err}[/]")
             return
         results.update("[dim]Simulating digest + ligation…[/dim]")
         self._trad_simulate_worker(inputs)
 
-    def _collect_simulate_inputs(self, enzymes: list[str]) -> tuple:
-        """Read every UI field the simulate flow needs into a plain
-        dict; the worker then runs off the UI thread on that
-        snapshot. Returns ``(inputs_or_None, err_msg_or_None)``."""
-        inputs: dict = {"enzymes": enzymes, "mode": self._mode}
-        if self._mode == "plasmid":
-            try:
-                t = self.query_one("#trad-source-table", DataTable)
-            except NoMatches:
-                return None, "Insert source table not found."
-            rec = self._record_for_table_row(t.cursor_row,
-                                               "#trad-source-table")
-            if rec is None:
-                return None, "Pick an insert plasmid first."
-            inputs["insert_rec"] = rec
-        elif self._mode == "feature":
-            try:
-                t = self.query_one("#trad-source-table", DataTable)
-                sel = self.query_one("#trad-feature-select", Select)
-            except NoMatches:
-                return None, "Feature picker not found."
-            rec = self._record_for_table_row(t.cursor_row,
-                                               "#trad-source-table")
-            if rec is None:
-                return None, "Pick a plasmid first."
-            if sel.value is Select.BLANK or not sel.value:
-                return None, "Pick a feature."
-            try:
-                feat_idx = int(str(sel.value))
-            except ValueError:
-                return None, "Bad feature selection."
-            inputs["insert_rec"] = rec
-            inputs["feat_idx"] = feat_idx
-        elif self._mode == "pcr":
-            try:
-                name_in = self.query_one("#trad-pcr-name", Input).value.strip()
-                seq_ta = self.query_one("#trad-pcr-seq", TextArea)
-            except NoMatches:
-                return None, "PCR fields not found."
-            inputs["pcr_name"] = name_in or "PCR-product"
-            inputs["pcr_seq"] = seq_ta.text or ""
-        else:
-            return None, f"Unknown insert mode: {self._mode!r}"
-        # Vector source (shared across modes).
+    def _collect_simulate_inputs(self, donors: list[dict],
+                                    backbone: dict,
+                                    backbone_enz: list[str]) -> tuple:
+        """Resolve every donor spec to a SeqRecord (or pre-cleaned
+        PCR sequence) + the backbone spec to its SeqRecord on the
+        UI thread. The worker then runs off the UI thread on this
+        snapshot — no widget access from the worker body. Returns
+        ``(inputs_or_None, err_msg_or_None)``."""
+        # Backbone source (single row from the lane).
+        backbone_eid = str(backbone.get("source_entry_id") or "")
+        if not backbone_eid:
+            return None, ("Backbone row has no source plasmid — "
+                            "re-add the row.")
+        backbone_rec = self._record_for_entry_id(backbone_eid)
+        if backbone_rec is None:
+            return None, (f"Backbone source plasmid {backbone_eid!r} "
+                            f"no longer in the library (was it deleted?). "
+                            f"Remove the backbone row and re-add.")
+        # Resolve each donor spec to whatever data the per-mode
+        # fragment builder needs. SeqRecords come from the parsed-
+        # record cache (shared with the source table renderer), so
+        # this is cheap.
+        resolved: list[dict] = []
+        for i, spec in enumerate(donors, start=1):
+            mode = spec.get("mode", "plasmid")
+            r = {"mode": mode, "name": spec.get("name") or f"frag-{i}",
+                 "enz_left":  spec.get("enz_left", ""),
+                 "enz_right": spec.get("enz_right", "")}
+            if mode in ("plasmid", "feature"):
+                eid = spec.get("source_entry_id") or ""
+                if not eid:
+                    return None, (
+                        f"Donor row {i}: missing source plasmid id "
+                        f"(re-add the row)."
+                    )
+                rec = self._record_for_entry_id(eid)
+                if rec is None:
+                    return None, (
+                        f"Donor row {i}: source plasmid {eid!r} no "
+                        f"longer in the library (was it deleted?). "
+                        f"Remove this row and re-add."
+                    )
+                r["insert_rec"] = rec
+                if mode == "feature":
+                    r["feat_idx"] = int(spec.get("feat_idx") or 0)
+                elif mode == "plasmid":
+                    _raw = spec.get("donor_frag_idx", -1)
+                    r["donor_frag_idx"] = (-1 if _raw is None
+                                              else int(_raw))
+            elif mode == "pcr":
+                r["pcr_name"] = str(spec.get("pcr_name") or "PCR-product")
+                r["pcr_seq"]  = str(spec.get("pcr_seq") or "")
+                if not r["pcr_seq"]:
+                    return None, (
+                        f"Donor row {i}: PCR fragment has no sequence."
+                    )
+            else:
+                return None, f"Donor row {i}: unknown mode {mode!r}"
+            resolved.append(r)
+        return {
+            "lane":        resolved,
+            "vec_rec":     backbone_rec,
+            "vec_enzymes": backbone_enz,
+            "vec_name":    str(backbone.get("name") or "backbone"),
+            # Backbone's user-picked fragment (-1 = auto-pick).
+            "vec_frag_idx": int(backbone.get("donor_frag_idx", -1)
+                                  or -1),
+        }, None
+
+    def _record_for_entry_id(self, entry_id: str) -> "SeqRecord | None":
+        """ID-keyed SeqRecord lookup — preferred over the row-index
+        path for stored lane references since a concurrent library
+        mutation could shift row indices. FIFO-evicts at
+        ``_RECORD_CACHE_MAX`` so a long-running session with many
+        plasmid picks doesn't grow the cache without bound."""
+        if not entry_id:
+            return None
+        if entry_id in self._record_cache:
+            return self._record_cache[entry_id]
+        entry = _find_library_entry_by_id(entry_id)
+        if entry is None:
+            return None
+        gb = entry.get("gb_text") or ""
+        if not gb:
+            return None
         try:
-            t = self.query_one("#trad-vector-table", DataTable)
-        except NoMatches:
-            return None, "Vector source table not found."
-        rec = self._record_for_table_row(t.cursor_row, "#trad-vector-table")
+            rec = _gb_text_to_record(gb)
+        except Exception:
+            _log.exception(
+                "trad-cloning: parse failed for entry %r", entry_id,
+            )
+            return None
+        if len(self._record_cache) >= self._RECORD_CACHE_MAX:
+            # FIFO: drop the oldest entry (insertion-order dicts).
+            # No log on eviction — the cap is far above realistic
+            # session activity; hitting it routinely would itself be
+            # a sign the user is doing something unusual (huge
+            # library + browsing-heavy workflow).
+            oldest = next(iter(self._record_cache))
+            self._record_cache.pop(oldest, None)
+        self._record_cache[entry_id] = rec
+        return rec
+
+    def _cached_digest(self, entry_id: str,
+                          enzymes: list[str],
+                          ) -> "tuple[list[dict] | None, str]":
+        """Memoised plasmid digest. Returns ``(fragments_or_None,
+        err_msg)``. Keyed by ``(entry_id, sorted_enzymes_tuple)`` so
+        adjacent lane rows that share enzymes hit the cache, and
+        every `_refresh_gel_preview` call after the first digests
+        only the lanes whose enzymes changed.
+
+        ``err_msg`` is the empty string on success. Non-empty errors
+        are NOT cached so a transient failure (e.g. library mutation
+        race) gets re-attempted next call."""
+        if not entry_id or not enzymes:
+            return None, "no enzymes"
+        key = (entry_id, tuple(sorted(set(enzymes))))
+        cached = self._digest_cache.get(key)
+        if cached is not None:
+            return cached, ""
+        rec = self._record_for_entry_id(entry_id)
         if rec is None:
-            return None, "Pick a destination vector."
-        inputs["vector_rec"] = rec
-        return inputs, None
+            return None, "source plasmid not found"
+        seq = str(rec.seq).upper()
+        circular = (
+            (rec.annotations or {}).get("topology", "") == "circular"
+        )
+        feats = self._record_features(rec)
+        try:
+            frags, err = _excise_fragment_pair(
+                seq, enzymes, circular=circular, features=feats,
+                source_label=str(rec.name or rec.id or "donor"),
+            )
+        except Exception as exc:
+            _log.exception(
+                "trad-digest: _excise_fragment_pair raised for %r",
+                entry_id,
+            )
+            return None, str(exc)
+        if err is not None:
+            return None, err["error"]
+        if len(self._digest_cache) >= self._DIGEST_CACHE_MAX:
+            oldest = next(iter(self._digest_cache))
+            self._digest_cache.pop(oldest, None)
+        self._digest_cache[key] = frags
+        return frags, ""
 
     @work(thread=True, exclusive=True, group="trad_simulate")
     def _trad_simulate_worker(self, inputs: dict) -> None:
-        """Off-thread digest + ligation. `_build_*_fragment` helpers
-        now take pre-captured records and return ``(frag, err_msg)``
-        tuples, so the whole flow runs pure of widget access here.
-        Pre-fix `_excise_fragment_pair` (Mb-scale IUPAC scan) ran on
-        the UI thread; this worker moves it off-thread alongside the
-        ligation. Stale-record guard (invariant #28) drops results if
-        the canvas reloaded mid-simulate."""
+        """Off-thread digest + N-way ligation. Loops the lane,
+        delegates to the per-mode insert-builder for each spec, then
+        ligates the chain to the vector via
+        `_simulate_traditional_cloning_multi`. Two stale-result
+        guards:
+          * ``entry_counter`` (invariant #28) — drops the result if
+            the user reloaded a different plasmid into the main
+            canvas mid-simulate.
+          * ``lane_token`` — drops the result if the lane / enzyme /
+            role / fragment-pick state changed since this worker
+            dispatched (the cached `_invalidate_results` flow bumps
+            the token on every mutation). Otherwise a slow digest
+            could land AFTER the user edited the lane and clobber
+            their in-progress state with a stale product."""
         entry_counter = getattr(self.app, "_record_load_counter", 0)
-        insert_frag, err = self._build_insert_fragment(inputs)
-        if err is not None:
-            self.app.call_from_thread(self._on_trad_simulate_failed, err)
-            return
-        vector_frag, err = self._build_vector_fragment(inputs)
+        lane_token    = self._lane_mutation_token
+        insert_frags: list[dict] = []
+        for i, spec in enumerate(inputs["lane"], start=1):
+            frag, err = self._build_insert_fragment_for_spec(spec)
+            if err is not None:
+                self.app.call_from_thread(
+                    self._on_trad_simulate_failed,
+                    f"Lane row {i} ({spec.get('name','?')}): {err}",
+                )
+                return
+            insert_frags.append(frag)
+        _raw_vfi = inputs.get("vec_frag_idx", -1)
+        vector_frag, err = self._build_vector_fragment_for_picker(
+            inputs["vec_rec"], inputs["vec_enzymes"],
+            donor_frag_idx=(-1 if _raw_vfi is None
+                              else int(_raw_vfi)),
+        )
         if err is not None:
             self.app.call_from_thread(self._on_trad_simulate_failed, err)
             return
         try:
-            outcome = _simulate_traditional_cloning(
-                insert_frag, vector_frag
+            outcome = _simulate_traditional_cloning_multi(
+                insert_frags, vector_frag,
             )
         except Exception as exc:
             _log.exception("trad-cloning: simulate failed")
@@ -55889,18 +59172,105 @@ class TraditionalCloningPane(Vertical):
             )
             return
         if entry_counter != getattr(self.app, "_record_load_counter", 0):
-            # Canvas moved on — drop the result. Pre-fix the worker
-            # returned silently here, leaving the "Simulating digest +
-            # ligation…" placeholder on screen forever; surface a
-            # short notice so the user knows their click was honored.
             self.app.call_from_thread(
                 self._on_trad_simulate_failed,
                 "Cancelled — active plasmid changed mid-simulate.",
             )
             return
+        if lane_token != self._lane_mutation_token:
+            self.app.call_from_thread(
+                self._on_trad_simulate_failed,
+                "Cancelled — lane changed mid-simulate. Click "
+                "Simulate again to re-run on the current lane.",
+            )
+            return
         self.app.call_from_thread(
             self._apply_trad_simulate_result, outcome
         )
+
+    def _build_insert_fragment_for_spec(self, spec: dict) -> tuple:
+        """Dispatch one lane spec to its mode-specific helper. The
+        spec carries its own ``enz_left`` / ``enz_right`` so we
+        rebuild the legacy 2-element ``enzymes`` list locally.
+
+        For plasmid mode, ``donor_frag_idx`` (-1 / 0 / 1) selects
+        which of the digest's two fragments is the donor: -1 means
+        "use the feature-aware auto-pick" (same behaviour the
+        Constructor's GB save uses); 0 or 1 is the user's explicit
+        override from the master/detail editor's donor radio."""
+        e1 = str(spec.get("enz_left") or "")
+        e2 = str(spec.get("enz_right") or "")
+        enzymes: list[str] = []
+        if e1:
+            enzymes.append(e1)
+        if e2 and e2 != e1:
+            enzymes.append(e2)
+        if not enzymes:
+            return None, ("No enzymes set — pick at least one in the "
+                            "edit panel below the lane.")
+        mode = spec.get("mode", "plasmid")
+        if mode == "plasmid":
+            _raw_dfi = spec.get("donor_frag_idx", -1)
+            frag, err = self._build_insert_from_plasmid(
+                spec["insert_rec"], enzymes,
+                donor_frag_idx=(-1 if _raw_dfi is None
+                                  else int(_raw_dfi)),
+            )
+        elif mode == "feature":
+            frag, err = self._build_insert_from_feature(
+                spec["insert_rec"], spec.get("feat_idx", 0), enzymes,
+            )
+        elif mode == "pcr":
+            frag, err = self._build_insert_from_pcr(
+                spec.get("pcr_name") or "PCR", spec["pcr_seq"], enzymes,
+            )
+        else:
+            return None, f"unknown mode {mode!r}"
+        # ↕ Flip — user flipped this row's orientation via the
+        # lane button. Reverse-complement the fragment so its
+        # ligation-side overhangs swap. Lets a backwards-facing
+        # fragment ligate without re-cutting the source plasmid.
+        if err is None and frag is not None and spec.get("flipped"):
+            frag = _rc_fragment(frag)
+        return frag, err
+
+    def _build_vector_fragment_for_picker(self, rec,
+                                              enzymes: list[str],
+                                              *,
+                                              donor_frag_idx: int = -1,
+                                              ) -> tuple:
+        """Vector digest + backbone-fragment pick. ``donor_frag_idx``
+        is the user's explicit override from the master/detail
+        editor's fragment radio:
+          *  -1 → auto-pick via `_pick_backbone_fragment` (feature-
+                  aware: rep_origin / antibiotic-resistance present
+                  → "this is the backbone").
+          *  0 / 1 → explicit fragment from the digest.
+
+        The override lets the user pick the SMALLER fragment as the
+        backbone when the auto-pick guesses wrong (e.g. an insert
+        that happens to carry a stray rep_origin annotation)."""
+        if rec is None:
+            return None, "Pick a destination vector."
+        seq = str(rec.seq).upper()
+        circular = (
+            (rec.annotations or {}).get("topology", "") == "circular"
+        )
+        feats = self._record_features(rec)
+        frags, err = _excise_fragment_pair(
+            seq, enzymes, circular=circular, features=feats,
+            source_label=str(rec.name or rec.id or "vector"),
+        )
+        if err is not None:
+            return None, f"{err['error']} (vector)"
+        if len(frags) != 2:
+            return None, (
+                f"Vector digest produced {len(frags)} fragments — "
+                f"need exactly 2."
+            )
+        if donor_frag_idx in (0, 1):
+            return frags[donor_frag_idx], None
+        return (_pick_backbone_fragment(frags) or frags[0]), None
 
     def _on_trad_simulate_failed(self, msg: str) -> None:
         try:
@@ -55941,8 +59311,24 @@ class TraditionalCloningPane(Vertical):
         return None, f"Unknown insert mode: {mode!r}"
 
     def _build_insert_from_plasmid(self, rec,
-                                      enzymes: list[str]) -> tuple:
-        """Returns ``(frag_or_None, err_msg_or_None)``."""
+                                      enzymes: list[str],
+                                      *,
+                                      donor_frag_idx: int = -1,
+                                      ) -> tuple:
+        """Returns ``(frag_or_None, err_msg_or_None)``.
+
+        ``donor_frag_idx`` selects which of the digest's two fragments
+        becomes the donor:
+          *  -1 → auto-pick via ``_pick_insert_fragment`` (feature-aware:
+                  rep_origin / antibiotic-resistance absent → "this is
+                  the insert"). Same default the modular GB path uses.
+          *  0 → first fragment (top-strand 5' side of the first cut).
+          *  1 → second fragment.
+
+        The explicit override lets the user veto the auto-pick when
+        the heuristic guesses wrong (e.g. an insert that happens to
+        carry a stray rep_origin annotation, or a carrier with
+        ambiguous markers)."""
         if rec is None:
             return None, "Pick an insert plasmid first."
         seq = str(rec.seq).upper()
@@ -55957,12 +59343,8 @@ class TraditionalCloningPane(Vertical):
         if len(frags) != 2:
             return None, (f"Need exactly 2 fragments after digest "
                             f"(got {len(frags)}). Pick different enzymes.")
-        # Pick the released-insert fragment via feature-aware
-        # selection (rep_origin / antibiotic-resistance absent).
-        # Falls back to smallest-fragment when feature detection
-        # is ambiguous — same shared helper the modular path uses,
-        # so traditional cloning behaves the same way when an
-        # insert outgrows its carrier across deep cycles.
+        if donor_frag_idx in (0, 1):
+            return frags[donor_frag_idx], None
         return (_pick_insert_fragment(frags) or frags[0]), None
 
     def _build_insert_from_feature(self, rec, feat_idx: int,
@@ -56142,48 +59524,114 @@ class TraditionalCloningPane(Vertical):
 
     @on(Button.Pressed, "#btn-trad-save-fwd")
     def _on_save_fwd(self, _: Button.Pressed) -> None:
-        self._save_product_to_library(self._fwd_product, suffix="fwd")
+        self._prompt_save_name(self._fwd_product, suffix="fwd")
 
     @on(Button.Pressed, "#btn-trad-save-rev")
     def _on_save_rev(self, _: Button.Pressed) -> None:
-        self._save_product_to_library(self._rev_product, suffix="rev")
+        self._prompt_save_name(self._rev_product, suffix="rev")
 
-    def _save_product_to_library(self, product: "dict | None", *,
-                                    suffix: str) -> None:
-        """Persist a simulated ligation product as a new library entry.
+    def _prompt_save_name(self, product: "dict | None", *,
+                           suffix: str) -> None:
+        """Push ``NamePlasmidModal`` with an auto-generated default name
+        and dup-check parity with the Golden Braid constructor. On
+        accept, the modal's callback runs `_commit_product_to_library`
+        with the user-chosen (sanitised, non-duplicate) name.
+        Cancellation is a no-op."""
+        if product is None or not product.get("top_seq"):
+            return
+        default_name = self._compose_default_name(suffix)
 
-        Builds a SeqRecord with the product's top strand and features,
-        then writes through `_save_library`. The caller (Save Forward
-        / Save Reverse button) is responsible for guaranteeing
-        `product` is non-None — buttons are disabled until simulate
-        succeeds.
+        def _on_named(user_name: "str | None") -> None:
+            if user_name is None:
+                # User cancelled — don't write anything.
+                return
+            self._commit_product_to_library(
+                product, suffix=suffix, name=user_name,
+            )
 
-        Auto-names the entry "trad-{suffix}-{base}-{n}" where `base` is
-        derived from the source/vector labels and `n` is incremented to
-        avoid collisions with existing library names. The user can
-        rename later via the standard library-rename flow."""
+        self.app.push_screen(
+            NamePlasmidModal(default_name, target_label="plasmid"),
+            callback=_on_named,
+        )
+
+    def _compose_default_name(self, suffix: str) -> str:
+        """Auto-default for ``NamePlasmidModal``: ``vector · frag1+frag2+...
+        (suffix)`` — same shape Golden Braid uses (`_compose_assembly_name`),
+        capped at 60 chars so the library row stays one line.
+
+        Falls back to ``trad-{suffix}`` when the lane has no backbone
+        row yet (defensive — Save is gated on a complete simulate, so
+        this branch shouldn't reach in normal use)."""
+        backbone = next(
+            (s for s in self._lane_inserts
+              if s.get("role") == "backbone"),
+            None,
+        )
+        vec_name = (str(backbone.get("name") or "")
+                     if isinstance(backbone, dict) else "")
+        labels: list[str] = []
+        for spec in self._lane_inserts:
+            if spec.get("role") == "backbone":
+                continue
+            nm = str(spec.get("name") or "?")
+            if nm and nm not in labels:
+                labels.append(nm)
+        joined = "+".join(labels) or "insert"
+        full = (f"{vec_name} · {joined} ({suffix})"
+                 if vec_name else f"{joined} ({suffix})")
+        return full[:60].rstrip()
+
+    def _commit_product_to_library(self, product: "dict | None", *,
+                                      suffix: str, name: str) -> None:
+        """Persist a simulated ligation product to the library under
+        ``name`` (already sanitised + dup-checked by
+        ``NamePlasmidModal``). Builds a SeqRecord with the product's
+        top strand + features, serialises to GenBank, attaches a
+        history XML when possible, and writes through the same
+        `_cache_lock` + `_save_library` chain the Constructor's
+        Save-to-Library flow uses.
+
+        No parts-bin mirror — trad cloning seldom yields modular
+        L0/TU parts; users wanting those workflows should use the
+        Golden Braid / MoClo tabs (which DO mirror to parts bin via
+        `_persist_assembly`). The library row's ``source`` is
+        tagged ``traditional:{suffix}`` so future cascade hooks can
+        identify trad-origin entries."""
         if product is None or not product.get("top_seq"):
             return
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         from Bio.SeqFeature import SeqFeature, FeatureLocation
         from datetime import date as _date_mod
-        # Auto-name. Library `_save_library` doesn't enforce uniqueness
-        # (per-entry name is just a label), but a unique name avoids UI
-        # confusion. Append a counter if needed.
-        base = f"trad-{suffix}"
-        existing = {e.get("name") for e in _load_library()
-                     if isinstance(e, dict)}
-        name = base
-        n = 1
-        while name in existing:
-            n += 1
-            name = f"{base}-{n}"
+        # ``NamePlasmidModal`` already rejected blanks + exact-name
+        # duplicates; re-run the sanitiser defensively in case a
+        # future code path bypasses the modal (e.g. an agent endpoint
+        # that calls this method directly).
+        name = _sanitize_plasmid_name(name, fallback=f"trad-{suffix}")
+        # Build the id from the sanitised name and disambiguate
+        # against existing library ids — same convention
+        # `_persist_assembly` uses. The user-visible `e["name"]` keeps
+        # the display name they typed (whitespace + '+' preserved);
+        # `e["id"]` is the LOCUS-safe form.
+        plasmid_id = re.sub(
+            r"[^A-Za-z0-9_-]+", "_", name,
+        ).strip("_") or "trad_product"
+        existing_ids = {
+            e.get("id") or "" for e in _load_library()
+            if isinstance(e, dict)
+        }
+        unique_id = plasmid_id
+        suffix_n = 2
+        while unique_id in existing_ids:
+            unique_id = f"{plasmid_id}_{suffix_n}"
+            suffix_n += 1
         rec = SeqRecord(
             Seq(product["top_seq"]),
-            id=name, name=name,
-            description=f"Traditional cloning {suffix} product "
-                          f"(simulated {_date_mod.today().isoformat()})",
+            id=unique_id, name=unique_id[:_GB_LOCUS_NAME_MAX],
+            description=(
+                f"Traditional cloning {suffix} product "
+                f"(simulated {_date_mod.today().isoformat()})"
+            ),
             annotations={"molecule_type": "DNA",
                           "topology":      "circular"},
         )
@@ -56204,12 +59652,8 @@ class TraditionalCloningPane(Vertical):
                 type=str(f.get("type", "misc_feature")),
                 qualifiers=qualifiers,
             ))
-        # Serialize to GenBank text + persist.
-        import io as _io
-        from Bio import SeqIO as _SeqIO
-        buf = _io.StringIO()
         try:
-            _SeqIO.write(rec, buf, "genbank")
+            gb_text = _record_to_gb_text(rec)
         except Exception as exc:
             self.app.notify(f"Failed to save: {exc}",
                               severity="error", timeout=8)
@@ -56221,17 +59665,21 @@ class TraditionalCloningPane(Vertical):
                 error=str(exc)[:120],
             )
             return
+        from datetime import date as _date_mod2
         entry = {
-            "id":      name,
+            "id":      unique_id,
             "name":    name,
             "size":    _seq_len(rec),
-            "gb_text": buf.getvalue(),
+            "n_feats": len(rec.features or []),
+            "source":  f"traditional:{suffix}",
+            "added":   _date_mod2.today().isoformat(),
+            "gb_text": gb_text,
         }
-        # Construction-history auto-record (Phase 4b). Build a
-        # CommercialSaaS-shape <HistoryTree> documenting the cloning step
-        # and attach it to the new library entry. Parent fragments
-        # carry their own history if they had one (imported from
-        # CommercialSaaS), so the result inherits the full lineage.
+        # Construction-history auto-record. Build a CommercialSaaS-shape
+        # <HistoryTree> documenting the cloning step and attach it to
+        # the new library entry. Parent fragments carry their own
+        # history if they had one (imported from CommercialSaaS), so
+        # the result inherits the full lineage.
         try:
             history_xml = self._build_history_for_product(
                 name=name, product_seq_len=_seq_len(rec),
@@ -56246,27 +59694,25 @@ class TraditionalCloningPane(Vertical):
         # Sweep #11 (2026-05-20): RMW under `_cache_lock` so a
         # concurrent worker save from a different group (Constructor,
         # Gibson, Domesticator mirror) can't read the same pre-state
-        # and silently drop our entry on its save. The id-uniqueness
-        # disambiguation above ran outside the lock; re-check inside
-        # the lock so a worker that took our `name` between the check
-        # and the save bumps us to the next free slot.
+        # and silently drop our entry on its save. Re-disambiguate the
+        # id inside the lock to defend against a race that took
+        # ``unique_id`` between the check above and the save here.
         global _library_cache
         with _cache_lock:
             entries = _load_library()
-            existing_names = {
-                e.get("name") for e in entries if isinstance(e, dict)
+            existing_now = {
+                e.get("id") or "" for e in entries if isinstance(e, dict)
             }
-            if name in existing_names:
-                bump = n + 1 if 'n' in locals() else 2
+            if unique_id in existing_now:
+                bump = suffix_n
                 while True:
-                    candidate = f"{base}-{bump}"
-                    if candidate not in existing_names:
-                        name = candidate
-                        entry["id"] = candidate
-                        entry["name"] = candidate
+                    candidate = f"{plasmid_id}_{bump}"
+                    if candidate not in existing_now:
+                        unique_id = candidate
+                        entry["id"] = unique_id
                         break
                     bump += 1
-            entries.append(entry)
+            entries.insert(0, entry)
             _library_cache = _typed_clone(entries)
         _clear_primer_cache = globals().get("_primer_usage_clear_cache")
         if _clear_primer_cache is not None:
@@ -56284,11 +59730,21 @@ class TraditionalCloningPane(Vertical):
         # Refresh the source/vector tables so the new entry is visible
         # without re-opening the modal.
         self._populate_library_tables()
+        # Refresh the MAIN app's LibraryPanel too — pre-2026-05-23 the
+        # trad save updated only the in-modal source picker, leaving
+        # the main library DataTable stale. Users would close the
+        # modal, see no new row, and think the save failed (cache +
+        # disk had it, UI didn't). Mirrors the agent-endpoint pattern
+        # that every other library-mutation path uses.
+        try:
+            _agent_refresh_library_panel(self.app)
+        except Exception:
+            _log.exception(
+                "trad save: failed to refresh main LibraryPanel"
+            )
         # Disable both Save buttons + drop the cached products so
-        # accidentally clicking Save again doesn't create
-        # `trad-fwd-2`, `trad-fwd-3`, ... duplicates of the same
-        # product. The user can re-Simulate to save again with a
-        # fresh increment.
+        # accidentally clicking Save again doesn't write a duplicate
+        # row. The user has to re-Simulate to save again.
         self._invalidate_results()
         self._trad_save_to_disk(entries)
 
@@ -56387,49 +59843,53 @@ class TraditionalCloningPane(Vertical):
         return _serialize_commercialsaas_history(root)
 
     def _current_source_entries(self) -> "tuple[dict, dict]":
-        """Return ``(insert_entry, vector_entry)`` from the library —
-        whichever rows are currently selected in the source / vector
-        DataTables. Raises ``LookupError`` if either pick is empty
-        (which the simulator already catches earlier — this is just
-        defence-in-depth for the history path)."""
-        try:
-            src_table = self.query_one("#trad-source-table", DataTable)
-            vec_table = self.query_one("#trad-vector-table", DataTable)
-        except NoMatches:
-            raise LookupError("source/vector tables not available")
-        # Match `_populate_library_tables` / `_record_for_table_row`'s
-        # natural sort so cursor rows resolve to the same entries the
-        # user sees + the simulator already digested. Pre-fix this
-        # reload was unsorted and the recorded parent in the history
-        # XML pointed to whichever entry happened to land at the
-        # cursor's disk-order index — typically not the one used in the
-        # actual digest.
-        entries = sorted(
-            (e for e in _load_library() if isinstance(e, dict)),
-            key=lambda e: _natural_sort_key(
-                e.get("name") or e.get("id") or ""
-            ),
+        """Return ``(insert_entry, vector_entry)`` for the history XML
+        path — reads the backbone row + the FIRST donor row from the
+        lane. Raises ``LookupError`` when either is missing (the
+        Simulate validator already gates on this; this is just
+        defence-in-depth for the history attachment).
+
+        Synthesised donors (PCR / feature) get a stub entry with no
+        history so the parent-node chain stops cleanly at the user-
+        supplied input."""
+        backbone = next(
+            (s for s in self._lane_inserts
+              if s.get("role") == "backbone"),
+            None,
         )
-        # In PCR mode the source table doesn't drive the lookup —
-        # instead the user pasted DNA, so synthesise an insert "entry"
-        # with no history.
-        if self._mode == "pcr":
+        if backbone is None:
+            raise LookupError("no backbone row in lane")
+        donor = next(
+            (s for s in self._lane_inserts
+              if s.get("role") != "backbone"),
+            None,
+        )
+        if donor is None:
+            raise LookupError("no donor row in lane")
+        # Backbone resolves to its library entry (it's always plasmid
+        # mode — the role radio enforces this).
+        vector_entry = (
+            _find_library_entry_by_id(backbone.get("source_entry_id"))
+            or {"name": backbone.get("name") or "backbone",
+                 "id":   backbone.get("source_entry_id") or "backbone",
+                 "size": 0}
+        )
+        # Donor: plasmid / feature mode → library lookup; pcr mode
+        # → synthesise a stub entry so the history-attach loop
+        # doesn't blow up on the missing id.
+        if donor.get("mode") == "pcr":
             insert_entry = {
-                "name":  (self.query_one("#trad-pcr-name",
-                                            Input).value.strip()
-                          or "PCR-product"),
-                "size":  0,   # filled in by caller if needed
+                "name":  donor.get("pcr_name") or "PCR-product",
                 "id":    "pcr",
+                "size":  len(str(donor.get("pcr_seq") or "")),
             }
         else:
-            si = src_table.cursor_row
-            if si < 0 or si >= len(entries):
-                raise LookupError("no insert source selected")
-            insert_entry = entries[si]
-        vi = vec_table.cursor_row
-        if vi < 0 or vi >= len(entries):
-            raise LookupError("no vector selected")
-        vector_entry = entries[vi]
+            insert_entry = (
+                _find_library_entry_by_id(donor.get("source_entry_id"))
+                or {"name": donor.get("name") or "insert",
+                     "id":   donor.get("source_entry_id") or "insert",
+                     "size": 0}
+            )
         return insert_entry, vector_entry
 
     @staticmethod
@@ -68507,7 +71967,14 @@ class NamePlasmidModal(ModalScreen):
                 seen_name_keys.add(key)
                 self._existing_names[key] = nm
             if eid:
-                self._existing_ids[eid.casefold()] = eid
+                # Map id → DISPLAY name (fall back to id when name is
+                # empty) so the dup-warning surfaces what the user sees
+                # in the library row, not the bare stale id. After a
+                # rename `e["id"]` is the OLD sanitised name (immutable
+                # by design) while `e["name"]` is the user's new label
+                # — showing the id confused users into thinking the
+                # warning referenced a phantom old plasmid.
+                self._existing_ids[eid.casefold()] = nm or eid
         # Surface data-integrity oddities: two library entries that
         # case-fold to the same display name are likely the
         # downstream of an unintended duplicate-save. The modal
@@ -68673,9 +72140,11 @@ class NamePlasmidModal(ModalScreen):
             return None
         if cleaned_id_cf in self._existing_ids:
             actual = _md_escape(self._existing_ids[cleaned_id_cf])
+            sanitised_safe = _md_escape(cleaned_id)
             status.update(
-                f"[bold red]✗ DUPLICATE — id conflicts with[/bold red] "
-                f"[b]{actual}[/b] (would auto-rename on save){cleaning_hint}"
+                f"[bold red]✗ Sanitised id[/bold red] [b]{sanitised_safe}[/b] "
+                f"[bold red]clashes with[/bold red] [b]{actual}[/b] "
+                f"(would auto-rename on save){cleaning_hint}"
             )
             save_btn.disabled = True
             return None
@@ -75607,6 +79076,18 @@ class PlasmidApp(App):
     # from "loaded then cleared", but a counter can.
     _record_load_counter: int = 0
     _MAX_UNDO = 50
+    # Skip the startup auto-load when the natural-sort-first library
+    # entry exceeds this bp size. Large records (chloroplast /
+    # mitochondrial genomes, full BACs, multi-cassette megaplasmids)
+    # take multiple seconds to GenBank-parse, marshal features, and
+    # rasterise the rail+seq panel on launch — blocking the canvas
+    # during what should be an instant open. A user-triggered click
+    # on the same row is fine (the modal/loading toast covers it),
+    # but auto-loading 100+ kb on every cold start surprises users
+    # who keep cap-class records at the top of their active
+    # collection. 50 kb leaves headroom for typical L1/L2 assemblies
+    # (~20–30 kb) while reliably catching organelle-sized records.
+    _AUTOLOAD_MAX_BP: int = 50_000
     # Last failure reason from `_do_save`, surfaced to the agent API
     # via `_h_save` so a CLI / agent caller can distinguish disk-full
     # from "no source path" without parsing the user-facing toast.
@@ -76299,13 +79780,28 @@ NamePlasmidModal { align: center middle; }
 #nameplasmid-btns Button { margin-right: 1; }
 
 /* ── Constructor modal ───────────────────────────────────── */
+/* Fullscreen (2026-05-23): the rebuilt Traditional pane stacks
+   palette/lane + gel preview + master/detail editor + vector picker
+   + action row + results + save row — well above the legacy 46-row
+   bounded box. Filling the viewport gives every tab room to breathe
+   without forcing inner scrollbars on a typical 48-row terminal.
+   Green accent piping (``$success``) matches the Parts Bin modal
+   for visual continuity — both are workbench-style multi-pane
+   screens where the user designs assemblies. */
 ConstructorModal { align: center middle; }
 #ctor-box {
-    width: 120; height: 46;
-    background: $surface; border: solid $accent; padding: 1 2;
+    width: 100%; height: 100%;
+    background: $surface; border: solid $success; padding: 1 2;
 }
-#ctor-title       { background: $accent-darken-2; padding: 0 1; margin-bottom: 1; }
+#ctor-title       { background: $success-darken-2; padding: 0 1; margin-bottom: 1; }
 #ctor-tabs        { height: 1fr; }
+/* Every TabPane inside the Constructor scrolls vertically when its
+   content overflows — the Traditional rebuild's tryptych + results +
+   save row easily exceed a 40-row terminal, and the modular tabs
+   (palette + lane + validation + buttons) can grow with long
+   validation messages. Without this, the user couldn't reach the
+   Save button on small terminals. */
+#ctor-tabs TabPane { overflow-y: auto; }
 #ctor-bottom      { height: 3; margin-top: 1; align: right middle; }
 #ctor-bottom Button { min-width: 10; }
 #ctor-vector-row  { height: 3; margin-bottom: 1; align: left middle; }
@@ -76319,10 +79815,12 @@ ConstructorModal { align: center middle; }
    for almost a month; symptoms ranged from "Add to Lane button
    gets clipped when validation grows long" to palette / lane
    tables collapsing to a single row. */
-/* ctor-main was h:18 originally; the level-row added in 2026-05-10
-   eats 3 rows of vertical budget. Drop main to 14 so the modular
-   pane fits inside `ctor-tabs` (h:36 minus tab header ≈ h:34). */
-.ctor-main        { height: 14; }
+/* Constructor modal is fullscreen (2026-05-23), so the modular
+   panes' palette/lane row gets `1fr` to flex into the available
+   vertical budget instead of the historic fixed h:14. min-height
+   preserves the legacy floor for terminals smaller than the modal
+   would otherwise want. */
+.ctor-main        { height: 1fr; min-height: 14; }
 .ctor-palette-col { width: 1fr; border-right: solid $primary-darken-2; padding-right: 1; }
 .ctor-palette-hdr { background: $primary-darken-2; padding: 0 1; height: 1; }
 .ctor-palette     { height: 1fr; }
@@ -76392,7 +79890,12 @@ ConstructorModal { align: center middle; }
     overflow-x: auto; overflow-y: auto;
 }
 /* ── Traditional cloning tab ────────────────────────────── */
-TraditionalCloningPane    { height: auto; }
+/* TraditionalCloningPane fills its TabPane (height: 1fr) and
+   scrolls vertically when the tryptych + results + save row don't
+   fit the terminal. Without overflow-y: auto the bottom rows
+   (Simulate + Save Forward/Reverse) get clipped on a 43-row
+   terminal because the body sums to ~46 rows after chrome. */
+TraditionalCloningPane    { height: 1fr; overflow-y: auto; }
 #trad-mode-row            { height: 3; align: left middle; margin-bottom: 1; }
 #trad-mode-label          { width: 18; color: $text-muted; }
 #trad-mode-row RadioSet   { layout: horizontal; height: 3; }
@@ -76400,33 +79903,124 @@ TraditionalCloningPane    { height: auto; }
 /* Source host sizes to its visible content. With the feature row +
    pcr rows hidden in plasmid mode, the host shrinks from 9 → 6
    rows so the results panel below has more room. */
-#trad-source-host         { height: auto; border: solid $primary-darken-2;
-                            padding: 0 1; margin-bottom: 1; }
-#trad-source-host > Static { color: $text-muted; padding: 0 1;
-                              background: $primary-darken-2; }
+/* Source host pcr-rows + feature-row sit BELOW the source DataTable
+   in the LEFT tryptych column. They auto-hide based on the active
+   mode so they don't eat vertical room when not in use. */
 #trad-pcr-name            { width: 1fr; }
 #trad-pcr-seq             { height: 4; border: solid $primary-darken-3; }
-#trad-source-table, #trad-vector-table { height: 4; }
-/* Feature-row + pcr-rows had no explicit height so they defaulted to
-   1fr — in feature / pcr modes they ballooned to fill `#trad-source-
-   host`, pushing the vector + enzyme + results panels off-screen. */
 #trad-feature-row         { height: 3; align: left middle; }
 #trad-pcr-rows            { height: auto; }
 #trad-feature-select      { width: 1fr; }
-/* Vector row sizes to its visible content (header + table) so it
-   doesn't claim a fixed row count regardless of table height. */
-#trad-vector-row          { height: auto; border: solid $primary-darken-2;
-                            padding: 0 1; margin-bottom: 1; }
-#trad-vector-row > Static { color: $text-muted; padding: 0 1;
-                            background: $primary-darken-2; }
-/* Enzyme selects + Simulate / Clear buttons share one row. */
-#trad-enzyme-row          { height: 3; align: left middle; margin-bottom: 1; }
-#trad-enzyme-label        { width: 18; color: $text-muted; }
-#trad-enzyme-row Select   { width: 22; margin-right: 2; }
-#trad-enzyme-row Button   { margin-right: 1; }
-/* Results panel + save row are siblings (not nested) — keeps the
-   results region tall enough to actually show simulation output. */
-#trad-results             { height: 1fr; min-height: 6;
+/* Tryptych layout (2026-05-23): the trad pane reads left-to-right
+   as a workflow — pick from the collection, queue + configure in
+   the lane, watch the gel paint. All three columns flex (1fr),
+   though the gel column is widened to 2fr because the band
+   rendering benefits from horizontal room (each lane takes ~8
+   chars; a 5-donor lane + ladder + vector needs ~64 chars wide).
+   Tryptych itself takes ``1fr`` so the vector picker + Simulate /
+   Save rows below land BELOW the fold without the tryptych
+   squeezing them off-screen. Column dividers were dropped 2026-05-23
+   (per user request) — the section-hdr bars + the natural padding
+   already read as column boundaries without the heavy vertical
+   green pipes. */
+.trad-tryptych            { height: 1fr; min-height: 22; }
+/* 2-cell horizontal padding between tryptych columns reads as
+   visible breathing room without the heavy vertical green pipes
+   the earlier revision used. */
+.trad-tryp-col-source     { width: 1fr; padding-right: 2; }
+.trad-tryp-col-lane       { width: 2fr; padding: 0 2; }
+.trad-tryp-col-gel        { width: 2fr; padding-left: 2; }
+.trad-source-table        { height: 1fr; }
+/* "Add Plasmid" spans the left column under the source picker. */
+.trad-add-btn             { width: 1fr; }
+/* Lane auto-sizes to content (rare to need more than ~5 rows in
+   practice); capped at 10 so a long lane scrolls internally
+   instead of starving the editor below. The remaining vertical
+   budget in the column flows to `#trad-edit-host` (1fr +
+   min-height: 11) so the enzyme / role / frag rows all fit
+   without a scroll bar in the common case. */
+.trad-lane                { height: auto; min-height: 4; max-height: 10; }
+.trad-section-hdr         { background: $success-darken-2;
+                            padding: 0 1; height: 1; color: $text; }
+/* Lane reorder/remove buttons sit under the lane DataTable. */
+#trad-lane-btns           { height: 3; align: left middle;
+                            margin-top: 0; }
+#trad-lane-btns Button    { margin-right: 1; min-width: 5; }
+/* Lane health status — single-line summary below the lane buttons.
+   Green ✓ when the lane will simulate; yellow/red ⚠ for missing
+   pieces or invalid state (e.g. 2 backbones). */
+.trad-lane-status         { height: 1; padding: 0 1; }
+/* Puzzle-piece visualization (OPTIONAL, 2026-05-23). Lives inside
+   `#trad-results` ABOVE the results text. Each fragment renders
+   as a 2-row feature bar with actual top/bot strand bases at the
+   cut sites. Backbone bookends the inserts (its right overhang at
+   the start, left overhang at the end). Mating junctions overlap
+   the overhang region so colored bases interlock; incompatible
+   junctions get a gap + ⚠. `overflow-x: auto` adds a horizontal
+   scrollbar when too many fragments to fit the panel width.
+   Renders WITHOUT markup parsing — overhang sequences may
+   contain `[` / `]` literally. */
+.trad-puzzle-view         { height: 4; overflow-x: auto;
+                            padding: 0 1; text-align: center; }
+/* Gel preview host fills the right tryptych column. No border —
+   the green section header bar above (``trad-section-hdr`` painted
+   `$success-darken-2`) already reads as the visual delimiter, and
+   the tryptych column padding keeps the gel rendering visually
+   anchored without a pipe around it. Content (Static text) auto-
+   sizes from the painted Text length. ``cursor: pointer`` on the
+   gel text signals to the user that bands are clickable. */
+#trad-gel-host            { padding: 0 0; }
+#trad-gel-text            { padding: 0 1; pointer: pointer; }
+/* Master/detail editor sits under the lane DataTable in the middle
+   tryptych column. ``height: 1fr`` flexes to fill whatever vertical
+   space the column has after the lane / buttons / status row above;
+   ``overflow-y: auto`` adds a scrollbar when the enzyme + role +
+   frag rows don't all fit (which happens at small terminal sizes
+   or when the frag radio expands to show multiple options). No
+   border — the section-hdr bar above already groups the rows
+   visually, and the padded enzyme / role / frag rows align with
+   the lane DataTable above without needing a containing pipe. */
+/* min-height: 11 fits all the editor rows (1 hdr + 3 enzymes +
+   3 role + 4 frag) without forcing a scroll bar in the common
+   case. Scroll only kicks in when the lane DataTable expands past
+   its baseline (10+ donor rows) and squeezes the column budget. */
+#trad-edit-host           { height: 1fr; min-height: 11;
+                            padding: 0 0; margin-top: 1;
+                            overflow-y: auto; }
+#trad-edit-hint           { padding: 0 1; }
+#trad-edit-enzyme-row     { height: 3; align: left middle; }
+#trad-edit-enzyme-label   { width: 10; color: $text-muted; }
+#trad-edit-enzyme-row Select { width: 1fr; margin-right: 1; }
+/* Frag-radio row stacks vertically — Fragment A / B labels carry
+   bp size + a ★ "likely donor" hint that doesn't fit two-up in a
+   ~43-char column. Vertical RadioSet gives each label the full
+   column width. */
+#trad-edit-frag-row       { height: 4; align: left top; }
+#trad-edit-frag-label     { width: 16; color: $text-muted; }
+#trad-edit-frag-row RadioSet { height: 4; width: 1fr; }
+#trad-edit-frag-row RadioButton { margin-right: 0; }
+/* Role radio row inside the edit panel. */
+#trad-edit-role-row       { height: 3; align: left middle; }
+#trad-edit-role-label     { width: 10; color: $text-muted; }
+#trad-edit-role-row RadioSet { layout: horizontal; height: 3;
+                                  width: 1fr; }
+#trad-edit-role-row RadioButton { margin-right: 2; }
+/* Action row (Simulate + Clear) — fixed h:3 button height so the
+   buttons are always reachable. Margins zeroed (2026-05-23) so
+   the tryptych above can flex its 1fr budget downward — the row
+   above is right-aligned to its own padding, and the row below
+   (results) carries its own border so they don't need extra
+   spacing here. The user saves one row of vertical real estate
+   per side, which flows back into `#trad-edit-host`. */
+#trad-action-row          { height: 3; align: left middle; }
+#trad-action-row Button   { margin-right: 1; }
+/* Results panel + save row are siblings (not nested). Bounded
+   max-height so a 1-line Forward/Reverse summary doesn't gobble
+   all leftover vertical space and push the Save buttons off the
+   bottom of the terminal. Scrolls internally when output is
+   longer than the cap. */
+#trad-results             { height: auto; min-height: 4;
+                            max-height: 10;
                             border: solid $primary-darken-2;
                             padding: 0 1; overflow-y: auto; }
 #trad-results > Static    { padding: 0 1; }
@@ -76434,7 +80028,11 @@ TraditionalCloningPane    { height: auto; }
 #trad-save-row Button     { margin-right: 1; }
 
 /* ── Gibson assembly tab ────────────────────────────────── */
-GibsonAssemblyPane        { height: auto; }
+/* Same scroll-on-overflow pattern as the Traditional pane — the
+   Gibson pane (lane + settings + results + save) can exceed 43
+   rows on small terminals; let the user scroll rather than clip
+   the save row. */
+GibsonAssemblyPane        { height: 1fr; overflow-y: auto; }
 #gib-mode-row             { height: 3; align: left middle; margin-bottom: 1; }
 #gib-mode-label           { width: 18; color: $text-muted; }
 #gib-mode-row RadioSet    { layout: horizontal; height: 3; }
@@ -77055,6 +80653,8 @@ SpeciesPickerModal { align: center middle; }
         # user shouldn't have to refocus the map first.
         Binding("alt+a",       "open_align_picker", "Align…",       show=False, priority=True),
         Binding("alt+shift+a", "clear_alignments", "Clear aligns",  show=False, priority=True),
+        Binding("alt+l",       "open_alignment_manager", "Manage alignments…",
+                show=False, priority=True),
         # Menu-bar keyboard shortcuts (2026-05-21). Pre-fix the top
         # menus were mouse-only — CI couldn't drive them, accessibility
         # users were stuck. Letters picked for uniqueness across
@@ -77978,18 +81578,55 @@ SpeciesPickerModal { align: center middle; }
                     ),
                 )
                 first = sorted_lib[0]
-                gb_text = first.get("gb_text", "")
-                if gb_text:
-                    try:
-                        record = _gb_text_to_record(gb_text)
-                        def _load_first(r=record):
-                            self._apply_record(r)
-                        self.call_after_refresh(_load_first)
-                    except Exception:
-                        _log.exception(
-                            "Auto-load of first library entry %r failed",
-                            first.get("name", "?"),
-                        )
+                first_size = int(first.get("size") or 0)
+                first_label = (
+                    first.get("name") or first.get("id") or "?"
+                )
+                # Size guard: a 100+ kb organelle-class record at
+                # position 1 made cold start take ~6 s in the wild
+                # (user report 2026-05-22 — NC_000932 / tobacco
+                # chloroplast genome auto-loading on every launch).
+                # Skip the auto-load above the cap and surface a toast
+                # so the user knows why the canvas opened blank and
+                # how to recover. The library panel still shows the
+                # row — they just click it to load on-demand.
+                if first_size > self._AUTOLOAD_MAX_BP:
+                    _log.info(
+                        "Auto-load skipped: first library entry %r "
+                        "is %d bp (> %d cap). Click the row to load.",
+                        first_label, first_size, self._AUTOLOAD_MAX_BP,
+                    )
+                    skip_label = first_label
+                    skip_size  = first_size
+                    skip_cap   = self._AUTOLOAD_MAX_BP
+                    def _notify_skip(
+                        lbl=skip_label, sz=skip_size, cap=skip_cap,
+                    ):
+                        try:
+                            self.notify(
+                                f"Auto-load skipped: {lbl!r} is "
+                                f"{sz:,} bp (cap {cap:,} bp). "
+                                f"Click the row to open it.",
+                                severity="information", timeout=8,
+                            )
+                        except Exception:
+                            _log.exception(
+                                "Auto-load skip toast failed for %r", lbl,
+                            )
+                    self.call_after_refresh(_notify_skip)
+                else:
+                    gb_text = first.get("gb_text", "")
+                    if gb_text:
+                        try:
+                            record = _gb_text_to_record(gb_text)
+                            def _load_first(r=record):
+                                self._apply_record(r)
+                            self.call_after_refresh(_load_first)
+                        except Exception:
+                            _log.exception(
+                                "Auto-load of first library entry %r failed",
+                                first_label,
+                            )
             elif not getattr(self, "_skip_seed", False):
                 self._seed_default_library()
 
@@ -80363,13 +84000,23 @@ SpeciesPickerModal { align: center middle; }
             q_name = (query_record.name or query_record.id or "query")
             t_name = (target_record.name or target_record.id or "target")
             try:
+                # axis="query": diff_plasmid mirrors the Alt+A flow —
+                # the currently-loaded plasmid is the query (first arg
+                # to `_pairwise_align`), the picked library entry is
+                # the target. See `_multi_align_worker` for the same
+                # rationale.
                 self._register_alignment(
                     name=q_name,
                     query_label=q_name,
                     target_label=t_name,
                     target_record=target_record,
-                    result=result,
+                    result=result, axis="query",
                 )
+                # Flush to the active library entry's stored alignments
+                # so the diff survives a record swap. Single registration,
+                # so the batched-flush pattern is overkill — call it
+                # straight away.
+                self._flush_active_alignments()
             except Exception:
                 _log.exception(
                     "_diff_align_worker: _register_alignment failed"
@@ -80396,15 +84043,38 @@ SpeciesPickerModal { align: center middle; }
 
     def _register_alignment(self, name: str, query_label: str,
                             target_label: str, target_record,
-                            result: dict) -> None:
+                            result: dict, *,
+                            axis: str = "target") -> None:
         """Append one alignment to the overlay band.
 
-        Pre-computes the per-target-column segment list once at
-        registration (`_alignment_to_target_segments`) so the renderer
-        doesn't walk gapped strings on every frame. First alignment
-        against a circular plasmid pins the map to linear topology —
-        rendering the overlay on a circle would mean bending bars
-        around the rim, which we don't support.
+        Pre-computes the per-column segment list once at registration
+        so the renderer doesn't walk gapped strings on every frame.
+        First alignment against a circular plasmid pins the map to
+        linear topology — rendering the overlay on a circle would
+        mean bending bars around the rim, which we don't support.
+
+        ``axis`` selects which side of the alignment is the
+        currently-loaded plasmid (= the render axis):
+
+          * ``"target"`` (default) — the Plasmidsaurus / sequencing-
+            pile flow: query = read, target = plasmid (current).
+            Segments are computed in target coordinates so bars land
+            at plasmid bp positions on the linear map.
+          * ``"query"`` — the Alt+A / diff-plasmid flow: query =
+            current plasmid, target = picked library entry. Segments
+            are computed in query coordinates so bars land at the
+            current plasmid's bp positions (regression-fix 2026-05-22:
+            pre-fix this used target-axis segments here too, which
+            put bars at the *picked* plasmid's bp positions on the
+            current plasmid's view — wrong whenever the alignment
+            wasn't 1:1).
+
+        The `t_lo` / `t_hi` / `segments` fields hold render-axis
+        coordinates regardless of which mode was used. The field
+        names stay "t_"-prefixed for backwards compatibility with
+        the renderer; the per-entry ``axis`` field distinguishes the
+        two modes when the renderer needs to dispatch letter-mode
+        helpers.
 
         Defensive: refuses to register a degenerate alignment (no
         gapped strings, or both empty) — those would paint nothing
@@ -80412,6 +84082,10 @@ SpeciesPickerModal { align: center middle; }
         produced bad results should surface the failure as a notify,
         not register an invisible entry.
         """
+        if axis not in ("target", "query"):
+            raise ValueError(
+                f"axis must be 'target' or 'query' (got {axis!r})"
+            )
         aq = result.get("aligned_q", "")
         at = result.get("aligned_t", "")
         if not aq or not at:
@@ -80429,7 +84103,10 @@ SpeciesPickerModal { align: center middle; }
             except Exception:
                 pass
             return
-        segs = _alignment_to_target_segments(aq, at)
+        if axis == "query":
+            segs = _alignment_to_query_segments(aq, at)
+        else:
+            segs = _alignment_to_target_segments(aq, at)
         if segs:
             t_lo = segs[0][0]
             t_hi = segs[-1][1]
@@ -80445,6 +84122,7 @@ SpeciesPickerModal { align: center middle; }
             "aligned_q":     aq,
             "aligned_t":     at,
             "t_start":       0,
+            "axis":          axis,
             "segments":      segs,
             "t_lo":          t_lo,
             "t_hi":          t_hi,
@@ -80534,6 +84212,10 @@ SpeciesPickerModal { align: center middle; }
         clear should poison any pending `_apply` callbacks from workers
         that started before the user clicked Clear, so a "delayed second
         wave" of registrations doesn't surprise the user.
+
+        Does NOT touch the library entry's stored `alignments` field —
+        stored alignments persist across loads (hydrated back by
+        `_hydrate_alignments_for_active` on the next record load).
         """
         n_before = len(self._alignments)
         self._alignments_generation += 1
@@ -80546,6 +84228,220 @@ SpeciesPickerModal { align: center middle; }
         except NoMatches:
             return
         pm.set_alignments([])
+
+    def _flush_active_alignments(self) -> None:
+        """Persist the currently-registered alignments onto the active
+        library entry's `alignments` field.
+
+        Called by alignment workers (`_multi_align_worker`,
+        `_diff_align_worker`, the Plasmidsaurus worker) after their
+        batch of registrations completes. Batches into one
+        `_save_library` write — multi-target Alt+A with N picks would
+        otherwise trigger N atomic-write storms against the (large)
+        `collections.json`.
+
+        **MERGE semantics, not REPLACE.** `self._alignments` only ever
+        contains visible alignments (hidden ones live in storage but
+        not on the band). A naive replace would silently wipe every
+        `visible: False` stored entry on the next flush — a real
+        footgun that swallows the user's hidden alignments the first
+        time they Alt+A after a manager-modal hide. Instead we walk
+        the existing stored list and update entries whose id matches
+        an in-memory alignment (via the `_stored_id` marker stamped
+        by `_hydrate_alignments_for_active`); fresh registrations get
+        appended; hidden stored entries (plus any that previously
+        failed to hydrate) are preserved untouched.
+
+        No-op when no record is loaded, when the loaded record isn't
+        in the library (ad-hoc file open, demo), or when nothing about
+        the stored list would change. The flush is non-fatal: a save
+        failure logs + notifies but doesn't unwind the in-memory band.
+        """
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            return
+        rec_id = getattr(rec, "id", None)
+        if not rec_id:
+            return
+        try:
+            entries = _load_library()
+        except Exception:
+            _log.exception("_flush_active_alignments: load_library failed")
+            return
+        idx = next(
+            (i for i, e in enumerate(entries) if e.get("id") == rec_id),
+            -1,
+        )
+        if idx < 0:
+            return
+        # ── Merge: preserve hidden stored entries ────────────────────
+        # `existing` is the on-disk stored list. We mutate a copy and
+        # write that back, so any entry we don't touch (hidden ones,
+        # parse-failures) survives the flush. `existing_by_id` lets
+        # us update an in-memory alignment's stored slot by id in O(1).
+        existing = list(entries[idx].get("alignments") or [])
+        existing_pos: dict[str, int] = {}
+        for pos, e in enumerate(existing):
+            eid = e.get("id")
+            if eid:
+                existing_pos[eid] = pos
+        fresh: list[dict] = []
+        for align in self._alignments:
+            stored = _serialize_alignment_for_storage(
+                align,
+                source=align.get("_stored_source", "manual"),
+            )
+            if stored is None:
+                continue
+            sid = stored.get("id")
+            if sid and sid in existing_pos:
+                # Update in-place: preserves list order so the manager
+                # modal's row order stays stable across flushes.
+                existing[existing_pos[sid]] = stored
+            else:
+                fresh.append(stored)
+        merged = existing + fresh
+        # Skip the save if nothing changed. Comparing full dicts is
+        # safer than the (id, visible) signature — catches result-data
+        # changes too (e.g., a re-run with refreshed alignment).
+        if merged == (entries[idx].get("alignments") or []):
+            return
+        entries[idx]["alignments"] = merged
+        try:
+            _save_library(entries, async_sync=True)
+        except (OSError, RuntimeError) as exc:
+            _log.exception(
+                "_flush_active_alignments: save failed for %r", rec_id,
+            )
+            _notify_save_failure(self, "Plasmid library", exc)
+            return
+        _log_event(
+            "alignments.persisted",
+            rec_id=rec_id,
+            n_total=len(merged),
+            n_visible=len(self._alignments),
+            n_hidden=len(merged) - len(self._alignments),
+        )
+
+    def _hydrate_alignments_for_active(self) -> None:
+        """Restore stored alignments from the active library entry
+        onto the overlay band. Called from `_apply_record` after the
+        existing `_clear_alignments` runs (so the band starts empty).
+
+        Only `visible: True` stored entries are registered onto the
+        band; the rest remain in storage and surface in the manager
+        modal. Each restored in-memory entry is stamped with the
+        original storage metadata (`_stored_id`, `_stored_visible`,
+        `_stored_source`, `_stored_added`, `_stored_label`) so the
+        next flush re-emits the same record (no uuid churn, no
+        visibility resets).
+
+        Stale-target detection: if a stored alignment's `target_id`
+        matches a current library entry but their sequence hashes
+        differ, the alignment still hydrates but the user is notified
+        — re-running via Alt+A refreshes the stored result.
+        """
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            return
+        rec_id = getattr(rec, "id", None)
+        if not rec_id:
+            return
+        try:
+            entries = _load_library()
+        except Exception:
+            _log.exception(
+                "_hydrate_alignments_for_active: load_library failed",
+            )
+            return
+        entry = next(
+            (e for e in entries if e.get("id") == rec_id), None,
+        )
+        if entry is None:
+            return
+        stored_list = entry.get("alignments") or []
+        if not stored_list:
+            return
+        # Pre-build a current-target lookup so the stale check
+        # doesn't pay a per-alignment GenBank re-parse.
+        library_by_id: dict = {}
+        for e in entries:
+            eid = e.get("id")
+            if eid:
+                library_by_id[eid] = e
+        stale_labels: list[str] = []
+        parse_failed_labels: list[str] = []
+        registered = 0
+        for stored in stored_list:
+            if not stored.get("visible", True):
+                continue
+            args = _deserialize_stored_alignment_args(stored)
+            if args is None:
+                # Parse failed (corrupt gb_text, missing field, etc.).
+                # The entry stays in storage so it's not silently dropped
+                # — but the user needs to know it's not on the band, or
+                # they'll wonder why their visible alignment vanished.
+                parse_failed_labels.append(
+                    stored.get("label")
+                    or stored.get("target_label")
+                    or "?"
+                )
+                continue
+            # Stale-target check: only when target_id maps to a current
+            # library entry. Ad-hoc targets (sequencing reads etc.) skip.
+            target_id = stored.get("target_id", "")
+            stored_hash = stored.get("target_seq_hash", "")
+            if (target_id and target_id in library_by_id
+                    and stored_hash):
+                cur = library_by_id[target_id]
+                cur_gb = cur.get("gb_text", "")
+                if cur_gb:
+                    try:
+                        cur_rec = _gb_text_to_record(cur_gb)
+                        cur_hash = _alignment_target_hash(str(cur_rec.seq))
+                    except Exception:
+                        cur_hash = ""
+                    if cur_hash and cur_hash != stored_hash:
+                        stale_labels.append(
+                            stored.get("label") or stored.get("target_label") or "?"
+                        )
+            self._register_alignment(**args)
+            # Stamp the freshly-appended entry with its storage
+            # metadata so the next flush round-trips losslessly.
+            if self._alignments:
+                tail = self._alignments[-1]
+                tail["_stored_id"]      = stored.get("id", "")
+                tail["_stored_visible"] = bool(stored.get("visible", True))
+                tail["_stored_source"]  = stored.get("source", "manual")
+                tail["_stored_added"]   = stored.get("added", "")
+                tail["_stored_label"]   = stored.get("label", "")
+                registered += 1
+        if registered:
+            _log_event(
+                "alignments.hydrated",
+                rec_id=rec_id, n_visible=registered,
+                n_stored=len(stored_list),
+            )
+        if stale_labels:
+            try:
+                self.notify(
+                    f"Stored alignment(s) against an edited target: "
+                    f"{', '.join(stale_labels)}. Re-run via Alt+A to refresh.",
+                    severity="warning", timeout=8,
+                )
+            except Exception:
+                pass
+        if parse_failed_labels:
+            try:
+                self.notify(
+                    f"Could not restore stored alignment(s): "
+                    f"{', '.join(parse_failed_labels)}. "
+                    f"The target sequence may have been corrupted in "
+                    f"storage — re-run via Alt+A to refresh.",
+                    severity="error", timeout=10,
+                )
+            except Exception:
+                pass
 
     @_action_log("app.open.align_picker")
     def action_open_align_picker(self) -> None:
@@ -80709,10 +84605,18 @@ SpeciesPickerModal { align: center middle; }
                 if self._alignments_generation != gen_at_entry:
                     return
                 try:
+                    # axis="query": the currently-loaded plasmid plays
+                    # the query role in this alignment (it's the first
+                    # arg to `_pairwise_align`), so segments must be in
+                    # query coordinates for the overlay bars to land at
+                    # the right bp positions on the linear map. Drill-in
+                    # `AlignmentScreen` still receives the picked record
+                    # as `target_record`, so its annotation lane labels
+                    # the picked plasmid's features (FuGFP, etc.).
                     self._register_alignment(
                         name=tn, query_label=qn,
                         target_label=tn, target_record=tr,
-                        result=r,
+                        result=r, axis="query",
                     )
                 except Exception:
                     _log.exception(
@@ -80722,12 +84626,24 @@ SpeciesPickerModal { align: center middle; }
             self.call_from_thread(_apply)
             successes += 1
 
-        # Final summary toast on completion.
+        # Final summary toast on completion. Also flushes the freshly-
+        # registered alignments onto the active library entry — one
+        # save for the whole batch (N=10 picks otherwise = N saves of
+        # the 156 MB collections.json, ~10 s of frozen UI). The flush
+        # runs on the UI thread to share `_cache_lock` with other
+        # save paths.
         def _summary():
             if self._record_load_counter != entry_counter:
                 return
             if self._alignments_generation != gen_at_entry:
                 return
+            if successes:
+                try:
+                    self._flush_active_alignments()
+                except Exception:
+                    _log.exception(
+                        "Multi-align: flush_active_alignments failed",
+                    )
             msg = f"{successes} alignment(s) added."
             if failures:
                 msg += f" {failures} failed (see log)."
@@ -80746,6 +84662,11 @@ SpeciesPickerModal { align: center middle; }
         cleared so the user knows the keystroke landed; empty-band
         case surfaces a friendly "nothing to clear" rather than a
         silent no-op.
+
+        Only clears the in-memory band — stored alignments on the
+        library entry are untouched. Re-loading the plasmid (or any
+        record-load that triggers hydrate) brings the visible ones
+        back. Use Alt+L's "Delete All" to permanently drop them.
         """
         n = len(self._alignments)
         if not n:
@@ -80754,8 +84675,112 @@ SpeciesPickerModal { align: center middle; }
             return
         self._clear_alignments()
         self.notify(
-            f"Cleared {n} alignment{'s' if n != 1 else ''}.",
-            severity="information", timeout=3,
+            f"Cleared {n} alignment{'s' if n != 1 else ''}. "
+            f"(Stored alignments preserved — Alt+L to manage.)",
+            severity="information", timeout=4,
+        )
+
+    @_action_log("app.open.alignment_manager")
+    def action_open_alignment_manager(self) -> None:
+        """Open the alignment manager modal for the active plasmid.
+
+        Bound to Alt+L. Lists every stored alignment (visible AND
+        hidden) for the currently-loaded library entry. The modal
+        supports per-row toggle visibility / open detail / delete,
+        plus bulk Hide / Show / Delete actions. Changes are batched
+        — Cancel discards them, Save & Close persists and re-hydrates
+        the band.
+        """
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            self.notify(
+                "Load a plasmid first — Alt+L manages its stored "
+                "alignments.",
+                severity="warning", timeout=4,
+            )
+            return
+        rec_id = getattr(rec, "id", None)
+        if not rec_id:
+            self.notify(
+                "Active record has no library id — stored alignments "
+                "require a library-tracked plasmid.",
+                severity="warning", timeout=4,
+            )
+            return
+        try:
+            entries = _load_library()
+        except Exception:
+            _log.exception("action_open_alignment_manager: load failed")
+            self.notify(
+                "Could not read the plasmid library.",
+                severity="error", timeout=4,
+            )
+            return
+        entry = next(
+            (e for e in entries if e.get("id") == rec_id), None,
+        )
+        if entry is None:
+            self.notify(
+                "Active record isn't in the current collection — "
+                "stored alignments require a tracked library entry.",
+                severity="warning", timeout=4,
+            )
+            return
+        stored = entry.get("alignments") or []
+        if not stored:
+            self.notify(
+                "No stored alignments for this plasmid. Alt+A to "
+                "register one.",
+                severity="information", timeout=4,
+            )
+            return
+        label = entry.get("name") or rec_id
+
+        def _on_done(updated):
+            if updated is None:
+                return  # Cancel — discard changes.
+            try:
+                entries2 = _load_library()
+            except Exception:
+                _log.exception(
+                    "action_open_alignment_manager: reload failed"
+                )
+                return
+            idx = next(
+                (i for i, e in enumerate(entries2)
+                 if e.get("id") == rec_id),
+                -1,
+            )
+            if idx < 0:
+                self.notify(
+                    "Plasmid no longer in library — alignment manager "
+                    "changes were not saved.",
+                    severity="warning", timeout=5,
+                )
+                return
+            entries2[idx]["alignments"] = updated
+            try:
+                _save_library(entries2, async_sync=True)
+            except (OSError, RuntimeError) as exc:
+                _log.exception(
+                    "action_open_alignment_manager: save failed for %r",
+                    rec_id,
+                )
+                _notify_save_failure(self, "Plasmid library", exc)
+                return
+            # Re-hydrate so the band reflects the new visibility/delete
+            # state. Pre-fix the band would lag behind storage until
+            # the user reloaded the record.
+            self._clear_alignments()
+            self._hydrate_alignments_for_active()
+            self.notify(
+                f"Alignment manager saved ({len(updated)} stored).",
+                severity="information", timeout=3,
+            )
+
+        self.push_screen(
+            AlignmentManagerModal(stored, plasmid_label=label),
+            callback=_on_done,
         )
 
     @_action_log("app.find.plasmid")
@@ -81099,6 +85124,21 @@ SpeciesPickerModal { align: center middle; }
             f"Loaded {record.name}  ({len(record.seq):,} bp, "
             f"{len(pm._feats)} features)"
         )
+
+        # Restore any alignments stored on this library entry (visible
+        # ones land back on the band). Skipped on in-place edits
+        # (clear_undo=False) because the band wasn't cleared above and
+        # those alignments are still the right ones for the active
+        # record. Wrapped in try/except so a malformed `alignments`
+        # field can't break record loading.
+        if clear_undo:
+            try:
+                self._hydrate_alignments_for_active()
+            except Exception:
+                _log.exception(
+                    "_apply_record: hydrate alignments failed for %r",
+                    record.id,
+                )
 
         # Kick off the deferred scan. `_record_load_counter` was
         # already incremented above; the dispatcher captures it as the
@@ -82500,8 +86540,21 @@ SpeciesPickerModal { align: center middle; }
         up off-thread.
         """
         entries = _load_library()
+        old_name = ""
+        cascade_grammar = ""
         for e in entries:
             if e.get("id") == entry_id:
+                old_name = str(e.get("name") or entry_id)
+                # Derive the parts-bin cascade grammar from the entry's
+                # `source` tag (set by `_persist_assembly` when the
+                # constructor saved the entry). Mirrors the match logic
+                # in `_request_plasmid_delete`'s cascade so rename +
+                # delete agree on what counts as the entry's part.
+                src_field = str(e.get("source") or "")
+                if src_field.startswith("constructor:"):
+                    parts_src = src_field.split(":", 2)
+                    if len(parts_src) >= 2:
+                        cascade_grammar = parts_src[1]
                 e["name"] = new_name
                 # Re-serialize the stored gb_text with the new LOCUS name.
                 # If the gb_text can't be parsed for any reason, fall back
@@ -82510,7 +86563,18 @@ SpeciesPickerModal { align: center middle; }
                 # fix the gb_text.
                 try:
                     rec = _gb_text_to_record(e.get("gb_text", ""))
-                    rec.name = new_name
+                    # The GenBank LOCUS line forbids whitespace and caps at
+                    # _GB_LOCUS_NAME_MAX chars. A display name like
+                    # "MAV 33 MOD D1var1+RUBY" makes the SeqIO writer raise
+                    # ValueError("Invalid whitespace in '...' for LOCUS line").
+                    # Sanitise to a LOCUS-safe form for rec.name; the
+                    # user-visible name stays on e["name"].
+                    safe_locus = (
+                        re.sub(r"[^A-Za-z0-9_-]+", "_", new_name).strip("_")
+                        [:_GB_LOCUS_NAME_MAX]
+                    )
+                    rec.name = safe_locus or entry_id[:_GB_LOCUS_NAME_MAX] \
+                        or "PLASMID"
                     rec.id   = entry_id   # don't let SeqIO rewrite the id
                     e["gb_text"] = _record_to_gb_text(rec)
                 except Exception:
@@ -82537,6 +86601,44 @@ SpeciesPickerModal { align: center middle; }
         _clear_primer_cache = globals().get("_primer_usage_clear_cache")
         if _clear_primer_cache is not None:
             _clear_primer_cache()
+
+        # Cascade rename into parts_bin.json so the bin entry that
+        # mirrors this plasmid follows the rename. Without this, the
+        # bin entry's `name` field keeps the OLD plasmid name and the
+        # library-delete cascade — which matches on (name, grammar) —
+        # leaves the bin entry orphaned when the user later deletes
+        # the renamed library plasmid. Mirrors the delete cascade's
+        # match logic (see `_request_plasmid_delete`): prefer (name,
+        # grammar) when the library entry has a constructor source;
+        # fall back to name-only for legacy / externally-loaded
+        # entries that never recorded a grammar. Self-match (cascade
+        # only updates entries whose OLD name matched).
+        cascaded_bin: "list[dict] | None" = None
+        if old_name and old_name != new_name:
+            try:
+                bin_entries = _load_parts_bin()
+                n_updated = 0
+                for b in bin_entries:
+                    if (b.get("name") or "") != old_name:
+                        continue
+                    if cascade_grammar and \
+                            (b.get("grammar") or "gb_l0") != cascade_grammar:
+                        continue
+                    b["name"] = new_name
+                    n_updated += 1
+                if n_updated > 0:
+                    global _parts_bin_cache
+                    _parts_bin_cache = _typed_clone(bin_entries)
+                    _clear_assembly_fragment_cache()
+                    cascaded_bin = bin_entries
+                    _log.info(
+                        "rename: cascaded %d parts-bin row(s) "
+                        "%r → %r (grammar %r)",
+                        n_updated, old_name, new_name,
+                        cascade_grammar or "<any>",
+                    )
+            except (OSError, ValueError):
+                _log.exception("rename: parts-bin cascade failed")
 
         # Refresh the library table now — reads from the freshly-
         # updated cache, so the new name shows without waiting for
@@ -82586,10 +86688,11 @@ SpeciesPickerModal { align: center middle; }
         # in-place save (`Ctrl+S` on the renamed record, or any further
         # library mutation that calls `_save_library`) re-writes the
         # whole library and picks up the rename then.
-        self._rename_save_to_disk(entries)
+        self._rename_save_to_disk(entries, cascaded_bin)
 
     @work(thread=True, exclusive=True, group="rename_save")
-    def _rename_save_to_disk(self, entries: "list[dict]") -> None:
+    def _rename_save_to_disk(self, entries: "list[dict]",
+                              cascaded_bin: "list[dict] | None" = None) -> None:
         """Worker: perform the slow disk write for a library rename.
 
         Off-loads the `_safe_save_json` call (writes a 100+ MB JSON +
@@ -82597,6 +86700,12 @@ SpeciesPickerModal { align: center middle; }
         100+ MB write). Uses `async_sync=True` so the collection
         mirror itself also runs through its own coalescing background
         thread.
+
+        ``cascaded_bin`` is the post-rename parts_bin.json snapshot
+        captured by the cascade above (non-None only when the rename
+        touched at least one bin row). Routed through `_save_parts_bin`
+        so the active-bin-collection mirror also picks up the rename
+        in one chained write.
 
         Exclusive group: a second rename mid-flight cancels the
         first. Cancellation is safe because the second worker's
@@ -82614,6 +86723,14 @@ SpeciesPickerModal { align: center middle; }
                 _notify_save_failure, self, "Plasmid library", exc,
             )
             return
+        if cascaded_bin is not None:
+            try:
+                _save_parts_bin(cascaded_bin)
+            except (OSError, RuntimeError) as exc:
+                _log.exception("rename: parts-bin disk save failed")
+                self.call_from_thread(
+                    _notify_save_failure, self, "Parts bin", exc,
+                )
         # Mirror the rename into the active collection — also slow,
         # also gets the async coalescing treatment so a burst of
         # renames doesn't queue up 5 sequential 150 MB writes.
