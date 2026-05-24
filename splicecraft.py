@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.20"
+__version__ = "0.9.21"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -3415,11 +3415,27 @@ def _build_system_info() -> dict:
                 info["user_data_files_present"].append({
                     "attr": attr, "name": p.name, "size": size,
                 })
+        # Sweep #26 (2026-05-23): bound the rglob count at 10k files.
+        # On a heavy install (thousands of experiment images / crash
+        # recoveries / .dna sidecars) the unbounded rglob was a CPU
+        # burst per diagnostic bundle / log-startup. The exact count
+        # past 10k isn't useful for triage — "≥10000" tells the same
+        # story without paying the walk cost.
+        _SYSTEM_INFO_RGLOB_CAP = 10_000
         for attr in _USER_DATA_DIR_ATTRS:
             p = globals().get(attr)
             if isinstance(p, Path) and p.is_dir():
+                n: "int | str" = -1
                 try:
-                    n = sum(1 for _ in p.rglob("*") if _.is_file())
+                    count = 0
+                    for child in p.rglob("*"):
+                        if child.is_file():
+                            count += 1
+                            if count >= _SYSTEM_INFO_RGLOB_CAP:
+                                n = f"≥{_SYSTEM_INFO_RGLOB_CAP}"
+                                break
+                    if n == -1:
+                        n = count
                 except OSError:
                     n = -1
                 info["user_data_dirs_present"].append({
@@ -5128,6 +5144,16 @@ _SCAN_CATALOG: "list[tuple]" = []
 
 
 _DEFAULT_RESTR_COLOR = "color(247)"  # neutral grey for unknown / custom
+
+# Sweep #26 (2026-05-23): cut-position validation bounds for custom
+# enzymes. Type IIS enzymes cut OUTSIDE the recognition site (offset
+# can be larger than `len(site)`); the ±30 window is generous enough
+# to accept every NEB Type IIS in production while still catching
+# typos. Lift to a module constant so the UI (`AddCustomEnzymeModal`)
+# and the agent endpoint (`_agent_validate_custom_enzyme_payload`)
+# share the same definition — pre-sweep both hardcoded ±30 inline,
+# inviting drift.
+_ENZYME_CUT_RANGE = 30
 
 
 def _rebuild_scan_catalog() -> None:
@@ -8519,6 +8545,35 @@ def _copy_to_clipboard_with_fallback(
         import datetime as _dt
         clip_dir = _DATA_DIR / "clipboard"
         clip_dir.mkdir(parents=True, exist_ok=True)
+        # Sweep #26 (2026-05-23): prune older clipboard fallback
+        # tmpfiles (>7 days OR beyond 100-file count cap). Pre-sweep
+        # the dir accumulated forever; a long-running session that
+        # frequently hit tier-3 (broken X11 / SSH / WSL-no-tty)
+        # could leave hundreds of MB of sequence-shaped tmpfiles
+        # around for the user's lifetime. Best-effort — any error
+        # falls through to the write.
+        _CLIP_MAX_AGE_S = 7 * 86400
+        _CLIP_MAX_FILES = 100
+        try:
+            import time as _time
+            now_ts = _time.time()
+            existing = list(clip_dir.glob("*.txt"))
+            for p in existing:
+                try:
+                    if (now_ts - p.stat().st_mtime) > _CLIP_MAX_AGE_S:
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            existing = [p for p in existing if p.exists()]
+            if len(existing) > _CLIP_MAX_FILES:
+                by_age = sorted(existing, key=lambda p: p.stat().st_mtime)
+                for p in by_age[:-_CLIP_MAX_FILES]:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)[:40] or "copy"
         ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = clip_dir / f"{ts}-{safe}.txt"
@@ -10568,7 +10623,7 @@ _GB_PARSE_CACHE_MAX = 16
 _GB_PARSE_CACHE_LOCK = threading.Lock()
 
 
-def _gb_text_to_record(text: str):
+def _gb_text_to_record(text: str, *, cache: bool = True):
     """Parse GenBank format text back to a SeqRecord.
 
     Defence-in-depth: cap input length at 64 MB before handing to
@@ -10582,6 +10637,13 @@ def _gb_text_to_record(text: str):
     `_GB_PARSE_CACHE_MAX`) keyed on `hash(text)`. Returned records are
     deepcopies of the cache value so callers can mutate freely (pitfall
     #17 contract). Empty-string / oversize inputs bypass the cache.
+
+    Sweep #26 (2026-05-23) — pass ``cache=False`` for one-shot batch
+    parses (Plasmidsaurus zip ingest, bulk-import folder walk) where
+    the cache would absorb the entire batch's parsed records before
+    eviction. A 50-sample run × 5 MB assemblies = ~250 MB cache
+    pressure on a single click; the records are consumed immediately
+    so caching them has no payoff.
     """
     if not text:
         from Bio import SeqIO
@@ -10592,18 +10654,20 @@ def _gb_text_to_record(text: str):
             f"({len(text):,} bytes > "
             f"{_GB_TEXT_MAX_BYTES:,} cap)"
         )
-    key = hash(text)
-    with _GB_PARSE_CACHE_LOCK:
-        hit = _GB_PARSE_CACHE.get(key)
-        if hit is not None:
-            _GB_PARSE_CACHE.move_to_end(key)
-            return deepcopy(hit)
+    if cache:
+        key = hash(text)
+        with _GB_PARSE_CACHE_LOCK:
+            hit = _GB_PARSE_CACHE.get(key)
+            if hit is not None:
+                _GB_PARSE_CACHE.move_to_end(key)
+                return deepcopy(hit)
     from Bio import SeqIO
     rec = SeqIO.read(StringIO(text), "genbank")
-    with _GB_PARSE_CACHE_LOCK:
-        _GB_PARSE_CACHE[key] = deepcopy(rec)
-        while len(_GB_PARSE_CACHE) > _GB_PARSE_CACHE_MAX:
-            _GB_PARSE_CACHE.popitem(last=False)
+    if cache:
+        with _GB_PARSE_CACHE_LOCK:
+            _GB_PARSE_CACHE[hash(text)] = deepcopy(rec)
+            while len(_GB_PARSE_CACHE) > _GB_PARSE_CACHE_MAX:
+                _GB_PARSE_CACHE.popitem(last=False)
     return rec
 
 
@@ -10678,26 +10742,51 @@ def _list_gbk_members_in_zip(zip_path: Path) -> "list[dict]":
     individual members above `_PLASMIDSAURUS_MEMBER_MAX_BYTES`, and
     listings beyond `_PLASMIDSAURUS_MAX_MEMBERS` to keep the picker
     snappy and resistant to malformed archives.
+
+    Sweep #26 (2026-05-23): closes the TOCTOU window between the
+    size check and the zip open by opening via ``os.open(path,
+    O_RDONLY)`` (which dereferences the symlink ONCE) then
+    ``fstat`` on the fd (immune to a concurrent path swap) and
+    ``zipfile.ZipFile(fileobj=os.fdopen(...))``. Pre-sweep a hostile
+    local process could swap the file between the path-based
+    ``stat()`` and the path-based ``ZipFile(str(p))`` call to
+    bypass the size cap.
     """
     import zipfile
+    import stat as _stat
     p = Path(zip_path)
-    if not p.exists():
-        raise ValueError(f"zip not found: {p}")
-    if not p.is_file():
-        raise ValueError(f"not a regular file: {p}")
     try:
-        size = p.stat().st_size
+        fd = os.open(str(p), os.O_RDONLY)
+    except FileNotFoundError as exc:
+        raise ValueError(f"zip not found: {p}") from exc
     except OSError as exc:
-        raise ValueError(f"could not stat zip: {exc}") from exc
-    if size > _PLASMIDSAURUS_ZIP_MAX_BYTES:
-        raise ValueError(
-            f"zip too large ({size:,} bytes; cap "
-            f"{_PLASMIDSAURUS_ZIP_MAX_BYTES:,})"
-        )
-    try:
-        zf = zipfile.ZipFile(str(p), "r")
-    except (zipfile.BadZipFile, OSError) as exc:
         raise ValueError(f"could not open zip: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise ValueError(f"not a regular file: {p}")
+        size = st.st_size
+        if size > _PLASMIDSAURUS_ZIP_MAX_BYTES:
+            raise ValueError(
+                f"zip too large ({size:,} bytes; cap "
+                f"{_PLASMIDSAURUS_ZIP_MAX_BYTES:,})"
+            )
+        try:
+            fobj = os.fdopen(fd, "rb")
+            fd = -1   # ownership transferred to fobj
+        except OSError as exc:
+            raise ValueError(f"could not open zip: {exc}") from exc
+        try:
+            zf = zipfile.ZipFile(fobj, "r")
+        except (zipfile.BadZipFile, OSError) as exc:
+            fobj.close()
+            raise ValueError(f"could not open zip: {exc}") from exc
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     members: list[dict] = []
     try:
         for info in zf.infolist():
@@ -10737,7 +10826,18 @@ def _list_gbk_members_in_zip(zip_path: Path) -> "list[dict]":
                 "size": int(info.file_size),
             })
     finally:
-        zf.close()
+        # Sweep #26: explicit close of both the zipfile AND the
+        # underlying fileobj. `ZipFile.close()` does NOT close a
+        # caller-supplied fileobj (per stdlib docs), so without
+        # this `fobj.close()` we'd leak the underlying fd.
+        try:
+            zf.close()
+        except OSError:
+            pass
+        try:
+            fobj.close()
+        except OSError:
+            pass
     members.sort(key=lambda m: _natural_sort_key(m["name"]))
     return members
 
@@ -10747,12 +10847,35 @@ def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
     text. Caller passes the result through `_gb_text_to_record` to get
     a SeqRecord. Raises ValueError on missing / oversized / unreadable
     member, on UTF-8 / latin-1 decode failure, or on an unsafe member
-    name (path traversal / NUL / ANSI smuggling)."""
+    name (path traversal / NUL / ANSI smuggling).
+
+    Sweep #26 (2026-05-23): TOCTOU-safe open via ``os.open`` +
+    ``fileobj`` — see ``_list_gbk_members_in_zip`` rationale.
+    """
     import zipfile
+    import stat as _stat
     if not _is_safe_zip_member_name(member_name):
         raise ValueError(f"unsafe zip member name: {member_name!r}")
     try:
-        with zipfile.ZipFile(str(zip_path), "r") as zf:
+        fd = os.open(str(zip_path), os.O_RDONLY)
+    except OSError as exc:
+        raise ValueError(f"could not open zip: {exc}") from exc
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"not a regular file: {zip_path}")
+        try:
+            fobj = os.fdopen(fd, "rb")
+            fd = -1
+        except OSError as exc:
+            raise ValueError(f"could not open zip: {exc}") from exc
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        with zipfile.ZipFile(fobj, "r") as zf:
             try:
                 # Sweep #9 (2026-05-19): route through the resolver
                 # so Windows-built zips with backslash separators in
@@ -10785,6 +10908,11 @@ def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
                 )
     except (zipfile.BadZipFile, OSError) as exc:
         raise ValueError(f"could not read zip: {exc}") from exc
+    finally:
+        try:
+            fobj.close()
+        except OSError:
+            pass
     # GenBank is ASCII per the spec; fall back to latin-1 only if a
     # stray high-bit byte slipped in (some sequencer pipelines do).
     try:
@@ -13258,6 +13386,16 @@ class PlasmidMap(Widget):
         self._feats_starts_sorted = [
             self._feats[i]["start"] for i in self._feats_by_start
         ]
+        # Sweep #26 (2026-05-23): precompute the index of wrap features
+        # (end < start) so `_draw_linear_flag` can walk only this small
+        # list instead of enumerating every feature on every frame.
+        # On dense plasmids (1000+ features) the per-frame O(F) wrap
+        # scan was a noticeable tax on rotation + zoom interaction.
+        # Mirrors the `_feats_by_start` precompute pattern.
+        self._wrap_feats_idx: list[int] = [
+            i for i, f in enumerate(self._feats)
+            if f["end"] < f["start"]
+        ]
         self._restr_feats = []
         # Per-plasmid persisted map-view preference takes precedence over
         # topology default. `_tui_map_mode` is stashed by `_library_load`
@@ -14662,11 +14800,14 @@ class PlasmidMap(Widget):
             feats_in_view.append(
                 (i, feat, max(view_s, sb), min(view_e, eb))
             )
-        for i, feat in enumerate(self._feats):
+        # Sweep #26 (2026-05-23): walk only the precomputed wrap-feat
+        # index, not every feature. The two `feats_in_view.append`
+        # paths are intentionally permissive — both halves of a wrap
+        # feature can appear in the visible window.
+        for i in self._wrap_feats_idx:
+            feat = self._feats[i]
             sb = feat["start"]
             eb = feat["end"]
-            if eb >= sb:
-                continue
             if view_s < eb:
                 feats_in_view.append(
                     (i, feat, view_s, min(view_e, eb))
@@ -21122,6 +21263,21 @@ def _resolve_pypi_url() -> str:
             override,
         )
         return _PYPI_JSON_URL
+    # Sweep #26 (2026-05-23): refuse plain http:// unless the user
+    # explicitly opts in via `$SPLICECRAFT_PYPI_INSECURE=1`. The
+    # update-check response feeds version-comparison logic that
+    # affects update-flow decisions; an in-path attacker on a
+    # corporate LAN could downgrade-attack via http response
+    # manipulation. Most legitimate corporate mirrors are https.
+    if (lower.startswith("http://")
+            and os.environ.get("SPLICECRAFT_PYPI_INSECURE", "").strip()
+            not in ("1", "true", "yes", "on")):
+        _log.warning(
+            "$SPLICECRAFT_PYPI_URL=%r refused: http:// strips TLS. "
+            "Set SPLICECRAFT_PYPI_INSECURE=1 to override.",
+            override,
+        )
+        return _PYPI_JSON_URL
     # Bound length too — a 10 MB env var would be silly but
     # someone could try.
     if len(override) > 2048:
@@ -25500,8 +25656,9 @@ class AddCustomEnzymeModal(ModalScreen[dict]):
         # Type IIS enzymes cut OUTSIDE the recognition site (offset
         # can be larger than len(site)) — guard for typos with
         # generous bounds but don't disallow real-world cases.
-        lo = -30
-        hi = len(site) + 30
+        # Sweep #26: bound from module constant `_ENZYME_CUT_RANGE`.
+        lo = -_ENZYME_CUT_RANGE
+        hi = len(site) + _ENZYME_CUT_RANGE
         if not (lo <= fwd_cut <= hi) or not (lo <= rev_cut <= hi):
             self._set_status(
                 f"[red]Cut positions must be within "
@@ -28151,7 +28308,9 @@ def _reconstruct_l0_features_in_seq(
         return out
     insert_seq = insert_seq.upper()
     bin_index: dict[str, dict] = {}
-    for p in _load_parts_bin():
+    # Sweep #26 (2026-05-23): readonly iter — refs are stashed in
+    # `bin_index` then passed to downstream readers; no mutation.
+    for p in _iter_parts_bin_readonly():
         nm = p.get("name") or ""
         if (nm
                 and nm not in bin_index
@@ -29654,6 +29813,29 @@ def _all_grammars() -> dict[str, dict]:
     return out
 
 
+def _iter_all_grammars_readonly() -> dict[str, dict]:
+    """Read-only view of all grammars — returns built-in refs (NOT
+    deepcopied) plus shallow-cloned custom grammars. Callers MUST
+    NOT mutate any returned dict (pitfall #17). Use for hot read
+    paths (per-frame status, classifier probes, picker enumeration)
+    where the per-call `deepcopy` of every built-in grammar dict in
+    ``_all_grammars`` is wasted. Mirrors
+    ``_iter_collections_readonly`` / ``_iter_library_readonly``.
+    Added by sweep #26 (2026-05-23).
+    """
+    out: dict[str, dict] = dict(_BUILTIN_GRAMMARS)
+    # Custom grammars need a shallow clone to inject `editable=True`
+    # without poisoning the user's loaded dict; cost is bounded by
+    # the user's custom-grammar count (typically 0–5).
+    for g in _load_custom_grammars():
+        gid = g.get("id")
+        if isinstance(gid, str):
+            g = dict(g)
+            g["editable"] = True
+            out[gid] = g
+    return out
+
+
 def _get_active_grammar() -> dict:
     """Return the currently-active grammar dict. Falls back to GB L0
     if the persisted ``active_grammar`` id no longer resolves (e.g.,
@@ -30093,7 +30275,13 @@ def _check_vector_match(
 # leave stale entries behind. Keyed by str → list of tuples so the
 # values are independently copy-able when returned to callers (we
 # return a `list(...)` so callers can mutate without poisoning).
+# Sweep #26 (2026-05-23): bounded at `_ACCEPTOR_TU_PAIRS_CACHE_MAX`
+# entries with FIFO eviction. Pre-sweep it was unbounded; in
+# practice bounded by (grammar_id × enzyme) tuples, but a user with
+# many custom grammars could grow this indefinitely. Matches the
+# 64-entry cap rationale for `_VECTOR_MATCH_CACHE`.
 _ACCEPTOR_TU_PAIRS_CACHE: "dict[tuple[str, str], list[tuple[str, str, str, str]]]" = {}
+_ACCEPTOR_TU_PAIRS_CACHE_MAX = 64
 
 
 def _grammar_acceptor_tu_pairs(
@@ -30188,6 +30376,12 @@ def _grammar_acceptor_tu_pairs(
         ).upper()
         if oh5 and oh3:
             out.append((role, ev_name, oh5, oh3))
+    # Sweep #26: FIFO-evict oldest entry if at cap.
+    if len(_ACCEPTOR_TU_PAIRS_CACHE) >= _ACCEPTOR_TU_PAIRS_CACHE_MAX:
+        try:
+            _ACCEPTOR_TU_PAIRS_CACHE.pop(next(iter(_ACCEPTOR_TU_PAIRS_CACHE)))
+        except (StopIteration, KeyError):
+            pass
     _ACCEPTOR_TU_PAIRS_CACHE[cache_key] = list(out)
     return out
 
@@ -40011,15 +40205,15 @@ class GrammarEditorModal(ModalScreen):
         def _picked(plasmid_id: "str | None") -> None:
             if not plasmid_id:
                 return
-            for entry in _load_library():
-                if entry.get("id") == plasmid_id:
-                    self._commit_entry_vector({
-                        "name":    str(entry.get("name") or plasmid_id),
-                        "size":    int(entry.get("size") or 0),
-                        "source":  f"library:{plasmid_id}",
-                        "gb_text": str(entry.get("gb_text") or ""),
-                    })
-                    return
+            # Sweep #26: helper avoids the full-library deepcopy.
+            entry = _find_library_entry_by_id(plasmid_id)
+            if entry is not None:
+                self._commit_entry_vector({
+                    "name":    str(entry.get("name") or plasmid_id),
+                    "size":    int(entry.get("size") or 0),
+                    "source":  f"library:{plasmid_id}",
+                    "gb_text": str(entry.get("gb_text") or ""),
+                })
         self.app.push_screen(PlasmidPickerModal(), _picked)
 
     @on(Button.Pressed, "#btn-ged-entry-file")
@@ -40582,9 +40776,10 @@ class GrammarManagerModal(ModalScreen):
         nm = str(g.get("name") or gid)
         # Count parts that reference this grammar so the warning can
         # mention concrete impact ("3 saved TUs use this grammar").
+        # Sweep #26: readonly iter — count-only.
         n_dependents = 0
         try:
-            for p in _load_parts_bin():
+            for p in _iter_parts_bin_readonly():
                 if (p.get("grammar") or "gb_l0") == gid:
                     n_dependents += 1
         except Exception:
@@ -40639,9 +40834,10 @@ class GrammarManagerModal(ModalScreen):
         nm = str(target.get("name") or gid)
         # Count dependent parts so the confirmation surfaces the
         # actual blast radius. Cheap O(n_parts); the bin is small.
+        # Sweep #26: readonly iter — count-only.
         n_dependents = 0
         try:
-            for p in _load_parts_bin():
+            for p in _iter_parts_bin_readonly():
                 if (p.get("grammar") or "gb_l0") == gid:
                     n_dependents += 1
         except Exception:
@@ -42382,7 +42578,11 @@ class PartsBinModal(Screen):
         """
         rows: list[dict] = []
         active = self._active_level
-        for p in _load_parts_bin():
+        # Sweep #26 (2026-05-23): readonly iter — the loop body only
+        # `.get()`s fields then builds a fresh row dict. Pre-sweep
+        # `_load_parts_bin()` deep-cloned every entry per palette
+        # repop (every grammar / level tab switch).
+        for p in _iter_parts_bin_readonly():
             lvl = _part_level(p)
             if not _level_matches_tab(lvl, active):
                 continue
@@ -46952,7 +47152,12 @@ class SequencingScreen(Screen):
                         txt = raw.decode("utf-8")
                     except UnicodeDecodeError:
                         txt = raw.decode("latin-1", errors="replace")
-                    rec = _gb_text_to_record(txt)
+                    # Sweep #26: `cache=False` — batch parses across
+                    # 50+ samples × multi-MB assemblies would absorb
+                    # the entire batch into `_GB_PARSE_CACHE` (~250 MB
+                    # in one click). One-shot reads here; no cache
+                    # benefit on subsequent calls.
+                    rec = _gb_text_to_record(txt, cache=False)
                     bp = f"{len(rec.seq):,}"
                     feats = str(
                         len([f for f in rec.features
@@ -52859,8 +53064,10 @@ class SynthesisLoadModal(ModalScreen):
             return
         # Filter library to linear entries via a cheap LOCUS-line peek
         # (avoids parsing every gb_text just to read topology).
+        # Sweep #26: readonly iter — loop body only `.get()`s fields
+        # then appends to a fresh `rows` list.
         rows: list[tuple[str, str, int]] = []
-        for e in _load_library():
+        for e in _iter_library_readonly():
             if not isinstance(e, dict):
                 continue
             gb_text = e.get("gb_text", "") or ""
@@ -62189,8 +62396,10 @@ class ConstructorModal(ModalScreen):
         if not lane:
             return None
         expected_level = self._source_levels.get(gid, 0)
+        # Sweep #26: readonly iter — refs stashed in `bin_index` then
+        # passed to downstream readers; no mutation.
         bin_index: dict[str, dict] = {}
-        for p in _load_parts_bin():
+        for p in _iter_parts_bin_readonly():
             nm = p.get("name") or ""
             if not _level_matches_tab(_part_level(p), expected_level):
                 continue
@@ -62555,8 +62764,11 @@ class ConstructorModal(ModalScreen):
         # Cross-reference back to the library to recover history for
         # parts that came from an earlier Save. Build a single dict
         # so the parts-loop is O(n) not O(n²).
+        # Sweep #26: readonly iter — refs stashed in `lib_by_name`
+        # and only read by downstream `_parent_node_for_entry`
+        # (which builds a fresh history node).
         lib_by_name: dict[str, dict] = {}
-        for e in _load_library():
+        for e in _iter_library_readonly():
             if isinstance(e, dict):
                 nm = e.get("name")
                 if nm:
@@ -73455,6 +73667,42 @@ def _check_agent_read_dir(path: Path) -> "str | None":
     return None
 
 
+def _check_agent_read_path_ancestors(path: Path) -> "str | None":
+    """Tighten read-endpoint path validation by walking every parent
+    component for symlinks. Mirrors the sweep-#4 hardening in
+    ``_check_agent_write_path`` but for read endpoints (Plasmidsaurus
+    zip ingestion, etc.).
+
+    Returns an error message string when an ancestor symlink would
+    redirect the read; None when safe. Sweep #26 (2026-05-23) —
+    closes the gap audit M8 flagged: read endpoints rejected the
+    target's `~user` expansion but a parent like `Documents/zips/`
+    being a symlink to `/etc` would still be followed silently by
+    the downstream ``os.open``.
+
+    The path itself does NOT need to exist — symlink refusal applies
+    only to existing components.
+    """
+    try:
+        parent = path.parent
+        if not parent.exists():
+            # Nothing to redirect through if it doesn't exist yet.
+            return None
+        resolved_parent = parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return f"could not resolve parent directory: {exc}"
+    try:
+        lexical_parent = parent.absolute()
+    except OSError as exc:
+        return f"could not normalise parent directory: {exc}"
+    if str(resolved_parent) != str(lexical_parent):
+        return (
+            f"parent path resolves through a symlink: "
+            f"{lexical_parent!s} → {resolved_parent!s}"
+        )
+    return None
+
+
 def _check_agent_write_path(path: Path) -> "str | None":
     """Tighter validation for agent write endpoints (`export-*`,
     `save`, etc.). Returns an error message string when the path is
@@ -75108,6 +75356,14 @@ def _h_list_plasmidsaurus_members(app, payload):
     path = _sanitize_path(raw_path)
     if path is None:
         return ({"error": "could not sanitize 'path'"}, 400)
+    # Sweep #26 (2026-05-23): defense-in-depth ancestor symlink walk.
+    # Pre-sweep an attacker-placed symlink at any parent (e.g.
+    # `~/Documents` → `/etc`) was silently followed by the
+    # downstream `os.open`.
+    anc_err = _check_agent_read_path_ancestors(path)
+    if anc_err is not None:
+        _log.warning("agent list-plasmidsaurus-members: %s", anc_err)
+        return ({"error": "zip rejected (see splicecraft log)"}, 400)
     # Sweep #25 (2026-05-23): collapse path-shape errors to a uniform
     # 400 so the differentiated error responses don't act as a
     # filesystem-state oracle (pre-fix an unauthenticated caller
@@ -75172,6 +75428,12 @@ def _h_align_plasmidsaurus_zip(app, payload):
     path = _sanitize_path(raw_path)
     if path is None:
         return ({"error": "could not sanitize 'path'"}, 400)
+    # Sweep #26 (2026-05-23): defense-in-depth ancestor symlink walk
+    # (see `_h_list_plasmidsaurus_members` rationale).
+    anc_err = _check_agent_read_path_ancestors(path)
+    if anc_err is not None:
+        _log.warning("agent align-plasmidsaurus-zip: %s", anc_err)
+        return ({"error": "zip rejected (see splicecraft log)"}, 400)
     # Sweep #25 (2026-05-23): collapse path errors to a uniform 400
     # (see `_h_list_plasmidsaurus_members` rationale).
     ok, reason = _safe_file_size_check(
@@ -75197,6 +75459,13 @@ def _h_align_plasmidsaurus_zip(app, payload):
                       else f"name={target_name!r}")
         return ({"error": f"no library entry matching {descriptor}"},
                 404)
+    # Sweep #26 (2026-05-23): capture the resolved id so the post-
+    # alignment re-check can detect a concurrent library mutation
+    # (target deleted/renamed mid-flight). The alignment itself runs
+    # against the snapshot we extracted above, but the result's
+    # `target_name` would otherwise reflect the pre-rename name with
+    # no way for the agent to detect the drift.
+    resolved_target_id = target_entry.get("id") or ""
     gb_text_target = target_entry.get("gb_text") or ""
     if not gb_text_target:
         return ({"error": "target entry has no gb_text"}, 422)
@@ -75257,6 +75526,27 @@ def _h_align_plasmidsaurus_zip(app, payload):
     except Exception as exc:
         _log.exception("align-plasmidsaurus-zip: alignment failed")
         return ({"error": f"alignment failed: {exc}"}, 500)
+    # Sweep #26 (2026-05-23): post-alignment drift check. If the
+    # target entry was deleted between resolve and alignment
+    # completion (multi-second CPU-bound `_pairwise_align`), surface
+    # 410 Gone — the alignment result is technically valid but the
+    # named target no longer exists, so any agent follow-up against
+    # it (set-active, load-entry) would 404.
+    if resolved_target_id:
+        current = _find_library_entry_by_id(resolved_target_id)
+        if current is None:
+            return ({"error": (
+                "target deleted mid-flight; alignment ran against "
+                "the resolved snapshot but the library entry is gone"
+            ), "target_id": resolved_target_id}, 410)
+        # If rename happened, the result still ships, but flag the
+        # drift in the payload so the agent's follow-ups can use the
+        # current name.
+        current_name = current.get("name") or ""
+        if current_name and current_name != (target_record.name
+                                              or target_record.id or ""):
+            result = dict(result)
+            result["_target_renamed_to"] = current_name
     _log_event(
         "alignment.agent",
         path=str(path), member=member,
@@ -76645,7 +76935,9 @@ def _h_list_parts(app, payload):
     if position is not None and not isinstance(position, str):
         return ({"error": "'position' must be string"}, 400)
     rows = []
-    for p in _load_parts_bin():
+    # Sweep #26: readonly iter — `_parts_bin_entry_summary` builds a
+    # fresh dict from `p.get(...)` reads.
+    for p in _iter_parts_bin_readonly():
         if grammar and (p.get("grammar") or "") != grammar:
             continue
         if lvl is not None and int(p.get("level") or 0) != lvl:
@@ -78803,7 +79095,9 @@ def _agent_validate_custom_enzyme_payload(payload: dict) -> "dict | str":
         rev_cut = int(rev_raw)
     except (TypeError, ValueError):
         return "'fwd_cut' and 'rev_cut' must be integers"
-    lo, hi = -30, len(site) + 30
+    # Sweep #26: shared `_ENZYME_CUT_RANGE` constant — was hardcoded
+    # ±30 in two places.
+    lo, hi = -_ENZYME_CUT_RANGE, len(site) + _ENZYME_CUT_RANGE
     if not (lo <= fwd_cut <= hi) or not (lo <= rev_cut <= hi):
         return f"cut positions must be in {lo}..{hi}"
     ftype = payload.get("type") or "other"
@@ -79348,9 +79642,29 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         else:
             payload, status = result, 200
         # Audit fix 2026-05-14: log every write endpoint's outcome at
-        # INFO so a "an agent silently overwrote my library" report has
-        # a forensic trail. Read endpoints stay at DEBUG (via the
-        # stdlib access line) to keep the log readable.
+        # INFO so a "an agent silently overwrote my library" report
+        # has a forensic trail. Read endpoints stay at DEBUG (via
+        # the stdlib access line) to keep the log readable.
+        #
+        # Sweep #26 (2026-05-23): emit the log AFTER `_send` succeeds
+        # so the log unambiguously means "state mutated AND client
+        # confirmed". A broken-socket `_send` failure emits a
+        # distinct `agent.write.send_failed` event instead so
+        # forensics can distinguish "handler succeeded but client
+        # never saw the response" from "handler succeeded and
+        # response delivered". Pre-fix the log fired before the
+        # response landed; a `_send` failure could leave the audit
+        # log saying success while the client retried.
+        try:
+            self._send(payload, status)
+        except (OSError, ValueError) as send_exc:
+            if write:
+                _log_event(
+                    "agent.write.send_failed",
+                    endpoint=path_part, status=status,
+                    error=str(send_exc)[:120],
+                )
+            raise
         if write:
             event_name = (
                 "agent.write.ok" if 200 <= status < 300
@@ -79359,7 +79673,6 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             _log_event(
                 event_name, endpoint=path_part, status=status,
             )
-        self._send(payload, status)
 
 
 class _AgentAPIServer(ThreadingMixIn, http.server.HTTPServer):
@@ -82137,34 +82450,38 @@ SpeciesPickerModal { align: center middle; }
         applies a tighter filter on `grammar_id`. The lazy load on
         first UI touch is correct; the double-read cost is small in
         practice (libraries that fit in 50 MB).
+
+        Sweep #26 (2026-05-23): drives the file list from
+        `_USER_DATA_FILE_ATTRS` (registry) + a label derivation that
+        falls back to `_AGENT_BACKUP_LABELS` inversion. Pre-sweep the
+        17-entry list was hand-maintained — same parity-drift class
+        as INV-64 caught for `_AGENT_BACKUP_LABELS`. Any future file
+        added to `_USER_DATA_FILE_ATTRS` now auto-enrolls.
         """
-        for path, label in [
-            (_LIBRARY_FILE,            "Plasmid library"),
-            (_PARTS_BIN_FILE,          "Parts bin"),
-            (_PARTS_BIN_COLLECTIONS_FILE, "Parts-bin collections"),
-            (_PRIMERS_FILE,            "Primer library"),
-            (_PRIMER_COLLECTIONS_FILE, "Primer collections"),
-            (_COLLECTIONS_FILE,        "Plasmid collections"),
-            (_ENTRY_VECTORS_FILE,      "Entry vectors"),
-            (_SETTINGS_FILE,           "Settings"),
-            # Sweep #9 (2026-05-19): 0.9.6's new persisted files.
-            # Without launch-time validation, corruption only surfaces
-            # on lazy first-load (warning lands in log, not always
-            # reaching the user via notify).
-            (_EXPERIMENTS_FILE,        "Experiments"),
-            (_EXPERIMENT_PROJECTS_FILE, "Experiment projects"),
-            (_GELS_FILE,               "Gels"),
-            # Sweep #15 (2026-05-20): protein-motif user overrides.
-            (_PROTEIN_MOTIFS_FILE,     "Protein motifs"),
-            # Enzyme catalog extensions (2026-05-22).
-            (_CUSTOM_ENZYMES_FILE,     "Custom enzymes"),
-            (_ENZYME_COLLECTIONS_FILE, "Enzyme collections"),
-            # Generation-tracked caches.
-            (_FEATURES_FILE,           "Feature library"),
-            (_FEATURE_COLORS_FILE,     "Feature colours"),
-            (_GRAMMARS_FILE,           "Cloning grammars"),
-            (_CODON_TABLES_FILE,       "Codon tables"),
-        ]:
+        # Build attr → user-friendly label from `_AGENT_BACKUP_LABELS`
+        # (label-key → attr-name) by inverting + title-casing. A label
+        # like `"plasmid_library"` becomes `"Plasmid library"`; this
+        # matches the pre-sweep hand-labels exactly for every existing
+        # entry. Falls back to the attr name (without `_FILE` suffix)
+        # for any attr not in the agent label registry.
+        attr_to_label: dict[str, str] = {}
+        for friendly, attr_name in _AGENT_BACKUP_LABELS.items():
+            attr_to_label[attr_name] = (
+                friendly.replace("_", " ").capitalize()
+            )
+        # Special-case the few labels where the pre-sweep hand-list
+        # used a non-standard form so the user notification text
+        # stays exactly as before.
+        attr_to_label.update({
+            "_COLLECTIONS_FILE":          "Plasmid collections",
+            "_PARTS_BIN_COLLECTIONS_FILE": "Parts-bin collections",
+            "_FEATURE_COLORS_FILE":       "Feature colours",
+        })
+        for attr in _USER_DATA_FILE_ATTRS:
+            path = globals().get(attr)
+            if not isinstance(path, Path):
+                continue
+            label = attr_to_label.get(attr) or attr.lstrip("_").rstrip("_FILE").replace("_", " ").capitalize()
             _, warning = _safe_load_json(path, label)
             if warning:
                 self.notify(warning, severity="warning", timeout=12)
@@ -82588,8 +82905,9 @@ SpeciesPickerModal { align: center middle; }
                 # Apply the record only if no record load has happened
                 # since we entered.
                 lib = self.query_one("#library", LibraryPanel)
+                # Sweep #26: id-set from readonly iter.
                 existing_ids = {
-                    e.get("id") for e in _load_library()
+                    e.get("id") for e in _iter_library_readonly()
                     if isinstance(e, dict)
                 }
                 if record.id not in existing_ids:

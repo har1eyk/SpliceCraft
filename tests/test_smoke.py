@@ -9844,8 +9844,17 @@ class TestFutureProofingFeatures:
         assert sc._resolve_pypi_url() == \
             "https://internal-mirror.corp/pypi/sc/json"
 
-    def test_pypi_url_override_when_http(self, monkeypatch):
+    def test_pypi_url_override_when_http_requires_insecure_optin(self, monkeypatch):
+        # Sweep #26 (2026-05-23): plain `http://` is refused unless
+        # the user explicitly opts in via SPLICECRAFT_PYPI_INSECURE=1.
+        # Defends against in-path attackers on a corporate LAN
+        # downgrade-attacking the update-check JSON.
         monkeypatch.setenv("SPLICECRAFT_PYPI_URL", "http://10.0.0.5/json")
+        monkeypatch.delenv("SPLICECRAFT_PYPI_INSECURE", raising=False)
+        # Without insecure opt-in: refused → falls back to default.
+        assert sc._resolve_pypi_url() == sc._PYPI_JSON_URL
+        # With insecure opt-in: honoured.
+        monkeypatch.setenv("SPLICECRAFT_PYPI_INSECURE", "1")
         assert sc._resolve_pypi_url() == "http://10.0.0.5/json"
 
     def test_pypi_url_rejects_file_scheme(self, monkeypatch):

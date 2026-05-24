@@ -338,17 +338,26 @@ class TestCheckDataFilesCoversNewFiles:
     surfaces on lazy first-load and the warning may not reach the user
     via `notify`."""
 
-    def test_check_data_files_source_lists_new_files(self):
+    def test_check_data_files_covers_new_files(self):
+        # Sweep #26 (2026-05-23): `_check_data_files` no longer hand-
+        # lists file attrs — it iterates `_USER_DATA_FILE_ATTRS`
+        # (the canonical registry). Verify both that the function
+        # source iterates the registry AND that the registry actually
+        # contains the four sweep-#9 + sibling persisted files.
         import inspect
         src = inspect.getsource(sc.PlasmidApp._check_data_files)
+        assert "_USER_DATA_FILE_ATTRS" in src, (
+            "_check_data_files must drive its file list from the "
+            "canonical _USER_DATA_FILE_ATTRS registry, not a hand-list"
+        )
         for token in (
             "_EXPERIMENTS_FILE",
             "_EXPERIMENT_PROJECTS_FILE",
             "_GELS_FILE",
             "_PARTS_BIN_COLLECTIONS_FILE",
         ):
-            assert token in src, (
-                f"_check_data_files missing validation row for {token}"
+            assert token in sc._USER_DATA_FILE_ATTRS, (
+                f"_USER_DATA_FILE_ATTRS missing {token}"
             )
 
 

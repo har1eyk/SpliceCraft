@@ -444,6 +444,54 @@ Four parallel sub-agents covered footguns/correctness, performance, resource uti
 
 * **Architectural recommendation deferred to v1.1.** The recurring cache-bust enumeration drift (caught 4 times: INV-43, INV-50, INV-64, here) and `_AGENT_BACKUP_LABELS` parity drift (INV-64) suggest a `_PERSISTENT_CACHE_REGISTRY: dict[str, CacheSpec]` with `attr_name`, `file_attr`, `backup_label`, `restore_handler`. The single source of truth would eliminate the entire bug class. Not landed this sweep — touches 5+ subsystems; defer until v1.0.0 ships.
 
+### Sweep #26 follow-up (same INV-66; 2026-05-23 same-day)
+
+User asked for "fix all deferred" after sweep #25's first pass landed v0.9.20. This second pass closed every deferred-list item with concrete value, leaving only the v1.1 architectural refactor unaddressed. Test count grew 37 → 61 in `tests/test_sweep25.py`; the file's docstring documents both batches.
+
+* **L2 — PyPI HTTPS-by-default.** `_resolve_pypi_url` now refuses `http://` overrides unless `SPLICECRAFT_PYPI_INSECURE=1` is explicitly set. The update-check response feeds version-comparison logic; an in-path attacker on a corporate LAN could downgrade-attack via plain-http manipulation. Tests in `TestSweep26PypiHttpDowngrade`.
+
+* **L4 — `_check_data_files` driven by `_USER_DATA_FILE_ATTRS` registry.** Pre-fix the 17-entry list was hand-maintained — same parity-drift class as INV-64 caught for `_AGENT_BACKUP_LABELS`. Now derives labels from `_AGENT_BACKUP_LABELS` inversion (with special-case overrides for 3 non-standard hand-labels) plus an attr-name fallback. New files added to `_USER_DATA_FILE_ATTRS` auto-enroll in startup validation. Tests in `TestSweep26CheckDataFilesRegistry`.
+
+* **L5 — `_ENZYME_CUT_RANGE = 30` module constant.** Replaces hardcoded `±30` in `AddCustomEnzymeModal._validate` (UI) and `_agent_validate_custom_enzyme_payload` (agent). Single point of adjustment. Tests in `TestSweep26EnzymeCutRangeConstant`.
+
+* **L6 — NCBI / Kazusa narrow excepts use `urllib.error.URLError`.** `_ncbi_taxid_search` and `_codon_fetch_kazusa` now `import urllib.error as _urllib_error` and catch `(OSError, _urllib_error.URLError [, ET.ParseError])` instead of bare `Exception`. Real bugs in the parse paths (KeyError on missing XML field, etc.) now propagate instead of disguising as "Network error".
+
+* **L7 — `agent.write.ok` log fires AFTER `_send` succeeds.** A broken-socket `_send` failure now emits a distinct `agent.write.send_failed` event so forensics can distinguish "handler succeeded but client never saw the response" from "handler succeeded and response delivered". Pre-sweep the log fired before the response landed; a `_send` failure could leave the audit log saying success while the client retried. Tests in `TestSweep26LogEventTimingAfterSend`.
+
+* **L8 — `_ACCEPTOR_TU_PAIRS_CACHE` FIFO cap = 64.** Pre-sweep unbounded (only invalidated on `_save_entry_vectors`). Bounded in practice by `(grammar_id × enzyme)` tuples, but a user with many custom grammars could grow this. Mirrors `_VECTOR_MATCH_CACHE`'s 64-entry cap.
+
+* **L9 — already landed in sweep #25's first pass** (lockfile unlink on graceful exit).
+
+* **L10 — `_build_system_info` rglob cap at 10k files.** Pre-sweep unbounded `rglob('*')` count over user-data dirs. On heavy installs (thousands of attachments / crash recovery files / .dna sidecars) this was a CPU burst per diagnostic bundle / log-startup. The exact count past 10k isn't useful for triage — `"≥10000"` tells the same story.
+
+* **M3 — already landed in sweep #25** (snapshot dir restore 5 GB cap).
+
+* **M7 — assessed already-mitigated.** Audit suggested O_EXCL on export writes. `_atomic_write_text`'s inner `lstat` check catches symlink-mid-flight; the remaining "regular file created between agent's check and atomic-replace" race isn't a security gap (just a different overwrite than expected). Skipped intentionally.
+
+* **M8 — `_check_agent_read_path_ancestors` helper + applied to Plasmidsaurus paths.** New helper mirrors `_check_agent_write_path`'s ancestor-walk pattern for read endpoints. Applied to `_h_list_plasmidsaurus_members` + `_h_align_plasmidsaurus_zip` so a parent symlink (`~/Documents` → `/etc`) doesn't silently redirect the downstream `os.open`. Tests in `TestSweep26AncestorReadCheck`.
+
+* **M12 — clipboard fallback dir prune.** `_DATA_DIR/clipboard/` tier-3 tmpfiles now prune on every write: 7-day age cap OR 100-file count cap (oldest first). Pre-sweep the dir accumulated forever; a long-running session that frequently hit tier-3 (broken X11 / SSH / WSL-no-tty) could leave hundreds of MB of sequence-shaped tmpfiles around.
+
+* **M16 — `ConstructorModal._build_palette_rows` + 5 more parts-bin readers** use `_iter_parts_bin_readonly`. Loop bodies only `.get()` fields then build fresh row dicts.
+
+* **M17 — `_iter_all_grammars_readonly` helper added.** Skips the per-call `deepcopy` of every built-in grammar dict that `_all_grammars` pays. Built-ins returned by reference (callers MUST NOT mutate); custom grammars get a shallow clone for `editable=True` injection. Callsite conversions deferred to a future sweep — adding the helper is the gating change. Tests in `TestSweep26GrammarsReadonly`.
+
+* **M18 — `_gb_text_to_record(cache=False)` for batch parses.** New keyword arg lets one-shot batch consumers skip the `_GB_PARSE_CACHE` populate. Used in Plasmidsaurus `_batch_extract_gbk_meta` where 50+ samples × multi-MB assemblies would absorb the entire batch into the cache (~250 MB pressure in one click). Tests in `TestSweep26GBParseCacheFlag`.
+
+* **M15 — 4 more library-iter conversions** (entry-vector picker, linear-library picker, traditional-cloning lib-by-name index, add-record id-set). All read-only patterns, no mutation.
+
+* **M19 — assessed lower-value.** Per-cache count cap of 16 is a reasonable bound; aggregate-bytes tracking adds complexity for a worst-case scenario that requires multiple multi-MB plasmids open in series. Documented as-is.
+
+* **M21 — `_h_align_plasmidsaurus_zip` post-alignment target-drift detection.** Captures `resolved_target_id` at handler entry; after the (possibly multi-second) `_pairwise_align` completes, re-looks up by id. Returns 410 Gone if the target was deleted mid-flight (alignment result is technically valid but the named target no longer exists for downstream `set-active`/`load-entry`). Surfaces `_target_renamed_to` flag in the result payload if the target was renamed (alignment still ships; agent's follow-ups use the current name). Tests in `TestSweep26AlignmentDriftDetection`.
+
+* **H7 — TOCTOU-safe zip open via `os.open` + `fileobj=`.** Both `_list_gbk_members_in_zip` and `_extract_gbk_member` now open the zip path via `os.open(path, O_RDONLY)` (which dereferences the symlink ONCE), `fstat` on the fd (immune to a concurrent path swap), then `zipfile.ZipFile(fileobj=os.fdopen(...))`. Closes the TOCTOU window that pre-sweep let a hostile local process swap the file between the path-based stat and the path-based `ZipFile(str(p))`. Explicit `fobj.close()` in `finally` since `ZipFile.close()` doesn't close caller-supplied fileobj. Tests in `TestSweep26ZipFdPass`.
+
+* **H13 — `_wrap_feats_idx` precomputed in `load_record`.** `_draw_linear_flag` no longer enumerates every feature on every render frame just to filter for wrap features. Maintains `_wrap_feats_idx: list[int]` alongside `_feats_by_start` per the established precompute pattern. On dense plasmids (1000+ features) the per-frame O(F) wrap scan was a noticeable tax on rotation + zoom interaction. Tests in `TestSweep26WrapFeatsIdx`.
+
+* **Removed unused `uuid` import** (left over from sweep #25 L3 switching to `secrets.token_urlsafe(32)`). Caught by `ruff check` in `release.py`'s gate.
+
+* **Architectural cache-registry refactor remains v1.1.** Same conclusion as sweep #25's first pass.
+
 ---
 
 ## [PIT-01]…[PIT-39] Known pitfalls (moved from CLAUDE.md)
