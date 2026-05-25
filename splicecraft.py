@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.24"
+__version__ = "0.9.25"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -5149,10 +5149,12 @@ _custom_enzymes_cache: "list | None" = None
 def _load_custom_enzymes() -> list[dict]:
     """Deep-copy on read (pitfall #17).
 
-    Sweep #26: first-load populate + cache reseat under `_cache_lock`
-    so a concurrent `_save_custom_enzymes` (which locks for reseat)
-    can't be clobbered by a cold-load reading stale disk."""
+    Sweep #26: double-checked locking — cache-hit fast path is
+    lock-free so an unrelated lock-holder can't freeze UI reads."""
     global _custom_enzymes_cache
+    cached = _custom_enzymes_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
         if _custom_enzymes_cache is None:
             entries, warning = _safe_load_json(
@@ -5257,9 +5259,11 @@ _NEB_MASTER_PSEUDO_NAME = "NEB master (all enzymes)"
 def _load_enzyme_collections() -> list[dict]:
     """Deep-copy on read so callers can mutate freely; pitfall #17.
 
-    Sweep #26: locked populate matches `_load_custom_enzymes` /
-    `_load_gels`."""
+    Sweep #26: double-checked locking — cache-hit fast path is lock-free."""
     global _enzyme_collections_cache
+    cached = _enzyme_collections_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
         if _enzyme_collections_cache is None:
             entries, warning = _safe_load_json(
@@ -31633,16 +31637,18 @@ _grammars_cache: "list | None" = None
 
 
 def _load_custom_grammars() -> list[dict]:
-    """Sweep #26: locked populate (mirrors `_load_features` / `_load_gels`)."""
+    """Sweep #26: double-checked locking — cache-hit fast path is lock-free."""
     global _grammars_cache
+    cached = _grammars_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
-        if _grammars_cache is not None:
-            return _typed_clone(_grammars_cache)
-        entries, warning = _safe_load_json(_GRAMMARS_FILE, "Cloning grammars")
-        if warning:
-            _log.warning(warning)
-        entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("id"), str)]
-        _grammars_cache = entries
+        if _grammars_cache is None:
+            entries, warning = _safe_load_json(_GRAMMARS_FILE, "Cloning grammars")
+            if warning:
+                _log.warning(warning)
+            entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("id"), str)]
+            _grammars_cache = entries
         return _typed_clone(_grammars_cache)
 
 
@@ -33334,24 +33340,32 @@ def _load_settings() -> dict:
     UI. Unknown keys are preserved for forward-compat.
     """
     global _settings_cache
-    # Sweep #26: locked populate (mirrors `_load_features` / `_load_gels`).
+    # Sweep #26: double-checked locking — the cache-hit fast path is
+    # lock-free. CRITICAL: `_set_setting` and `_load_settings` fire
+    # on every keystroke / map render, so any other thread holding
+    # `_cache_lock` (e.g. `_flush_active_alignments` doing its 1-3 s
+    # `_load_library` deepcopy on a 156 MB library) would otherwise
+    # freeze the UI for the duration. The cold populate-from-disk
+    # path still acquires the lock with a double-check after.
+    cached = _settings_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
-        if _settings_cache is not None:
-            return _typed_clone(_settings_cache)
-        entries, warning = _safe_load_json(_SETTINGS_FILE, "Settings")
-        if warning:
-            _log.warning(warning)
-        settings: dict = {}
-        for e in entries:
-            if not isinstance(e, dict):
-                continue
-            k, v = e.get("key"), e.get("value")
-            if isinstance(k, str):
-                settings[k] = v
-        cleaned, warns = _validate_settings(settings)
-        for w in warns:
-            _log.warning(w)
-        _settings_cache = cleaned
+        if _settings_cache is None:
+            entries, warning = _safe_load_json(_SETTINGS_FILE, "Settings")
+            if warning:
+                _log.warning(warning)
+            settings: dict = {}
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                k, v = e.get("key"), e.get("value")
+                if isinstance(k, str):
+                    settings[k] = v
+            cleaned, warns = _validate_settings(settings)
+            for w in warns:
+                _log.warning(w)
+            _settings_cache = cleaned
         return _typed_clone(_settings_cache)
 
 
@@ -35096,21 +35110,23 @@ def _load_features() -> list[dict]:
     DomesticatorModal feature picker, etc.) as if it had been saved.
     """
     global _features_cache, _features_generation
-    # Sweep #26: locked populate (mirrors `_load_gels` / `_load_custom_enzymes`).
+    # Sweep #26: double-checked locking — cache-hit fast path is lock-free.
+    cached = _features_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
-        if _features_cache is not None:
-            return _typed_clone(_features_cache)
-        entries, warning = _safe_load_json(_FEATURES_FILE, "Feature library")
-        if warning:
-            _log.warning(warning)
-        entries = [e for e in entries if isinstance(e, dict)]
-        _features_cache = entries
-        # A fresh disk read is the result of either first-load or an
-        # external invalidation (test harness setting `_features_cache =
-        # None`, or a hand-edit of features.json). Either way the contents
-        # may have changed since the last write, so bump the generation so
-        # consumers know to rebuild any derived indices.
-        _features_generation += 1
+        if _features_cache is None:
+            entries, warning = _safe_load_json(_FEATURES_FILE, "Feature library")
+            if warning:
+                _log.warning(warning)
+            entries = [e for e in entries if isinstance(e, dict)]
+            _features_cache = entries
+            # A fresh disk read is the result of either first-load or an
+            # external invalidation (test harness setting `_features_cache =
+            # None`, or a hand-edit of features.json). Either way the contents
+            # may have changed since the last write, so bump the generation so
+            # consumers know to rebuild any derived indices.
+            _features_generation += 1
         return _typed_clone(_features_cache)
 
 
@@ -35146,33 +35162,35 @@ def _load_protein_motifs() -> list[dict]:
     overridden by user edits stored in `protein_motifs.json`. Deep-
     copied so callers can mutate freely.
 
-    Sweep #26: locked populate (mirrors `_load_features` / `_load_gels`)."""
+    Sweep #26: double-checked locking — cache-hit fast path is lock-free."""
     global _protein_motifs_cache
+    cached = _protein_motifs_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
-        if _protein_motifs_cache is not None:
-            return _typed_clone(_protein_motifs_cache)
-        user_entries, warning = _safe_load_json(
-            _PROTEIN_MOTIFS_FILE, "Protein motifs",
-        )
-        if warning:
-            _log.warning(warning)
-        user_entries = [e for e in user_entries if isinstance(e, dict)]
-        user_by_name: dict[str, dict] = {
-            str(e.get("name") or ""): e for e in user_entries if e.get("name")
-        }
-        merged: list[dict] = []
-        builtin_names: set[str] = set()
-        for builtin in _PROTEIN_MOTIFS:
-            name = str(builtin.get("name") or "")
-            builtin_names.add(name)
-            merged.append(user_by_name.get(name, dict(builtin)))
-        # User-added novel motifs (name NOT in builtins) append in
-        # insertion order so user-defined items land predictably.
-        for e in user_entries:
-            name = str(e.get("name") or "")
-            if name and name not in builtin_names:
-                merged.append(dict(e))
-        _protein_motifs_cache = merged
+        if _protein_motifs_cache is None:
+            user_entries, warning = _safe_load_json(
+                _PROTEIN_MOTIFS_FILE, "Protein motifs",
+            )
+            if warning:
+                _log.warning(warning)
+            user_entries = [e for e in user_entries if isinstance(e, dict)]
+            user_by_name: dict[str, dict] = {
+                str(e.get("name") or ""): e for e in user_entries if e.get("name")
+            }
+            merged: list[dict] = []
+            builtin_names: set[str] = set()
+            for builtin in _PROTEIN_MOTIFS:
+                name = str(builtin.get("name") or "")
+                builtin_names.add(name)
+                merged.append(user_by_name.get(name, dict(builtin)))
+            # User-added novel motifs (name NOT in builtins) append in
+            # insertion order so user-defined items land predictably.
+            for e in user_entries:
+                name = str(e.get("name") or "")
+                if name and name not in builtin_names:
+                    merged.append(dict(e))
+            _protein_motifs_cache = merged
         return _typed_clone(_protein_motifs_cache)
 
 
@@ -35282,22 +35300,24 @@ def _load_feature_colors() -> dict[str, str]:
     structure to the value side.
     """
     global _feature_colors_cache
-    # Sweep #26: locked populate (mirrors `_load_features`).
+    # Sweep #26: double-checked locking — cache-hit fast path is lock-free.
+    cached = _feature_colors_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
-        if _feature_colors_cache is not None:
-            return _typed_clone(_feature_colors_cache)
-        entries, warning = _safe_load_json(_FEATURE_COLORS_FILE, "Feature colors")
-        if warning:
-            _log.warning(warning)
-        result: dict[str, str] = {}
-        for e in entries:
-            if not isinstance(e, dict):
-                continue
-            ft  = e.get("feature_type")
-            col = e.get("color")
-            if isinstance(ft, str) and ft and isinstance(col, str) and col:
-                result[ft] = col
-        _feature_colors_cache = _typed_clone(result)
+        if _feature_colors_cache is None:
+            entries, warning = _safe_load_json(_FEATURE_COLORS_FILE, "Feature colors")
+            if warning:
+                _log.warning(warning)
+            result: dict[str, str] = {}
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                ft  = e.get("feature_type")
+                col = e.get("color")
+                if isinstance(ft, str) and ft and isinstance(col, str) and col:
+                    result[ft] = col
+            _feature_colors_cache = _typed_clone(result)
         return _typed_clone(_feature_colors_cache)
 
 
@@ -48012,9 +48032,12 @@ def _load_experiment_projects() -> "list[dict]":
     the in-memory cache. Mirrors the `_load_parts_bin_collections`
     contract per invariant #17.
 
-    Sweep #26: locked populate matches every other `_load_*` helper.
+    Sweep #26: double-checked locking — cache-hit fast path is lock-free.
     """
     global _experiment_projects_cache
+    cached = _experiment_projects_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
         if _experiment_projects_cache is None:
             entries, warning = _safe_load_json(
@@ -48359,19 +48382,24 @@ def _load_gels() -> "list[dict]":
     """Cached + deepcopy-on-read load (invariant #17). Filters non-
     dict entries defensively (hand-edited JSON / schema drift).
 
-    Sweep #26 (2026-05-25): first-load populate + cache reseat held
-    under `_cache_lock` so a concurrent `_save_gels` (which DOES
-    lock for its reseat) and this cold-load can't interleave —
-    pre-fix the load could read pre-save disk state and overwrite
-    the worker's freshly-locked cache."""
+    Sweep #26 (2026-05-25) — double-checked locking. The cache-hit
+    fast path runs without acquiring `_cache_lock` so an unrelated
+    worker holding the lock (e.g., `_flush_active_alignments` doing
+    its 1–3 s `_load_library` deepcopy on a 156 MB library) cannot
+    freeze every UI-thread `_load_gels` for the duration. Only the
+    cold populate-from-disk path acquires the lock, with a double-
+    check after the acquire so a concurrent save's reseat isn't
+    clobbered."""
     global _gels_cache
+    cached = _gels_cache
+    if cached is not None:
+        return _typed_clone(cached)
     with _cache_lock:
-        if _gels_cache is not None:
-            return _typed_clone(_gels_cache)
-        entries, warning = _safe_load_json(_GELS_FILE, "Gels")
-        if warning:
-            _log.warning(warning)
-        _gels_cache = [e for e in entries if isinstance(e, dict)]
+        if _gels_cache is None:
+            entries, warning = _safe_load_json(_GELS_FILE, "Gels")
+            if warning:
+                _log.warning(warning)
+            _gels_cache = [e for e in entries if isinstance(e, dict)]
         return _typed_clone(_gels_cache)
 
 

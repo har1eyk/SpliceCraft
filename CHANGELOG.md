@@ -14,6 +14,14 @@
 
 ---
 
+## [0.9.25] — 2026-05-25
+
+_(auto-generated from commits since v0.9.24)_
+
+* Sweep #26 — adversarial audit · L2 chokepoint extension · 20 agent RMW locks · 3 TOCTOU fixes · hot-path deepcopy elimination · UI modal hardening · invariant #74
+
+---
+
 ## [0.9.24] — 2026-05-25
 
 _(auto-generated changelog — no notable commits found since the previous release)_
