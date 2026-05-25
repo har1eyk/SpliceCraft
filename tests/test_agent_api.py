@@ -1906,9 +1906,11 @@ class TestPlasmidStatusEndpoints:
         status, payload = _http(f"{base}/list-plasmid-statuses", token=token)
         assert status == 200
         assert payload["ok"] is True
-        # Strict canonical vocabulary — exactly the four statuses.
+        # Strict canonical vocabulary — DESIGNING / CLONING /
+        # SEQUENCING / VERIFIED / ERROR (the last added in v0.9.24
+        # for failed-clone tracking, INV-76).
         assert set(payload["statuses"]) == {
-            "DESIGNING", "CLONING", "SEQUENCING", "VERIFIED"
+            "DESIGNING", "CLONING", "SEQUENCING", "VERIFIED", "ERROR"
         }
         # Each status carries a hex color; the agent can use it for
         # rendering without re-deriving from the GUI.

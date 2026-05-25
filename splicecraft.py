@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.22"
+__version__ = "0.9.24"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -4416,6 +4416,12 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     _clear_primer_cache = globals().get("_primer_usage_clear_cache")
     if _clear_primer_cache is not None:
         _clear_primer_cache()
+    # INV-75 (2026-05-25): invalidate the bulk-align matcher's
+    # library-side k-mer cache. Any add/delete/rename/edit could
+    # change `gb_text` for an existing id, and the cache key
+    # includes the gb_text hash so stale entries would simply miss
+    # — but blowing the whole map keeps the invariant simple.
+    _invalidate_library_kmer_cache()
 
 
 # ── Plasmid collections ────────────────────────────────────────────────────────
@@ -12235,6 +12241,29 @@ def _normalize_for_match(name: str) -> str:
 
 _KMER_SEQ_LEN_CAP = 50_000  # bp
 
+# INV-75 (2026-05-25): library-side k-mer cache. Pre-cache the bulk-
+# align matcher rebuilt the k-mer set for every library entry on
+# every click (~10–15 s on a 90-entry × 18 kb library). Keyed by
+# `(entry_id, seq_hash)` so a library edit invalidates only the
+# changed entries — the seq_hash is the same SHA256 used by
+# `_alignment_target_hash`. Module-level for cross-call reuse.
+# Invalidated bulk via `_invalidate_library_kmer_cache()` on every
+# `_save_library` (covers add/delete/rename/edit) since stale entries
+# can't outrank fresh ones — the matcher cost is dominated by NEW
+# entries on first call, then near-zero on subsequent calls until
+# the next library save.
+_LIBRARY_KMER_CACHE: "dict[tuple[str, str], set]" = {}
+_LIBRARY_KMER_CACHE_LOCK = threading.RLock()
+
+
+def _invalidate_library_kmer_cache() -> None:
+    """Clear the library-side k-mer cache. Called from `_save_library`
+    so a fresh load on the next matcher click sees current entries.
+    Thread-safe (RLock; safe re-entry from save chains)."""
+    with _LIBRARY_KMER_CACHE_LOCK:
+        _LIBRARY_KMER_CACHE.clear()
+
+
 # INV-73 (2026-05-25): minimum sample-side k-mer count required for
 # the strong-match path in `_match_samples_to_library`. Below this a
 # sample's Jaccard is dominated by happenstance overlaps (a 25 bp
@@ -12348,6 +12377,7 @@ def _match_samples_to_library(
     ``alternatives`` is the top-3 candidates with scores so the
     user can see what was close.
     """
+    import hashlib as _hashlib  # noqa: F401 — used in k-mer cache key
     out: list[dict] = []
     if not samples:
         return out
@@ -12367,6 +12397,11 @@ def _match_samples_to_library(
     lib_kmer_cache: "dict[str, set]" = {}
     lib_parse_failures: "set[str]" = set()
     if sequence_fallback:
+        # INV-75 (2026-05-25): consult the module-level
+        # `_LIBRARY_KMER_CACHE` first. Hits skip parse + k-mer build
+        # entirely; misses build, store, then proceed. A library
+        # `_save_library` clears the cache so stale entries can't
+        # outrank fresh ones.
         for e in library:
             if not isinstance(e, dict):
                 continue
@@ -12375,8 +12410,23 @@ def _match_samples_to_library(
             if not eid or not gb:
                 continue
             try:
+                # Hash the gb_text directly (cheap, ~50 µs at 18 kb)
+                # rather than parse-then-hash. The cache key uses
+                # gb_text hash because a manual gb_text edit must
+                # invalidate even if the entry id stays the same.
+                gb_hash = _hashlib.sha256(
+                    gb.encode("utf-8", errors="replace"),
+                ).hexdigest()[:16]
+                with _LIBRARY_KMER_CACHE_LOCK:
+                    cached = _LIBRARY_KMER_CACHE.get((eid, gb_hash))
+                if cached is not None:
+                    lib_kmer_cache[eid] = cached
+                    continue
                 rec = _gb_text_to_record(gb, cache=False)
-                lib_kmer_cache[eid] = _kmer_set(str(rec.seq))
+                kmers = _kmer_set(str(rec.seq))
+                lib_kmer_cache[eid] = kmers
+                with _LIBRARY_KMER_CACHE_LOCK:
+                    _LIBRARY_KMER_CACHE[(eid, gb_hash)] = kmers
             except Exception:
                 _log.exception(
                     "match-samples: kmer build failed for %r", eid,
@@ -12988,11 +13038,26 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
         raise plain_exc if plain_exc is not None else RuntimeError(
             "no alignment candidates produced",
         )
-    # Pick by overall identity_pct (gap-inclusive). Higher = more of
-    # the target is covered by matches, which is what makes the
-    # overlay band informative.
+    # INV-76 (2026-05-25): rank by absolute n_matches (with
+    # ungapped_identity_pct as the tiebreaker). Pre-fix the picker
+    # used gap-inclusive `identity_pct` which biased toward the
+    # rotation that covered the most LENGTH — for length-mismatched
+    # pairs (e.g. a 200 bp consensus vs a 5 kb plasmid) a rotation
+    # whose matched region was small but high-quality could lose
+    # to a rotation that padded gaps over more length. The matched-
+    # bp count `n_matches` is the rotation-independent "how many bp
+    # actually line up at this rotation" — that's what makes the
+    # overlay informative AND what corresponds to the correct
+    # rotation biologically. `ungapped_identity_pct` breaks ties
+    # in favour of cleaner matched regions.
+    def _rank_key(c):
+        r = c[3]
+        return (
+            int(r.get("n_matches", 0) or 0),
+            float(r.get("ungapped_identity_pct", 0.0) or 0.0),
+        )
     best_kind, best_offset, best_is_rc, best_result = max(
-        candidates, key=lambda c: c[3].get("identity_pct", 0.0),
+        candidates, key=_rank_key,
     )
     best_result = dict(best_result)
     best_result["picked_rotation"] = best_kind
@@ -16660,10 +16725,16 @@ class PlasmidMap(Widget):
             letters = align.get("letters")
             if letter_mode and letters is None:
                 if align.get("axis") == "query":
+                    # INV-76 (2026-05-25): pass `q_start`, not
+                    # `t_start`. The helper signature expects the
+                    # QUERY-axis offset for the query-axis path.
+                    # Pre-fix a query-axis alignment with non-zero
+                    # query offset rendered letters at shifted bp
+                    # positions on the plasmid.
                     letters = _alignment_to_query_letters(
                         align.get("aligned_q", ""),
                         align.get("aligned_t", ""),
-                        align.get("t_start", 0),
+                        align.get("q_start", 0),
                     )
                 else:
                     letters = _alignment_to_target_letters(
@@ -48487,6 +48558,14 @@ class SequencingScreen(Screen):
        below stay independent. */
     #sequencing-plasmidsaurus Label { color: $text-muted; margin-top: 1; }
 
+    /* INV-74 (2026-05-25): bulk-align progress widgets — hidden until
+       the worker fires, then surfaced as a status line + bar so the
+       user can see per-sample progress instead of a UI-hang silence. */
+    .bulk-align-progress { display: none; }
+    .bulk-align-progress.-active { display: block; }
+    #bulk-align-progress { margin-top: 1; color: $text; }
+    #bulk-align-bar { width: 100%; margin-top: 1; }
+
     /* ── General sub-tab ───────────────────────────────────────
        Zip-picker tree on top (fixed 12 rows — enough to scroll
        through ~10 entries before scrolling kicks in) and the run
@@ -48616,6 +48695,9 @@ class SequencingScreen(Screen):
         # the overlay band, otherwise the user closes the screen and
         # a stale alignment still surfaces seconds later.
         self._cancelled: bool = False
+        # INV-74 (2026-05-25): one-shot dismiss flag — guards against
+        # the double-dismiss `ScreenStackError` user-reported crash.
+        self._dismissed: bool = False
         self._initial_tab: str = initial_tab or "plasmidsaurus"
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
@@ -48713,6 +48795,19 @@ class SequencingScreen(Screen):
                 "Bulk auto-align all samples",
                 id="btn-bulk-align", variant="primary",
             )
+        # INV-74 (2026-05-25): per-sample progress text + bar so the
+        # bulk-align batch doesn't look like a UI hang. Hidden by
+        # default; shown when the worker fires and reset when done.
+        # Pre-fix a 10-sample × 18 kb plasmid bulk-align stalled the
+        # UI for ~2 minutes with no indication anything was happening.
+        yield Static(
+            "", id="bulk-align-progress", markup=True,
+            classes="bulk-align-progress",
+        )
+        yield ProgressBar(
+            id="bulk-align-bar", show_eta=False,
+            classes="bulk-align-progress",
+        )
 
     def _compose_quality_subtab(self) -> ComposeResult:
         """Quality sub-sub-tab: contamination / k-mer / coverage
@@ -49921,10 +50016,13 @@ class SequencingScreen(Screen):
 
     @on(Button.Pressed, "#btn-bulk-align")
     def _bulk_align(self, _) -> None:
-        """Run the matcher against every loaded sample + active library
-        and push the bulk-confirm modal. Worker runs after the user
-        confirms; each alignment persists onto its target's library
-        entry just like the per-sample flow does."""
+        """Dispatch the bulk-align flow. INV-74 (2026-05-25): the
+        matcher runs on a worker thread so a large library (Eden ≈ 90
+        entries × 18 kb plasmids = ~5–30 s of k-mer build) doesn't
+        freeze the UI before the confirm modal opens. Pre-fix the
+        click-handler ran `_match_samples_to_library` synchronously
+        on the UI thread and looked like a complete hang.
+        """
         samples = (self._parsed_run or {}).get("samples") or []
         if not samples:
             try:
@@ -49951,12 +50049,40 @@ class SequencingScreen(Screen):
             except Exception:
                 pass
             return
-        # Run the matcher off the UI thread when sequence-fallback is
-        # needed (kmer build is O(n_lib_entries × seq_len)) — for a
-        # 100-entry library × 17 kb each that's ~100 ms, tolerable
-        # synchronously, but a 1000-entry library × 200 kb would
-        # frame-drop. Defer the polish to a worker if it shows up
-        # in profiling.
+        # Disable the button + show "matching..." status immediately so
+        # the user sees the click registered. Re-enable in the worker's
+        # completion callback (both success + failure paths).
+        try:
+            btn = self.query_one("#btn-bulk-align", Button)
+            btn.disabled = True
+        except NoMatches:
+            pass
+        try:
+            from textual.widgets import ProgressBar
+            txt = self.query_one("#bulk-align-progress", Static)
+            bar = self.query_one("#bulk-align-bar", ProgressBar)
+            txt.add_class("-active")
+            bar.add_class("-active")
+            txt.update(
+                f"[b]Matching {len(samples)} sample(s) to {len(library)} "
+                f"library entr{'y' if len(library) == 1 else 'ies'} "
+                f"by name + k-mer…[/b]"
+            )
+            # Indeterminate-style: total=None makes Textual render a
+            # rolling animation rather than a fixed-progress bar — fits
+            # the "we don't know how long this takes" matcher phase.
+            bar.update(total=None)
+        except (NoMatches, AttributeError):
+            pass
+        self._match_samples_worker(samples, library)
+
+    @work(thread=True, exclusive=True, group="plasmidsaurus_matcher")
+    def _match_samples_worker(
+        self, samples: "list[dict]", library: "list[dict]",
+    ) -> None:
+        """INV-74 (2026-05-25): off-thread matcher. Returns to the UI
+        thread to push the confirm modal (and re-enable the Bulk-align
+        button). All UI mutations route through `call_from_thread`."""
         try:
             matches = _match_samples_to_library(
                 samples, library,
@@ -49965,16 +50091,50 @@ class SequencingScreen(Screen):
                 zip_path=self._zip_path,
             )
         except Exception:
-            _log.exception("BulkAlign: matcher raised")
-            try:
-                self.app.notify(
-                    "Bulk-align matcher failed — see splicecraft log.",
-                    severity="error", timeout=6,
-                )
-            except Exception:
-                pass
+            _log.exception(
+                "BulkAlign: matcher raised (n_samples=%d, n_library=%d)",
+                len(samples), len(library),
+            )
+
+            def _err():
+                try:
+                    self.app.notify(
+                        "Bulk-align matcher failed — see splicecraft log.",
+                        severity="error", timeout=6,
+                    )
+                except Exception:
+                    pass
+                self._reset_bulk_align_button()
+            self.app.call_from_thread(_err)
             return
 
+        def _ok():
+            self._reset_bulk_align_button()
+            self._push_bulk_confirm_modal(matches)
+        self.app.call_from_thread(_ok)
+
+    def _reset_bulk_align_button(self) -> None:
+        """Re-enable the Bulk-align button + hide the progress
+        widgets. Called from the matcher worker's completion path."""
+        try:
+            btn = self.query_one("#btn-bulk-align", Button)
+            btn.disabled = False
+        except NoMatches:
+            pass
+        try:
+            from textual.widgets import ProgressBar
+            txt = self.query_one("#bulk-align-progress", Static)
+            bar = self.query_one("#bulk-align-bar", ProgressBar)
+            txt.remove_class("-active")
+            bar.remove_class("-active")
+            txt.update("")
+        except (NoMatches, AttributeError):
+            pass
+
+    def _push_bulk_confirm_modal(self, matches: "list[dict]") -> None:
+        """Open BulkAlignConfirmModal + wire its callback to the
+        worker. Extracted from `_bulk_align` so the matcher worker
+        can defer back to the UI thread for the modal push."""
         def _on_confirmed(committed) -> None:
             if not committed:
                 return
@@ -49987,6 +50147,33 @@ class SequencingScreen(Screen):
                     timeout=4,
                 )
             except Exception:
+                pass
+            # INV-74 (2026-05-25): paint the progress widgets BEFORE the
+            # worker spawns. User-reported symptom: "after pressing Run,
+            # thread hangs before toast / progress shows up". The hang
+            # is the window between modal dismiss and the worker's
+            # first `call_from_thread(_progress_show)` — for the first
+            # sample's C-loop align, that can be 1–30 s of silence.
+            # Doing the show here (synchronously on the UI thread,
+            # which is where _on_confirmed runs) gives the user an
+            # immediate "Preparing batch…" cue.
+            try:
+                from textual.widgets import ProgressBar
+                txt = self.query_one(
+                    "#bulk-align-progress", Static,
+                )
+                bar = self.query_one(
+                    "#bulk-align-bar", ProgressBar,
+                )
+                txt.add_class("-active")
+                bar.add_class("-active")
+                n_total = len(committed)
+                txt.update(
+                    f"[b]Preparing batch:[/b] {n_align} alignment(s), "
+                    f"{n_add} add-as-new… ({n_total} total)"
+                )
+                bar.update(total=max(1, n_total), progress=0)
+            except (NoMatches, AttributeError):
                 pass
             entry_counter = getattr(self.app, "_record_load_counter", 0)
             self._bulk_align_worker(committed, entry_counter)
@@ -50018,8 +50205,42 @@ class SequencingScreen(Screen):
                 severity="warning", timeout=4,
             )
             return
+        # INV-74 (2026-05-25): show + reset the progress widgets. Pre-fix
+        # the worker ran silently for 30s–5min depending on sample count
+        # × plasmid size and looked like a UI hang. Now the user sees
+        # "Aligning N/M: <sample> → <target>…" per iteration plus a
+        # filling progress bar.
+        n_total = len(committed)
+
+        def _progress_show():
+            try:
+                from textual.widgets import ProgressBar
+                bar = self.query_one("#bulk-align-bar", ProgressBar)
+                txt = self.query_one("#bulk-align-progress", Static)
+                bar.add_class("-active")
+                txt.add_class("-active")
+                # Reset the bar to 0/total so a re-run after a previous
+                # batch starts clean. `update(total=N, progress=0)` is
+                # the documented one-shot reset for Textual ProgressBar.
+                bar.update(total=max(1, n_total), progress=0)
+                txt.update(
+                    f"[b]Bulk-align starting[/b] · {n_total} sample(s)…"
+                )
+            except (NoMatches, AttributeError):
+                pass
+        self.app.call_from_thread(_progress_show)
         n_aligned = 0
         n_failed = 0
+        # INV-75 (2026-05-25): batch-flush accumulators. All
+        # successful alignments + add-as-new entries are collected
+        # in memory and written in ONE library save at end of loop.
+        # `pending_alignments[target_id]` is the list of stored-
+        # alignment dicts to append to that target's `alignments`
+        # field. `pending_adds` is the list of new library entries
+        # to append wholesale. See INV-75 in docs/invariants.md for
+        # the perf rationale (N saves × 1-2 s each → 1 save).
+        pending_alignments: "dict[str, list[dict]]" = {}
+        pending_adds: "list[dict]" = []
         # INV-72 (2026-05-25): track add-as-new save successes /
         # failures separately so the summary toast doesn't claim N
         # entries were added when disk-full / permission-denied
@@ -50058,6 +50279,48 @@ class SequencingScreen(Screen):
             gbk_member = sample.get("gbk")
             sample_name = (sample.get("name") or sample.get("base")
                            or "?")
+            # INV-74 (2026-05-25): per-iteration progress update so
+            # the user sees "Aligning 3/10: MAV34 → MAV_38…" and the
+            # bar fills. Hidden-by-default class is removed up front
+            # in `_progress_show`. Defensive — if the widget isn't
+            # mounted (raced screen close), we skip rather than crash.
+            i_one_based = n_aligned + n_failed + add_counters["ok"] \
+                          + add_counters["err"] + 1
+            target_entry_pre = m.get("target_entry") or {}
+            tgt_name_pre = (
+                target_entry_pre.get("name")
+                or target_entry_pre.get("id") or "?"
+            )
+            action_pre = m.get("action") or "?"
+            verb = (
+                "Aligning" if action_pre == "align"
+                else "Adding" if action_pre == "add"
+                else "Skipping"
+            )
+            disp_sample = _display_label_for_gbk(
+                gbk_member or sample_name,
+            ) or sample_name
+            progress_msg = (
+                f"[b]{verb} {i_one_based}/{n_total}:[/b] "
+                f"{disp_sample}"
+                + (f" → {tgt_name_pre}" if action_pre == "align" else "")
+                + "…"
+            )
+
+            def _tick(msg=progress_msg, i=i_one_based):
+                try:
+                    from textual.widgets import ProgressBar
+                    txt = self.query_one(
+                        "#bulk-align-progress", Static,
+                    )
+                    bar = self.query_one(
+                        "#bulk-align-bar", ProgressBar,
+                    )
+                    txt.update(msg)
+                    bar.update(total=max(1, n_total), progress=i - 1)
+                except (NoMatches, AttributeError):
+                    pass
+            self.app.call_from_thread(_tick)
             if not gbk_member:
                 # INV-72 (2026-05-25): pre-fix this skip was silent —
                 # a Plasmidsaurus zip with a malformed manifest would
@@ -50136,163 +50399,202 @@ class SequencingScreen(Screen):
                 )
                 target_id = target_entry.get("id")
 
-                def _register(
-                    r=result, tr=target_rec, lbl=display_label,
-                    tlbl=target_label, tid=target_id,
-                ):
-                    # Same flow as the per-sample `_align_worker`'s
-                    # `_show` callback: swap canvas to target,
-                    # register alignment, flush. We don't reuse
-                    # `_show` directly because it carries a Cancel
-                    # flag that's bound to per-sample modal state.
-                    current = getattr(self.app, "_current_record", None)
-                    cur_id = (
-                        getattr(current, "id", None)
-                        if current else None
-                    )
-                    if tid and cur_id != tid:
-                        try:
-                            self.app._apply_record(tr)  # type: ignore[attr-defined]
-                        except Exception:
-                            _log.exception(
-                                "BulkAlign: load target into canvas "
-                                "failed for %r", tid,
-                            )
-                            return
-                    try:
-                        registered_entry = self.app._register_alignment(  # type: ignore[attr-defined]
-                            name=lbl, query_label=lbl,
-                            target_label=tlbl,
-                            target_record=tr, result=r,
-                        )
-                        # Tag the registered alignment as "sequencing"
-                        # so AlignmentManagerModal can mass-delete a
-                        # batch later. Skip when register refused
-                        # (malformed strings) — pre-fix `_alignments
-                        # [-1]` would tag the previous entry instead,
-                        # corrupting its source field.
-                        if registered_entry is not None:
-                            registered_entry["_stored_source"] = (
-                                "sequencing"
-                            )
-                        flush = getattr(
-                            self.app, "_flush_active_alignments", None,
-                        )
-                        if callable(flush):
-                            flush()
-                        persist = getattr(
-                            self.app,
-                            "_persist_map_mode_for_active", None,
-                        )
-                        if callable(persist):
-                            persist("linear")
-                        # Auto-tag the target's workflow status to
-                        # SEQUENCING after a successful bulk-align.
-                        # Only when the entry has no explicit status
-                        # set — don't overwrite the user's
-                        # DESIGNING/CLONING/VERIFIED intent.
-                        if (registered_entry is not None and tid):
-                            target_entry = _find_library_entry_by_id(tid)
-                            cur_status = _sanitize_plasmid_status(
-                                target_entry.get("status")
-                                if target_entry else ""
-                            )
-                            if cur_status == "":
-                                self.app._set_plasmid_status_fast(  # type: ignore[attr-defined]
-                                    tid, "SEQUENCING", notify=False,
-                                )
-                    except Exception:
-                        _log.exception(
-                            "BulkAlign: _register_alignment failed for "
-                            "%r", lbl,
-                        )
-
-                self.app.call_from_thread(_register)
-                # Absorb `_register`'s intentional canvas swap into
-                # `expected_counter` so the next iteration's stale-load
-                # guard doesn't fire on our own work. An external swap
-                # by the user during the next iteration would push the
-                # counter higher than `expected_counter` and abort.
-                expected_counter = getattr(
-                    self.app, "_record_load_counter", 0,
-                )
+                # INV-75 (2026-05-25): accumulate the stored alignment
+                # dict in `pending_alignments` keyed by target_id. The
+                # batch commit at end-of-loop writes ALL targets in
+                # ONE library save — pre-fix each successful align
+                # triggered a per-target `_flush_active_alignments`
+                # which loaded the cached library, modified one
+                # entry, and wrote 156 MB to disk via the collection
+                # mirror. For a 10-sample bulk-align that's ~10-20 s
+                # of wasted save time. Also drops the canvas-swap
+                # (`_apply_record`) per sample — bulk-align's user
+                # value is "make these alignments stick on the right
+                # library entries", not "flash through every target
+                # in 5 seconds". The canvas stays on the user's
+                # original plasmid; alignments materialise at end.
+                tgt_seq = str(target_rec.seq)
+                stored_align = {
+                    "id":              _uuid.uuid4().hex,
+                    "label":           display_label,
+                    "query_label":     display_label,
+                    "target_label":    target_label,
+                    "target_id":       target_id or "",
+                    "target_gb_text":  tgt_gb,
+                    "target_seq_hash": _alignment_target_hash(tgt_seq),
+                    "axis":            "target",
+                    "result":          result,
+                    "visible":         True,
+                    "added":           _date.today().isoformat(),
+                    "source":          "sequencing",
+                }
+                if target_id:
+                    pending_alignments.setdefault(
+                        target_id, [],
+                    ).append(stored_align)
                 n_aligned += 1
             elif action == "add":
-                # Add the sample's consensus as a new library entry
-                # with provenance metadata so the user can see where
-                # it came from. Build the entry dict directly rather
-                # than going through `_record_to_library_entry` —
-                # that helper expects a `Path` for the display-name
-                # stem, which we don't have here (the source is a
-                # zip-member path, not a filesystem file).
-                #
-                # INV-72 (2026-05-25): the success/failure result is
-                # stashed in the shared `add_counters` dict so the
-                # summary toast can distinguish "added N" from
-                # "failed to save N more" (pre-fix the OSError was
-                # caught + logged but n_added still incremented, so
-                # the user saw "added 5 new" when only 3 actually
-                # landed on disk).
-                def _add(qr=query_rec, gbk=gbk_member,
-                          sname=sample_name, counters=add_counters):
-                    try:
-                        gb_text_q = _record_to_gb_text(qr)
-                        display_name = (sname or qr.name
-                                         or qr.id or "plasmid").strip()
-                        # Strip control chars to keep the LibraryPanel
-                        # table render safe against hostile names.
-                        display_name = "".join(
-                            c if c.isprintable() else "_"
-                            for c in display_name
-                        )[:_BULK_IMPORT_MAX_NAME_LEN]
-                        entry = {
-                            "name":    display_name,
-                            "id":      str(qr.id or display_name).strip(),
-                            "size":    len(qr.seq),
-                            "n_feats": len([
-                                f for f in qr.features
-                                if f.type != "source"
-                            ]),
-                            "source":  (f"plasmidsaurus:{run_id}:{sname}"
-                                        if run_id
-                                        else f"plasmidsaurus:{sname}"),
-                            "added":   _date.today().isoformat(),
-                            "gb_text": gb_text_q,
-                            "status":  "",
-                        }
-                        entries = _load_library()
-                        seen = {
-                            e.get("id") for e in entries
-                            if isinstance(e, dict)
-                        }
-                        base_id = entry["id"]
-                        n = 1
-                        while entry["id"] in seen:
-                            n += 1
-                            entry["id"] = f"{base_id}_{n}"
-                        entries.append(entry)
-                        _save_library(entries)
-                        counters["ok"] += 1
-                    except (OSError, ValueError, RuntimeError):
-                        _log.exception(
-                            "BulkAlign: add-as-new failed for %r", gbk,
-                        )
-                        counters["err"] += 1
-
-                # call_from_thread runs `_add` synchronously on the UI
-                # thread and returns when it's done — so the counters
-                # are already updated by the time we look at the
-                # next iteration's _record_load_counter.
-                self.app.call_from_thread(_add)
+                # Build the new-entry dict (no save here — accumulated
+                # for batch commit). Counters bumped in the commit
+                # step so failures bubble correctly.
+                try:
+                    gb_text_q = _record_to_gb_text(query_rec)
+                    display_name = (
+                        sample_name or query_rec.name
+                        or query_rec.id or "plasmid"
+                    ).strip()
+                    display_name = "".join(
+                        c if c.isprintable() else "_"
+                        for c in display_name
+                    )[:_BULK_IMPORT_MAX_NAME_LEN]
+                    new_entry = {
+                        "name":    display_name,
+                        "id":      str(query_rec.id or display_name).strip(),
+                        "size":    len(query_rec.seq),
+                        "n_feats": len([
+                            f for f in query_rec.features
+                            if f.type != "source"
+                        ]),
+                        "source":  (f"plasmidsaurus:{run_id}:{sample_name}"
+                                    if run_id
+                                    else f"plasmidsaurus:{sample_name}"),
+                        "added":   _date.today().isoformat(),
+                        "gb_text": gb_text_q,
+                        "status":  "",
+                    }
+                    pending_adds.append(new_entry)
+                except (OSError, ValueError, RuntimeError):
+                    _log.exception(
+                        "BulkAlign: add-as-new build failed for %r",
+                        gbk_member,
+                    )
+                    add_counters["err"] += 1
             else:
                 # Unknown action — skip.
                 continue
 
-        # Materialise the add success/failure counts now that every
-        # call_from_thread(_add) has returned (synchronous dispatch).
-        # n_added reflects only entries that actually saved; the
-        # add-save failures get their own column in the summary so the
-        # user knows to retry / check disk.
+        # INV-75 (2026-05-25): batch commit. One library load + one
+        # save covers every successful alignment + every add-as-new
+        # entry. Runs on the UI thread (via call_from_thread) so the
+        # cache write + LibraryPanel refresh stay consistent. Holds
+        # `_cache_lock` for the full RMW per INV-73.
+        def _commit_batch(
+            pa=pending_alignments, padds=pending_adds,
+            counters=add_counters,
+        ):
+            try:
+                with _cache_lock:
+                    entries = _load_library()
+                    id_to_idx = {
+                        e.get("id"): i
+                        for i, e in enumerate(entries)
+                        if isinstance(e, dict) and e.get("id")
+                    }
+                    touched_target_ids: "set[str]" = set()
+                    # Apply pending alignments: append to each target
+                    # entry's `alignments` list. Auto-tag SEQUENCING
+                    # if the target's status was empty, and set
+                    # map_mode=linear (alignment overlay needs the
+                    # linear view per INV-67).
+                    for tid, aligns in pa.items():
+                        idx = id_to_idx.get(tid)
+                        if idx is None:
+                            # Target was deleted between matcher and
+                            # commit — drop the alignment, log it.
+                            _log.warning(
+                                "BulkAlign: target %r vanished mid-"
+                                "batch; dropping %d alignment(s)",
+                                tid, len(aligns),
+                            )
+                            continue
+                        existing = list(
+                            entries[idx].get("alignments") or [],
+                        )
+                        existing.extend(aligns)
+                        entries[idx]["alignments"] = existing
+                        if not _sanitize_plasmid_status(
+                            entries[idx].get("status"),
+                        ):
+                            entries[idx]["status"] = "SEQUENCING"
+                        entries[idx]["map_mode"] = "linear"
+                        touched_target_ids.add(tid)
+                    # Apply pending adds: append with id-collision
+                    # disambiguation against the post-merge id space.
+                    seen_ids = {
+                        e.get("id") for e in entries
+                        if isinstance(e, dict)
+                    }
+                    added_ids: "list[str]" = []
+                    for new_entry in padds:
+                        try:
+                            base_id = new_entry["id"]
+                            n = 1
+                            while new_entry["id"] in seen_ids:
+                                n += 1
+                                new_entry["id"] = f"{base_id}_{n}"
+                            seen_ids.add(new_entry["id"])
+                            entries.append(new_entry)
+                            added_ids.append(new_entry["id"])
+                            counters["ok"] += 1
+                        except (KeyError, TypeError):
+                            _log.exception(
+                                "BulkAlign: add-as-new commit failed "
+                                "for entry %r",
+                                new_entry.get("name", "?"),
+                            )
+                            counters["err"] += 1
+                    if not touched_target_ids and not added_ids:
+                        return  # nothing to save
+                    _save_library(entries, async_sync=True)
+            except (OSError, RuntimeError) as exc:
+                _log.exception(
+                    "BulkAlign: batch commit failed (n_targets=%d, "
+                    "n_adds=%d)",
+                    len(pa), len(padds),
+                )
+                _notify_save_failure(
+                    self.app, "Plasmid library", exc,
+                )
+                counters["err"] += len(padds)
+                return
+            # Refresh LibraryPanel for every touched entry so the
+            # Seq + Status cells reflect the new alignments without
+            # a full repopulate.
+            try:
+                lib = self.app.query_one("#library", LibraryPanel)
+                for tid in touched_target_ids:
+                    lib.refresh_seq_cell(tid)
+                    lib.refresh_status_cell(tid)
+                if added_ids:
+                    # Switch to plasmids view + repopulate so the new
+                    # entries show up. (Adds aren't a single-cell
+                    # update; the row didn't exist before.)
+                    lib._view_mode = "plasmids"
+                    lib._apply_view_mode()
+                    lib._repopulate_plasmids()
+            except NoMatches:
+                pass
+            # If the currently-active record is in the touched set,
+            # re-hydrate its alignment band so the new overlay shows
+            # up without requiring a manual switch-away-and-back.
+            try:
+                cur = getattr(self.app, "_current_record", None)
+                cur_id = getattr(cur, "id", None) if cur else None
+                if cur_id in touched_target_ids:
+                    hydrate = getattr(
+                        self.app,
+                        "_hydrate_alignments_for_active", None,
+                    )
+                    if callable(hydrate):
+                        hydrate()
+            except Exception:
+                _log.exception(
+                    "BulkAlign: post-commit re-hydration failed",
+                )
+        self.app.call_from_thread(_commit_batch)
+        # Materialise the add success/failure counts after the
+        # batch commit so the summary reflects actually-persisted
+        # add-as-new totals.
         n_added_local = add_counters["ok"]
         n_add_failed_local = add_counters["err"]
 
@@ -50354,6 +50656,30 @@ class SequencingScreen(Screen):
             )
         except Exception:  # noqa: BLE001 — logging must never raise
             pass
+        # INV-74 (2026-05-25): hide the progress widgets when the
+        # batch completes (success OR cancel). Fill the bar before
+        # hide so the final state is visually correct for a beat.
+        def _progress_done():
+            try:
+                from textual.widgets import ProgressBar
+                bar = self.query_one("#bulk-align-bar", ProgressBar)
+                txt = self.query_one("#bulk-align-progress", Static)
+                bar.update(total=max(1, n_total), progress=n_total)
+                txt.update(
+                    f"[b]Bulk-align complete:[/b] {n_aligned} aligned · "
+                    f"{add_counters['ok']} added · "
+                    f"{add_counters['err']} add-failed · "
+                    f"{n_failed} failed"
+                )
+                # Leave the final message visible for ~6 s, then hide.
+                self.set_timer(6.0, lambda: (
+                    bar.remove_class("-active"),
+                    txt.remove_class("-active"),
+                    txt.update(""),
+                ))
+            except (NoMatches, AttributeError):
+                pass
+        self.app.call_from_thread(_progress_done)
 
     @on(Button.Pressed, "#btn-sequencing-close")
     def _close_btn(self, _) -> None:
@@ -50364,7 +50690,27 @@ class SequencingScreen(Screen):
         # before registering its result so the user doesn't see a
         # stale overlay paint after closing the screen.
         self._cancelled = True
-        self.dismiss(None)
+        # INV-74 (2026-05-25): guard against double-dismiss.
+        # Pre-fix the close-button + Esc keybinding could fire both,
+        # OR a `_dismiss_once` modal already popped us, OR the
+        # callback chain re-entered cancel — second `dismiss(None)`
+        # raises `ScreenStackError: Can't pop screen` because the
+        # screen is no longer on the stack. User-reported crash on
+        # 0.9.22 with that exact traceback.
+        if getattr(self, "_dismissed", False):
+            return
+        self._dismissed = True
+        try:
+            if not self.is_mounted:
+                return
+            if len(self.app._screen_stack) <= 1:
+                return
+            self.dismiss(None)
+        except Exception:  # noqa: BLE001 — dismiss must not crash app
+            _log.exception(
+                "SequencingScreen.action_cancel: dismiss failed; "
+                "screen state may be inconsistent",
+            )
 
 
 # Back-compat alias. `PlasmidsaurusAlignModal` is the legacy class name
@@ -58573,9 +58919,16 @@ class AlignmentScreen(Screen):
             match_track = []
             for i in range(chunk_s, chunk_e):
                 cq, ct = aq[i], at[i]
+                # INV-76 (2026-05-25): case-fold before comparing.
+                # `_pairwise_align` (post-INV-72) uppercases inputs
+                # via `_normalize_dna_for_align`, but stored
+                # alignments from pre-INV-72 saves can carry
+                # mixed-case `aligned_q`/`aligned_t` — and soft-
+                # masked input (lowercase = repeat region) would
+                # render as mismatch despite being a biology match.
                 if cq == "-" or ct == "-":
                     match_track.append("─")
-                elif cq == ct:
+                elif cq.upper() == ct.upper():
                     match_track.append("│")
                 else:
                     match_track.append("✗")
@@ -58587,7 +58940,7 @@ class AlignmentScreen(Screen):
                     out.append("─", style="dim")
                 elif ct == "-":
                     out.append(cq, style="bold yellow on grey15")
-                elif cq != ct:
+                elif cq.upper() != ct.upper():
                     out.append(cq, style="bold red")
                 else:
                     out.append(cq, style="white")
@@ -77236,18 +77589,25 @@ def _check_agent_write_path(path: Path) -> "str | None":
 #   VERIFIED   — sequence-confirmed and ready to share / use
 # Empty string is the "no status assigned" sentinel and is never
 # rendered as a coloured badge.
+# INV-76 (2026-05-25): ERROR added as a fifth canonical status for
+# plasmids whose sequencing came back showing a failed clone (wrong
+# insert, frame-shift, contamination, etc.) and the workflow needs
+# revision. Red ball mirrors the other statuses: a single colour
+# the user can spot at a glance in the library panel.
 _PLASMID_STATUS_VALUES: tuple[str, ...] = (
-    "DESIGNING", "CLONING", "SEQUENCING", "VERIFIED",
+    "DESIGNING", "CLONING", "SEQUENCING", "VERIFIED", "ERROR",
 )
-# Display colours per status. Purple / orange / blue / green —
+# Display colours per status. Purple / orange / blue / green / red —
 # distinct enough on the standard 256-colour palettes Textual
 # renders into; the green for VERIFIED also doubles as the "good
-# to go" indicator that the at-a-glance circle uses.
+# to go" indicator that the at-a-glance circle uses, and the red
+# for ERROR is the standard "needs attention / revise" flag.
 _PLASMID_STATUS_COLORS: dict[str, str] = {
     "DESIGNING":  "#B975FF",   # purple
     "CLONING":    "#FFA62B",   # orange (matches the app's accent)
     "SEQUENCING": "#5FB3FF",   # blue
     "VERIFIED":   "#4EBF71",   # green (matches success accent)
+    "ERROR":      "#FF5C5C",   # red  (matches error/divergent accent)
 }
 
 
@@ -90828,55 +91188,162 @@ SpeciesPickerModal { align: center middle; }
         spam the user.
         """
         new_status = _sanitize_plasmid_status(new_status)
-        # INV-73 (2026-05-25): hold `_cache_lock` for the entire RMW.
-        # Pre-fix this read-modify-write was unlocked: a bulk-align
-        # auto-tag concurrently flushing an alignment to the same
-        # entry could see the load → flush save → status save sequence
-        # clobber the alignment field, making the LibraryPanel Seq
-        # column ✓ vanish after the status change landed.
-        # `_flush_active_alignments` already holds the same RLock so
-        # the two paths serialize cleanly; RLock allows the inner
-        # `_save_library`/`_load_library` to re-enter without
-        # deadlock.
-        with _cache_lock:
-            entries = _load_library()
-            target_idx = -1
-            for i, e in enumerate(entries):
-                if e.get("id") == entry_id:
-                    target_idx = i
-                    break
-            if target_idx < 0:
-                if notify:
-                    self.notify("Library entry vanished.",
-                                 severity="warning")
-                return False
-            prev = _sanitize_plasmid_status(
-                entries[target_idx].get("status"),
-            )
-            if prev == new_status:
-                return True   # no-op
-            entries[target_idx]["status"] = new_status
-            try:
-                _save_library(entries, async_sync=True)
-            except (OSError, ValueError) as exc:
-                _notify_save_failure(self, "Plasmid library", exc)
-                return False
+        # INV-77 (2026-05-25): early no-op check using lock-free read
+        # so a same-status pick doesn't pay the worker spawn cost.
+        prev_entry = next(
+            (e for e in _iter_library_readonly()
+             if e.get("id") == entry_id),
+            None,
+        )
+        if prev_entry is None:
+            if notify:
+                self.notify("Library entry vanished.",
+                             severity="warning")
+            return False
+        if _sanitize_plasmid_status(
+            prev_entry.get("status"),
+        ) == new_status:
+            return True  # no-op
+        # INV-77 (2026-05-25): refresh the LibraryPanel cells FIRST
+        # (synchronous, ~5 ms) so the user sees the new status
+        # immediately. The actual disk save runs in a worker; if it
+        # fails, a follow-up notify surfaces the error. Pre-fix the
+        # save was synchronous on the UI thread — under rapid-fire
+        # status changes the queued mirror workers would saturate
+        # `_cache_lock` and a subsequent status pick blocked the UI
+        # thread for several seconds, making it look like the modal
+        # "lock"-ed up. The in-memory cache update (in the worker)
+        # happens before the disk write returns, so subsequent
+        # `_iter_library_readonly` reads see the latest status with
+        # at most ~10 ms staleness.
+        self._set_plasmid_status_worker(
+            entry_id=entry_id,
+            new_status=new_status,
+            notify=notify,
+        )
+        # Optimistic cell refresh: paint the new status now even
+        # though the disk save hasn't returned yet. The worker's
+        # in-memory cache update happens almost immediately; cell
+        # refresh queries the cache and would see the new value
+        # within a frame anyway. If the save fails, the worker
+        # notifies and a re-refresh restores the previous state.
         try:
             lib = self.query_one("#library", LibraryPanel)
-            lib.refresh_status_cell(entry_id)
-            # INV-73 (2026-05-25): also refresh the Seq cell after a
-            # status change. The Seq cell reads from the same entry
-            # dict that may have just been overwritten by a different
-            # writer — keeping the two cells in render-sync prevents
-            # the "✓ vanishes on status shift" user-visible symptom
-            # even when the underlying alignments survived.
-            lib.refresh_seq_cell(entry_id)
+            # Build a synthetic entry with the new status so the
+            # cell paints correctly even if the cache hasn't
+            # updated yet (the worker is concurrent).
+            optimistic = dict(prev_entry)
+            optimistic["status"] = new_status
+            self._paint_status_cells_directly(lib, entry_id, optimistic)
         except NoMatches:
             pass
         if notify:
             label = new_status or "(none)"
             self.notify(f"Status set: {label}")
         return True
+
+    def _paint_status_cells_directly(
+        self, lib, entry_id: str, entry: dict,
+    ) -> None:
+        """INV-77 helper: paint the ● + Status cells from a given
+        entry dict without re-fetching from cache. Used for the
+        optimistic update path in `_set_plasmid_status_fast` so the
+        cell shows the new status even before the disk save's worker
+        has updated the cache."""
+        try:
+            from textual.coordinate import Coordinate
+            t = lib.query_one("#lib-table", DataTable)
+            status = _sanitize_plasmid_status(entry.get("status"))
+            color = _PLASMID_STATUS_COLORS.get(status)
+            if color is not None:
+                ball_cell = Text("●", style=color)
+            else:
+                ball_cell = Text("·", style="dim")
+            if status and color is not None:
+                status_cell = Text(status, style=f"{color} bold")
+            else:
+                status_cell = Text("—", style="dim")
+            for i, row_key in enumerate(t.rows.keys()):
+                if row_key.value == entry_id:
+                    t.update_cell_at(Coordinate(i, 0), ball_cell)
+                    t.update_cell_at(Coordinate(i, 2), status_cell)
+                    return
+        except (NoMatches, AttributeError):
+            pass
+
+    @work(thread=True, exclusive=False, group="status_save")
+    def _set_plasmid_status_worker(
+        self, *, entry_id: str, new_status: str, notify: bool,
+    ) -> None:
+        """INV-77 (2026-05-25): off-thread disk save for status
+        changes. Holds `_cache_lock` for the full RMW (preserves the
+        INV-73 race protection) but does so on a worker thread so
+        the UI thread stays responsive. Multiple workers in the
+        same group serialize on the lock, which is correct — the
+        last status pick wins.
+
+        Failure paths surface a toast via `call_from_thread` since
+        we're off the UI thread.
+        """
+        with _cache_lock:
+            try:
+                entries = _load_library()
+            except Exception:
+                _log.exception(
+                    "status save: load_library failed for %r",
+                    entry_id,
+                )
+                return
+            target_idx = -1
+            for i, e in enumerate(entries):
+                if e.get("id") == entry_id:
+                    target_idx = i
+                    break
+            if target_idx < 0:
+                # Entry deleted between optimistic paint and save —
+                # log + skip. The optimistic cell will show stale
+                # status until the LibraryPanel rebuilds.
+                _log.warning(
+                    "status save: entry %r vanished mid-save",
+                    entry_id,
+                )
+                return
+            if _sanitize_plasmid_status(
+                entries[target_idx].get("status"),
+            ) == new_status:
+                return  # raced with another writer; no-op
+            entries[target_idx]["status"] = new_status
+            try:
+                _save_library(entries, async_sync=True)
+            except (OSError, ValueError) as exc:
+                _log.exception(
+                    "status save: persist failed for %r", entry_id,
+                )
+                # Surface the failure on the UI thread.
+                def _err(_exc=exc):
+                    _notify_save_failure(
+                        self, "Plasmid library", _exc,
+                    )
+                try:
+                    self.call_from_thread(_err)
+                except Exception:  # noqa: BLE001 — best-effort
+                    pass
+                return
+        # Refresh the cells from the now-persisted cache so the
+        # display matches disk (covers the case where the optimistic
+        # paint was wrong because the save raced with a different
+        # writer).
+        def _refresh_cells():
+            try:
+                lib = self.query_one("#library", LibraryPanel)
+                lib.refresh_status_cell(entry_id)
+                lib.refresh_seq_cell(entry_id)
+            except NoMatches:
+                pass
+        try:
+            self.call_from_thread(_refresh_cells)
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
 
     @on(LibraryPanel.StatusRequested)
     def _library_status_requested(self, event: LibraryPanel.StatusRequested):
@@ -90886,12 +91353,27 @@ SpeciesPickerModal { align: center middle; }
         slow active-collection mirror to a background worker and
         does an incremental cell update instead of a full table
         repopulate.
+
+        INV-77 (2026-05-25): read the entry lock-free via
+        `_iter_library_readonly` instead of `_find_library_entry_by_id`.
+        Pre-fix, after a few quick status updates the queued async
+        collection-mirror workers (each ~1-2 s on a 156 MB
+        collections.json) saturated `_cache_lock` — subsequent `s`
+        presses blocked on the lock and the modal silently failed to
+        appear for many seconds, looking like a dead keybinding.
+        The read here only feeds the modal's "Current: X" display; a
+        stale-by-100ms value is fine, and the actual write still
+        locks correctly.
         """
         if event.entry_id is None:
             self.notify("Highlight a library row first.",
                          severity="warning")
             return
-        entry = _find_library_entry_by_id(event.entry_id)
+        entry = next(
+            (e for e in _iter_library_readonly()
+             if e.get("id") == event.entry_id),
+            None,
+        )
         if entry is None:
             self.notify("Library entry not found.", severity="warning")
             return

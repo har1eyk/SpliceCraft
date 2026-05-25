@@ -14,33 +14,65 @@
 
 ---
 
+## [0.9.24] — 2026-05-25
+
+_(auto-generated changelog — no notable commits found since the previous release)_
+
+---
+
+## [0.9.23] — 2026-05-25
+
+### Bug fixes
+
+- **Bulk-align no longer freezes the UI before the confirm modal opens.** The matcher used to run synchronously on the UI thread — for a sizeable library (e.g. Eden ~90 entries × 18 kb plasmids) it could lock the app for many seconds with no feedback, looking like a complete hang. The matcher now runs on a worker thread with a visible "Matching N samples to M library entries…" status and a rolling progress indicator.
+- **Closing the Plasmidsaurus sequencing screen no longer crashes the app.** Hitting Close (or Esc) twice in quick succession, or having the screen dismissed by a callback chain mid-close, used to raise `ScreenStackError: Can't pop screen`. The cancel path is now one-shot and guards against being called when the screen is already gone.
+- **Status modal pops up reliably after rapid status changes on a large library.** Pre-fix, after a few quick `s`-key status updates on a 100+ MB library, the queued async collection-mirror writes saturated the cache lock for several seconds; subsequent `s` presses blocked silently with no modal appearing. Two fixes: the picker now reads its current-status display lock-free, and the actual save runs on a background worker (with optimistic cell repaint so you see the new status immediately). Rapid-fire status changes no longer freeze the UI thread waiting for in-flight mirror saves.
+- **Letter-mode overlay positions are now correct on rotated query alignments.** When the alignment had a non-zero query rotation (Alt+A diff against an RC'd or rotated read), the letter-mode display passed the wrong axis offset to the per-bp letter helper, shifting the rendered bases by N positions on the plasmid.
+- **Soft-masked / mixed-case alignments no longer show false mismatches.** The detail-view match track used case-sensitive comparison on the alignment strings — soft-masked (lowercase) repeat regions rendered as red mismatch despite being identical to the target. Comparison is now case-insensitive (matches the segment classifier).
+- **Rotation picker now ranks by absolute matched bp + ungapped identity instead of gap-inclusive identity.** Pre-fix, on length-mismatched pairs (e.g. a 200 bp Plasmidsaurus consensus against a 5 kb plasmid), a rotation that padded gaps over more length could outrank a rotation whose matched region was small but high-quality — leading to biologically wrong alignment frames. The picker now picks the rotation that aligns the most actual bp.
+
+### New features
+
+- **Bulk-align now shows live per-sample progress.** Instead of a silent multi-minute wait, you see `Aligning 3/10: MAV34 → MAV_38…` and a filling progress bar in the Plasmidsaurus Samples tab. The progress widget activates immediately when you press Run (synchronously, before the first alignment kicks off) so there's no silent gap between confirming the batch and seeing things move. The final tally (aligned / added / add-failed / failed) stays on screen for 6 seconds after the batch completes, then auto-hides.
+- **ERROR plasmid status (red ball).** Fifth canonical workflow status next to DESIGNING / CLONING / SEQUENCING / VERIFIED. Use for plasmids whose sequencing came back showing a failed clone (wrong insert, frame-shift, contamination, etc.) that need revision. The library panel shows a red status ball; the status picker offers ERROR as a sibling of the existing options.
+
+### Performance
+
+- **Bulk-align matcher k-mer cache.** The matcher rebuilt the k-mer set for every library entry on every click (~10–15 s on a ~90-entry × 18 kb library). The library-side k-mer sets are now cached in module memory keyed by (entry id, gb_text hash) — second and subsequent matcher clicks against an unchanged library are near-instant. Cache is invalidated on every `_save_library`, so an edit/add/delete picks up cleanly.
+- **Bulk-align does ONE library save at the end of the batch instead of N.** Pre-fix each successful alignment triggered a full `_flush_active_alignments` (~1–2 s for the 156 MB collections-mirror save) — for a 10-sample batch, ~10–20 s of pure I/O. The worker now accumulates all alignments + add-as-new entries in memory and commits them in a single transaction at the end. The per-sample canvas-swap (`_apply_record`) is also gone — alignments materialize on their targets at end-of-batch instead of flashing each target through the canvas. Net effect on a 10-sample × 18 kb × ~90-entry library: roughly **2–3× faster end-to-end**.
+
+---
+
 ## [0.9.22] — 2026-05-25
 
-**Alignment hardening sweep (INV-73)** — five real bugs closed after a parallel-agent audit on top of INV-72:
+### Bug fixes
 
-- **Bulk-align now applies to every confirmed sample, not just the first.** Pre-fix the worker's stale-load guard treated the canvas swap to each target as an "external" load and aborted the rest of the batch after the first iteration — users confirming N rows in the modal saw only one plasmid get its alignment + status change. The worker now absorbs its own intentional canvas swaps into the load-counter check while still catching truly external swaps.
-- **LibraryPanel Seq column ✓ no longer vanishes when the plasmid status changes.** `_set_plasmid_status_fast` now holds `_cache_lock` for the full read-modify-write so a concurrent alignment flush can't have its alignment field clobbered by a status save built on a pre-flush snapshot. Status changes also incrementally refresh the Seq cell now (mirrors the Status cell refresh).
-- **Aligned plasmid display labels no longer carry the Plasmidsaurus prefix or underscores** — `RUN42_1_MAV34.gbk` now renders as `MAV34` in alignment rows. Matches the existing TUI convention of spaces over underscores in names.
-- **`_flush_active_alignments` is thread-safe.** Concurrent alignment workers (`_diff_align_worker`, `_align_worker`, `_multi_align_worker` — different `@work` groups) can no longer interleave their library writes and silently lose each other's alignments.
-- **`_extract_variants_from_alignment` capped at 10 000 variants** with a truncation sentinel so a fully-divergent 200 kb alignment can't blow memory in the VerificationReportModal. Callers filtering by `type=='snp'/'insertion'/'deletion'` skip the sentinel naturally.
-- **`_kmer_set` strong-match requires ≥ 50 canonical k-mers** so a 25 bp sample can't score a coincidental Jaccard 1.0 against a library entry that happens to contain a primer-length match region.
-- **`_deserialize_stored_alignment_args` validates rotation-picker fields** (`picked_rotation` ∈ {none, query, target}, non-negative rotation offsets, bool `query_rc`). Corrupted values coerce to safe defaults with a warning log.
-- **New `_coverage_pct_from_result` helper** centralises the coverage-percent clamp + zero-target guard so toast and verification report can't drift in display logic.
+- **Bulk alignment now applies to every confirmed sample.** Previously, after you confirmed N samples in the Plasmidsaurus bulk-align modal, only the first one actually got its alignment and SEQUENCING tag applied — the rest were silently dropped. Fixed.
+- **The Seq-column ✓ no longer disappears when you change a plasmid's status.** Setting a SEQUENCING-tagged plasmid to VERIFIED used to wipe its stored alignment from the library panel. Now the ✓ stays put.
+- **Aligned plasmid rows show clean names.** Plasmidsaurus alignment labels used to read `1 RUN42_1_MAV34` with the raw run prefix and underscores. Now they read `1 MAV34` — Plasmidsaurus prefix stripped and any remaining underscores converted to spaces.
+- **Concurrent alignment workers no longer overwrite each other's saves.** If two alignment workers (Alt+A multi-align, Plasmidsaurus bulk, Alt+\\ diff) ran at the same time, the second one could clobber the first one's stored alignments. The flush path is now properly serialised.
+- **The verification report can't run the app out of memory anymore.** A divergent alignment (e.g., picking the wrong target) used to walk every column into a variant record — for a 200 kb mismatch, that's 200 000 dicts. Capped at 10 000 with a clear truncation indicator.
+- **Short samples no longer match the wrong plasmid by accident.** A tiny (~25 bp) Plasmidsaurus consensus could score a coincidental 100% k-mer hit against any library entry containing a primer-length match region, then get filed against the wrong plasmid. The matcher now requires a minimum-quality signal before trusting a strong sequence match.
+- **Toast vs verification-report coverage numbers stay in sync.** The same `min(100%, …)` clamp + zero-target guard runs at both display sites, so a corrupted result can't render ">100% coverage" anywhere.
 
-**F9 / diagnostic bundle improvements:**
+### New features
 
-- `events_summary.json` — last 200 structured `_log_event` lines extracted from rotating logs and shipped as JSON. Bug-reports can be parsed without regex against the raw log; rotated backups walked too.
-- `system_info.json` gains terminal + locale capture (`TERM`, `COLORTERM`, `LANG`, `LC_*`, etc.) and TTY flags so rendering bugs on `TERM=dumb` / `LANG=C` / piped stdout are visible in triage.
+- **F9 diagnostic bundles now include a structured event summary.** `events_summary.json` carries the last 200 `_log_event` entries as JSON (rotated backups walked too) — bug reports are parseable without regex against the raw log.
+- **Diagnostic bundles capture terminal + locale info.** `system_info.json` now records `TERM`, `COLORTERM`, `LANG`, `LC_*`, TTY-vs-pipe flags, etc. — rendering bugs on `TERM=dumb`, mojibake from `LANG=C`, and CJK / RTL locale issues are now visible in triage.
+- **Bulk-align outcomes survive past the toast.** `_bulk_align_worker` emits a structured `alignment.bulk.summary` event with the per-batch totals (aligned / added / add-failed / failed / committed), so the diagnostic bundle captures the result even after you dismiss the toast.
+- **Alignment-failure logs name the inputs.** When an alignment worker raises, the log line now carries the query/target ids, sequence lengths, and topology — bug reports become reproducible without spelunking through UI snapshots.
 
-**Event logger:**
+### Hardening
 
-- `_bulk_align_worker` now emits `alignment.bulk.summary` (n_aligned / n_added / n_add_failed / n_failed / n_committed) — diagnostic bundle captures bulk-align outcomes even after the toast is dismissed.
-- `_align_worker` and `_diff_align_worker` exception logs now carry query/target ids + lengths + topology for reproducibility.
-- `_action_log` decorator leaves a `_log.debug` breadcrumb when `_log_event` itself fails (was silent before).
+- Stored alignment rotation metadata (`picked_rotation`, `query_rotation`, `target_rotation`, `query_rc`) now validates on load — a corrupted file gets coerced to safe defaults with a warning rather than silently misframing downstream segments.
+- New `_display_label_for_gbk` helper centralises Plasmidsaurus filename → TUI-friendly label conversion, so future call sites stay consistent.
+- New `_coverage_pct_from_result` helper centralises the coverage display math.
+- `_action_log` decorator now leaves a debug breadcrumb if structured event emission itself fails (was silent before).
 
-**Pyright cleanup:** workspace pyright now reports **0 errors, 0 warnings**. `pyrightconfig.json` includes `tests/` with an `executionEnvironments` block that suppresses Textual-Widget generic-type narrowing issues (intentional in tests, not real bugs). Real bugs caught in pass: `test_smoke.py::_timed` unbound `result`, duplicate method name in `test_genbank_io.py`.
+### Code quality
 
-**New tests (27 cases):** `TestVariantExtractionCap`, `TestExtractVariantsMixedAndDivergent`, `TestPickedRotationEnumValidation`, `TestCoveragePctHelper`, `TestKmerSetForStrongMatchThreshold`, `TestAlignmentQualityStatusBoundaries`, `TestFlushAlignmentsLocked`.
+- Workspace pyright now reports **0 errors, 0 warnings**. The `tests/` tree opts out of Textual Widget generic-type narrowing issues (which aren't real bugs in TUI integration tests) via `executionEnvironments` — main source code keeps strict checking. Two real test bugs caught in pass and fixed: unbound `result` in a smoke test's timing helper, duplicate method name in a genbank parser test.
+- 27 new alignment regression tests covering variant extraction caps, rotation enum validation, k-mer thresholds, status-badge boundaries, flush locking, and coverage-helper edge cases.
 
 ---
 
