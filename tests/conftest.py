@@ -125,6 +125,25 @@ def _protect_user_data(tmp_path, monkeypatch):
     monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", True)
     monkeypatch.setattr(sc, "_SAVES_AUTHORIZED_REASON",
                           "pytest _protect_user_data")
+    # One-shot backfill flags (2026-05-24 sweep). Default to TRUE in
+    # tests so the load-triggered migrations are SKIPPED — most tests
+    # seed handcrafted entries with `id != sanitize(name)` and would
+    # see their fixture data rewritten by the backfill, which is
+    # disruptive and not the test's subject. Tests that EXPLICITLY
+    # exercise a backfill (or need the migrated post-state) opt in
+    # by setting the relevant flag back to False before triggering
+    # the load — see `TestLibraryIdBackfill` for the pattern.
+    monkeypatch.setattr(sc, "_id_name_backfill_done", True)
+    monkeypatch.setattr(sc, "_parts_bin_sequence_backfill_done", True)
+    monkeypatch.setattr(sc, "_collections_backfill_done", True)
+    monkeypatch.setattr(
+        sc, "_parts_bin_collections_backfill_done", True,
+    )
+    monkeypatch.setattr(sc, "_entry_vectors_name_trim_done", True)
+    monkeypatch.setattr(sc, "_primers_name_trim_done", True)
+    monkeypatch.setattr(
+        sc, "_primer_collections_backfill_done", True,
+    )
 
     # Skip the launch splash for every test by default — the splash modal
     # blocks input until dismissed, which would break every `pilot.click`

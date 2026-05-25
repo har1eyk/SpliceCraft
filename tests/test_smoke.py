@@ -805,13 +805,25 @@ class TestNamePlasmidModalDupWarning:
             await pilot.pause()
             await pilot.pause(0.05)
             # Rename so e['name'] diverges from e['id']
-            app._rename_library_entry(tiny_record.id, "Renamed Display Label")
+            old_id = tiny_record.id  # capture pre-rename id (gets mutated below)
+            app._rename_library_entry(old_id, "Renamed Display Label")
             await pilot.pause(0.05)
+            # After rename, `tiny_record.id` itself reflects the new
+            # sanitised id because `_current_record` (which the
+            # rename flow mutates) is the same object as `tiny_record`
+            # under the test fixture. The library's id was rewritten
+            # to match the display name by the new rename flow (id is
+            # no longer immutable post-2026-05-24).
+            assert tiny_record.id == "Renamed_Display_Label"
             modal = NamePlasmidModal("brand-new-name")
+            # The map's value is the DISPLAY name (not the bare id)
+            # — confirming `_existing_ids` still surfaces the user-
+            # facing label, even though id and display now agree.
             assert tiny_record.id.casefold() in modal._existing_ids
-            # The map's value is the DISPLAY name, not the bare id
             assert modal._existing_ids[tiny_record.id.casefold()] == \
                 "Renamed Display Label"
+            # The PRE-rename id is gone from the library + modal map.
+            assert old_id.casefold() not in modal._existing_ids
 
     async def test_id_conflict_warning_surfaces_display_name(
         self, tiny_record, isolated_library
@@ -843,6 +855,344 @@ class TestNamePlasmidModalDupWarning:
             assert "Renamed Display Label" in status_text, (
                 f"warning should name the display label; got {status_text!r}"
             )
+
+
+class TestRenameUpdatesId:
+    """Post-2026-05-24 invariant: a library entry's `id` always
+    equals `sanitize(name)`. Renames update both fields together so
+    the user can recycle a freed-up display name without hitting the
+    stale-id collision in `NamePlasmidModal`."""
+
+    async def test_rename_updates_id_to_sanitised_new_name(
+        self, tiny_record, isolated_library
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            old_id = tiny_record.id
+            app._rename_library_entry(old_id, "MAV 33")
+            await pilot.pause(0.05)
+            lib = sc._load_library()
+            assert len(lib) == 1
+            assert lib[0]["id"]   == "MAV_33"
+            assert lib[0]["name"] == "MAV 33"
+            # The pre-rename id is fully gone — no entry holds it.
+            assert all(e["id"] != old_id for e in lib)
+
+    async def test_rename_disambiguates_when_desired_id_taken(
+        self, tiny_record, isolated_library
+    ):
+        """Two distinct display names can sanitise to the same id
+        (e.g. ``MAV 33`` and ``MAV-33`` both → ``MAV_33``). When a
+        rename would create such a collision, the renamed entry's id
+        gets the `_2` suffix; the entry that already held the bare
+        id keeps it."""
+        # Seed two entries: the second one collides on sanitised id
+        # if the first is renamed to "MAV 33" (because the first is
+        # then "MAV_33" and the second already is too).
+        sc._save_library([
+            {"id": "TEST001",  "name": "TEST001",  "size": 1, "n_feats": 0},
+            {"id": "MAV_33",   "name": "MAV 33",   "size": 1, "n_feats": 0},
+        ])
+        sc._library_cache = None
+        sc._id_name_backfill_done = True   # skip backfill (already aligned)
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Rename TEST001 → "MAV-33" (sanitises to MAV_33, which
+            # the other entry already holds). Expect MAV_33_2.
+            app._rename_library_entry("TEST001", "MAV-33")
+            await pilot.pause(0.05)
+            lib = sc._load_library()
+            by_name = {e["name"]: e["id"] for e in lib}
+            assert by_name["MAV 33"]  == "MAV_33"
+            assert by_name["MAV-33"]  == "MAV_33_2"
+
+
+class TestLibraryIdBackfill:
+    """Pre-2026-05-24 the rename flow left `e["id"]` immutable, so
+    legacy libraries can carry entries with `id != sanitize(name)`.
+    `_load_library` runs a one-shot backfill on first read to bring
+    these in line. Idempotent: second read with already-aligned
+    entries does nothing."""
+
+    def test_backfill_rewrites_id_to_match_name(self):
+        """Direct unit test of the pure backfill helper, no app /
+        pilot involved."""
+        entries = [
+            {"id": "MAV_34", "name": "MAV 33", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+        ]
+        out, n_changed = sc._backfill_library_ids_match_names(entries)
+        assert n_changed == 1
+        assert out[0]["id"]   == "MAV_33"
+        assert out[0]["name"] == "MAV 33"
+
+    def test_backfill_idempotent_on_aligned_entries(self):
+        entries = [
+            {"id": "MAV_33", "name": "MAV 33", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+            {"id": "Sample_A", "name": "Sample A", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+        ]
+        _, n_changed = sc._backfill_library_ids_match_names(entries)
+        assert n_changed == 0
+
+    def test_backfill_disambiguates_when_two_legacy_ids_collide(self):
+        """Two legacy entries whose display names sanitise to the
+        same id: the earlier-walked entry keeps the base id, the
+        later one gets `_2`. Order matters because library entries
+        are stored most-recent-first; the freshly renamed plasmid
+        appears first in iteration."""
+        entries = [
+            # Came from an old rename (id stale)
+            {"id": "OLD_TAG", "name": "MAV 33", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+            # Also sanitises to MAV_33 from a different display
+            {"id": "ANOTHER", "name": "MAV-33", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+        ]
+        out, n_changed = sc._backfill_library_ids_match_names(entries)
+        assert n_changed == 2
+        # First-walked wins the base id; second gets the bump.
+        assert out[0]["id"] == "MAV_33"
+        assert out[1]["id"] == "MAV_33_2"
+
+    def test_backfill_leaves_pathological_names_alone(self):
+        """Entries with empty or all-punctuation display names can't
+        derive a useful id — the backfill keeps the existing id so
+        the entry remains addressable."""
+        entries = [
+            {"id": "kept_as_is", "name": "", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+            {"id": "also_kept", "name": "///", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+        ]
+        out, n_changed = sc._backfill_library_ids_match_names(entries)
+        assert n_changed == 0
+        assert out[0]["id"] == "kept_as_is"
+        assert out[1]["id"] == "also_kept"
+
+    def test_load_library_triggers_backfill_once(
+        self, tmp_path, monkeypatch
+    ):
+        """Setting up a library JSON with id != sanitize(name) on
+        disk, then calling `_load_library`, should rewrite the
+        entries (in memory + on disk) on first read; second read
+        sees the aligned state without further work."""
+        tmp_lib = tmp_path / "library.json"
+        monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
+        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc, "_id_name_backfill_done", False)
+        # Write a legacy v1 envelope where id doesn't match name.
+        import json
+        tmp_lib.write_text(json.dumps({
+            "_schema_version": 1,
+            "entries": [
+                {"id": "MAV_34", "name": "MAV 33",
+                 "size": 1, "n_feats": 0, "gb_text": ""},
+            ],
+        }))
+        loaded = sc._load_library()
+        assert loaded[0]["id"]   == "MAV_33"
+        assert loaded[0]["name"] == "MAV 33"
+        # And the backfill rewrote the JSON on disk too.
+        re_read = json.loads(tmp_lib.read_text())
+        assert re_read["entries"][0]["id"] == "MAV_33"
+
+    def test_backfill_trims_leading_and_trailing_whitespace(self):
+        """The name-trim arm of the backfill strips leading/trailing
+        whitespace from `e["name"]` so the delete-cascade's strict
+        `==` against parts_bin doesn't silently miss the row.
+        Real-world trigger: a `.dna` file like `'MAV 27 ….dna'`
+        (trailing space before the extension) seeded the library
+        with `name='MAV 27 …'` while the parts_bin row carried the
+        trimmed version."""
+        entries = [
+            # Trailing-space name, id already aligned to the trimmed form
+            {"id": "MAV_27", "name": "MAV 27 ", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+            # Leading + trailing space
+            {"id": "Sample", "name": "  Sample  ", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+        ]
+        out, n_changed = sc._backfill_library_ids_match_names(entries)
+        assert n_changed == 2
+        assert out[0]["name"] == "MAV 27"
+        assert out[1]["name"] == "Sample"
+
+    def test_backfill_handles_corrupt_entries_without_aborting(self):
+        """One malformed entry (non-string id) must NOT abort the
+        whole batch. The remaining well-formed entries still get
+        migrated. Hardening guard for the 'broken row #5 of 80'
+        scenario where pre-hardening behaviour was to crash and
+        leave the other 75 entries stuck pre-migration."""
+        entries = [
+            # Well-formed legacy
+            {"id": "OLD", "name": "MyPlasmid", "size": 1, "n_feats": 0,
+             "gb_text": ""},
+            # Pathological — non-dict slipped in
+            "not a dict",
+            # Well-formed legacy after the bad one
+            {"id": "ALSO_OLD", "name": "OtherPlasmid", "size": 1,
+             "n_feats": 0, "gb_text": ""},
+        ]
+        out, n_changed = sc._backfill_library_ids_match_names(entries)
+        assert n_changed == 2
+        # Both dicts got migrated; the string is preserved in place
+        # so we don't silently drop user data.
+        assert out[0]["id"] == "MyPlasmid"
+        assert out[1] == "not a dict"
+        assert out[2]["id"] == "OtherPlasmid"
+
+    def test_parts_bin_sequence_backfill_skips_on_overhang_mismatch(self):
+        """Hardening guard: if the re-digest of `gb_text` returns
+        oh5/oh3 that DISAGREE with the stored entry's overhangs,
+        the backfill MUST skip the entry rather than silently
+        rewriting `sequence` with a body that doesn't match the
+        stored chain semantics."""
+        from unittest.mock import patch
+        entries = [{
+            "name": "MyTU", "type": "TU", "level": 1,
+            "oh5": "GGAG", "oh3": "CGCT",
+            "sequence": "",
+            "gb_text": "LOCUS x 100 bp DNA\n//\n",
+        }]
+        # Stub the digest probe to return DIFFERENT overhangs than
+        # what's stored — simulates a grammar-drift scenario.
+        with patch.object(
+            sc, "_assembly_fragment_from_source",
+            return_value={"sequence": "ATGC", "oh5": "AATG",
+                          "oh3": "GCTT"},
+        ):
+            out, n_changed = sc._backfill_parts_bin_sequences(entries)
+        assert n_changed == 0
+        # Sequence left untouched — the on-demand display path will
+        # re-probe at render time so the user still sees A body
+        # (just via the lazy path, not the eager backfill).
+        assert out[0]["sequence"] == ""
+
+    def test_parts_bin_sequence_backfill_skips_on_huge_body(self):
+        """Hardening guard: a re-digest that returns a body LARGER
+        than the gb_text is malformed by definition — body is a
+        fragment of the full plasmid. Backfill skips rather than
+        storing garbage."""
+        from unittest.mock import patch
+        small_gb = "LOCUS x\n//"   # 12 bytes
+        entries = [{
+            "name": "MyTU", "type": "TU", "level": 1,
+            "oh5": "", "oh3": "",   # empty so overhang sanity is a no-op
+            "sequence": "",
+            "gb_text": small_gb,
+        }]
+        with patch.object(
+            sc, "_assembly_fragment_from_source",
+            return_value={"sequence": "A" * 1000, "oh5": "",
+                          "oh3": ""},
+        ):
+            out, n_changed = sc._backfill_parts_bin_sequences(entries)
+        assert n_changed == 0
+        assert out[0]["sequence"] == ""
+
+    def test_entry_vectors_name_trim_does_not_add_name_field(self):
+        """Hardening guard: if an entry vector somehow has no
+        `name` field, the trim backfill MUST NOT inject one.
+        Adding a field where none existed would change the entry's
+        schema shape and could trip downstream consumers that
+        treat presence-vs-absence as a signal."""
+        entries = [{"grammar_id": "gb_l0", "role": "Alpha1"}]
+        out, n_changed = sc._backfill_entry_vector_names(entries)
+        assert n_changed == 0
+        assert "name" not in out[0]
+
+    def test_entry_vectors_name_trim_skips_non_string_name(self):
+        """Hardening guard: a hand-edited JSON with `"name": null`
+        or `"name": 42` should be skipped, not stringified."""
+        entries = [
+            {"grammar_id": "gb_l0", "name": None},
+            {"grammar_id": "gb_l0", "name": 42},
+        ]
+        out, n_changed = sc._backfill_entry_vector_names(entries)
+        assert n_changed == 0
+        assert out[0]["name"] is None
+        assert out[1]["name"] == 42
+
+
+class TestNamePlasmidModalWhitespaceWarning:
+    """Live status-line warning for leading/trailing whitespace in
+    the typed name. The save flow strips for the user anyway, but
+    surfacing the warning BEFORE save lets the user notice that what
+    they typed isn't what they'll get."""
+
+    async def test_trailing_space_shows_warning(
+        self, isolated_library, isolated_parts_bin
+    ):
+        sc._save_library([])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            status = modal.query_one(
+                "#nameplasmid-status", sc.Static,
+            )
+            save_btn = modal.query_one(
+                "#btn-nameplasmid-save", sc.Button,
+            )
+            inp.value = "MAV 27 "
+            await pilot.pause()
+            rendered = str(status.render()).lower()
+            assert "trailing" in rendered
+            assert "whitespace" in rendered
+            # Save stays enabled — the strip happens at submit time.
+            assert save_btn.disabled is False
+
+    async def test_leading_space_shows_warning(
+        self, isolated_library, isolated_parts_bin
+    ):
+        sc._save_library([])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            status = modal.query_one(
+                "#nameplasmid-status", sc.Static,
+            )
+            inp.value = "  MAV 27"
+            await pilot.pause()
+            rendered = str(status.render()).lower()
+            assert "leading" in rendered
+            assert "whitespace" in rendered
+
+    async def test_no_warning_when_already_trimmed(
+        self, isolated_library, isolated_parts_bin
+    ):
+        sc._save_library([])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            status = modal.query_one(
+                "#nameplasmid-status", sc.Static,
+            )
+            inp.value = "MAV 27"
+            await pilot.pause()
+            rendered = str(status.render()).lower()
+            assert "whitespace" not in rendered
+            assert "available" in rendered
 
 
 class TestDeleteFocusRouting:
@@ -3264,14 +3614,18 @@ class TestSearchInputWidget:
             # the seed `tiny_record` if it's listed.
             ours = {"pBin1", "pBin2", "pBin10", "pBin20"}
             order = []
+            # Column layout per `LibraryPanel._repopulate_plasmids` (post-
+            # `[INV-69]`): row[0]=status circle, row[1]=Name, row[2]=
+            # workflow status, row[3]=Seq badge, row[4]=bp. The status
+            # circle is its own column now, so the Name cell is just the
+            # name (optionally `*`-prefixed when dirty on the active row).
             for row_key in t.rows:
                 row = t.get_row(row_key)
-                cell0 = row[0]
-                name = cell0.plain if hasattr(cell0, "plain") else str(cell0)
-                # Strip the colour-circle prefix (2 cells: `● ` for
-                # status-bearing rows, `  ` for no-status rows) plus
-                # the dirty-marker asterisk.
-                name = name.lstrip("● ").lstrip("*")
+                name_cell = row[1]
+                name = (name_cell.plain
+                         if hasattr(name_cell, "plain")
+                         else str(name_cell))
+                name = name.lstrip("*")
                 if name in ours:
                     order.append(name)
             assert order == ["pBin1", "pBin2", "pBin10", "pBin20"], (
@@ -5144,6 +5498,7 @@ class TestShiftClickFeatureExtend:
 
         def _timed(fn):
             best = float("inf")
+            result = None
             for _ in range(3):
                 t0 = time.perf_counter()
                 result = fn()
@@ -7875,9 +8230,8 @@ class TestShiftClickFeatureExtend:
             _total = 200
         # Stitch via query_one indirection — too invasive without a
         # full mount. Just exercise the early-return:
-        result = sc.PlasmidApp._extend_selection_to.__wrapped__ \
-            if hasattr(sc.PlasmidApp._extend_selection_to, "__wrapped__") \
-            else sc.PlasmidApp._extend_selection_to
+        _fn = sc.PlasmidApp._extend_selection_to
+        result = getattr(_fn, "__wrapped__", _fn)
         # The unbound method needs `self` with .query_one — easier to
         # just assert via the integration tests above. This unit
         # check is a placeholder noting the helper exists.

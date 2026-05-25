@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.21"
+__version__ = "0.9.22"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -442,6 +442,28 @@ def _log_startup_banner() -> None:
                   _STACKS_LOG_PATH)
     except NameError:
         pass
+    # Distinguish dev-source runs (`python3 /path/to/splicecraft.py`)
+    # from pipx-installed launches. The two pull from different files
+    # on disk, so a bug fix in the dev tree won't show up in the
+    # installed app until `pipx upgrade splicecraft` (or a release).
+    # Without this line, log triage on which version is actually
+    # running requires `inspect.getfile(splicecraft.main)` over an
+    # interactive prompt; the tag makes it greppable.
+    try:
+        import splicecraft as _self_mod
+        _src_path = getattr(_self_mod, "__file__", "?") or "?"
+        if "/site-packages/" in _src_path or "/pipx/" in _src_path:
+            _origin = "installed"
+        elif _src_path.endswith("splicecraft.py"):
+            _origin = "dev-source"
+        else:
+            _origin = "unknown"
+        _log.info("origin    : %s (%s)", _origin, _src_path)
+        _log.info("version   : %s", _self_mod.__version__)
+    except (ImportError, AttributeError):
+        # Bootstrap edge case (running before splicecraft is fully
+        # importable); skip rather than crash startup.
+        pass
     _log.info("=" * 60)
 
 
@@ -687,7 +709,21 @@ def _action_log(event_name: str):
                     # log as "_action_log:531" — useless for tracing.
                     _log_event(event_name, _stacklevel=3, **ctx)
                 except Exception:  # noqa: BLE001 — logging must never raise
-                    pass
+                    # INV-73 (2026-05-25): the silent-swallow used to
+                    # mean a malformed _log_event payload caused the
+                    # entire log entry to vanish with no trace. Now
+                    # we leave a debug-level breadcrumb on the std
+                    # logger so a power user grepping the log can
+                    # spot the regression — the action still runs
+                    # so user-facing behaviour is untouched.
+                    try:
+                        _log.debug(
+                            "_action_log decorator: event emit "
+                            "failed for %s; action still ran",
+                            event_name,
+                        )
+                    except Exception:  # noqa: BLE001 — last-resort
+                        pass
             return func(self, *args, **kwargs)
         return wrapper
     return decorator
@@ -2940,6 +2976,99 @@ def _scrub_path(text: str) -> str:
     return out
 
 
+_EVENT_LINE_RE = re.compile(
+    # `<ts> [<sid>] <level> <name>:<line> event <name> <json>`
+    # We anchor on " event <name> " (space-event-space-name-space)
+    # so an arbitrary "event" appearing in the format string before
+    # this point can't trigger a false split.
+    r" event ([A-Za-z0-9_\.]+) (\{.*\})\s*$"
+)
+
+
+def _extract_recent_events(log_path: "Path | None" = None,
+                            n: int = 200) -> "list[dict]":
+    """Parse the last ``n`` structured events out of the rotating
+    log file and return them as a list of dicts.
+
+    Each entry: ``{"ts": ..., "session": ..., "level": ...,
+    "event": ..., "fields": {...}}``. Used by the F9 diagnostic
+    bundle (INV-73) to expose the causal chain as parseable JSON
+    instead of forcing a bug-reader to regex the raw log.
+
+    Never raises — a malformed line is skipped silently with a
+    debug log. The diagnostic bundle path runs under the worst
+    conditions (the user is reporting a crash); the LAST thing we
+    want is the event extractor crashing the bundle.
+
+    Reads at most 1 MB from the END of the log so a massive
+    runaway log can't blow memory. Walks across the rotated
+    backups too if the current log doesn't have enough events,
+    so a user who pressed F9 right after the log rotated still
+    gets useful context.
+    """
+    p = Path(log_path) if log_path is not None else Path(_LOG_PATH)
+    if not p.exists():
+        return []
+    # Collect candidate log files newest-first: current + rotated
+    # backups (e.g. splicecraft.log, splicecraft.log.1, .log.2).
+    try:
+        log_dir = p.parent
+        log_glob = p.name + "*"
+        candidates = sorted(
+            (f for f in log_dir.glob(log_glob) if f.is_file()),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        candidates = [p] if p.is_file() else []
+    events: list[dict] = []
+    max_bytes_per_file = 1 * 1024 * 1024
+    for f in candidates:
+        if len(events) >= n:
+            break
+        try:
+            size = f.stat().st_size
+            with open(f, "rb") as fh:
+                if size > max_bytes_per_file:
+                    fh.seek(-max_bytes_per_file, 2)
+                    fh.readline()  # drop possibly-truncated first line
+                raw = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            m = _EVENT_LINE_RE.search(line)
+            if not m:
+                continue
+            event_name = m.group(1)
+            try:
+                fields = json.loads(m.group(2))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # Pull the line prefix (everything before " event "):
+            # "<ts> [<sid>] <level> <name>:<line>".
+            prefix = line[:m.start()]
+            ts = prefix[:23] if len(prefix) >= 23 else prefix
+            sid = ""
+            level = ""
+            sid_m = re.search(r"\[([A-Za-z0-9]+)\]", prefix)
+            if sid_m:
+                sid = sid_m.group(1)
+            lvl_m = re.search(
+                r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b", prefix,
+            )
+            if lvl_m:
+                level = lvl_m.group(1)
+            events.append({
+                "ts": ts, "session": sid, "level": level,
+                "event": event_name, "fields": fields,
+            })
+    # Newest-last for human readability (matches log order).
+    events.reverse()
+    if len(events) > n:
+        events = events[-n:]
+    return events
+
+
 def _read_log_tail(path: "Path | None" = None,
                    n_lines: int = _UI_SNAPSHOT_LOG_TAIL_LINES,
                    max_bytes: int = _UI_SNAPSHOT_MAX_LOG_BYTES,
@@ -3449,6 +3578,32 @@ def _build_system_info() -> dict:
                 })
     except (AttributeError, TypeError, OSError):
         pass
+    # INV-73 (2026-05-25): capture terminal + locale env vars. Rendering
+    # bugs on `TERM=dumb`, mojibake from `LANG=C` / wrong locale, and
+    # CJK / right-to-left issues are invisible without this. Allowlist
+    # only the env vars that matter for rendering — never $PATH,
+    # $HOME, $USER, anything that could leak system layout or
+    # credentials.
+    _ENV_ALLOWLIST = (
+        "TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION",
+        "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+        "SHELL", "WSL_DISTRO_NAME", "XDG_SESSION_TYPE",
+    )
+    try:
+        info["terminal_env"] = {
+            k: os.environ.get(k, "") for k in _ENV_ALLOWLIST
+            if os.environ.get(k)
+        }
+    except (AttributeError, KeyError):
+        info["terminal_env"] = {}
+    try:
+        info["tty"] = {
+            "stdin_isatty":  sys.stdin.isatty(),
+            "stdout_isatty": sys.stdout.isatty(),
+            "stderr_isatty": sys.stderr.isatty(),
+        }
+    except (AttributeError, OSError, ValueError):
+        info["tty"] = {}
     return info
 
 
@@ -3547,6 +3702,27 @@ def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
             except (OSError, TypeError, ValueError):
                 pass
 
+            # 4.5. Structured event log summary (INV-73, 2026-05-25).
+            # `_log_event` emits JSON-after-"event " in each log
+            # line — extract the last 200 events and present as a
+            # parseable JSON array so a bug-reporter (or an AI
+            # parsing the bundle) gets the causal chain without
+            # regex against the rolling text log. The extractor
+            # itself must NEVER raise — a malformed event line
+            # gets skipped, not propagated, because the bundle path
+            # is invoked under crash conditions where the log is
+            # the LAST thing we want to be fragile about.
+            try:
+                events_summary = _extract_recent_events(
+                    log_path, n=200,
+                )
+                zf.writestr(
+                    "events_summary.json",
+                    json.dumps(events_summary, indent=2),
+                )
+            except Exception:  # noqa: BLE001 — bundle path must not crash
+                _log.exception("bundle: event-summary extraction failed")
+
             # 5. README pointing at how to use the bundle.
             zf.writestr(
                 "README.md",
@@ -3559,7 +3735,9 @@ def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
                 f"- `ui_snapshots/` — last {_DIAGNOSTIC_BUNDLE_MAX_UI_SNAPSHOTS} "
                 "UI snapshots captured via Alt+D\n"
                 "- `settings.json` — your persisted toggles (paths scrubbed)\n"
-                "- `system_info.json` — version + platform metadata\n\n"
+                "- `system_info.json` — version + platform metadata\n"
+                "- `events_summary.json` — last 200 structured events "
+                "(`_log_event` output, JSON-parseable)\n\n"
                 "Email this archive (or paste the relevant log lines) "
                 "to your bug report.\n",
             )
@@ -3922,22 +4100,209 @@ _cache_lock = threading.RLock()
 
 _library_cache: "list | None" = None
 
+# One-shot guard for the id-name backfill migration. Flipped on the
+# first successful library-from-disk read; subsequent reads (this
+# process) skip the scan even if the cache gets nuked + reloaded.
+# Persistence on disk is via the rewritten library: a migrated entry
+# has `id == sanitize(name)`, so a future load on the same machine
+# finds nothing to change.
+_id_name_backfill_done: bool = False
+
+
+def _backfill_library_ids_match_names(
+        entries: list[dict]) -> "tuple[list[dict], int]":
+    """Enforce two invariants across library entries:
+      1. `e["name"]` has no leading or trailing whitespace.
+      2. `e["id"] == sanitize(e["name"])` (with `_2`/`_3` bumps on
+         collision).
+
+    Pre-2026-05-24 the rename flow updated `name` and `gb_text` but
+    left `id` immutable; pre-2026-05-24 the file-import path also
+    inherited trailing whitespace from `.dna` filenames (e.g.
+    `'MAV 27 ….dna'` produced `name='MAV 27 …'` with the space).
+    The new rule is that the internal id tracks the **trimmed**
+    external display name; this backfill brings legacy libraries
+    over without a separate migrator-per-entry registration.
+
+    Mutates entries in place. Returns `(entries, n_changed)`.
+    Idempotent: a second pass over an already-aligned library
+    returns `n_changed == 0` without touching disk.
+
+    Disambiguation: when two distinct display names sanitise to the
+    same id (e.g. "MAV 34" and "MAV-34" both → "MAV_34"), the
+    earlier-walked entry keeps the base id; later ones get a
+    `_2`/`_3` suffix. Order in the library is preservation order
+    (most-recent-first per `_persist_assembly`'s `insert(0, …)`),
+    so the most recently saved entry wins the bare id.
+
+    **Hardening (2026-05-24):**
+      * **Per-entry try/except** so one corrupt entry doesn't abort
+        the whole batch — surfaces via `_log.exception`.
+      * **Never deletes entries** — pathological / malformed rows
+        keep their original fields.
+      * **Type guard at every field read** — `str()`/`get()` coerce
+        so hand-edited JSON with non-string id/name doesn't crash.
+      * **gb_text re-serialise failure is non-fatal** — JSON `id`
+        update still lands; gb_text may show the old LOCUS until
+        the next explicit save.
+    """
+    existing_ids: set[str] = set()
+    n_changed = 0
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        # Per-entry guard wraps the field-read + mutate steps so a
+        # single malformed row (e.g. non-string id from hand-edited
+        # JSON) doesn't abort the whole walk. The migration's whole
+        # purpose is to make legacy libraries usable; failing hard
+        # on row #5 of 80 would leave the other 75 stuck pre-
+        # migration. We use a sentinel-flag pattern instead of a
+        # try/except wrapping the entire body so the existing
+        # control flow (continues, conditional id update) keeps its
+        # original shape.
+        try:
+            raw_nm = e.get("name") or ""
+            nm = str(raw_nm).strip()
+            cur_id = str(e.get("id") or "").strip()
+        except (TypeError, AttributeError):
+            _log.exception(
+                "library id backfill: skipped malformed entry "
+                "(non-dict-shaped name/id field)",
+            )
+            continue
+        # ── (1) name-trim arm ────────────────────────────────────
+        # Whitespace-only diff counts as a change even when the id
+        # already matches: the cascade-match in
+        # `_request_plasmid_delete` does strict `==`, so a stale
+        # trailing space silently breaks the parts_bin cascade.
+        name_changed = (nm != raw_nm)
+        if name_changed:
+            e["name"] = nm
+        if not nm or not cur_id:
+            # Nothing to derive from; record the (possibly trimmed)
+            # state and move on. Pathological case but tolerated.
+            existing_ids.add(cur_id)
+            if name_changed:
+                n_changed += 1
+            continue
+        desired_id = re.sub(r"[^A-Za-z0-9_]+", "_", nm).strip("_")
+        if not desired_id:
+            # Pathological name (all non-alphanumeric); keep the
+            # current id so the entry remains addressable.
+            existing_ids.add(cur_id)
+            if name_changed:
+                n_changed += 1
+            continue
+        # ── (2) id-tracks-name arm ───────────────────────────────
+        unique_id = desired_id
+        suffix = 2
+        while unique_id in existing_ids and unique_id != cur_id:
+            unique_id = f"{desired_id}_{suffix}"
+            suffix += 1
+        id_changed = (unique_id != cur_id)
+        if not (id_changed or name_changed):
+            existing_ids.add(cur_id)
+            continue
+        # Re-serialise gb_text's LOCUS line so a future gb-only
+        # reader (CommercialSaaS export, agent endpoint that parses
+        # gb_text directly) sees the same trimmed name + new id.
+        # Failure is non-fatal — the JSON fields still land; gb_text
+        # may show the old name until the next explicit save.
+        try:
+            rec = _gb_text_to_record(e.get("gb_text", "") or "")
+            safe_locus = (
+                re.sub(r"[^A-Za-z0-9_-]+", "_", nm).strip("_")
+                [:_GB_LOCUS_NAME_MAX]
+            ) or unique_id[:_GB_LOCUS_NAME_MAX] or "PLASMID"
+            rec.name = safe_locus
+            rec.id = unique_id
+            e["gb_text"] = _record_to_gb_text(rec)
+        except (ValueError, TypeError, AttributeError):
+            _log.exception(
+                "library id backfill: gb_text re-serialise failed "
+                "for id=%r → %r", cur_id, unique_id,
+            )
+        if id_changed:
+            e["id"] = unique_id
+        existing_ids.add(unique_id)
+        n_changed += 1
+    return entries, n_changed
+
+
+def _ensure_library_cache_populated_and_migrated() -> None:
+    """Idempotent helper that:
+      1. Loads the library from disk into `_library_cache` if the
+         cache is None.
+      2. Runs the one-shot id-name backfill migration on first
+         successful load (gated by `_id_name_backfill_done`).
+      3. Saves the migrated entries back to disk if the backfill
+         changed anything.
+
+    Used by every cache-populating path (`_load_library`,
+    `_iter_library_readonly`, `_find_library_entry_by_*`) so that
+    no matter which one is called first at startup, the backfill
+    runs exactly once and on a fresh-from-disk snapshot. Without
+    this centralisation, a startup path that hit
+    `_iter_library_readonly` before `_load_library` would populate
+    the cache pre-migration; the subsequent `_load_library` would
+    see the cached state and skip the backfill check — leaving the
+    library with stale ids until the next process restart.
+
+    Takes `_cache_lock` for the disk read + cache write so concurrent
+    callers don't double-load or double-migrate. Save runs outside
+    the inner lock (RLock allows re-entry from `_save_library`'s own
+    locking) but the backfill flag flip is inside.
+    """
+    global _library_cache, _id_name_backfill_done
+    with _cache_lock:
+        if _library_cache is None:
+            entries, warning = _safe_load_json(
+                _LIBRARY_FILE, "Plasmid library",
+            )
+            if warning:
+                _log.warning(warning)
+            _library_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        if _id_name_backfill_done:
+            return
+        # Migration runs on whatever is in the cache — usually the
+        # fresh disk read above, but tolerant of a cache that was
+        # warmed by an earlier code path.
+        _library_cache, n_changed = _backfill_library_ids_match_names(
+            _library_cache,
+        )
+        _id_name_backfill_done = True
+        if n_changed == 0:
+            return
+        _log.info(
+            "library: id-name backfill rewrote %d entry id(s) "
+            "to match display name", n_changed,
+        )
+        _log_event("library.id_backfill", n_changed=n_changed)
+        save_target = _library_cache
+    # Save outside the inner block (still RLock-protected via
+    # `_save_library`'s own `with _cache_lock`). Failure is non-fatal:
+    # the cache holds the migrated state for this process; disk
+    # catches up on the next mutation that triggers `_save_library`.
+    try:
+        _save_library(save_target)
+    except (OSError, RuntimeError):
+        _log.exception(
+            "library: id-name backfill save failed; the "
+            "in-memory cache is migrated but disk still "
+            "carries pre-migration ids until the next save",
+        )
+
+
 def _load_library() -> list[dict]:
-    global _library_cache
     # Deep-copy on read (sacred invariant #17): library entries carry
     # nested dicts (qualifiers, history, primer-pair info). Caller-side
     # mutation of those nested objects would otherwise poison the cache
     # for every subsequent reader. Mirrors `_load_collections` /
     # `_load_features` / `_load_parts_bin` / `_load_primers`.
-    if _library_cache is not None:
-        return _typed_clone(_library_cache)
-    entries, warning = _safe_load_json(_LIBRARY_FILE, "Plasmid library")
-    if warning:
-        _log.warning(warning)
-    # Drop non-dict entries (hand-edited JSON, schema drift) so that
-    # .get() calls downstream don't raise AttributeError.
-    entries = [e for e in entries if isinstance(e, dict)]
-    _library_cache = entries
+    _ensure_library_cache_populated_and_migrated()
+    assert _library_cache is not None
     return _typed_clone(_library_cache)
 
 
@@ -3953,12 +4318,8 @@ def _iter_library_readonly() -> list[dict]:
     (sweep #23) and added as part of sweep #25 (2026-05-23) to close
     the perf gap on ~40 library-read callsites.
     """
-    global _library_cache
-    if _library_cache is None:
-        entries, warning = _safe_load_json(_LIBRARY_FILE, "Plasmid library")
-        if warning:
-            _log.warning(warning)
-        _library_cache = [e for e in entries if isinstance(e, dict)]
+    _ensure_library_cache_populated_and_migrated()
+    assert _library_cache is not None
     return _library_cache
 
 
@@ -3985,19 +4346,9 @@ def _find_library_entry_by_id(entry_id: "str | None") -> "dict | None":
     """
     if not isinstance(entry_id, str) or not entry_id:
         return None
-    global _library_cache
+    _ensure_library_cache_populated_and_migrated()
+    assert _library_cache is not None
     with _cache_lock:
-        if _library_cache is None:
-            # Cache miss — trigger a load (under the lock so concurrent
-            # callers don't race the file read).
-            entries, warning = _safe_load_json(
-                _LIBRARY_FILE, "Plasmid library",
-            )
-            if warning:
-                _log.warning(warning)
-            _library_cache = [
-                e for e in entries if isinstance(e, dict)
-            ]
         for e in _library_cache:
             if e.get("id") == entry_id:
                 return _typed_clone(e)
@@ -4018,17 +4369,9 @@ def _find_library_entry_by_name(entry_name: str) -> "dict | None":
     """
     if not isinstance(entry_name, str) or not entry_name:
         return None
-    global _library_cache
+    _ensure_library_cache_populated_and_migrated()
+    assert _library_cache is not None
     with _cache_lock:
-        if _library_cache is None:
-            entries, warning = _safe_load_json(
-                _LIBRARY_FILE, "Plasmid library",
-            )
-            if warning:
-                _log.warning(warning)
-            _library_cache = [
-                e for e in entries if isinstance(e, dict)
-            ]
         for e in _library_cache:
             if e.get("name") == entry_name:
                 return _typed_clone(e)
@@ -4093,17 +4436,79 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
 _COLLECTIONS_FILE = _DATA_DIR / "collections.json"
 _collections_cache: "list | None" = None
 
+# One-shot guard for the per-collection embedded-plasmid backfill.
+# Each collection in `collections.json` carries a `plasmids` list
+# that's a snapshot of library entries. After the library's
+# `_backfill_library_ids_match_names` runs, those embedded copies
+# in NON-active collections can drift — the active collection is
+# auto-resynced via `_sync_active_collection_plasmids` on every
+# `_save_library`, but inactive collections only get refreshed when
+# the user activates them. The backfill walks every collection and
+# applies the same id-name + whitespace trim to its embedded
+# plasmids list (using the SAME helper as the library backfill —
+# `_backfill_library_ids_match_names` works on any
+# library-entry-shaped list).
+_collections_backfill_done: bool = False
+
+
+def _ensure_collections_cache_populated_and_migrated() -> None:
+    """Populate the collections cache and run the embedded-plasmids
+    id-name backfill once per process. Mirrors
+    `_ensure_library_cache_populated_and_migrated` so any cache-
+    populating path (collections list, picker, search) sees post-
+    migration entries."""
+    global _collections_cache, _collections_backfill_done
+    with _cache_lock:
+        if _collections_cache is None:
+            entries, warning = _safe_load_json(
+                _COLLECTIONS_FILE, "Plasmid collections",
+            )
+            if warning:
+                _log.warning(warning)
+            _collections_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        if _collections_backfill_done:
+            return
+        n_changed_total = 0
+        for coll in _collections_cache:
+            if not isinstance(coll, dict):
+                continue
+            plasmids = coll.get("plasmids")
+            if not isinstance(plasmids, list):
+                continue
+            _, n = _backfill_library_ids_match_names(plasmids)
+            n_changed_total += n
+        _collections_backfill_done = True
+        if n_changed_total == 0:
+            return
+        _log.info(
+            "collections: embedded-plasmid id-name backfill rewrote "
+            "%d entry id(s)/name(s) across all collections",
+            n_changed_total,
+        )
+        _log_event(
+            "collections.plasmid_backfill",
+            n_changed=n_changed_total,
+        )
+        save_target = _collections_cache
+    try:
+        _save_collections(save_target)
+    except (OSError, RuntimeError):
+        _log.exception(
+            "collections: embedded-plasmid backfill save failed; "
+            "in-memory cache is migrated but disk still carries "
+            "pre-migration ids until the next save",
+        )
+
+
 def _load_collections() -> list[dict]:
     """Return a deepcopy of the collections list so callers can mutate
     entries (rename, edit plasmids list) without poisoning the in-memory
     cache. Matches the `_load_features` contract documented in CLAUDE.md.
     """
-    global _collections_cache
-    if _collections_cache is None:
-        entries, warning = _safe_load_json(_COLLECTIONS_FILE, "Plasmid collections")
-        if warning:
-            _log.warning(warning)
-        _collections_cache = [e for e in entries if isinstance(e, dict)]
+    _ensure_collections_cache_populated_and_migrated()
+    assert _collections_cache is not None
     return _typed_clone(_collections_cache)
 
 
@@ -4115,12 +4520,8 @@ def _iter_collections_readonly() -> list[dict]:
     the ~30–50 ms `_typed_clone` cost is meaningful on big libraries.
     For any path that mutates entries, use `_load_collections()` instead.
     """
-    global _collections_cache
-    if _collections_cache is None:
-        entries, warning = _safe_load_json(_COLLECTIONS_FILE, "Plasmid collections")
-        if warning:
-            _log.warning(warning)
-        _collections_cache = [e for e in entries if isinstance(e, dict)]
+    _ensure_collections_cache_populated_and_migrated()
+    assert _collections_cache is not None
     return _collections_cache
 
 
@@ -11653,6 +12054,507 @@ def _find_annotation_transfers(source_rec, target_rec, *,
     return transfers
 
 
+# INV-73 (2026-05-25): result cap to bound memory on completely-
+# divergent alignments (e.g. a sample matched against the wrong
+# target — every column becomes a variant). A 200 kb fully-divergent
+# alignment without the cap = ~200k dicts × ~200 B = 40 MB just for
+# variants, with the VerificationReportModal then walking them all.
+# 10k variants covers any realistic "noisy near-match" usage; above
+# that we stop walking and append a sentinel so callers can surface
+# truncation rather than silently underreport.
+_MAX_VARIANTS_PER_ALIGNMENT = 10_000
+
+
+def _extract_variants_from_alignment(
+    aligned_q: str, aligned_t: str,
+    *, max_variants: int = _MAX_VARIANTS_PER_ALIGNMENT,
+) -> "list[dict]":
+    """Walk a pairwise alignment string pair and emit one variant
+    record per discrepancy. Returns ``[{type, target_pos, length,
+    ref, alt}, ...]`` where ``target_pos`` is 0-indexed in the
+    (unrotated) target frame — non-gap positions of ``aligned_t``
+    walk target bp 0..N-1.
+
+    Variant types:
+
+      * ``"snp"``       — single-base mismatch (column where both
+                          aq and at are non-gap and differ).
+      * ``"insertion"`` — query has bases the target doesn't (gap
+                          run in aligned_t). ``target_pos`` is the
+                          target bp the insertion occurs BEFORE
+                          (= the index that would have been
+                          consumed next). ``length`` = bp inserted.
+      * ``"deletion"``  — target has bases the query doesn't (gap
+                          run in aligned_q). ``target_pos`` is the
+                          first target bp covered by the deletion.
+                          ``length`` = bp deleted.
+      * ``"truncated"`` — sentinel appended only when the result hit
+                          ``max_variants`` (default
+                          ``_MAX_VARIANTS_PER_ALIGNMENT``). Carries
+                          ``target_pos`` (last walked bp), ``length``
+                          = 0, ``ref`` = ``alt`` = ``""``, and
+                          ``omitted_after_pos`` so callers can show
+                          a "10000+ variants" indicator. Callers
+                          filtering by type=='snp'/'insertion'/
+                          'deletion' naturally skip it.
+
+    Adjacent SNPs are emitted individually (one row per column)
+    rather than merged; downstream consumers can re-merge if
+    desired. Consecutive gap columns ARE merged into a single
+    insertion/deletion entry — that matches biology better
+    (one indel event vs many one-base indels).
+
+    Returns an empty list when either string is empty or they
+    differ in length (degenerate; defensive against caller mishap).
+    """
+    if not aligned_q or not aligned_t:
+        return []
+    if len(aligned_q) != len(aligned_t):
+        return []
+    variants: list[dict] = []
+    target_pos = 0
+    i = 0
+    n = len(aligned_t)
+    cap = max(1, int(max_variants)) if max_variants else 0
+    while i < n:
+        if cap and len(variants) >= cap:
+            # Hit the result cap — stop walking and emit a sentinel.
+            # The remaining tail isn't enumerated but `target_pos` is
+            # the last bp we accounted for; callers can surface a
+            # "10000+ variants" hint rather than silently dropping.
+            variants.append({
+                "type":              "truncated",
+                "target_pos":        target_pos,
+                "length":            0,
+                "ref":               "",
+                "alt":               "",
+                "omitted_after_pos": target_pos,
+            })
+            break
+        ac = aligned_q[i]
+        bc = aligned_t[i]
+        if ac == "-" and bc == "-":
+            # Degenerate column (both gap) — ignore. PairwiseAligner
+            # doesn't produce these in normal use.
+            i += 1
+            continue
+        if ac == "-":
+            # Deletion run: query is gapped, target has bp(s) here.
+            run_start_target = target_pos
+            ref_chars: list[str] = []
+            while i < n and aligned_q[i] == "-" and aligned_t[i] != "-":
+                ref_chars.append(aligned_t[i])
+                target_pos += 1
+                i += 1
+            variants.append({
+                "type":       "deletion",
+                "target_pos": run_start_target,
+                "length":     len(ref_chars),
+                "ref":        "".join(ref_chars),
+                "alt":        "",
+            })
+            continue
+        if bc == "-":
+            # Insertion run: target is gapped, query has bp(s) here.
+            alt_chars: list[str] = []
+            while i < n and aligned_t[i] == "-" and aligned_q[i] != "-":
+                alt_chars.append(aligned_q[i])
+                i += 1
+            variants.append({
+                "type":       "insertion",
+                "target_pos": target_pos,
+                "length":     len(alt_chars),
+                "ref":        "",
+                "alt":        "".join(alt_chars),
+            })
+            continue
+        # Both non-gap.
+        if ac.upper() != bc.upper():
+            variants.append({
+                "type":       "snp",
+                "target_pos": target_pos,
+                "length":     1,
+                "ref":        bc.upper(),
+                "alt":        ac.upper(),
+            })
+        target_pos += 1
+        i += 1
+    return variants
+
+
+def _display_label_for_gbk(name: str) -> str:
+    """INV-73 (2026-05-25): convert a Plasmidsaurus gbk basename
+    (e.g. ``RUN42_1_MAV34.gbk``) into a display-ready label
+    (``MAV34``) by stripping the run-id prefix, the file extension,
+    and replacing any remaining underscores with spaces. User
+    feedback: "no underscores in names in the TUI".
+
+    Falls back to the basename minus extension if no run prefix
+    is found, so non-Plasmidsaurus filenames still get clean
+    display labels.
+    """
+    if not name:
+        return ""
+    leaf = name.rsplit("/", 1)[-1]
+    for ext in (".gbk", ".gb", ".genbank", ".dna"):
+        if leaf.lower().endswith(ext):
+            leaf = leaf[: -len(ext)]
+            break
+    m = re.match(
+        r"^[A-Z0-9]+_\d+_(.+)$", leaf, flags=re.IGNORECASE,
+    )
+    if m:
+        leaf = m.group(1)
+    return leaf.replace("_", " ").strip()
+
+
+def _normalize_for_match(name: str) -> str:
+    """Reduce a name to a comparable canonical form for the bulk
+    auto-align matcher: strip extension, drop Plasmidsaurus
+    `<RUN>_<N>_` prefix, lowercase, strip non-alphanumeric. Examples:
+    `RUN42_genbank-files/RUN42_1_MAV34.gbk` → `mav34`, `MAV 38 CAM
+    cTPFuGFP+RUBY` → `mav38camctpfugfpruby`.
+    """
+    if not name:
+        return ""
+    leaf = name.rsplit("/", 1)[-1]
+    for ext in (".gbk", ".gb", ".genbank", ".dna", ".fasta", ".fa"):
+        if leaf.lower().endswith(ext):
+            leaf = leaf[: -len(ext)]
+            break
+    # Strip Plasmidsaurus-style `<RUN_ID>_<N>_` prefix: alphanumeric
+    # run code, underscore, digits, underscore. Anchored so a
+    # sample whose user-label happens to start with digits doesn't
+    # false-positive trim.
+    import re as _re
+    m = _re.match(r"^[A-Z0-9]+_\d+_(.+)$", leaf, flags=_re.IGNORECASE)
+    if m:
+        leaf = m.group(1)
+    return _re.sub(r"[^a-z0-9]", "", leaf.lower())
+
+
+_KMER_SEQ_LEN_CAP = 50_000  # bp
+
+# INV-73 (2026-05-25): minimum sample-side k-mer count required for
+# the strong-match path in `_match_samples_to_library`. Below this a
+# sample's Jaccard is dominated by happenstance overlaps (a 25 bp
+# sample of mostly-primer-like sequence can score 1.0 against any
+# library entry containing that primer region). 50 k-mers ≈ ~70 bp
+# sample at k=20 — short for a Plasmidsaurus consensus, which is the
+# realistic floor where the user might genuinely want a sequence-
+# based match.
+_MIN_KMER_SET_FOR_STRONG_MATCH = 50
+
+
+def _kmer_set(seq: str, k: int = 20,
+              *, cap: int = _KMER_SEQ_LEN_CAP,
+              canonical: bool = True) -> set:
+    """Return the set of unique k-mers (default k=20) in ``seq``.
+    Case-insensitive (uppercase canonicalisation). Empty when seq is
+    shorter than k.
+
+    ``canonical=True`` (default) normalises each k-mer to the
+    lexicographically smaller of (k-mer, reverse_complement(k-mer))
+    so the comparison is **strand-agnostic** — a Plasmidsaurus read
+    that assembled in the opposite orientation to its library entry
+    still matches at full Jaccard. Pre-fix the matcher returned 0%
+    overlap for clearly-identical sequences when one was the RC of
+    the other (CAM-3 vs MAV 38 on the user's setup, 2026-05-24).
+    Set ``canonical=False`` if you really want orientation-sensitive
+    behaviour.
+
+    Sequences longer than ``cap`` (default 50 kb) are truncated to
+    the first ``cap`` bp — building a k-mer set for a 154 kb
+    chloroplast genome × 89 library entries exploded RAM to >5 GB
+    on the user's setup. 50 kb covers the vast majority of plasmids
+    (typical synthetic constructs run 5-20 kb); for larger entries
+    the truncated sketch is sufficient to spot a related plasmid
+    by homology of the first 50 kb.
+
+    Used by the bulk-align matcher to compare sequence similarity.
+    k=20 strikes a balance: long enough that a 4-base alphabet gives
+    essentially no random collisions across plasmid-sized sequences
+    (~4^20 ≈ 10^12), short enough that a few-bp insert / deletion /
+    SNP between related plasmids still leaves most kmers shared.
+    """
+    if not seq:
+        return set()
+    s = seq.upper()
+    if cap and len(s) > cap:
+        s = s[:cap]
+    if len(s) < k:
+        return set()
+    if not canonical:
+        return {s[i:i + k] for i in range(len(s) - k + 1)}
+    # Canonical: each k-mer's representative is the lexicographically
+    # smaller of (k-mer, RC(k-mer)). `_rc` handles full IUPAC.
+    out: set = set()
+    for i in range(len(s) - k + 1):
+        km = s[i:i + k]
+        rc = _rc(km)
+        out.add(km if km < rc else rc)
+    return out
+
+
+def _match_samples_to_library(
+    samples: "list[dict]",
+    library: "list[dict]",
+    *,
+    sequence_fallback: bool = True,
+    min_name_score: float = 0.85,
+    min_kmer_jaccard_strong: float = 0.50,
+    min_kmer_jaccard_weak: float = 0.20,
+    extract_gbk_fn=None,
+    zip_path=None,
+) -> "list[dict]":
+    """Suggest a library-entry match for each Plasmidsaurus sample.
+
+    For each ``sample`` (dict carrying ``name`` + ``gbk`` from
+    `_parse_plasmidsaurus_zip`), returns a record describing the
+    best library match found, the matching method, a 0..1 score,
+    and a recommended action: ``"align"`` (high-confidence match)
+    or ``"add"`` (no match, propose ingesting as a new entry).
+
+    **Sequence-first decision tree** (2026-05-24 revision —
+    name-substring was over-eager and could pick a coincidental
+    name overlap as the target even when a different library entry
+    was 99%-identical by sequence):
+
+      1. If ``extract_gbk_fn`` + ``zip_path`` provided, compute k-mer
+         Jaccard between the sample and EVERY library entry, plus
+         normalize-name match score (exact / substring).
+      2. Strong sequence match wins outright (Jaccard ≥
+         ``min_kmer_jaccard_strong``, default 0.50 ≈ ≥67% sequence
+         identity over the matched region) — this is the biology
+         being right, even if names don't match.
+      3. Exact / near-exact name match wins as a fallback (≥
+         ``min_name_score``, default 0.85) when sequence match was
+         weak — covers the "user labelled the sample correctly but
+         consensus assembly is poor" case.
+      4. Weak sequence match (Jaccard ≥ ``min_kmer_jaccard_weak``,
+         default 0.20) is the last-resort fallback — better than
+         no match for a related-but-divergent target.
+      5. Nothing above? Propose "add as new".
+
+    Each row's ``note`` field surfaces BOTH scores so the user can
+    spot weak matches at a glance in the confirm modal.
+
+    Performance: O(n_samples × n_library × avg_kmer_size). For a
+    6-sample run × 100-entry library × 17 kb plasmids ≈ 6 s.
+    Library k-mer sets are built once and reused across all samples.
+
+    Returns: ``list[{sample, action, target_entry, score, method,
+    note, name_score, kmer_score, alternatives}]`` where
+    ``alternatives`` is the top-3 candidates with scores so the
+    user can see what was close.
+    """
+    out: list[dict] = []
+    if not samples:
+        return out
+    # Pre-normalize library names for the name-match pass.
+    norm_lib: list[tuple[str, dict]] = []
+    for e in library:
+        if not isinstance(e, dict):
+            continue
+        n = _normalize_for_match(e.get("name", "") or e.get("id", ""))
+        if n:
+            norm_lib.append((n, e))
+    # Pre-build library k-mer sets once. Parse failures are tracked
+    # separately so callers can distinguish "no sequence match" from
+    # "couldn't even parse the target" — pre-fix both fell through
+    # to the same no-match path and the user couldn't tell whether
+    # to fix the target or the sample.
+    lib_kmer_cache: "dict[str, set]" = {}
+    lib_parse_failures: "set[str]" = set()
+    if sequence_fallback:
+        for e in library:
+            if not isinstance(e, dict):
+                continue
+            eid = e.get("id")
+            gb = e.get("gb_text")
+            if not eid or not gb:
+                continue
+            try:
+                rec = _gb_text_to_record(gb, cache=False)
+                lib_kmer_cache[eid] = _kmer_set(str(rec.seq))
+            except Exception:
+                _log.exception(
+                    "match-samples: kmer build failed for %r", eid,
+                )
+                lib_kmer_cache[eid] = set()
+                lib_parse_failures.add(eid)
+    for s in samples:
+        sample_name = s.get("name") or s.get("base") or ""
+        gbk_member = s.get("gbk")
+        if not gbk_member:
+            out.append({
+                "sample": s, "action": "skip", "target_entry": None,
+                "score": 0.0, "method": "no-gbk",
+                "note": "no consensus .gbk",
+                "name_score": 0.0, "kmer_score": 0.0,
+                "alternatives": [],
+            })
+            continue
+        # Compute per-library name + sequence score; collect the
+        # combined ranking for visibility.
+        norm_sample = _normalize_for_match(sample_name)
+        sample_kmers: set = set()
+        if (sequence_fallback and extract_gbk_fn is not None
+                and zip_path is not None):
+            try:
+                sample_gb = extract_gbk_fn(zip_path, gbk_member)
+                sample_rec = _gb_text_to_record(sample_gb, cache=False)
+                sample_kmers = _kmer_set(str(sample_rec.seq))
+            except Exception:
+                _log.exception(
+                    "match-samples: sample kmer build failed for %r",
+                    gbk_member,
+                )
+        # Per-entry scores: name + kmer. Combined for ranking is
+        # "best of either, weighted toward kmer" — sequence trumps
+        # name substring (the regression we just fixed).
+        per_entry: list[dict] = []
+        for entry in library:
+            if not isinstance(entry, dict):
+                continue
+            eid = entry.get("id")
+            if not eid:
+                continue
+            n_lib = _normalize_for_match(
+                entry.get("name", "") or eid,
+            )
+            # Name score.
+            if not n_lib or not norm_sample:
+                name_score = 0.0
+            elif norm_sample == n_lib:
+                name_score = 1.0
+            elif (norm_sample in n_lib or n_lib in norm_sample):
+                overlap = min(len(norm_sample), len(n_lib))
+                total = max(len(norm_sample), len(n_lib))
+                name_score = overlap / total if total else 0.0
+            else:
+                name_score = 0.0
+            # Sequence score (k-mer Jaccard).
+            lib_kmers = lib_kmer_cache.get(eid, set())
+            if sample_kmers and lib_kmers:
+                inter = len(sample_kmers & lib_kmers)
+                union = len(sample_kmers | lib_kmers)
+                kmer_score = inter / union if union else 0.0
+            else:
+                kmer_score = 0.0
+            per_entry.append({
+                "entry": entry, "name_score": name_score,
+                "kmer_score": kmer_score,
+            })
+        # Combined ranking: sequence score is the primary signal
+        # (it reflects biology); name score breaks ties. Boost name
+        # match slightly so two equal-Jaccard candidates pick the
+        # named one.
+        def _combined(d):
+            return d["kmer_score"] + 0.05 * d["name_score"]
+        per_entry.sort(key=_combined, reverse=True)
+        # Pick decision: strong-kmer wins, else strong-name fallback,
+        # else weak-kmer fallback, else add-as-new.
+        best = per_entry[0] if per_entry else None
+        best_name = (
+            max(per_entry, key=lambda d: d["name_score"])
+            if per_entry else None
+        )
+        chosen: "dict | None" = None
+        method = "no-match"
+        # INV-73 (2026-05-25): require a minimum number of sample
+        # k-mers before the strong-match path can fire. A 25 bp
+        # sample (~6 k-mers @ k=20) that happens to share all 6 with
+        # some library entry's 10 kb sketch would score Jaccard 6/N
+        # — still high enough to trip ≥0.5 if N is small for a
+        # similarly-tiny library entry, OR could be a coincidental
+        # full-collision when the library entry contains a primer-
+        # length match region. Below the threshold the kmer signal
+        # isn't statistically meaningful — fall through to name
+        # match. Weak-match path still accepts (last-resort fallback,
+        # the user sees both scores in the modal).
+        sample_kmers_meaningful = (
+            len(sample_kmers) >= _MIN_KMER_SET_FOR_STRONG_MATCH
+        )
+        if (best is not None
+                and best["kmer_score"] >= min_kmer_jaccard_strong
+                and sample_kmers_meaningful):
+            chosen = best
+            method = "kmer-strong"
+        elif (best_name is not None
+                and best_name["name_score"] >= min_name_score):
+            chosen = best_name
+            method = ("name-exact" if best_name["name_score"] >= 0.999
+                       else "name-near")
+        elif best is not None and best["kmer_score"] >= min_kmer_jaccard_weak:
+            chosen = best
+            method = "kmer-weak"
+        # Top-3 alternatives surface candidates that almost won so
+        # the user can spot a borderline case.
+        alternatives = [
+            {
+                "entry_id":   d["entry"].get("id"),
+                "entry_name": d["entry"].get("name") or "?",
+                "name_score": d["name_score"],
+                "kmer_score": d["kmer_score"],
+            }
+            for d in per_entry[:3]
+        ]
+        if chosen is not None:
+            note_bits = []
+            if chosen["kmer_score"] > 0:
+                note_bits.append(
+                    f"{chosen['kmer_score']:.0%} k-mer"
+                )
+            if chosen["name_score"] > 0:
+                note_bits.append(
+                    f"{chosen['name_score']:.0%} name"
+                )
+            note = " / ".join(note_bits) or method
+            out.append({
+                "sample": s, "action": "align",
+                "target_entry": chosen["entry"],
+                "score": max(chosen["kmer_score"], chosen["name_score"]),
+                "method": method, "note": note,
+                "name_score": chosen["name_score"],
+                "kmer_score": chosen["kmer_score"],
+                "alternatives": alternatives,
+            })
+            continue
+        # No match: default action is to add this sample as a new
+        # library entry (preserves provenance: user gets the read
+        # in their library with no further effort). User can flip
+        # to "skip" in the confirm modal.
+        best_kmer = (best["kmer_score"] if best else 0.0)
+        best_nm_score = (best_name["name_score"] if best_name else 0.0)
+        if best_kmer > 0 or best_nm_score > 0:
+            note = (f"best k-mer {best_kmer:.0%}, "
+                    f"best name {best_nm_score:.0%}")
+        else:
+            note = "no library match"
+        out.append({
+            "sample": s, "action": "add", "target_entry": None,
+            "score": max(best_kmer, best_nm_score),
+            "method": "no-match",
+            "note": note,
+            "name_score": best_nm_score,
+            "kmer_score": best_kmer,
+            "alternatives": alternatives,
+        })
+    # Surface library parse failures as a single batched log so the
+    # user can investigate via the diagnostic bundle rather than
+    # ~~silently proposing "add as new"~~ when the actual problem is
+    # a corrupted library entry blocking the comparison.
+    if lib_parse_failures:
+        _log.warning(
+            "match-samples: %d library entries failed to parse and "
+            "were excluded from sequence comparison: %s",
+            len(lib_parse_failures),
+            sorted(lib_parse_failures)[:10],
+        )
+    return out
+
+
 def _find_circular_alignment_offset(
     query: str, target: str, *,
     k: int = 25, n_attempts: int = 12,
@@ -11785,6 +12687,424 @@ def _rotate_seq_record(record, offset: int):
     return new_rec
 
 
+def _rotate_aligned_to_original_query_frame(
+    aligned_q: str, aligned_t: str, q_rot: int, qn: int,
+) -> "tuple[str, str]":
+    """Symmetric counterpart of `_rotate_aligned_to_original_target_frame`
+    for the QUERY axis. Pre-condition: alignment was produced against
+    ``rotated_query = query[q_rot:] + query[:q_rot]``. Post: non-gap
+    positions in returned ``aligned_q`` track original query positions
+    0..qn-1.
+
+    Used by `_diff_align_worker` (axis="query") when the picked
+    rotation was query-rotation — segments must come out in the
+    canvas plasmid's native frame, and for axis="query" the canvas
+    is the QUERY, so we transform aq back to original query frame.
+    """
+    if q_rot == 0 or qn == 0 or not aligned_q:
+        return aligned_q, aligned_t
+    q_rot = q_rot % qn
+    if q_rot == 0:
+        return aligned_q, aligned_t
+    cut_query_bp = (qn - q_rot) % qn
+    cnt = 0
+    cut_col = -1
+    for i, c in enumerate(aligned_q):
+        if c == "-":
+            continue
+        if cnt == cut_query_bp:
+            cut_col = i
+            break
+        cnt += 1
+    if cut_col < 0:
+        # Symmetric to the target-frame helper's fall-through:
+        # unreachable for global alignments (`_pick_best_rotation`
+        # exclusively uses global mode). Log so a future local-mode
+        # caller can diagnose silent rotated-frame segments.
+        _log.warning(
+            "_rotate_aligned_to_original_query_frame: cut point "
+            "(%d non-gap chars) not found in aligned_q (had %d) — "
+            "alignment doesn't span rotation point; returning "
+            "unchanged.",
+            cut_query_bp, cnt,
+        )
+        return aligned_q, aligned_t
+    new_q = aligned_q[cut_col:] + aligned_q[:cut_col]
+    new_t = aligned_t[cut_col:] + aligned_t[:cut_col]
+    return new_q, new_t
+
+
+def _rotate_aligned_to_original_target_frame(
+    aligned_q: str, aligned_t: str, t_rot: int, tn: int,
+) -> "tuple[str, str]":
+    """Rotate gapped alignment strings ``(aligned_q, aligned_t)`` so
+    that the non-gap positions of ``aligned_t`` track the ORIGINAL
+    target sequence (positions 0..tn-1), not the rotated target.
+
+    Pre-condition: the alignment was produced against
+    ``rotated_target = target[t_rot:] + target[:t_rot]`` — i.e.
+    ``aligned_t`` non-gap chars currently represent rotated_target
+    positions 0..tn-1. Post-condition: non-gap chars represent
+    original target positions 0..tn-1. The cut+concat can create a
+    wrap-spanning alignment when the original origin falls inside a
+    matched region — downstream segment computation
+    (`_alignment_to_target_segments`) handles that as two segments
+    around the origin.
+
+    Used by `_align_worker` in `SequencingScreen` and
+    `_diff_align_worker` in `PlasmidApp` whenever the rotation
+    direction picked was "rotate target" — segments must come out
+    in the canvas plasmid's native coordinate frame so the overlay
+    bars sit at the right bp on the linear map.
+
+    No-op when ``t_rot == 0`` (no rotation applied), ``tn == 0``
+    (degenerate target), or the cut point isn't found in the
+    alignment (the alignment didn't span the rotation origin —
+    falls back to leaving strings unchanged).
+    """
+    if t_rot == 0 or tn == 0 or not aligned_t:
+        return aligned_q, aligned_t
+    t_rot = t_rot % tn
+    if t_rot == 0:
+        return aligned_q, aligned_t
+    # We want the column where rotated_target bp `tn - t_rot` lives —
+    # that's the bp that corresponds to original target bp 0.
+    cut_target_bp = (tn - t_rot) % tn
+    # Walk aligned_t. The kth non-gap char (0-indexed) represents
+    # rotated_target position k. Find the column whose non-gap index
+    # is `cut_target_bp`.
+    cnt = 0
+    cut_col = -1
+    for i, c in enumerate(aligned_t):
+        if c == "-":
+            continue
+        if cnt == cut_target_bp:
+            cut_col = i
+            break
+        cnt += 1
+    if cut_col < 0:
+        # Defensive: aligned_t doesn't span the rotation point
+        # (alignment had fewer than `cut_target_bp + 1` non-gap
+        # chars). Only reachable in local-mode alignments where the
+        # match region doesn't cover the full target — `_pick_best_
+        # rotation` exclusively uses global mode so `cnt` always
+        # reaches `tn` and the cut succeeds. If a future caller
+        # introduces local mode, the segments produced from the
+        # unchanged strings will land in rotated-target frame and
+        # render at the wrong canvas bp. Log so the silent fall-
+        # through is at least diagnosable.
+        _log.warning(
+            "_rotate_aligned_to_original_target_frame: cut point "
+            "(%d non-gap chars) not found in aligned_t (had %d) — "
+            "alignment doesn't span rotation point; returning "
+            "unchanged. Caller must be using global alignment OR "
+            "expect segments in rotated frame.",
+            cut_target_bp, cnt,
+        )
+        return aligned_q, aligned_t
+    new_t = aligned_t[cut_col:] + aligned_t[:cut_col]
+    new_q = aligned_q[cut_col:] + aligned_q[:cut_col]
+    return new_q, new_t
+
+
+def _pick_best_rotation(query_seq: str, target_seq: str, *,
+                         is_circular: bool,
+                         mode: str = "global",
+                         canvas_axis: str = "target") -> dict:
+    """Run pairwise alignment with the best of three rotation
+    strategies: plain (no rotation), rotate-query, rotate-target.
+    Picks whichever gives the highest overall ``identity_pct`` — more
+    aligned bases = more informative overlay bars on the canvas.
+
+    Returns the alignment ``result`` dict with two extra fields:
+
+      * ``picked_rotation``: ``"none"``, ``"query"``, or ``"target"``.
+      * ``query_rotation`` / ``target_rotation``: the offset applied
+        (0 for the unpicked side and for ``"none"``).
+
+    ``canvas_axis`` selects which side of the alignment is the
+    canvas plasmid (= the axis whose coordinate frame the segments
+    must land in):
+
+      * ``"target"`` (default) — Plasmidsaurus flow. Canvas == target.
+        Picking ``"target"`` rotation requires shifting aq/at back to
+        the original target frame via
+        `_rotate_aligned_to_original_target_frame`; picking
+        ``"query"`` leaves at in original target frame (no shift).
+      * ``"query"`` — diff-plasmid / Alt+A flow. Canvas == query.
+        Picking ``"query"`` rotation requires shifting aq/at back to
+        the original query frame via
+        `_rotate_aligned_to_original_query_frame`; picking
+        ``"target"`` leaves aq in original query frame (no shift).
+
+    Caller always passes the ORIGINAL (unrotated) ``target_record``
+    to `_register_alignment`; the alignment strings already encode
+    the rotation for the canvas-axis side.
+
+    Optimisation: plain alignment is always run first. Rotations are
+    only attempted when ``is_circular`` is true AND the plain
+    identity is below ``_ROTATION_TRY_THRESHOLD_PCT`` (default 80) —
+    a well-aligned plasmid pair doesn't pay the 2x C-loop cost.
+
+    Raises whatever `_pairwise_align` raises if EVERY candidate
+    alignment fails. Callers wrap with the same ValueError /
+    Exception split they use for the plain `_pairwise_align` call.
+    """
+    if canvas_axis not in ("target", "query"):
+        raise ValueError(
+            f"canvas_axis must be 'target' or 'query' (got {canvas_axis!r})"
+        )
+    # Reject empty inputs upfront. `_pairwise_align` has its own
+    # length cap (`_PAIRWISE_MAX_LEN`) and degenerate-input handling,
+    # but 0-length sequences would silently produce a 0%-identity
+    # candidate that downstream code can't usefully render — better
+    # to fail loudly here so the caller surfaces a clear error.
+    if not query_seq or not target_seq:
+        raise ValueError(
+            "query and target sequences must be non-empty "
+            f"(query={len(query_seq)} bp, target={len(target_seq)} bp)"
+        )
+    # Normalise once at entry. Every candidate alignment + every
+    # frame-shift below uses the cleaned strings, so `len(target_seq)`
+    # in the frame-shift helpers matches what `_pairwise_align`
+    # actually consumed. Pre-fix a caller that passed raw FASTA
+    # (with header/whitespace) would see frame-shifts mis-compute
+    # because `_pairwise_align`'s internal normalisation shrank the
+    # effective sequence length.
+    query_seq = _normalize_dna_for_align(query_seq)
+    target_seq = _normalize_dna_for_align(target_seq)
+    if not query_seq or not target_seq:
+        raise ValueError(
+            "query / target sequence is empty after IUPAC normalisation"
+        )
+    # Pre-compute RC of query for the orientation-agnostic trials.
+    # `_rc` handles full IUPAC, so non-ACGT bases survive correctly.
+    rc_query_seq = _rc(query_seq) if query_seq else ""
+    # Each candidate carries (kind, offset, is_rc, result). Forward
+    # AND reverse-complement of the query are tried at the plain
+    # tier so a read assembled in the opposite orientation to the
+    # library entry still picks up. Same defence as the canonical
+    # k-mer fix in `_kmer_set`.
+    #
+    # Early termination: when any candidate's overall identity
+    # crosses ``_ROTATION_EARLY_STOP_PCT`` (default 99.5%), the
+    # picker stops attempting further candidates — it's already a
+    # near-perfect alignment, no rotation can meaningfully improve
+    # it, and each extra C-loop costs ~5 s on a 20 kb plasmid.
+    candidates: list[tuple[str, int, bool, dict]] = []
+    plain_exc: "Exception | None" = None
+
+    def _good_enough() -> bool:
+        return any(
+            c[3].get("identity_pct", 0.0) >= _ROTATION_EARLY_STOP_PCT
+            for c in candidates
+        )
+
+    try:
+        r_plain = _pairwise_align(query_seq, target_seq, mode=mode)
+        candidates.append(("none", 0, False, r_plain))
+    except Exception as exc:
+        plain_exc = exc
+    if rc_query_seq and not _good_enough():
+        try:
+            r_plain_rc = _pairwise_align(rc_query_seq, target_seq, mode=mode)
+            candidates.append(("none", 0, True, r_plain_rc))
+        except Exception:
+            _log.exception(
+                "rotation picker: plain RC alignment raised",
+            )
+    plain_id = max((c[3].get("identity_pct", 0.0) for c in candidates),
+                    default=0.0)
+    # Only try the rotation candidates when (a) the target is
+    # circular, (b) plain alignment is poor enough that rotation
+    # might rescue it. The 80% threshold is empirical: anything
+    # above ~80% identity is already in the right register and
+    # rotation can only marginally improve it (not worth the 2x
+    # C-loop).
+    if (is_circular and plain_id < _ROTATION_TRY_THRESHOLD_PCT
+            and not _good_enough()):
+        # Rotation trials are run for BOTH orientations (fwd + RC)
+        # when plain alignment in either orientation was below
+        # threshold. Pre-fix the picker only tried rotation on
+        # whichever plain orientation scored higher — for a random
+        # target the RC plain has spuriously high identity (~50%)
+        # which made the picker skip forward-rotation trials and
+        # miss the true rotation alignment. Each candidate also
+        # gates on `_good_enough()` so once any candidate hits the
+        # early-stop threshold we don't keep paying the C-loop.
+        for rot_is_rc in (False, True):
+            if _good_enough():
+                break
+            eff_query = rc_query_seq if rot_is_rc else query_seq
+            if not eff_query:
+                continue
+            # Query rotation: find a unique seed in target, locate
+            # in query, rotate query so its origin aligns with
+            # target's.
+            try:
+                q_rot = _find_circular_alignment_offset(
+                    target_seq, eff_query,
+                )
+            except Exception:
+                _log.exception(
+                    "rotation picker: query-seed probe raised",
+                )
+                q_rot = 0
+            if q_rot:
+                try:
+                    rq = eff_query[q_rot:] + eff_query[:q_rot]
+                    r = _pairwise_align(rq, target_seq, mode=mode)
+                    candidates.append(("query", q_rot, rot_is_rc, r))
+                except Exception:
+                    _log.exception(
+                        "rotation picker: query-rotated align raised",
+                    )
+            if _good_enough():
+                break
+            # Target rotation: find a unique seed in query, locate
+            # in target, rotate target so its origin aligns with
+            # query's.
+            try:
+                t_rot = _find_circular_alignment_offset(
+                    eff_query, target_seq,
+                )
+            except Exception:
+                _log.exception(
+                    "rotation picker: target-seed probe raised",
+                )
+                t_rot = 0
+            if t_rot:
+                try:
+                    rt = target_seq[t_rot:] + target_seq[:t_rot]
+                    r = _pairwise_align(eff_query, rt, mode=mode)
+                    candidates.append(("target", t_rot, rot_is_rc, r))
+                except Exception:
+                    _log.exception(
+                        "rotation picker: target-rotated align raised",
+                    )
+    if not candidates:
+        # Every alignment failed — re-raise the plain failure so the
+        # caller can surface a user-visible error.
+        raise plain_exc if plain_exc is not None else RuntimeError(
+            "no alignment candidates produced",
+        )
+    # Pick by overall identity_pct (gap-inclusive). Higher = more of
+    # the target is covered by matches, which is what makes the
+    # overlay band informative.
+    best_kind, best_offset, best_is_rc, best_result = max(
+        candidates, key=lambda c: c[3].get("identity_pct", 0.0),
+    )
+    best_result = dict(best_result)
+    best_result["picked_rotation"] = best_kind
+    best_result["query_rotation"] = best_offset if best_kind == "query" else 0
+    best_result["target_rotation"] = (
+        best_offset if best_kind == "target" else 0
+    )
+    # `query_rc` signals the read was reverse-complemented before
+    # alignment — drill-in viewers / diagnostic surfaces can flip the
+    # displayed read accordingly. The aligned_q stored is in the
+    # RC frame when this is True; segments are still in canvas-axis
+    # frame (the RC orientation only affects how the query bases
+    # are displayed in the drill-in).
+    best_result["query_rc"] = best_is_rc
+    # Shift aligned strings back to original canvas-axis frame so
+    # downstream segment computation lands on the canvas plasmid's
+    # bp positions. Persistence round-trips through these rotated
+    # strings, so re-hydrate also computes segments in original frame.
+    # Only the side that matches the canvas axis needs shifting —
+    # rotation on the OTHER side leaves the canvas-axis frame intact.
+    if (best_kind == "target" and best_offset
+            and canvas_axis == "target"):
+        new_q, new_t = _rotate_aligned_to_original_target_frame(
+            best_result.get("aligned_q", ""),
+            best_result.get("aligned_t", ""),
+            best_offset, len(target_seq),
+        )
+        best_result["aligned_q"] = new_q
+        best_result["aligned_t"] = new_t
+    elif (best_kind == "query" and best_offset
+            and canvas_axis == "query"):
+        # Note: when query was RC'd before rotation, the resulting
+        # `aligned_q` is in the rotated-RC-query frame. Shifting
+        # back to "original query" frame would un-shift the rotation
+        # but the RC remains — segments still correct in the canvas
+        # query frame (positions don't depend on strand, just on
+        # which side of the alignment they map to). Acceptable.
+        new_q, new_t = _rotate_aligned_to_original_query_frame(
+            best_result.get("aligned_q", ""),
+            best_result.get("aligned_t", ""),
+            best_offset, len(query_seq),
+        )
+        best_result["aligned_q"] = new_q
+        best_result["aligned_t"] = new_t
+    return best_result
+
+
+# Threshold below which rotation candidates are tried (above which
+# plain alignment is "good enough" and the 2x C-loop isn't worth it).
+# Tunable — empirically ~80% identity covers the same-plasmid case
+# while leaving headroom for partial-homology cases.
+_ROTATION_TRY_THRESHOLD_PCT = 80.0
+
+# When any candidate's overall identity_pct crosses this threshold,
+# `_pick_best_rotation` stops attempting further candidates. 99.5%
+# is "essentially perfect" — any additional alignment would either
+# tie or lose, so spending another C-loop (~5 s on a 20 kb plasmid)
+# is wasted. Real biology rarely produces 100% reads (sequencing
+# noise leaves a handful of SNPs), so 99.5% admits the realistic
+# best case without holding out for a literal 100%.
+_ROTATION_EARLY_STOP_PCT = 99.5
+
+
+_IUPAC_NUC_CHARS = frozenset("ACGTUMRWSYKVHDBN")
+_IUPAC_NUC_PATTERN = re.compile(r"^[ACGTUMRWSYKVHDBN]+$")
+# Strip whole FASTA header lines first (`>name optional desc\n`) so
+# the header text doesn't leak into the cleaned sequence; then strip
+# all whitespace / digits. Compiled separately because the FASTA
+# pattern is line-anchored.
+_FASTA_HEADER_PATTERN = re.compile(r"^>[^\n]*\n?", re.MULTILINE)
+_SCRUB_PATTERN     = re.compile(r"[\s\d]+")
+
+
+def _normalize_dna_for_align(seq: str) -> str:
+    """Scrub FASTA header lines + whitespace + digits from ``seq``,
+    uppercase, and validate that every remaining character is an IUPAC
+    nucleotide code (``ACGTUMRWSYKVHDBN``).
+
+    Covers the common bad-paste failure modes upstream of the C-loop:
+
+      * FASTA pasted as-is — ``>name`` line gets stripped along with
+        the embedded newlines, leaving only the sequence body.
+      * GenBank ``ORIGIN`` block — leading bp position numbers, line
+        wraps, spaces between every 10 bp.
+      * Protein pasted in a DNA-only field — would have ``EFILPQ`` etc.
+        Pre-fix Biopython chewed through these and produced a
+        "no alignment" result with no clue why.
+
+    Returns the cleaned string. Raises ``ValueError`` on a foreign
+    character (with the offending char(s) named in the message so
+    the user can find them in the source).
+    """
+    if not seq:
+        return ""
+    # Two-pass scrub: FASTA headers first (line-anchored), then
+    # whitespace/digits across the whole string. Order matters —
+    # stripping `\n` first would let the header text leak into the
+    # body and trip the IUPAC check on a leading "MYPLASMID" etc.
+    s = _FASTA_HEADER_PATTERN.sub("", seq)
+    s = _SCRUB_PATTERN.sub("", s).upper()
+    if not s:
+        return ""
+    if not _IUPAC_NUC_PATTERN.match(s):
+        bad = sorted(set(s) - _IUPAC_NUC_CHARS)
+        raise ValueError(
+            f"sequence contains non-IUPAC nucleotide character(s): "
+            f"{', '.join(repr(c) for c in bad[:6])}"
+            f"{' (truncated)' if len(bad) > 6 else ''}"
+        )
+    return s
+
+
 @_timed("op.pairwise_align")
 def _pairwise_align(query_seq: str, target_seq: str,
                      *, mode: str = "global",
@@ -11812,12 +13132,15 @@ def _pairwise_align(query_seq: str, target_seq: str,
 
     Raises ValueError on empty / oversized / non-IUPAC input or when
     Biopython can't produce an alignment (rare; falls through cleanly).
+    Inputs are normalised via `_normalize_dna_for_align` first —
+    whitespace, digits, and FASTA `>` markers are stripped; a foreign
+    character (e.g. a protein letter) raises before the C-loop runs.
     """
     from Bio.Align import PairwiseAligner
     if not isinstance(query_seq, str) or not isinstance(target_seq, str):
         raise ValueError("query_seq and target_seq must be str")
-    q = query_seq.strip().upper()
-    t = target_seq.strip().upper()
+    q = _normalize_dna_for_align(query_seq)
+    t = _normalize_dna_for_align(target_seq)
     if not q or not t:
         raise ValueError("query / target sequence is empty")
     if len(q) > _PAIRWISE_MAX_LEN or len(t) > _PAIRWISE_MAX_LEN:
@@ -12147,6 +13470,17 @@ def _serialize_alignment_for_storage(
         target_seq = str(target_record.seq)
     except (AttributeError, TypeError):
         target_seq = ""
+    # An empty target_seq means the record is malformed — we can't
+    # persist a useful alignment without it (stale-target hash would
+    # mis-fire on every reload, and the deserialized record would
+    # have no sequence for the renderer). Surface + drop.
+    if not target_seq:
+        _log.warning(
+            "alignment serialize: target has no sequence for %r; "
+            "refusing to persist (broken record)",
+            in_memory_entry.get("name", "?"),
+        )
+        return None
     target_id = ""
     try:
         target_id = str(getattr(target_record, "id", "") or "")
@@ -12187,8 +13521,16 @@ def _deserialize_stored_alignment_args(
     `_register_alignment`. The `target_gb_text` field is round-tripped
     back into a SeqRecord; everything else is passed through.
 
-    Returns None when the stored entry is malformed (no gb_text, or
-    the gb_text fails to parse) — caller skips with a log entry.
+    Returns None when the stored entry is malformed (no gb_text, the
+    gb_text fails to parse, or the result dict is missing the
+    `aligned_q`/`aligned_t` fields the segment computation needs).
+    Caller skips with a log entry.
+
+    Backward-compat: pre-2026-05-24 stored alignments don't carry the
+    rotation-picker fields (``picked_rotation``, ``query_rotation``,
+    ``target_rotation``, ``query_rc``). Defaults are injected here so
+    the hydrated entry has consistent shape — downstream consumers
+    can treat any stored alignment uniformly.
     """
     gb_text = stored.get("target_gb_text", "")
     if not gb_text:
@@ -12205,13 +13547,229 @@ def _deserialize_stored_alignment_args(
             stored.get("label", "?"),
         )
         return None
+    result = dict(stored.get("result") or {})
+    # Schema validation: aligned_q / aligned_t are mandatory — without
+    # them `_alignment_to_target_segments` would either raise or
+    # produce empty segments, and the alignment would silently fail
+    # to register. Surface a clear log entry + skip rather than
+    # cascading downstream.
+    if not result.get("aligned_q") or not result.get("aligned_t"):
+        _log.warning(
+            "alignment hydrate: stored entry %r missing aligned_q / "
+            "aligned_t in result dict; skipping",
+            stored.get("label", "?"),
+        )
+        return None
+    # Lengths must match — caller's segment walk assumes paired
+    # columns. A corrupted store or schema mismatch could violate this.
+    if len(result["aligned_q"]) != len(result["aligned_t"]):
+        _log.warning(
+            "alignment hydrate: stored entry %r has unequal aligned "
+            "string lengths (q=%d, t=%d); skipping",
+            stored.get("label", "?"),
+            len(result["aligned_q"]), len(result["aligned_t"]),
+        )
+        return None
+    # Backward-compat defaults: pre-rotation-picker stored alignments
+    # lack these fields. Inject safe defaults so downstream code can
+    # uniformly access them without `.get("...", default)` everywhere.
+    result.setdefault("picked_rotation", "none")
+    result.setdefault("query_rotation",  0)
+    result.setdefault("target_rotation", 0)
+    result.setdefault("query_rc",        False)
+    # INV-73 (2026-05-25): validate the rotation-picker fields against
+    # their expected value space. A corrupted storage file (manual
+    # edit / cross-version downgrade / partial write recovery) could
+    # carry e.g. picked_rotation="both" or a negative rotation
+    # offset — downstream consumers would silently misinterpret the
+    # alignment frame. Coerce back to safe defaults with a warning
+    # rather than crashing or skipping the whole entry (the aligned
+    # strings themselves are still good — only the rotation metadata
+    # is suspect).
+    _PICKED_ROT_OK = {"none", "query", "target"}
+    if result["picked_rotation"] not in _PICKED_ROT_OK:
+        _log.warning(
+            "alignment hydrate: stored entry %r has invalid "
+            "picked_rotation=%r (expected one of %s); coercing to "
+            "'none'", stored.get("label", "?"),
+            result["picked_rotation"], sorted(_PICKED_ROT_OK),
+        )
+        result["picked_rotation"] = "none"
+    for _rot_key in ("query_rotation", "target_rotation"):
+        v = result.get(_rot_key)
+        if not isinstance(v, int) or v < 0:
+            _log.warning(
+                "alignment hydrate: stored entry %r has invalid "
+                "%s=%r (expected non-negative int); coercing to 0",
+                stored.get("label", "?"), _rot_key, v,
+            )
+            result[_rot_key] = 0
+    if not isinstance(result.get("query_rc"), bool):
+        _log.warning(
+            "alignment hydrate: stored entry %r has non-bool "
+            "query_rc=%r; coercing to False",
+            stored.get("label", "?"), result.get("query_rc"),
+        )
+        result["query_rc"] = False
     return {
         "name":          stored.get("label", "alignment"),
         "query_label":   stored.get("query_label", ""),
         "target_label":  stored.get("target_label", ""),
         "target_record": target_record,
-        "result":        stored.get("result") or {},
+        "result":        result,
         "axis":          stored.get("axis", "target"),
+    }
+
+
+# Thresholds for the LibraryPanel "Seq" status badge. Tunable; chosen
+# so a clean Plasmidsaurus consensus of the library plasmid lights up
+# ✓, a read with a handful of SNPs lights up ⚠, and a fundamentally
+# different plasmid (length-mismatched or low identity) lights up ✗.
+_SEQ_STATUS_VERIFIED_UNGAPPED_PCT = 99.5
+_SEQ_STATUS_VERIFIED_COVERAGE_PCT = 99.0
+_SEQ_STATUS_VERIFIED_MAX_GAPS     = 0
+_SEQ_STATUS_NEAR_UNGAPPED_PCT     = 95.0
+_SEQ_STATUS_NEAR_COVERAGE_PCT     = 80.0
+
+
+def _coverage_pct_from_result(result: dict, target_len: int) -> float:
+    """Compute clamped coverage% from a `_pairwise_align` result dict.
+
+    Coverage = aligned_bp / target_bp, capped at 100% defensively
+    (a corrupted result or local-alignment self-overlap could in
+    principle inflate the ratio; ">100%" reads as a bug to the
+    user, so cap for display while the underlying numbers ride
+    untouched in storage). Returns 0.0 for missing / zero
+    target_len so callers can format unconditionally.
+    """
+    if not target_len or target_len <= 0:
+        return 0.0
+    try:
+        aligned_bp = (
+            int(result.get("n_matches", 0) or 0)
+            + int(result.get("n_mismatches", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        return 0.0
+    if aligned_bp <= 0:
+        return 0.0
+    return min(100.0, 100.0 * aligned_bp / target_len)
+
+
+def _alignment_quality_status(
+    result: dict, target_len: int,
+) -> "tuple[str, str, str]":
+    """Classify a single stored alignment's `result` dict into a
+    one-glyph status code suitable for the LibraryPanel "Seq" column.
+
+    Returns ``(code, glyph, color)`` where:
+
+      * ``code`` is one of ``"verified"`` / ``"near"`` / ``"partial"``
+        / ``"divergent"`` — for sort/filter consumers.
+      * ``glyph`` is a single rendered character (``✓`` / ``⚠`` /
+        ``~`` / ``✗``) for the LibraryPanel column cell.
+      * ``color`` is the rich-style colour name (``"green"`` /
+        ``"yellow"`` / ``"red"``).
+
+    Thresholds use BOTH ungapped identity AND coverage% so a read that
+    matches a sub-region perfectly (e.g. plasmidsaurus consensus of
+    a different but related plasmid) doesn't false-positive as
+    ``verified``. ``n_gaps == 0`` is the strict invariant for ``✓`` —
+    even one indel demotes to ``⚠`` since indels are typically a
+    bigger deal than SNPs for a cloning workflow.
+    """
+    if not isinstance(result, dict):
+        return ("divergent", "✗", "red")
+    n_match = int(result.get("n_matches", 0) or 0)
+    n_mismatch = int(result.get("n_mismatches", 0) or 0)
+    n_gaps = int(result.get("n_gaps", 0) or 0)
+    ungapped = float(result.get("ungapped_identity_pct", 0.0) or 0.0)
+    # Defensive: negative values from a corrupted result dict would
+    # make the coverage calc nonsensical and could let a `verified`
+    # status fire on garbage. Treat any negative as divergent.
+    if n_match < 0 or n_mismatch < 0 or n_gaps < 0 or ungapped < 0:
+        return ("divergent", "✗", "red")
+    aligned_bp = n_match + n_mismatch
+    coverage_pct = (
+        100.0 * aligned_bp / target_len if target_len else 0.0
+    )
+    if (ungapped >= _SEQ_STATUS_VERIFIED_UNGAPPED_PCT
+            and coverage_pct >= _SEQ_STATUS_VERIFIED_COVERAGE_PCT
+            and n_gaps <= _SEQ_STATUS_VERIFIED_MAX_GAPS
+            and n_mismatch == 0):
+        return ("verified", "✓", "green")
+    if (ungapped >= _SEQ_STATUS_NEAR_UNGAPPED_PCT
+            and coverage_pct >= _SEQ_STATUS_NEAR_COVERAGE_PCT):
+        return ("near", "⚠", "yellow")
+    if coverage_pct < _SEQ_STATUS_NEAR_COVERAGE_PCT:
+        return ("partial", "~", "yellow")
+    return ("divergent", "✗", "red")
+
+
+# Code → priority used when an entry has multiple alignments. Best
+# (highest priority) code wins for the badge. A "verified" alignment
+# overrules a "divergent" one, etc. Drives the per-entry summary in
+# `_library_entry_alignment_summary`.
+_SEQ_STATUS_PRIORITY = {
+    "verified":  3,
+    "near":      2,
+    "partial":   1,
+    "divergent": 0,
+}
+
+
+def _library_entry_alignment_summary(entry: dict) -> "dict | None":
+    """Reduce an entry's stored ``alignments`` list to a single
+    sequencing-status summary suitable for the LibraryPanel column.
+
+    Returns ``None`` when the entry has no stored alignments (caller
+    renders ``—`` dim). Otherwise returns
+    ``{code, glyph, color, n_total, n_visible, label}`` where ``label``
+    is the cell-ready Rich-markup string ("✓", "⚠ 2", etc.).
+
+    Picks the best-coded alignment (verified > near > partial >
+    divergent) for the headline glyph. Total alignment count is
+    appended in parens when > 1 so the user knows how many reads
+    are aligned to this entry.
+    """
+    alignments = entry.get("alignments")
+    if not isinstance(alignments, list) or not alignments:
+        return None
+    target_len = int(entry.get("size") or 0)
+    best_code = None
+    best_glyph = None
+    best_color = None
+    best_priority = -1
+    n_visible = 0
+    for align in alignments:
+        if not isinstance(align, dict):
+            continue
+        if not align.get("visible", True):
+            continue
+        n_visible += 1
+        result = align.get("result") or {}
+        code, glyph, color = _alignment_quality_status(result, target_len)
+        pr = _SEQ_STATUS_PRIORITY.get(code, -1)
+        if pr > best_priority:
+            best_priority = pr
+            best_code = code
+            best_glyph = glyph
+            best_color = color
+    if best_code is None:
+        # All entries were hidden — surface count but no headline glyph.
+        return {
+            "code": "hidden", "glyph": "·", "color": "dim",
+            "n_total": len(alignments), "n_visible": 0,
+            "label": f"· ({len(alignments)})",
+        }
+    suffix = f" {n_visible}" if n_visible > 1 else ""
+    return {
+        "code":      best_code,
+        "glyph":     best_glyph,
+        "color":     best_color,
+        "n_total":   len(alignments),
+        "n_visible": n_visible,
+        "label":     f"{best_glyph}{suffix}",
     }
 
 
@@ -16381,7 +17939,17 @@ class LibraryPanel(Widget):
         coll = self.query_one("#lib-coll-table", DataTable)
         coll.add_columns("Name", "Plasmids")
         plas = self.query_one("#lib-table", DataTable)
-        plas.add_columns("Name", "Status", "bp")
+        # Columns:
+        #   ● — workflow status colour ball (its own column for
+        #       at-a-glance scanning; previously embedded as a prefix
+        #       in the Name cell).
+        #   Name — display name only (no prefix).
+        #   Status — workflow status text (DESIGNING / CLONING /
+        #            SEQUENCING / VERIFIED).
+        #   Seq — sequencing-alignment status badge (✓ / ⚠ / ~ /
+        #         ✗ / —) via `_library_entry_alignment_summary`.
+        #   bp — sequence length.
+        plas.add_columns("●", "Name", "Status", "Seq", "bp")
         self._apply_view_mode()
         self._apply_panel_width()
         self._repopulate()
@@ -16617,17 +18185,17 @@ class LibraryPanel(Widget):
             name_disp = name_disp[:name_inner]
             status = _sanitize_plasmid_status(entry.get("status"))
             color  = _PLASMID_STATUS_COLORS.get(status)
-            # Build the name cell as a `Text` so the circle prefix
-            # gets its own colour while the name itself stays the
-            # default foreground (otherwise long names tint).
-            name_cell = Text(no_wrap=True, overflow="ellipsis")
+            # ● column: status-coloured filled circle. Empty when no
+            # status is set so the column reserves space but doesn't
+            # render a dot. Far-left position makes it the first
+            # thing the eye lands on when scanning the library.
             if color is not None:
-                name_cell.append("● ", style=color)
+                ball_cell = Text("●", style=color)
             else:
-                # Reserve the same 2 cells for "no status" entries
-                # so the names align column-wise. Empty space, no
-                # background tint.
-                name_cell.append("  ")
+                ball_cell = Text("·", style="dim")
+            # Name column: clean display name (no circle prefix —
+            # that moved to its own ● column on the left).
+            name_cell = Text(no_wrap=True, overflow="ellipsis")
             name_cell.append(name_disp)
             # Status column: coloured workflow tag, or a dim em-dash
             # when no status is set.
@@ -16636,9 +18204,24 @@ class LibraryPanel(Widget):
                                     style=f"{color} bold")
             else:
                 status_cell = Text("—", style="dim")
+            # Seq column: badge summarising the entry's stored
+            # alignments via `_library_entry_alignment_summary`. Dim
+            # em-dash when the entry has no sequencing data — quickly
+            # distinguishes verified vs unsequenced constructs across
+            # the library at a glance.
+            seq_summary = _library_entry_alignment_summary(entry)
+            if seq_summary is None:
+                seq_cell = Text("—", style="dim")
+            else:
+                seq_cell = Text(
+                    seq_summary["label"],
+                    style=f"{seq_summary['color']} bold",
+                )
             t.add_row(
+                ball_cell,
                 name_cell,
                 status_cell,
+                seq_cell,
                 f"{entry['size']:,}",
                 key=entry["id"],
             )
@@ -16677,14 +18260,21 @@ class LibraryPanel(Widget):
                 prev_status = _sanitize_plasmid_status(e.get("status"))
                 break
         # Pre-build the new entry dict so collision detection can
-        # compare against it directly.
-        display_name = (
+        # compare against it directly. `.strip()` on the display name
+        # is sacred — a `.dna` filename like `'MAV 27 ….dna'` (with a
+        # trailing space before the extension) used to seed a library
+        # `name` field with the same trailing space, which then broke
+        # the delete-cascade's strict `==` match against the parts_bin
+        # row (saved without the space). 2026-05-24: trim at every
+        # `e["name"]` and `e["id"]` write site; the backfill in
+        # `_load_library` cleans legacy entries.
+        display_name = str(
             getattr(record, "_tui_display_name", None)
-            or record.name or record.id
-        )
+            or record.name or record.id or ""
+        ).strip()
         new_entry = {
             "name":    display_name,
-            "id":      record.id,
+            "id":      str(record.id or "").strip(),
             "size":    len(record.seq),
             "n_feats": len([f for f in record.features if f.type != "source"]),
             "source":  getattr(record, "_tui_source", f"id:{record.id}"),
@@ -16862,13 +18452,13 @@ class LibraryPanel(Widget):
                         )
                         silent_replace_ids.add(rec_id)
                         break
-            display_name = (
+            display_name = str(
                 getattr(record, "_tui_display_name", None)
-                or record.name or record.id
-            )
+                or record.name or record.id or ""
+            ).strip()
             prospective.append({
                 "name":    display_name,
-                "id":      record.id,
+                "id":      str(record.id or "").strip(),
                 "size":    len(record.seq),
                 "n_feats": len([
                     f for f in record.features if f.type != "source"
@@ -17215,6 +18805,102 @@ class LibraryPanel(Widget):
             self._refresh_active_row()
         self._update_header()
 
+    def refresh_status_cell(self, entry_id: str) -> None:
+        """Update the ● + Status cells for a single library entry
+        without repopulating the whole table.
+
+        Used by the status-change paths (`PlasmidStatusPickerModal`
+        callback, bulk-align auto-tagging) so a 156 MB
+        collections.json save doesn't gate the UI repaint behind a
+        full table rebuild. Mirrors `refresh_seq_cell` for the
+        status-related columns.
+        """
+        if not entry_id:
+            return
+        if self._view_mode != "plasmids":
+            return
+        try:
+            t = self.query_one("#lib-table", DataTable)
+        except NoMatches:
+            return
+        entry = _find_library_entry_by_id(entry_id)
+        if entry is None:
+            return
+        status = _sanitize_plasmid_status(entry.get("status"))
+        color = _PLASMID_STATUS_COLORS.get(status)
+        # Mirror `_repopulate_plasmids` cell construction so the
+        # refreshed row matches the rest of the table exactly.
+        if color is not None:
+            ball_cell = Text("●", style=color)
+        else:
+            ball_cell = Text("·", style="dim")
+        if status and color is not None:
+            status_cell = Text(status, style=f"{color} bold")
+        else:
+            status_cell = Text("—", style="dim")
+        try:
+            from textual.coordinate import Coordinate
+            for i, row_key in enumerate(t.rows.keys()):
+                if row_key.value == entry_id:
+                    # ● = col 0, Name = 1, Status = col 2.
+                    t.update_cell_at(Coordinate(i, 0), ball_cell)
+                    t.update_cell_at(Coordinate(i, 2), status_cell)
+                    return
+        except Exception:
+            _log.exception(
+                "LibraryPanel.refresh_status_cell: incremental "
+                "update failed; falling back to full repopulate",
+            )
+            self._repopulate_plasmids()
+
+    def refresh_seq_cell(self, entry_id: str) -> None:
+        """Update the Seq-column cell for a single library entry without
+        repopulating the whole table.
+
+        Called from `_flush_active_alignments` after a stored alignment
+        update so the LibraryPanel badge tracks current state. No-op
+        when the panel is in collections view (table isn't visible) or
+        the entry isn't in the displayed rows (filter out, deleted
+        mid-flight) — the next full `_repopulate_plasmids` catches up.
+        """
+        if not entry_id:
+            return
+        if self._view_mode != "plasmids":
+            return
+        try:
+            t = self.query_one("#lib-table", DataTable)
+        except NoMatches:
+            return
+        entry = _find_library_entry_by_id(entry_id)
+        if entry is None:
+            return
+        summary = _library_entry_alignment_summary(entry)
+        if summary is None:
+            cell = Text("—", style="dim")
+        else:
+            cell = Text(
+                summary["label"],
+                style=f"{summary['color']} bold",
+            )
+        try:
+            from textual.coordinate import Coordinate
+            for i, row_key in enumerate(t.rows.keys()):
+                if row_key.value == entry_id:
+                    # Seq is column index 3: ●=0, Name=1, Status=2,
+                    # Seq=3, bp=4. Matches the `add_columns` order
+                    # in `on_mount`. If the column order ever shifts,
+                    # update all spots in lockstep.
+                    t.update_cell_at(
+                        Coordinate(i, 3), cell,
+                    )
+                    return
+        except Exception:
+            _log.exception(
+                "LibraryPanel.refresh_seq_cell: incremental update "
+                "failed; falling back to full repopulate"
+            )
+            self._repopulate_plasmids()
+
     def _refresh_active_row(self) -> None:
         """Update just the active plasmid's Name cell, not the whole table.
 
@@ -17242,7 +18928,9 @@ class LibraryPanel(Widget):
             from textual.coordinate import Coordinate
             for i, row_key in enumerate(t.rows.keys()):
                 if row_key.value == self._active_id:
-                    t.update_cell_at(Coordinate(i, 0), display)
+                    # Name = column 1 in the new layout (●=0,
+                    # Name=1, Status=2, Seq=3, bp=4).
+                    t.update_cell_at(Coordinate(i, 1), display)
                     return
         except Exception:
             self._repopulate_plasmids()
@@ -17322,11 +19010,20 @@ class LibraryPanel(Widget):
                     if len(parts_src) >= 2:
                         lib_grammar = parts_src[1]
                 bin_entries = _load_parts_bin()
+                # 2026-05-24: `.strip()` both sides of the name match
+                # so a stale trailing space in the library entry's
+                # name (e.g. `'MAV 27 …'` inherited from a `.dna`
+                # filename) doesn't silently miss the parts_bin row
+                # (saved without the space). Defence-in-depth — the
+                # save-side trim + load-side backfill both also fix
+                # this; the strip here ensures legacy state that
+                # slipped past both still cascades correctly.
+                name_t = name.strip()
                 if lib_grammar:
                     kept = [
                         b for b in bin_entries
                         if not (
-                            (b.get("name") or "") == name
+                            str(b.get("name") or "").strip() == name_t
                             and (b.get("grammar") or "gb_l0")
                                 == lib_grammar
                         )
@@ -17339,7 +19036,7 @@ class LibraryPanel(Widget):
                     # tag.
                     kept = [
                         b for b in bin_entries
-                        if (b.get("name") or "") != name
+                        if str(b.get("name") or "").strip() != name_t
                     ]
                 n_dropped = len(bin_entries) - len(kept)
                 if n_dropped > 0:
@@ -17694,7 +19391,7 @@ class LibraryPanel(Widget):
                     )
             existing = _load_collections()
             existing.append({
-                "name":        name,
+                "name":        str(name or "").strip(),
                 "description": description,
                 "plasmids":    plasmids,
                 "saved":       _date.today().isoformat(),
@@ -29873,18 +31570,76 @@ _ENTRY_VECTORS_FILE = _DATA_DIR / "entry_vectors.json"
 _entry_vectors_cache: "list | None" = None
 
 
+# One-shot guard for the entry-vectors `name` whitespace trim.
+# Pre-2026-05-24 the file-import seed path (`.dna` filenames carrying
+# trailing whitespace) could land in entry_vector rows too. Trim is
+# idempotent; flag prevents re-scanning every load.
+_entry_vectors_name_trim_done: bool = False
+
+
+def _backfill_entry_vector_names(
+        entries: list[dict]) -> "tuple[list[dict], int]":
+    """Trim leading / trailing whitespace from each entry vector's
+    `name` field. Returns `(entries, n_changed)`. Idempotent.
+
+    **Hardening:** only mutates entries that already HAVE a `name`
+    key — never adds the field where missing. Skips non-dict entries
+    + non-string names (defensive against hand-edited JSON)."""
+    n_changed = 0
+    for e in entries:
+        if not isinstance(e, dict) or "name" not in e:
+            continue
+        raw = e["name"]
+        if not isinstance(raw, str):
+            continue
+        trimmed = raw.strip()
+        if trimmed != raw:
+            e["name"] = trimmed
+            n_changed += 1
+    return entries, n_changed
+
+
 def _load_entry_vectors() -> list[dict]:
-    global _entry_vectors_cache
-    if _entry_vectors_cache is not None:
-        return _typed_clone(_entry_vectors_cache)
-    entries, warning = _safe_load_json(_ENTRY_VECTORS_FILE,
-                                         "Entry vectors")
-    if warning:
-        _log.warning(warning)
-    entries = [e for e in entries
-                 if isinstance(e, dict)
-                 and isinstance(e.get("grammar_id"), str)]
-    _entry_vectors_cache = entries
+    global _entry_vectors_cache, _entry_vectors_name_trim_done
+    with _cache_lock:
+        if _entry_vectors_cache is None:
+            entries, warning = _safe_load_json(
+                _ENTRY_VECTORS_FILE, "Entry vectors",
+            )
+            if warning:
+                _log.warning(warning)
+            _entry_vectors_cache = [
+                e for e in entries
+                if isinstance(e, dict)
+                and isinstance(e.get("grammar_id"), str)
+            ]
+        if not _entry_vectors_name_trim_done:
+            _entry_vectors_cache, n_changed = (
+                _backfill_entry_vector_names(_entry_vectors_cache)
+            )
+            _entry_vectors_name_trim_done = True
+            if n_changed > 0:
+                _log.info(
+                    "entry-vectors: name trim backfill cleaned %d "
+                    "entries", n_changed,
+                )
+                _log_event(
+                    "entry_vectors.name_trim_backfill",
+                    n_changed=n_changed,
+                )
+                save_target = _entry_vectors_cache
+            else:
+                save_target = None
+        else:
+            save_target = None
+    if save_target is not None:
+        try:
+            _save_entry_vectors(save_target)
+        except (OSError, RuntimeError):
+            _log.exception(
+                "entry-vectors: name trim backfill save failed",
+            )
+    assert _entry_vectors_cache is not None
     return _typed_clone(_entry_vectors_cache)
 
 
@@ -31932,19 +33687,176 @@ def _design_gb_primers(
 _PARTS_BIN_FILE = _DATA_DIR / "parts_bin.json"
 _parts_bin_cache: "list | None" = None
 
+# One-shot guard for the L1+ sequence-body backfill. Flipped on the
+# first successful parts_bin-from-disk read. Pre-2026-05-24 the
+# constructor save hardcoded `sequence: ""` on L1+ bin entries
+# (relying on gb_text as the source of truth); the user surfaced
+# that this looked broken in the parts_bin viewer next to Load-Part-
+# imported TUs which DO carry the released body. The backfill re-
+# digests each affected entry's gb_text via
+# `_assembly_fragment_from_source` and persists the body.
+_parts_bin_sequence_backfill_done: bool = False
+
+
+def _backfill_parts_bin_sequences(
+        entries: list[dict]) -> "tuple[list[dict], int]":
+    """Populate `entry["sequence"]` for L1+ parts_bin entries where
+    it was left empty by the pre-2026-05-24 constructor save. Re-
+    digests `entry["gb_text"]` with the grammar's level-up enzyme
+    via `_assembly_fragment_from_source`; on a successful release
+    the bin entry's `sequence` becomes the body (overhangs stripped).
+    Idempotent — entries with a non-empty `sequence` OR no `gb_text`
+    are left alone.
+
+    **Hardening (2026-05-24):**
+      * **Type guard at every field read** — coerce via `str()` and
+        `int()` so a hand-edited JSON with `"sequence": null` /
+        `"level": "1"` doesn't crash mid-walk.
+      * **Overhang sanity check** — if the re-digest returns
+        `oh5`/`oh3` that disagree with the stored overhangs (by
+        more than capitalisation), SKIP the entry. A mismatch means
+        either the grammar has changed since the entry was saved or
+        the stored overhangs are stale; in either case populating
+        `sequence` with a body that doesn't match the stored
+        overhangs would surface as a phantom "released body"
+        that the constructor can't actually re-release. The user
+        loses zero data (the original empty `sequence` is preserved
+        for the on-demand display path to re-probe).
+      * **Length sanity check** — released body must be `< gb_text`
+        length (since the body is a fragment of the plasmid). Drops
+        garbage if the digest helper ever returns a malformed dict.
+      * **Per-entry try/except** so one corrupt entry doesn't abort
+        the whole batch; surfaces via `_log.exception`.
+
+    Returns `(entries, n_changed)`. Mutates in place."""
+    n_changed = 0
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        try:
+            cur_seq = str(e.get("sequence") or "")
+            if cur_seq:
+                continue
+            gb_text = str(e.get("gb_text") or "")
+            try:
+                level = int(e.get("level") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not gb_text or level < 1:
+                continue
+            grammar_id = str(e.get("grammar") or "gb_l0")
+            grammar = (
+                _all_grammars().get(grammar_id)
+                or _BUILTIN_GRAMMARS.get("gb_l0", {})
+            )
+            level_up = _assembly_fragment_from_source(
+                {"gb_text": gb_text, "name": str(e.get("name") or "")},
+                grammar, source_level=level,
+            )
+            if not isinstance(level_up, dict):
+                continue
+            body = str(level_up.get("sequence") or "")
+            if not body:
+                continue
+            # Length sanity: the body is a fragment of the full
+            # plasmid, so it must be strictly smaller than gb_text.
+            # gb_text includes the LOCUS header + features + sequence
+            # block so the comparison is conservative; any body
+            # bigger than the entire gb_text is garbage.
+            if len(body) >= len(gb_text):
+                _log.warning(
+                    "parts-bin sequence backfill: skipping %r — "
+                    "re-digest body (%d bp) >= gb_text (%d bytes); "
+                    "likely a malformed digest result",
+                    e.get("name"), len(body), len(gb_text),
+                )
+                continue
+            # Overhang sanity: stored overhangs are the authoritative
+            # representation of how the part chains in the next
+            # cycle. If the re-digest gives different overhangs, the
+            # grammar OR the stored entry has drifted — populate
+            # `sequence` from a digest that disagrees with the stored
+            # ohs would silently corrupt downstream assemblies. Match
+            # case-insensitively (the rest of the codebase uppercases
+            # DNA on storage; defensive against hand-edited JSON).
+            stored_oh5 = str(e.get("oh5") or "").upper()
+            stored_oh3 = str(e.get("oh3") or "").upper()
+            new_oh5 = str(level_up.get("oh5") or "").upper()
+            new_oh3 = str(level_up.get("oh3") or "").upper()
+            if (stored_oh5 and stored_oh3
+                    and (new_oh5 != stored_oh5
+                         or new_oh3 != stored_oh3)):
+                _log.warning(
+                    "parts-bin sequence backfill: skipping %r — "
+                    "re-digest overhangs (%s/%s) disagree with "
+                    "stored (%s/%s); grammar may have drifted",
+                    e.get("name"), new_oh5, new_oh3,
+                    stored_oh5, stored_oh3,
+                )
+                continue
+            e["sequence"] = body
+            n_changed += 1
+        except Exception:
+            # Belt-and-braces: one corrupt entry must not abort the
+            # whole batch. Log + skip so the user can inspect.
+            _log.exception(
+                "parts-bin sequence backfill: skipped %r due to "
+                "uncaught exception", e.get("name"),
+            )
+            continue
+    return entries, n_changed
+
+
+def _ensure_parts_bin_cache_populated_and_migrated() -> None:
+    """Mirrors `_ensure_library_cache_populated_and_migrated`:
+    funnels every parts_bin cache-populating path through one place
+    so the L1+ sequence backfill runs exactly once regardless of
+    which entry point first touched the cache.
+    """
+    global _parts_bin_cache, _parts_bin_sequence_backfill_done
+    with _cache_lock:
+        if _parts_bin_cache is None:
+            entries, warning = _safe_load_json(
+                _PARTS_BIN_FILE, "Parts bin",
+            )
+            if warning:
+                _log.warning(warning)
+            _parts_bin_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        if _parts_bin_sequence_backfill_done:
+            return
+        _parts_bin_cache, n_changed = _backfill_parts_bin_sequences(
+            _parts_bin_cache,
+        )
+        _parts_bin_sequence_backfill_done = True
+        if n_changed == 0:
+            return
+        _log.info(
+            "parts-bin: sequence backfill populated %d L1+ entry "
+            "body sequence(s) from gb_text", n_changed,
+        )
+        _log_event(
+            "parts_bin.sequence_backfill", n_changed=n_changed,
+        )
+        save_target = _parts_bin_cache
+    try:
+        _save_parts_bin(save_target)
+    except (OSError, RuntimeError):
+        _log.exception(
+            "parts-bin: sequence backfill save failed; the in-memory "
+            "cache is migrated but disk still carries empty `sequence` "
+            "fields until the next save",
+        )
+
+
 def _load_parts_bin() -> list[dict]:
-    global _parts_bin_cache
-    if _parts_bin_cache is not None:
-        # Deep-copy on read: parts entries carry nested dicts (qualifiers,
-        # primer pairs, mutation lists). Caller mutations of those nested
-        # objects would otherwise poison the in-memory cache for every
-        # subsequent reader (sacred invariant #17).
-        return _typed_clone(_parts_bin_cache)
-    entries, warning = _safe_load_json(_PARTS_BIN_FILE, "Parts bin")
-    if warning:
-        _log.warning(warning)
-    entries = [e for e in entries if isinstance(e, dict)]
-    _parts_bin_cache = entries
+    # Deep-copy on read: parts entries carry nested dicts (qualifiers,
+    # primer pairs, mutation lists). Caller mutations of those nested
+    # objects would otherwise poison the in-memory cache for every
+    # subsequent reader (sacred invariant #17).
+    _ensure_parts_bin_cache_populated_and_migrated()
+    assert _parts_bin_cache is not None
     return _typed_clone(_parts_bin_cache)
 
 
@@ -31958,12 +33870,8 @@ def _iter_parts_bin_readonly() -> list[dict]:
     (2026-05-23) mirroring ``_iter_library_readonly`` /
     ``_iter_collections_readonly``.
     """
-    global _parts_bin_cache
-    if _parts_bin_cache is None:
-        entries, warning = _safe_load_json(_PARTS_BIN_FILE, "Parts bin")
-        if warning:
-            _log.warning(warning)
-        _parts_bin_cache = [e for e in entries if isinstance(e, dict)]
+    _ensure_parts_bin_cache_populated_and_migrated()
+    assert _parts_bin_cache is not None
     return _parts_bin_cache
 
 def _save_parts_bin(entries: list[dict]) -> None:
@@ -32016,22 +33924,71 @@ _parts_bin_collections_cache: "list | None" = None
 _DEFAULT_PARTS_BIN_NAME = "Main Parts Bin"
 
 
+# One-shot guard for the per-parts-bin-collection embedded-parts
+# sequence backfill. Parallels `_parts_bin_sequence_backfill_done`
+# but for the inactive parts_bin_collections (the active one is
+# kept in sync by `_save_parts_bin` → collections mirror).
+_parts_bin_collections_backfill_done: bool = False
+
+
+def _ensure_parts_bin_collections_cache_populated_and_migrated() -> None:
+    """Populate the parts-bin-collections cache + run the embedded-
+    parts sequence backfill once per process. Same pattern as
+    `_ensure_collections_cache_populated_and_migrated`."""
+    global _parts_bin_collections_cache
+    global _parts_bin_collections_backfill_done
+    with _cache_lock:
+        if _parts_bin_collections_cache is None:
+            entries, warning = _safe_load_json(
+                _PARTS_BIN_COLLECTIONS_FILE, "Parts-bin collections",
+            )
+            if warning:
+                _log.warning(warning)
+            _parts_bin_collections_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        if _parts_bin_collections_backfill_done:
+            return
+        n_changed_total = 0
+        for bin_coll in _parts_bin_collections_cache:
+            if not isinstance(bin_coll, dict):
+                continue
+            parts = bin_coll.get("parts")
+            if not isinstance(parts, list):
+                continue
+            _, n = _backfill_parts_bin_sequences(parts)
+            n_changed_total += n
+        _parts_bin_collections_backfill_done = True
+        if n_changed_total == 0:
+            return
+        _log.info(
+            "parts-bin-collections: sequence backfill populated %d "
+            "L1+ entry body sequence(s) across all bin collections",
+            n_changed_total,
+        )
+        _log_event(
+            "parts_bin_collections.sequence_backfill",
+            n_changed=n_changed_total,
+        )
+        save_target = _parts_bin_collections_cache
+    try:
+        _save_parts_bin_collections(save_target)
+    except (OSError, RuntimeError):
+        _log.exception(
+            "parts-bin-collections: sequence backfill save failed; "
+            "in-memory cache is migrated but disk still carries "
+            "empty `sequence` fields until the next save",
+        )
+
+
 def _load_parts_bin_collections() -> list[dict]:
     """Return a deepcopy of the parts-bin collections list so callers
     can mutate entries (rename, edit parts list) without poisoning the
     in-memory cache. Mirrors the `_load_collections` contract per
     invariant #17.
     """
-    global _parts_bin_collections_cache
-    if _parts_bin_collections_cache is None:
-        entries, warning = _safe_load_json(
-            _PARTS_BIN_COLLECTIONS_FILE, "Parts-bin collections",
-        )
-        if warning:
-            _log.warning(warning)
-        _parts_bin_collections_cache = [
-            e for e in entries if isinstance(e, dict)
-        ]
+    _ensure_parts_bin_collections_cache_populated_and_migrated()
+    assert _parts_bin_collections_cache is not None
     return _typed_clone(_parts_bin_collections_cache)
 
 
@@ -32153,18 +34110,76 @@ def _sync_active_parts_bin_parts(entries: list[dict]) -> None:
 _PRIMERS_FILE = _DATA_DIR / "primers.json"
 _primers_cache: "list | None" = None
 
+# One-shot guard for the primer-library name whitespace trim.
+# Symmetric to the library + entry-vectors trims (PIT-36): trailing
+# whitespace from .dna filename imports or hand-edited JSON would
+# break exact-match lookups in primer dup-check and rename flows.
+_primers_name_trim_done: bool = False
+
+
+def _backfill_primer_names(
+        entries: list[dict]) -> "tuple[list[dict], int]":
+    """Trim leading / trailing whitespace from each primer entry's
+    `name` field. Returns `(entries, n_changed)`. Idempotent.
+    Sequence + tm fields are left untouched — only `name` is the
+    user-facing label that participates in `==` matching.
+
+    **Hardening:** only mutates entries that already HAVE a `name`
+    key — never adds the field where missing. Skips non-dict entries
+    + non-string names (defensive against hand-edited JSON)."""
+    n_changed = 0
+    for e in entries:
+        if not isinstance(e, dict) or "name" not in e:
+            continue
+        raw = e["name"]
+        if not isinstance(raw, str):
+            continue
+        trimmed = raw.strip()
+        if trimmed != raw:
+            e["name"] = trimmed
+            n_changed += 1
+    return entries, n_changed
+
+
 def _load_primers() -> list[dict]:
-    global _primers_cache
-    if _primers_cache is not None:
-        # Deep-copy on read: primer entries carry nested dicts (qualifiers,
-        # binding-region info, per-pair attribute dicts). Caller mutations
-        # of nested objects would poison the cache (sacred invariant #17).
-        return _typed_clone(_primers_cache)
-    entries, warning = _safe_load_json(_PRIMERS_FILE, "Primer library")
-    if warning:
-        _log.warning(warning)
-    entries = [e for e in entries if isinstance(e, dict)]
-    _primers_cache = entries
+    """Load + cache primers, with one-shot name-trim backfill on
+    first read (PIT-36 whitespace-trim invariant applied to the
+    primer subsystem too). Deep-copy on read per invariant #17."""
+    global _primers_cache, _primers_name_trim_done
+    with _cache_lock:
+        if _primers_cache is None:
+            entries, warning = _safe_load_json(
+                _PRIMERS_FILE, "Primer library",
+            )
+            if warning:
+                _log.warning(warning)
+            _primers_cache = [e for e in entries if isinstance(e, dict)]
+        if not _primers_name_trim_done:
+            _primers_cache, n_changed = _backfill_primer_names(
+                _primers_cache,
+            )
+            _primers_name_trim_done = True
+            if n_changed > 0:
+                _log.info(
+                    "primers: name trim backfill cleaned %d entries",
+                    n_changed,
+                )
+                _log_event(
+                    "primers.name_trim_backfill", n_changed=n_changed,
+                )
+                save_target = _primers_cache
+            else:
+                save_target = None
+        else:
+            save_target = None
+    if save_target is not None:
+        try:
+            _save_primers(save_target)
+        except (OSError, RuntimeError):
+            _log.exception(
+                "primers: name trim backfill save failed",
+            )
+    assert _primers_cache is not None
     return _typed_clone(_primers_cache)
 
 def _dedupe_primers_by_sequence(entries: list[dict]) -> list[dict]:
@@ -32625,16 +34640,61 @@ _primer_collections_cache: "list | None" = None
 _DEFAULT_PRIMER_COLLECTION_NAME = "Main"
 
 
+_primer_collections_backfill_done: bool = False
+
+
 def _load_primer_collections() -> list[dict]:
-    """Deep-copy on read so callers can mutate freely; pitfall #17."""
-    global _primer_collections_cache
-    if _primer_collections_cache is None:
-        entries, warning = _safe_load_json(
-            _PRIMER_COLLECTIONS_FILE, "Primer collections",
-        )
-        if warning:
-            _log.warning(warning)
-        _primer_collections_cache = [e for e in entries if isinstance(e, dict)]
+    """Deep-copy on read so callers can mutate freely; pitfall #17.
+    One-shot name-trim backfill on first load: walks every collection
+    and applies `_backfill_primer_names` to its embedded `primers`
+    list (parallel to `_ensure_collections_cache_populated_and_migrated`
+    for the library, and to the same backfill applied to the live
+    `primers.json` in `_load_primers`).
+    """
+    global _primer_collections_cache, _primer_collections_backfill_done
+    with _cache_lock:
+        if _primer_collections_cache is None:
+            entries, warning = _safe_load_json(
+                _PRIMER_COLLECTIONS_FILE, "Primer collections",
+            )
+            if warning:
+                _log.warning(warning)
+            _primer_collections_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        if not _primer_collections_backfill_done:
+            n_changed_total = 0
+            for pc in _primer_collections_cache:
+                if not isinstance(pc, dict):
+                    continue
+                primers = pc.get("primers")
+                if not isinstance(primers, list):
+                    continue
+                _, n = _backfill_primer_names(primers)
+                n_changed_total += n
+            _primer_collections_backfill_done = True
+            if n_changed_total > 0:
+                _log.info(
+                    "primer-collections: name trim backfill cleaned "
+                    "%d embedded primer(s)", n_changed_total,
+                )
+                _log_event(
+                    "primer_collections.name_trim_backfill",
+                    n_changed=n_changed_total,
+                )
+                save_target = _primer_collections_cache
+            else:
+                save_target = None
+        else:
+            save_target = None
+    if save_target is not None:
+        try:
+            _save_primer_collections(save_target)
+        except (OSError, RuntimeError):
+            _log.exception(
+                "primer-collections: name trim backfill save failed",
+            )
+    assert _primer_collections_cache is not None
     return _typed_clone(_primer_collections_cache)
 
 
@@ -42825,12 +44885,53 @@ class PartsBinModal(Screen):
             return
 
         seq_view = self.query_one("#parts-seq-view", TextArea)
-        if r["sequence"]:
+        # On-demand recovery for legacy L1+ entries (saved pre-2026-
+        # 05-24) where `sequence` was hardcoded to "" because the
+        # bin entry kept `gb_text` as the source of truth. Re-digest
+        # via `_assembly_fragment_from_source` so the user sees the
+        # released body without having to re-build the assembly.
+        # The helper is LRU-cached on `(gb_text_hash, grammar_id,
+        # source_level, primary_enzyme, level_up_enzyme)` so the
+        # second highlight on the same row is free.
+        body_seq = r.get("sequence") or ""
+        if (not body_seq
+                and r.get("gb_text")
+                and int(r.get("level") or 0) >= 1):
+            try:
+                grammar_id = r.get("grammar") or "gb_l0"
+                grammar = (
+                    _all_grammars().get(grammar_id)
+                    or _BUILTIN_GRAMMARS.get("gb_l0", {})
+                )
+                # Bin entries record the part's OWN level (e.g.
+                # `level=1` for a TU). The digest probe needs the
+                # SOURCE level — i.e. the part's level minus 1
+                # is the level at which it was assembled, so to
+                # release it again we treat the part as a source
+                # at `level - 1` and ask for its next-level fragment.
+                # In practice `_assembly_fragment_from_source` takes
+                # `source_level` = the part's own level when probing
+                # a stored plasmid for re-release (same convention
+                # `_persist_assembly` uses with `target_level`).
+                src_level = int(r.get("level") or 1)
+                level_up = _assembly_fragment_from_source(
+                    {"gb_text": r["gb_text"],
+                     "name": r.get("name") or ""},
+                    grammar, source_level=src_level,
+                )
+                if isinstance(level_up, dict):
+                    body_seq = str(level_up.get("sequence") or "")
+            except (ValueError, TypeError, KeyError):
+                _log.exception(
+                    "parts-bin: on-demand body recovery failed for %r",
+                    r.get("name"),
+                )
+        if body_seq:
             header = (
                 f"> {r['name']} | {r['type']} | pos {r['position']} | "
-                f"{r['oh5']}…{r['oh3']} | {len(r['sequence'])} bp\n"
+                f"{r['oh5']}…{r['oh3']} | {len(body_seq)} bp\n"
             )
-            seq_view.text = header + r["sequence"]
+            seq_view.text = header + body_seq
         else:
             # Empty-sequence user part (rare — only via a hand-edited
             # parts_bin.json since the built-in catalog rows are gone
@@ -46497,6 +48598,13 @@ class SequencingScreen(Screen):
         # New code reads `_parsed_run["samples"]` instead.
         self._members: list[dict] = []
         self._selected_member: "str | None" = None
+        # 1-based index of the selected sample in `_parsed_run["samples"]`
+        # plus its `.gbk` leaf filename (no extension) — used to build
+        # the alignment label `f"{order} {basename}"` so the overlay
+        # band shows e.g. `1 RUN42_1_MAV34` instead of the full
+        # `RUN42_genbank-files/RUN42_1_MAV34.gbk` zip path.
+        self._selected_order_num: "int | None" = None
+        self._selected_gbk_basename: "str | None" = None
         # Structured parse of the loaded zip — populated by
         # `_on_zip_picked` via `_parse_plasmidsaurus_zip`. Empty dict
         # until a valid zip lands, which is also how the sub-tab
@@ -46535,21 +48643,35 @@ class SequencingScreen(Screen):
                 initial="psaurus-sub-general",
                 id="plasmidsaurus-subtabs",
             ):
-                with TabPane("General", id="psaurus-sub-general"):
+                # Tab labels carry step numbers so the workflow is
+                # obvious from the tab bar itself: 1 → 2 → 3, with
+                # Quality as optional QC inspection in between. The
+                # numeric prefix replaces the more polished but
+                # less self-explanatory bare names ("General",
+                # "Samples", "Align") that left users tab-bouncing
+                # to figure out what each step did.
+                with TabPane("1. Pick zip", id="psaurus-sub-general"):
                     yield from self._compose_general_subtab()
-                with TabPane("Samples", id="psaurus-sub-samples",
+                with TabPane("2. Pick sample", id="psaurus-sub-samples",
                               disabled=True):
                     yield from self._compose_samples_subtab()
-                with TabPane("Quality", id="psaurus-sub-quality",
+                with TabPane("QC (optional)", id="psaurus-sub-quality",
                               disabled=True):
                     yield from self._compose_quality_subtab()
-                with TabPane("Align", id="psaurus-sub-align",
+                with TabPane("3. Pick target + align",
+                              id="psaurus-sub-align",
                               disabled=True):
                     yield from self._compose_align_subtab()
 
     def _compose_general_subtab(self) -> ComposeResult:
         """General sub-sub-tab: zip file picker + run-level overview.
         The only tab enabled before a zip is loaded."""
+        yield Static(
+            "[b]Step 1 of 3:[/b] pick the Plasmidsaurus results [b].zip[/b] "
+            "for this run.\n"
+            "[dim]The next two tabs unlock once the zip parses.[/dim]",
+            markup=True, id="plasmidsaurus-general-hint",
+        )
         yield Label("Browse for the run .zip "
                     "(highlighted lime-green):")
         yield _ZipAwareDirectoryTree(
@@ -46564,6 +48686,11 @@ class SequencingScreen(Screen):
             "Samples / Quality / Align tabs.[/dim]",
             id="plasmidsaurus-run-meta", markup=True,
         )
+        with Horizontal(id="general-report-btns"):
+            yield Button(
+                "View verification report",
+                id="btn-view-report", variant="default",
+            )
 
     def _compose_samples_subtab(self) -> ComposeResult:
         """Samples sub-sub-tab: per-sample DataTable. Clicking a row
@@ -46571,20 +48698,29 @@ class SequencingScreen(Screen):
         reads `_selected_member` to know which .gbk to pipe through
         the aligner."""
         yield Static(
-            "[dim]Click a sample row to mark it as the alignment "
-            "query. The Align tab will use the picked sample's .gbk "
-            "consensus.[/dim]",
+            "[b]Step 2 of 3:[/b] click the sample row whose read you "
+            "want to align.\n"
+            "[dim]Then move to the [b]3. Pick target + align[/b] tab "
+            "— it will use this sample's .gbk consensus as the "
+            "query. Or use [b]Bulk auto-align[/b] below to match "
+            "every sample to its library entry in one batch.[/dim]",
             id="plasmidsaurus-sample-hint", markup=True,
         )
         yield DataTable(id="align-members", cursor_type="row",
                           zebra_stripes=True)
+        with Horizontal(id="bulk-align-btns"):
+            yield Button(
+                "Bulk auto-align all samples",
+                id="btn-bulk-align", variant="primary",
+            )
 
     def _compose_quality_subtab(self) -> ComposeResult:
         """Quality sub-sub-tab: contamination / k-mer / coverage
         per sample, plus the run-level extras (gel.png etc.)."""
         yield Static(
-            "[dim]Per-sample QC metrics parsed from the run's "
-            "summary-files/ and per-base-data/ folders.[/dim]",
+            "[b]Optional:[/b] inspect QC metrics for each sample "
+            "(contamination, k-mer profile, per-base coverage). "
+            "Doesn't affect the alignment — purely informational.",
             id="plasmidsaurus-quality-hint", markup=True,
         )
         yield DataTable(id="plasmidsaurus-quality-table",
@@ -46597,8 +48733,18 @@ class SequencingScreen(Screen):
         """Align sub-sub-tab: pick a target + run pairwise alignment
         against the sample chosen on the Samples tab."""
         yield Static(
-            "[dim]No sample picked yet — switch to the Samples tab "
-            "and click a row.[/dim]",
+            "[b]Step 3 of 3:[/b] pick the library plasmid this "
+            "sample should align to, then press Align.\n"
+            "[dim]On Align: the picked library plasmid loads onto "
+            "the canvas, and this sample appears as a blue overlay "
+            "bar on its linear view. The alignment persists onto "
+            "the library entry — re-loading the plasmid restores "
+            "the bar.[/dim]",
+            id="plasmidsaurus-align-help", markup=True,
+        )
+        yield Static(
+            "[dim]No sample picked yet — go back to the "
+            "[b]2. Pick sample[/b] tab and click a row.[/dim]",
             id="plasmidsaurus-align-query", markup=True,
         )
         yield Label("Target plasmid (from active collection):")
@@ -46609,7 +48755,8 @@ class SequencingScreen(Screen):
         )
         yield Static("", id="align-status", markup=True)
         with Horizontal(id="align-btns"):
-            yield Button("Align", id="btn-align-go",
+            yield Button("Align & open target on canvas",
+                          id="btn-align-go",
                           variant="primary", disabled=True)
 
     def _compose_sanger_pane(self) -> ComposeResult:
@@ -46740,6 +48887,24 @@ class SequencingScreen(Screen):
                 f"[green]Added {entry.get('name') or entry['id']} "
                 f"to library.[/green]"
             )
+        except NoMatches:
+            pass
+        # Disable the Add button so re-clicking can't silently create
+        # a duplicate entry (the pre-fix `_<N>` suffix-collision loop
+        # would happily mint `MAV_38_2`, `MAV_38_3`, ... on each
+        # click). User has to pick a different trace to re-arm.
+        try:
+            self.query_one("#btn-sanger-add", Button).disabled = True
+        except NoMatches:
+            pass
+        # Refresh the main LibraryPanel so the new entry shows up
+        # without the user having to navigate away + back. Mirrors the
+        # pattern used by the primer-goto + collection-switch paths.
+        try:
+            lib = self.app.query_one("#library", LibraryPanel)
+            lib._view_mode = "plasmids"
+            lib._apply_view_mode()
+            lib._repopulate_plasmids()
         except NoMatches:
             pass
 
@@ -46937,6 +49102,8 @@ class SequencingScreen(Screen):
         self._parsed_run = {}
         self._members = []
         self._selected_member = None
+        self._selected_order_num = None
+        self._selected_gbk_basename = None
         # Tables clear silently if they're not mounted yet (e.g.
         # an early `_on_zip_picked` fired during compose race).
         for tid in (
@@ -47262,6 +49429,8 @@ class SequencingScreen(Screen):
         # (rejected by `_is_safe_zip_member_name`).
         if not row_key or row_key.startswith(self._NO_GBK_KEY_PREFIX):
             self._selected_member = None
+            self._selected_order_num = None
+            self._selected_gbk_basename = None
             try:
                 self.query_one("#btn-align-go", Button).disabled = True
             except NoMatches:
@@ -47277,24 +49446,53 @@ class SequencingScreen(Screen):
                 pass
             return
         self._selected_member = str(row_key)
+        # Derive the 1-based order number (row index in the sorted
+        # samples list) and the .gbk leaf filename (no extension).
+        # `_parsed_run["samples"]` mirrors the table's natural-sort
+        # order so the index here matches what the user sees.
+        self._selected_order_num = None
+        self._selected_gbk_basename = None
+        samples = self._parsed_run.get("samples") or []
+        for idx, s in enumerate(samples, start=1):
+            if s.get("gbk") == self._selected_member:
+                self._selected_order_num = idx
+                break
+        # INV-73 (2026-05-25): use `_display_label_for_gbk` so the
+        # Plasmidsaurus run+order prefix is stripped and remaining
+        # underscores become spaces — keeps the alignment-row label
+        # free of TUI-unfriendly punctuation per user feedback.
+        self._selected_gbk_basename = _display_label_for_gbk(
+            self._selected_member,
+        )
         try:
             self.query_one("#btn-align-go", Button).disabled = False
         except NoMatches:
             pass
         try:
+            label_prefix = (
+                f"#{self._selected_order_num} "
+                if self._selected_order_num is not None else ""
+            )
+            display_basename = (
+                self._selected_gbk_basename
+                if self._selected_gbk_basename
+                else self._selected_member
+            )
             self.query_one(
                 "#plasmidsaurus-align-query", Static,
             ).update(
-                f"[bold]Query:[/bold] "
-                f"{_esc_md(self._selected_member)}"
+                f"[b]Sample picked:[/b] {label_prefix}"
+                f"{_esc_md(display_basename)}\n"
+                f"[dim]Pick a target plasmid below and press "
+                f"Align.[/dim]"
             )
         except NoMatches:
             pass
         try:
             self.query_one("#align-status", Static).update(
                 f"[dim]Selected: {_esc_md(self._selected_member)}"
-                f" — open the Align tab to run the pairwise "
-                f"alignment.[/dim]"
+                f" — open the [b]3. Pick target + align[/b] tab "
+                f"to run the pairwise alignment.[/dim]"
             )
         except NoMatches:
             pass
@@ -47358,10 +49556,21 @@ class SequencingScreen(Screen):
             (target_rec.annotations or {}).get("topology", "").lower()
             == "circular"
         )
+        # Build the display label: `<order> <gbk_basename>`. Falls back
+        # to the raw zip member path if state is missing (defensive —
+        # `_on_member_selected` always populates these alongside
+        # `_selected_member`).
+        if (self._selected_order_num is not None
+                and self._selected_gbk_basename):
+            display_label = (
+                f"{self._selected_order_num} {self._selected_gbk_basename}"
+            )
+        else:
+            display_label = self._selected_member
         self._align_worker(
             query_seq=str(query_rec.seq),
             target_seq=str(target_rec.seq),
-            query_label=self._selected_member,
+            query_label=display_label,
             target_label=target_label,
             target_record=target_rec,
             target_is_circular=target_is_circular,
@@ -47373,55 +49582,43 @@ class SequencingScreen(Screen):
                        query_label: str, target_label: str,
                        target_record, target_is_circular: bool,
                        entry_counter: int) -> None:
-        """Worker: run `_pairwise_align` off the UI thread, then push
-        the visualisation screen. Inputs captured at entry; stale-load
-        guard on the load counter (mirrors `_restr_scan_worker`).
+        """Worker: run `_pairwise_align` off the UI thread, then load
+        the target into the canvas and register the alignment as a
+        blue overlay bar on its linear view. Inputs captured at entry;
+        stale-load guard on the load counter (mirrors `_restr_scan_worker`).
 
         Circular-target rotation (GH #16, 2026-05-14): when the target
-        is circular, find a unique seed kmer in the query, locate it
-        in the target, and rotate the target so the seeds align
-        before running the global align. Without this, the global
-        aligner pairs bp 1 of the query with bp 1 of the target —
-        catastrophic on a plasmid where Plasmidsaurus reads start at
-        an arbitrary origin and almost never match the GenBank origin.
+        is circular, the Plasmidsaurus virtual plasmid and the GenBank
+        reference almost never share an origin. Pre-fix the global
+        aligner pairs bp 1 of each, paying gaps to slide the smaller
+        offset back into register — visibly broken vs. CommercialSaaS.
+        Original fix rotated the *target*, but that put the alignment
+        result in a rotated coordinate frame that no longer matched
+        the canvas plasmid (which displays the library's original
+        origin). Now we rotate the *query* instead: bp 0 of the
+        rotated read aligns with bp 0 of the (unrotated) target, so
+        `aligned_t` positions land in the canvas plasmid's native
+        coordinate frame — the overlay bars sit at the right bp.
 
         Also captures `_alignments_generation` so a user who hits
         Clear Alignments while the C-loop ran doesn't see this stale
         result reappear on the overlay band when the worker lands.
         """
         gen_at_entry = getattr(self.app, "_alignments_generation", 0)
-        rotation = 0
-        rotated_target_seq = target_seq
-        rotated_target_record = target_record
-        if target_is_circular:
-            try:
-                rotation = _find_circular_alignment_offset(
-                    query_seq, target_seq,
-                )
-            except Exception:
-                _log.exception(
-                    "plasmidsaurus align: seed-offset probe raised",
-                )
-                rotation = 0
-            if rotation:
-                rotated_target_seq = (
-                    target_seq[rotation:] + target_seq[:rotation]
-                )
-                try:
-                    rotated_target_record = _rotate_seq_record(
-                        target_record, rotation,
-                    )
-                except Exception:
-                    _log.exception(
-                        "plasmidsaurus align: target record rotation "
-                        "failed (offset=%d)", rotation,
-                    )
-                    rotated_target_record = target_record
         try:
-            result = _pairwise_align(
-                query_seq, rotated_target_seq, mode="global",
+            # `_pick_best_rotation` tries plain first; only attempts
+            # query-rot + target-rot when target is circular AND
+            # plain alignment is poor (< 80% identity). The chosen
+            # candidate's aligned_q/aligned_t are pre-shifted to the
+            # ORIGINAL target frame when target-rotation wins, so the
+            # caller can pass the unrotated `target_record` to
+            # `_register_alignment` and the segments still land at
+            # the right bp on the canvas.
+            result = _pick_best_rotation(
+                query_seq, target_seq,
+                is_circular=target_is_circular,
+                mode="global",
             )
-            result["target_rotation"] = rotation
         except ValueError as exc:
             # PEP 3110 clears `exc` once the except scope exits, and
             # `_err` runs later on the UI thread via call_from_thread.
@@ -47437,7 +49634,17 @@ class SequencingScreen(Screen):
             self.app.call_from_thread(_err)
             return
         except Exception as exc:
-            _log.exception("PlasmidsaurusAlignModal worker failed")
+            # INV-73 (2026-05-25): add sequence-length context so a
+            # "alignment failed" bug report tells us whether to look
+            # at the C-loop, the input normalisation, or the wrapper.
+            _log.exception(
+                "PlasmidsaurusAlignModal worker failed: "
+                "query_len=%d target_len=%d query_label=%r "
+                "target_label=%r circular=%r",
+                len(query_seq) if query_seq else -1,
+                len(target_seq) if target_seq else -1,
+                query_label, target_label, target_is_circular,
+            )
             err_msg = _esc_md(str(exc))
             def _err():
                 try:
@@ -47452,7 +49659,10 @@ class SequencingScreen(Screen):
         def _show():
             # Stale-load guard: discard if user swapped plasmids while
             # the C-loop ran. Pre-fix the worker's push_screen happily
-            # painted an alignment for the OLD record.
+            # painted an alignment for the OLD record. NOTE: we may
+            # ourselves swap the canvas to the picked target below,
+            # which would bump the counter — so the check has to
+            # happen FIRST, before our own load.
             if (getattr(self.app, "_record_load_counter", 0)
                     != entry_counter):
                 return
@@ -47468,28 +49678,50 @@ class SequencingScreen(Screen):
             if (getattr(self.app, "_alignments_generation", 0)
                     != gen_at_entry):
                 return
+            # Mirror the Alt+A flow: the picked library plasmid plays
+            # the role of the canvas reference, and the plasmidsaurus
+            # virtual plasmid (query) lands as an overlay bar on its
+            # linear view. If the target isn't already loaded, swap
+            # to it now so the alignment + the persisted-alignment
+            # flush both land on the right library entry.
+            current = getattr(self.app, "_current_record", None)
+            cur_id = getattr(current, "id", None) if current else None
+            tgt_id = getattr(target_record, "id", None)
+            if tgt_id and cur_id != tgt_id:
+                try:
+                    self.app._apply_record(target_record)  # type: ignore[attr-defined]
+                except Exception:
+                    _log.exception(
+                        "Plasmidsaurus: loading target into canvas "
+                        "failed for %r", tgt_id,
+                    )
+                    return
             # Register on the linear-map overlay band instead of pushing
             # AlignmentScreen — the user can click the lane to drill
             # into the full-screen viewer (kept for base-level review).
-            # Use the rotated target record so the viewer's feature
-            # lane lines up with the alignment columns when the
-            # circular-target seed offset was applied.
+            # `target_record` is the library's original (unrotated)
+            # record, matching what the canvas now displays; segments
+            # come out in that frame because the query was rotated to
+            # match it, not the other way around.
             try:
-                self.app._register_alignment(  # type: ignore[attr-defined]
+                registered_entry = self.app._register_alignment(  # type: ignore[attr-defined]
                     name=query_label,
                     query_label=query_label,
                     target_label=target_label,
-                    target_record=rotated_target_record,
+                    target_record=target_record,
                     result=result,
                 )
-                # Persist the read alignment onto the open plasmid's
-                # library entry so re-loading the plasmid restores the
-                # band. Tagged source="sequencing" so the manager modal
-                # can mass-delete a sequencing batch later. Skipped
-                # silently when the active record isn't in the library.
-                aligns = getattr(self.app, "_alignments", None)
-                if aligns:
-                    aligns[-1]["_stored_source"] = "sequencing"
+                # Persist the read alignment onto the target's library
+                # entry so re-loading restores the band. Tagged
+                # source="sequencing" so the manager modal can
+                # mass-delete a sequencing batch later. The canvas is
+                # now the target (loaded above) so the flush lands on
+                # the right entry. Use the register return value
+                # rather than `_alignments[-1]` so a register-refused
+                # case (malformed strings) doesn't tag the previous
+                # entry.
+                if registered_entry is not None:
+                    registered_entry["_stored_source"] = "sequencing"
                 flush = getattr(
                     self.app, "_flush_active_alignments", None,
                 )
@@ -47517,13 +49749,52 @@ class SequencingScreen(Screen):
                 )
             ident_total = result.get("identity_pct", 0.0)
             ident_ungap = result.get("ungapped_identity_pct", ident_total)
+            # Coverage metrics: how much of the target the read
+            # actually aligned to. Pre-fix the toast surfaced only
+            # `ungapped_identity_pct` ("99.9% identity (aligned
+            # region)"), which read as "the alignment is nearly
+            # perfect" — but for length-mismatched plasmids the bulk
+            # of the target was unaligned (gray on the overlay band)
+            # and the user couldn't tell from the toast why the band
+            # had so much gray. New toast leads with aligned-bp /
+            # target-bp + coverage% + overall identity (the
+            # gap-inclusive metric that actually predicts how much
+            # blue/red the band shows) and only mentions ungapped
+            # identity as a parenthetical for the matched region.
+            n_match    = int(result.get("n_matches", 0) or 0)
+            n_mismatch = int(result.get("n_mismatches", 0) or 0)
+            aligned_bp = n_match + n_mismatch
+            tgt_bp = (
+                int(result.get("t_len", 0) or 0)
+                or len(str(target_record.seq))
+            )
+            # INV-73 (2026-05-25): coverage clamp routed through
+            # `_coverage_pct_from_result` so the rule lives in one
+            # place (mirrors the VerificationReportModal site).
+            coverage_pct = _coverage_pct_from_result(result, tgt_bp)
+            picked = result.get("picked_rotation", "none")
+            rot_note = ""
+            if picked == "query":
+                rot_note = (
+                    f" · read rotated by "
+                    f"{int(result.get('query_rotation') or 0):,} bp"
+                )
+            elif picked == "target":
+                rot_note = (
+                    f" · target frame shifted by "
+                    f"{int(result.get('target_rotation') or 0):,} bp"
+                )
             try:
                 self.app.notify(
                     f"Aligned {query_label} → {target_label} · "
-                    f"{ident_ungap:.1f}% identity (aligned region) · "
+                    f"{aligned_bp:,}/{tgt_bp:,} bp "
+                    f"({coverage_pct:.0f}% coverage) at "
+                    f"{ident_total:.1f}% identity "
+                    f"({ident_ungap:.1f}% in matched region)"
+                    f"{rot_note} · "
                     f"click read on map to inspect.",
                     title="Alignment added",
-                    severity="information", timeout=6,
+                    severity="information", timeout=8,
                 )
             except Exception:
                 pass
@@ -47533,6 +49804,556 @@ class SequencingScreen(Screen):
             if self.is_mounted:
                 self.dismiss(result)
         self.app.call_from_thread(_show)
+
+    @on(Button.Pressed, "#btn-view-report")
+    def _view_report(self, _) -> None:
+        """Open the cross-library verification report. Click a row in
+        the report to load that plasmid + scroll the cursor to its
+        first stored variant. Dismisses the Sequencing screen so the
+        user lands on the canvas with the picked plasmid loaded."""
+        def _on_picked(result):
+            if not result or not isinstance(result, tuple):
+                return
+            if result[0] != "open":
+                return
+            _kind, entry_id, pos = result
+            entry = _find_library_entry_by_id(entry_id or "")
+            if entry is None:
+                try:
+                    self.app.notify(
+                        "Picked plasmid not found in library — was "
+                        "it deleted while the report was open?",
+                        severity="warning", timeout=5,
+                    )
+                except Exception:
+                    pass
+                return
+            # Load the picked plasmid into the canvas via the same
+            # path LibraryPanel uses (`_apply_record` + display-name
+            # stash + map-mode stash + alignment hydrate).
+            self._jump_to_library_entry_at_pos(entry, int(pos or 0))
+
+        self.app.push_screen(
+            VerificationReportModal(only_with_alignments=True),
+            callback=_on_picked,
+        )
+
+    def _jump_to_library_entry_at_pos(
+        self, entry: dict, target_bp: int,
+    ) -> None:
+        """Load the library entry into the canvas and (after the
+        load completes) scroll the seq-panel cursor to ``target_bp``.
+        Called from the verification report's "Open in canvas"
+        action — the user wants to inspect the first variant of the
+        picked alignment, so dropping them on bp 0 is unhelpful.
+
+        Dismisses the SequencingScreen as a side effect so the
+        canvas is fully visible after the load.
+        """
+        gb_text = entry.get("gb_text", "")
+        if not gb_text:
+            try:
+                self.app.notify(
+                    "Library entry has no embedded sequence — can't "
+                    "open in canvas.", severity="warning", timeout=5,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            record = _gb_text_to_record(gb_text)
+        except Exception as exc:
+            _log.exception(
+                "VerificationReport: gb parse failed for %r",
+                entry.get("id"),
+            )
+            try:
+                self.app.notify(
+                    f"Failed to load plasmid: {exc}",
+                    severity="error", timeout=6,
+                )
+            except Exception:
+                pass
+            return
+        display = entry.get("name")
+        if isinstance(display, str) and display.strip():
+            try:
+                record._tui_display_name = display.strip()
+            except Exception:
+                pass
+        try:
+            self.app._apply_record(record)  # type: ignore[attr-defined]
+        except Exception:
+            _log.exception(
+                "VerificationReport: _apply_record failed for %r",
+                entry.get("id"),
+            )
+            return
+        # Schedule a cursor jump after the screen-pop + canvas paint
+        # settle. `set_timer` on the App side hops to the next tick;
+        # by then `_current_record` is the loaded entry and the
+        # seq panel is mounted.
+        def _scroll():
+            try:
+                sp = self.app.query_one("#seq-panel", SequencePanel)
+                clamped = max(0, min(target_bp, len(record.seq) - 1))
+                # No public jump-to-bp helper; the existing
+                # `_focus_feature` path takes a feature dict (not what
+                # we have here). Manual cursor-set + visibility ensure
+                # is the smallest equivalent.
+                sp._cursor_pos = clamped
+                sp._refresh_view()
+                sp._ensure_cursor_visible()
+            except (NoMatches, AttributeError):
+                pass
+            except Exception:
+                _log.exception(
+                    "VerificationReport: cursor jump failed",
+                )
+        try:
+            self.app.set_timer(0.2, _scroll)
+        except Exception:
+            _log.exception(
+                "VerificationReport: set_timer for cursor jump failed",
+            )
+        if self.is_mounted:
+            self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-bulk-align")
+    def _bulk_align(self, _) -> None:
+        """Run the matcher against every loaded sample + active library
+        and push the bulk-confirm modal. Worker runs after the user
+        confirms; each alignment persists onto its target's library
+        entry just like the per-sample flow does."""
+        samples = (self._parsed_run or {}).get("samples") or []
+        if not samples:
+            try:
+                self.app.notify(
+                    "No samples loaded — pick a Plasmidsaurus zip "
+                    "on the [b]1. Pick zip[/b] tab first.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            library = list(_iter_library_readonly())
+        except Exception:
+            _log.exception("BulkAlign: _iter_library_readonly failed")
+            library = []
+        if not library:
+            try:
+                self.app.notify(
+                    "Active library is empty — add at least one "
+                    "plasmid before bulk-aligning.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
+            return
+        # Run the matcher off the UI thread when sequence-fallback is
+        # needed (kmer build is O(n_lib_entries × seq_len)) — for a
+        # 100-entry library × 17 kb each that's ~100 ms, tolerable
+        # synchronously, but a 1000-entry library × 200 kb would
+        # frame-drop. Defer the polish to a worker if it shows up
+        # in profiling.
+        try:
+            matches = _match_samples_to_library(
+                samples, library,
+                sequence_fallback=True,
+                extract_gbk_fn=_extract_gbk_member,
+                zip_path=self._zip_path,
+            )
+        except Exception:
+            _log.exception("BulkAlign: matcher raised")
+            try:
+                self.app.notify(
+                    "Bulk-align matcher failed — see splicecraft log.",
+                    severity="error", timeout=6,
+                )
+            except Exception:
+                pass
+            return
+
+        def _on_confirmed(committed) -> None:
+            if not committed:
+                return
+            n_align = sum(1 for m in committed if m.get("action") == "align")
+            n_add   = sum(1 for m in committed if m.get("action") == "add")
+            try:
+                self.app.notify(
+                    f"Bulk run: aligning {n_align}, adding {n_add} as "
+                    f"new library entries…",
+                    timeout=4,
+                )
+            except Exception:
+                pass
+            entry_counter = getattr(self.app, "_record_load_counter", 0)
+            self._bulk_align_worker(committed, entry_counter)
+        self.app.push_screen(
+            BulkAlignConfirmModal(matches),
+            callback=_on_confirmed,
+        )
+
+    @work(thread=True, exclusive=True, group="plasmidsaurus_bulk_align")
+    def _bulk_align_worker(self, committed: "list[dict]",
+                            entry_counter: int) -> None:
+        """Batch worker: walk the user-confirmed action list and
+        execute each row. Aligns matched samples (routes through
+        `_pick_best_rotation` like the per-sample worker); adds
+        unmatched samples as new library entries with provenance
+        metadata (`source: plasmidsaurus:<run_id>:<sample_name>`).
+
+        Stale-load guard captures `entry_counter` at modal-confirm
+        time; if the user swaps the active plasmid mid-batch the
+        worker terminates (the in-flight registrations would land
+        on the wrong canvas record).
+        """
+        run_id = (self._parsed_run or {}).get("run_id") or ""
+        zip_path = self._zip_path
+        if zip_path is None:
+            self.app.call_from_thread(
+                self.app.notify,
+                "Bulk-align cancelled — zip path is no longer available.",
+                severity="warning", timeout=4,
+            )
+            return
+        n_aligned = 0
+        n_failed = 0
+        # INV-72 (2026-05-25): track add-as-new save successes /
+        # failures separately so the summary toast doesn't claim N
+        # entries were added when disk-full / permission-denied
+        # silently dropped some on the floor. `add_counters["ok"]` is
+        # the source of truth for "actually persisted"; the cancel /
+        # summary readouts read it. call_from_thread(_add) is
+        # synchronous so the counter is current at every iteration
+        # boundary.
+        add_counters = {"ok": 0, "err": 0}
+        # INV-73 (2026-05-25): track the load counter we EXPECT the
+        # app to be at. Bulk-align's `_register` callback intentionally
+        # swaps the canvas via `_apply_record(target_rec)` (each sample
+        # may target a different library entry), which bumps
+        # `_record_load_counter`. Pre-fix the guard treated those
+        # intentional swaps as a stale load and aborted the batch
+        # after the FIRST sample — so the user saw only ONE plasmid
+        # get its alignment + status change applied, even though they
+        # confirmed N rows in the modal. Now we absorb each
+        # _register-driven swap into `expected_counter`; an
+        # *external* swap (user clicks another plasmid mid-batch)
+        # advances the counter past expected and triggers the abort.
+        expected_counter = entry_counter
+        for m in committed:
+            if (getattr(self.app, "_record_load_counter", 0)
+                    != expected_counter):
+                self.app.call_from_thread(
+                    self.app.notify,
+                    f"Bulk-align cancelled — active plasmid changed "
+                    f"(aligned {n_aligned}, added {add_counters['ok']}, "
+                    f"add-failed {add_counters['err']}, "
+                    f"failed {n_failed} so far).",
+                    severity="warning", timeout=6,
+                )
+                return
+            sample = m.get("sample") or {}
+            gbk_member = sample.get("gbk")
+            sample_name = (sample.get("name") or sample.get("base")
+                           or "?")
+            if not gbk_member:
+                # INV-72 (2026-05-25): pre-fix this skip was silent —
+                # a Plasmidsaurus zip with a malformed manifest would
+                # report "failed N" in the summary with no clue why.
+                # Log so the diagnostic bundle captures the cause.
+                _log.warning(
+                    "BulkAlign: skipping sample %r — no .gbk member "
+                    "field (malformed manifest or missing consensus)",
+                    sample_name,
+                )
+                n_failed += 1
+                continue
+            try:
+                gb_text = _extract_gbk_member(zip_path, gbk_member)
+                query_rec = _gb_text_to_record(gb_text)
+            except Exception:
+                _log.exception(
+                    "BulkAlign: extract/parse failed for %r",
+                    gbk_member,
+                )
+                n_failed += 1
+                continue
+            action = m.get("action")
+            if action == "align":
+                target_entry = m.get("target_entry") or {}
+                tgt_gb = target_entry.get("gb_text", "")
+                if not tgt_gb:
+                    n_failed += 1
+                    continue
+                try:
+                    target_rec = _gb_text_to_record(tgt_gb)
+                except Exception:
+                    _log.exception(
+                        "BulkAlign: target parse failed for %r",
+                        target_entry.get("id"),
+                    )
+                    n_failed += 1
+                    continue
+                target_is_circular = (
+                    (target_rec.annotations or {}).get("topology", "")
+                    .lower() == "circular"
+                )
+                try:
+                    result = _pick_best_rotation(
+                        str(query_rec.seq), str(target_rec.seq),
+                        is_circular=target_is_circular,
+                        mode="global", canvas_axis="target",
+                    )
+                except Exception:
+                    _log.exception(
+                        "BulkAlign: alignment failed for %r vs %r",
+                        gbk_member, target_entry.get("id"),
+                    )
+                    n_failed += 1
+                    continue
+                # Pre-compute the bulk-align display label off the UI
+                # thread: `<order_num> <basename_no_ext>` matches the
+                # per-sample flow.
+                idx_1based = 0
+                for i, s in enumerate((self._parsed_run or {})
+                                       .get("samples") or [], 1):
+                    if s.get("gbk") == gbk_member:
+                        idx_1based = i
+                        break
+                # INV-73 (2026-05-25): strip Plasmidsaurus prefix +
+                # convert underscores to spaces so the alignment-row
+                # label is TUI-friendly (per user request).
+                basename = _display_label_for_gbk(gbk_member)
+                display_label = (
+                    f"{idx_1based} {basename}" if idx_1based
+                    else basename
+                )
+                target_label = (
+                    target_entry.get("name")
+                    or target_entry.get("id") or "?"
+                )
+                target_id = target_entry.get("id")
+
+                def _register(
+                    r=result, tr=target_rec, lbl=display_label,
+                    tlbl=target_label, tid=target_id,
+                ):
+                    # Same flow as the per-sample `_align_worker`'s
+                    # `_show` callback: swap canvas to target,
+                    # register alignment, flush. We don't reuse
+                    # `_show` directly because it carries a Cancel
+                    # flag that's bound to per-sample modal state.
+                    current = getattr(self.app, "_current_record", None)
+                    cur_id = (
+                        getattr(current, "id", None)
+                        if current else None
+                    )
+                    if tid and cur_id != tid:
+                        try:
+                            self.app._apply_record(tr)  # type: ignore[attr-defined]
+                        except Exception:
+                            _log.exception(
+                                "BulkAlign: load target into canvas "
+                                "failed for %r", tid,
+                            )
+                            return
+                    try:
+                        registered_entry = self.app._register_alignment(  # type: ignore[attr-defined]
+                            name=lbl, query_label=lbl,
+                            target_label=tlbl,
+                            target_record=tr, result=r,
+                        )
+                        # Tag the registered alignment as "sequencing"
+                        # so AlignmentManagerModal can mass-delete a
+                        # batch later. Skip when register refused
+                        # (malformed strings) — pre-fix `_alignments
+                        # [-1]` would tag the previous entry instead,
+                        # corrupting its source field.
+                        if registered_entry is not None:
+                            registered_entry["_stored_source"] = (
+                                "sequencing"
+                            )
+                        flush = getattr(
+                            self.app, "_flush_active_alignments", None,
+                        )
+                        if callable(flush):
+                            flush()
+                        persist = getattr(
+                            self.app,
+                            "_persist_map_mode_for_active", None,
+                        )
+                        if callable(persist):
+                            persist("linear")
+                        # Auto-tag the target's workflow status to
+                        # SEQUENCING after a successful bulk-align.
+                        # Only when the entry has no explicit status
+                        # set — don't overwrite the user's
+                        # DESIGNING/CLONING/VERIFIED intent.
+                        if (registered_entry is not None and tid):
+                            target_entry = _find_library_entry_by_id(tid)
+                            cur_status = _sanitize_plasmid_status(
+                                target_entry.get("status")
+                                if target_entry else ""
+                            )
+                            if cur_status == "":
+                                self.app._set_plasmid_status_fast(  # type: ignore[attr-defined]
+                                    tid, "SEQUENCING", notify=False,
+                                )
+                    except Exception:
+                        _log.exception(
+                            "BulkAlign: _register_alignment failed for "
+                            "%r", lbl,
+                        )
+
+                self.app.call_from_thread(_register)
+                # Absorb `_register`'s intentional canvas swap into
+                # `expected_counter` so the next iteration's stale-load
+                # guard doesn't fire on our own work. An external swap
+                # by the user during the next iteration would push the
+                # counter higher than `expected_counter` and abort.
+                expected_counter = getattr(
+                    self.app, "_record_load_counter", 0,
+                )
+                n_aligned += 1
+            elif action == "add":
+                # Add the sample's consensus as a new library entry
+                # with provenance metadata so the user can see where
+                # it came from. Build the entry dict directly rather
+                # than going through `_record_to_library_entry` —
+                # that helper expects a `Path` for the display-name
+                # stem, which we don't have here (the source is a
+                # zip-member path, not a filesystem file).
+                #
+                # INV-72 (2026-05-25): the success/failure result is
+                # stashed in the shared `add_counters` dict so the
+                # summary toast can distinguish "added N" from
+                # "failed to save N more" (pre-fix the OSError was
+                # caught + logged but n_added still incremented, so
+                # the user saw "added 5 new" when only 3 actually
+                # landed on disk).
+                def _add(qr=query_rec, gbk=gbk_member,
+                          sname=sample_name, counters=add_counters):
+                    try:
+                        gb_text_q = _record_to_gb_text(qr)
+                        display_name = (sname or qr.name
+                                         or qr.id or "plasmid").strip()
+                        # Strip control chars to keep the LibraryPanel
+                        # table render safe against hostile names.
+                        display_name = "".join(
+                            c if c.isprintable() else "_"
+                            for c in display_name
+                        )[:_BULK_IMPORT_MAX_NAME_LEN]
+                        entry = {
+                            "name":    display_name,
+                            "id":      str(qr.id or display_name).strip(),
+                            "size":    len(qr.seq),
+                            "n_feats": len([
+                                f for f in qr.features
+                                if f.type != "source"
+                            ]),
+                            "source":  (f"plasmidsaurus:{run_id}:{sname}"
+                                        if run_id
+                                        else f"plasmidsaurus:{sname}"),
+                            "added":   _date.today().isoformat(),
+                            "gb_text": gb_text_q,
+                            "status":  "",
+                        }
+                        entries = _load_library()
+                        seen = {
+                            e.get("id") for e in entries
+                            if isinstance(e, dict)
+                        }
+                        base_id = entry["id"]
+                        n = 1
+                        while entry["id"] in seen:
+                            n += 1
+                            entry["id"] = f"{base_id}_{n}"
+                        entries.append(entry)
+                        _save_library(entries)
+                        counters["ok"] += 1
+                    except (OSError, ValueError, RuntimeError):
+                        _log.exception(
+                            "BulkAlign: add-as-new failed for %r", gbk,
+                        )
+                        counters["err"] += 1
+
+                # call_from_thread runs `_add` synchronously on the UI
+                # thread and returns when it's done — so the counters
+                # are already updated by the time we look at the
+                # next iteration's _record_load_counter.
+                self.app.call_from_thread(_add)
+            else:
+                # Unknown action — skip.
+                continue
+
+        # Materialise the add success/failure counts now that every
+        # call_from_thread(_add) has returned (synchronous dispatch).
+        # n_added reflects only entries that actually saved; the
+        # add-save failures get their own column in the summary so the
+        # user knows to retry / check disk.
+        n_added_local = add_counters["ok"]
+        n_add_failed_local = add_counters["err"]
+
+        def _summary(n_added=n_added_local, n_add_failed=n_add_failed_local):
+            # Refresh the LibraryPanel after add-as-new entries land
+            # (alignments already trigger refresh per flush).
+            if n_added:
+                try:
+                    lib = self.app.query_one(
+                        "#library", LibraryPanel,
+                    )
+                    lib._view_mode = "plasmids"
+                    lib._apply_view_mode()
+                    lib._repopulate_plasmids()
+                except NoMatches:
+                    pass
+            try:
+                # Surface add-save failures distinctly. Pre-fix
+                # `n_added` was the count of "tried to add", not
+                # "saved successfully" — a disk-full or
+                # permission-denied OSError was caught + logged but
+                # the toast still claimed N new entries.
+                parts = [
+                    f"aligned {n_aligned}",
+                    f"added {n_added} new",
+                ]
+                if n_add_failed:
+                    parts.append(f"add failed {n_add_failed}")
+                if n_failed:
+                    parts.append(f"failed {n_failed}")
+                self.app.notify(
+                    "Bulk-align complete · " + " · ".join(parts),
+                    title="Bulk alignment",
+                    severity=(
+                        "warning"
+                        if (n_add_failed or n_failed)
+                        else "information"
+                    ),
+                    timeout=8,
+                )
+            except Exception:
+                pass
+        self.app.call_from_thread(_summary)
+        # INV-73 (2026-05-25): batch summary as a structured event so
+        # the diagnostic bundle's events_summary.json captures the
+        # bulk-align outcome. Pre-fix the toast was the only record;
+        # if the user dismissed it (or pressed F9 after a session
+        # restart) the bulk-align outcome was unrecoverable from the
+        # bundle. Logged in the worker thread (`_log_event` is
+        # thread-safe).
+        try:
+            _log_event(
+                "alignment.bulk.summary",
+                n_aligned=int(n_aligned),
+                n_added=int(n_added_local),
+                n_add_failed=int(n_add_failed_local),
+                n_failed=int(n_failed),
+                n_committed=len(committed),
+            )
+        except Exception:  # noqa: BLE001 — logging must never raise
+            pass
 
     @on(Button.Pressed, "#btn-sequencing-close")
     def _close_btn(self, _) -> None:
@@ -55964,10 +58785,522 @@ class MultiAlignPickerModal(ModalScreen):
             except Exception:
                 pass
             return
+        # Stale-id filter: if a library mutation happened while the
+        # modal was open (agent endpoint deletion, external file edit,
+        # collection switch from a sibling pane), `_selected_ids` may
+        # carry entry ids that no longer resolve. Drop them silently
+        # rather than dismissing with ghost ids that downstream
+        # `_action_open_align_picker` would just `continue` past with
+        # a "not found" warning per target. Use the readonly-iter
+        # helper to skip the per-call deepcopy.
+        try:
+            live_ids = {
+                e.get("id") for e in _iter_library_readonly()
+                if isinstance(e, dict) and e.get("id")
+            }
+        except Exception:
+            _log.exception(
+                "MultiAlignPickerModal: live-id filter failed; "
+                "dismissing with the full selection",
+            )
+            live_ids = None
+        if live_ids is not None:
+            picked = [i for i in self._selected_ids if i in live_ids]
+            n_dropped = len(self._selected_ids) - len(picked)
+            if n_dropped:
+                try:
+                    self.app.notify(
+                        f"{n_dropped} selected target(s) were removed "
+                        "from the library while this picker was open — "
+                        "aligning the remaining {n}.".format(n=len(picked))
+                        if picked else
+                        f"All {n_dropped} selected target(s) were "
+                        "removed from the library while this picker "
+                        "was open — nothing to align.",
+                        severity="warning", timeout=5,
+                    )
+                except Exception:
+                    pass
+                if not picked:
+                    return
+            self.dismiss(picked)
+            return
         self.dismiss(list(self._selected_ids))
 
     @on(Button.Pressed, "#btn-mam-cancel")
     def _cancel_btn(self, _):
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Bulk Plasmidsaurus alignment ──────────────────────────────────────────────
+#
+# `BulkAlignConfirmModal` is the confirm step before running a
+# whole-zip auto-alignment in one batch. Surfaces the matcher's per-
+# sample proposed action (align / add / skip) and lets the user flip
+# any row before committing. Dismiss returns the final per-row action
+# list; the caller's worker batches the alignments and adds.
+
+class BulkAlignConfirmModal(ModalScreen):
+    """Confirm step for the "align every sample to its library match"
+    bulk flow. Shows one row per Plasmidsaurus sample with the
+    matcher's suggested action and target. Per-row Space toggles
+    action: align ↔ add ↔ skip (rotates).
+
+    Dismiss payload:
+      * ``None``       — cancelled.
+      * ``list[dict]`` — committed actions, one per input sample.
+
+    Each committed row has the same shape as `_match_samples_to_library`
+    output (``{sample, action, target_entry, score, method, note}``)
+    so the worker can dispatch off ``action`` directly.
+    """
+
+    BINDINGS = [
+        Binding("space",  "toggle_action",  "Toggle action", show=True,
+                priority=True),
+        Binding("enter",  "run",            "Run",           show=True),
+        Binding("escape", "cancel",         "Cancel",        show=True),
+        Binding("q",      "cancel",         "Cancel",        show=False),
+    ]
+
+    DEFAULT_CSS = """
+    BulkAlignConfirmModal { align: center middle; }
+    BulkAlignConfirmModal > Vertical {
+        width: 80%; min-width: 80; max-width: 140;
+        height: auto; max-height: 80%;
+        padding: 1 2;
+        background: $surface;
+        border: tall $primary;
+    }
+    BulkAlignConfirmModal #bulk-title { text-style: bold;
+        background: $primary; color: $text; padding: 0 1;
+        margin-bottom: 1; }
+    BulkAlignConfirmModal #bulk-help { color: $text-muted;
+        margin-bottom: 1; }
+    BulkAlignConfirmModal DataTable { height: auto; max-height: 25;
+        margin-bottom: 1; }
+    BulkAlignConfirmModal #bulk-summary { color: $text-muted;
+        margin-bottom: 1; }
+    BulkAlignConfirmModal Horizontal { width: 100%;
+        height: auto; align: center middle; }
+    BulkAlignConfirmModal Button { margin: 0 1; }
+    """
+
+    _GLYPH = {"align": "→", "add": "+", "skip": "·"}
+    _COLOR = {"align": "green", "add": "cyan", "skip": "yellow"}
+
+    def __init__(self, matches: "list[dict]"):
+        super().__init__()
+        # Defensive copy so user toggles in the modal don't leak into
+        # the caller's matches list (the caller still owns the source
+        # data for retry / diagnostic purposes).
+        self._matches: list[dict] = [dict(m) for m in matches]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="bulk-dlg"):
+            yield Static(" Bulk-align Plasmidsaurus samples ",
+                          id="bulk-title")
+            yield Static(
+                "Each sample is paired with the best-match library "
+                "entry by name (substring) or by k-mer similarity. "
+                "Space rotates the cursor row's action: "
+                "[green]→ align[/green] · "
+                "[cyan]+ add as new[/cyan] · "
+                "[yellow]· skip[/yellow]. "
+                "Enter to commit, Esc to cancel.",
+                id="bulk-help", markup=True,
+            )
+            yield DataTable(id="bulk-table", cursor_type="row",
+                             zebra_stripes=True)
+            yield Static("", id="bulk-summary", markup=True)
+            with Horizontal(id="bulk-btns"):
+                yield Button("Run", id="btn-bulk-run", variant="primary")
+                yield Button("Cancel", id="btn-bulk-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#bulk-table", DataTable)
+        t.add_columns("#", "Sample", "Action",
+                        "Target / new name",
+                        "k-mer", "Name", "Note")
+        for i, m in enumerate(self._matches, 1):
+            self._add_or_update_row(t, i, m)
+        if self._matches:
+            t.move_cursor(row=0)
+            t.focus()
+        self._refresh_summary()
+
+    def _add_or_update_row(self, t: "DataTable", idx_1based: int,
+                            m: dict, *, update: bool = False) -> None:
+        """Append a row for match ``m`` (or rewrite the cursor row in
+        place when ``update=True``). Centralised so action toggles
+        re-render the same cells without table re-population."""
+        sample_name = (
+            (m.get("sample") or {}).get("name")
+            or (m.get("sample") or {}).get("base")
+            or "?"
+        )
+        action = m.get("action", "skip")
+        glyph = self._GLYPH.get(action, "?")
+        color = self._COLOR.get(action, "white")
+        action_cell = Text(f"{glyph} {action}",
+                            style=f"{color} bold")
+        target_entry = m.get("target_entry")
+        if action == "align" and target_entry is not None:
+            target_label = (target_entry.get("name")
+                            or target_entry.get("id") or "?")
+            target_cell = Text(target_label)
+        elif action == "add":
+            target_cell = Text(
+                f"(new entry: {sample_name})", style="cyan dim",
+            )
+        else:
+            target_cell = Text("—", style="dim")
+        # k-mer + name scores in separate columns. Colour-code by
+        # strength so weak matches stand out at a glance.
+        kmer = float(m.get("kmer_score") or 0.0)
+        if kmer >= 0.5:
+            kmer_cell = Text(f"{kmer:.0%}", style="green bold")
+        elif kmer >= 0.2:
+            kmer_cell = Text(f"{kmer:.0%}", style="yellow")
+        elif kmer > 0:
+            kmer_cell = Text(f"{kmer:.0%}", style="red")
+        else:
+            kmer_cell = Text("—", style="dim")
+        name = float(m.get("name_score") or 0.0)
+        if name >= 0.999:
+            name_cell = Text("exact", style="green bold")
+        elif name >= 0.85:
+            name_cell = Text(f"{name:.0%}", style="yellow")
+        elif name > 0:
+            name_cell = Text(f"{name:.0%}", style="dim")
+        else:
+            name_cell = Text("—", style="dim")
+        note = m.get("note") or m.get("method") or ""
+        note_cell = Text(note, style="dim")
+        cells = (
+            Text(str(idx_1based), style="dim"),
+            Text(sample_name),
+            action_cell, target_cell,
+            kmer_cell, name_cell, note_cell,
+        )
+        if update:
+            try:
+                from textual.coordinate import Coordinate
+                row_idx = t.cursor_row
+                for col, cell in enumerate(cells):
+                    t.update_cell_at(Coordinate(row_idx, col), cell)
+                return
+            except Exception:
+                _log.exception(
+                    "BulkAlignConfirmModal: incremental row update failed"
+                )
+        t.add_row(*cells, key=str(idx_1based))
+
+    def action_toggle_action(self) -> None:
+        """Rotate the cursor row's action: align → add → skip → align.
+        For samples without a target_entry, the "align" choice falls
+        back to "add" (can't align without a target).
+        """
+        t = self.query_one("#bulk-table", DataTable)
+        row_idx = t.cursor_row
+        if row_idx is None or row_idx < 0 or row_idx >= len(self._matches):
+            return
+        m = self._matches[row_idx]
+        cur = m.get("action", "skip")
+        order = ["align", "add", "skip"]
+        try:
+            nxt = order[(order.index(cur) + 1) % len(order)]
+        except ValueError:
+            nxt = "align"
+        # Coerce "align" → "add" when there's no target to align to.
+        if nxt == "align" and m.get("target_entry") is None:
+            nxt = "add"
+        m["action"] = nxt
+        self._add_or_update_row(t, row_idx + 1, m, update=True)
+        self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
+        n_align = sum(1 for m in self._matches if m.get("action") == "align")
+        n_add   = sum(1 for m in self._matches if m.get("action") == "add")
+        n_skip  = sum(1 for m in self._matches if m.get("action") == "skip")
+        try:
+            self.query_one("#bulk-summary", Static).update(
+                f"[bold]{n_align}[/bold] to align · "
+                f"[cyan]{n_add}[/cyan] to add as new · "
+                f"[yellow]{n_skip}[/yellow] to skip · "
+                f"[dim]{len(self._matches)} total[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-bulk-run")
+    def _run_btn(self, _) -> None:
+        self.action_run()
+
+    def action_run(self) -> None:
+        # Filter out skip rows — the worker only cares about
+        # actionable rows. Cancelled (None) is distinct from "run
+        # with nothing actionable" (empty list).
+        committed = [
+            m for m in self._matches
+            if m.get("action") in ("align", "add")
+        ]
+        self.dismiss(committed)
+
+    @on(Button.Pressed, "#btn-bulk-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Verification report modal ─────────────────────────────────────────────────
+#
+# `VerificationReportModal` summarises every stored alignment across the
+# active library in one sortable table: per-row the plasmid name, seq
+# status badge, identity %, coverage %, SNP count, indel count, source.
+# Click a row to jump to that plasmid's canvas with the alignment loaded
+# and the cursor positioned at the first variant. Designed for the
+# "I just sequenced 6 plasmids — did they all match?" check-the-batch
+# moment.
+
+class VerificationReportModal(ModalScreen):
+    """Read-only summary of stored sequencing alignments across the
+    active library. Rows are sorted by status priority (✗ first, then
+    ⚠, ~, ✓, — last) so anomalies surface at the top.
+
+    Dismiss payload:
+      * ``None``                    — modal closed without picking.
+      * ``("open", entry_id, pos)`` — user picked a row to inspect;
+        caller loads the plasmid + scrolls cursor to ``pos`` bp.
+    """
+
+    BINDINGS = [
+        Binding("enter",  "open_row",   "Open in canvas",
+                show=True, priority=True),
+        Binding("escape", "cancel",     "Close", show=True),
+        Binding("q",      "cancel",     "Close", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    VerificationReportModal { align: center middle; }
+    VerificationReportModal > Vertical {
+        width: 90%; max-width: 160; min-width: 80;
+        height: auto; max-height: 90%;
+        padding: 1 2;
+        background: $surface;
+        border: tall $primary;
+    }
+    VerificationReportModal #vrm-title { text-style: bold;
+        background: $primary; color: $text; padding: 0 1;
+        margin-bottom: 1; }
+    VerificationReportModal #vrm-help { color: $text-muted;
+        margin-bottom: 1; }
+    VerificationReportModal DataTable { height: auto;
+        max-height: 30; margin-bottom: 1; }
+    VerificationReportModal Horizontal { width: 100%;
+        height: auto; align: center middle; }
+    VerificationReportModal Button { margin: 0 1; }
+    """
+
+    def __init__(self, *, only_with_alignments: bool = True):
+        """Build the report from the active library.
+
+        ``only_with_alignments`` (default True): skip entries that have
+        no stored alignments — most users want the "what got
+        sequenced" view, not the "what's in my library" view.
+        """
+        super().__init__()
+        self._only_with_alignments: bool = only_with_alignments
+        self._rows_data: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="vrm-dlg"):
+            yield Static(" Sequencing verification report ",
+                          id="vrm-title")
+            yield Static(
+                "One row per stored alignment in the active library. "
+                "[red]✗[/red] divergent (low identity), "
+                "[yellow]⚠[/yellow] near-match (some SNPs / indels), "
+                "[yellow]~[/yellow] partial coverage, "
+                "[green]✓[/green] verified. "
+                "Enter or click a row to load that plasmid + jump to "
+                "the first variant.",
+                id="vrm-help", markup=True,
+            )
+            yield DataTable(id="vrm-table", cursor_type="row",
+                             zebra_stripes=True)
+            yield Static("", id="vrm-summary", markup=True)
+            with Horizontal(id="vrm-btns"):
+                yield Button("Open in canvas",
+                              id="btn-vrm-open", variant="primary")
+                yield Button("Close", id="btn-vrm-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#vrm-table", DataTable)
+        t.add_columns(
+            "Plasmid", "Read", "Seq",
+            "Identity", "Coverage", "SNPs", "Indels", "Source",
+        )
+        self._collect_rows()
+        for r in self._rows_data:
+            self._add_row(t, r)
+        if self._rows_data:
+            t.move_cursor(row=0)
+            t.focus()
+        self._refresh_summary()
+
+    def _collect_rows(self) -> None:
+        try:
+            entries = list(_iter_library_readonly())
+        except Exception:
+            _log.exception("VerificationReportModal: library load failed")
+            entries = []
+        rows: list[dict] = []
+        for entry in entries:
+            alignments = entry.get("alignments") or []
+            if not isinstance(alignments, list):
+                continue
+            if self._only_with_alignments and not alignments:
+                continue
+            target_len = int(entry.get("size") or 0)
+            for align in alignments:
+                if not isinstance(align, dict):
+                    continue
+                if not align.get("visible", True):
+                    continue
+                result = align.get("result") or {}
+                code, glyph, color = _alignment_quality_status(
+                    result, target_len,
+                )
+                aq = result.get("aligned_q") or ""
+                at = result.get("aligned_t") or ""
+                variants = _extract_variants_from_alignment(aq, at)
+                n_snps = sum(1 for v in variants if v["type"] == "snp")
+                n_indels = sum(
+                    1 for v in variants
+                    if v["type"] in ("insertion", "deletion")
+                )
+                first_variant_pos = (
+                    int(variants[0]["target_pos"]) if variants else 0
+                )
+                ident_total = float(result.get("identity_pct", 0.0))
+                # INV-73 (2026-05-25): coverage routed through the
+                # shared `_coverage_pct_from_result` helper so the
+                # clamp + zero-target guard live in one place.
+                coverage_pct = _coverage_pct_from_result(
+                    result, target_len,
+                )
+                rows.append({
+                    "entry_id":   entry.get("id") or "",
+                    "entry_name": entry.get("name") or "?",
+                    "read_label": align.get("label")
+                                  or align.get("target_label") or "?",
+                    "code":       code,
+                    "glyph":      glyph,
+                    "color":      color,
+                    "ident":      ident_total,
+                    "coverage":   coverage_pct,
+                    "n_snps":     n_snps,
+                    "n_indels":   n_indels,
+                    "source":     align.get("source") or "manual",
+                    "first_pos":  first_variant_pos,
+                })
+        # Sort by status priority (worst first) so anomalies are on top.
+        priority_inv = {
+            "divergent": 0, "partial": 1, "near": 2, "verified": 3,
+        }
+        rows.sort(key=lambda r: (
+            priority_inv.get(r["code"], 4), r["entry_name"].lower(),
+        ))
+        self._rows_data = rows
+
+    def _add_row(self, t: "DataTable", r: dict) -> None:
+        plasmid_cell = Text(r["entry_name"])
+        read_cell = Text(r["read_label"], style="dim")
+        seq_cell = Text(r["glyph"], style=f"{r['color']} bold")
+        ident_cell = Text(f"{r['ident']:.1f}%")
+        cov_cell = Text(f"{r['coverage']:.0f}%")
+        snp_cell = (
+            Text(f"{r['n_snps']}", style="yellow")
+            if r["n_snps"] else Text("0", style="dim")
+        )
+        indel_cell = (
+            Text(f"{r['n_indels']}", style="red")
+            if r["n_indels"] else Text("0", style="dim")
+        )
+        source_cell = Text(r["source"], style="dim")
+        # Row key encodes (entry_id, first_variant_pos) so the open
+        # handler can resolve both from the cursor row without a
+        # secondary index. Pipe separator since neither half contains
+        # one (library ids reject `|`, target_pos is an int).
+        key = f"{r['entry_id']}|{r['first_pos']}"
+        t.add_row(
+            plasmid_cell, read_cell, seq_cell,
+            ident_cell, cov_cell, snp_cell, indel_cell, source_cell,
+            key=key,
+        )
+
+    def _refresh_summary(self) -> None:
+        n_total = len(self._rows_data)
+        if not n_total:
+            text = "[dim]No stored sequencing alignments in the active library.[/dim]"
+        else:
+            counts: dict[str, int] = {}
+            for r in self._rows_data:
+                counts[r["code"]] = counts.get(r["code"], 0) + 1
+            parts = []
+            if counts.get("verified"):
+                parts.append(
+                    f"[green]✓ {counts['verified']} verified[/green]"
+                )
+            if counts.get("near"):
+                parts.append(
+                    f"[yellow]⚠ {counts['near']} near-match[/yellow]"
+                )
+            if counts.get("partial"):
+                parts.append(
+                    f"[yellow]~ {counts['partial']} partial[/yellow]"
+                )
+            if counts.get("divergent"):
+                parts.append(
+                    f"[red]✗ {counts['divergent']} divergent[/red]"
+                )
+            text = " · ".join(parts) + f" · [dim]{n_total} total[/dim]"
+        try:
+            self.query_one("#vrm-summary", Static).update(text)
+        except NoMatches:
+            pass
+
+    @on(DataTable.RowSelected, "#vrm-table")
+    def _row_selected(self, _) -> None:
+        self.action_open_row()
+
+    @on(Button.Pressed, "#btn-vrm-open")
+    def _open_btn(self, _) -> None:
+        self.action_open_row()
+
+    def action_open_row(self) -> None:
+        try:
+            t = self.query_one("#vrm-table", DataTable)
+        except NoMatches:
+            return
+        key = _cursor_row_key(t)
+        if not key or "|" not in key:
+            return
+        entry_id, _sep, pos_str = key.partition("|")
+        try:
+            pos = int(pos_str)
+        except ValueError:
+            pos = 0
+        self.dismiss(("open", entry_id, pos))
+
+    @on(Button.Pressed, "#btn-vrm-close")
+    def _close_btn(self, _) -> None:
         self.dismiss(None)
 
     def action_cancel(self) -> None:
@@ -61713,6 +65046,49 @@ class ConstructorModal(ModalScreen):
             self._refresh_palette(gid)
             self._refresh_validation(gid)
 
+    @on(TabbedContent.TabActivated, "#ctor-tabs")
+    def _on_ctor_tab_activated(
+        self, event: TabbedContent.TabActivated,
+    ) -> None:
+        """Refresh per-tab source data when the user switches tabs.
+
+        Modular tabs (GB / MoClo) re-read `parts_bin.json` so a part
+        saved during this session is immediately pickable. Trad /
+        Gibson re-read `plasmid_library.json` so a TU / MOD assembled
+        in another tab during this session shows up in their source-
+        plasmid picker without closing the modal. Pre-2026-05-24 only
+        the GB/MoClo palette refreshed (palette is per-grammar but
+        sourced from parts_bin which IS updated on save); trad and
+        gibson kept the snapshot they read at on_mount.
+        """
+        tab_id = (event.tab.id or "").removeprefix("--content-tab-")
+        if tab_id == "ctor-tab-traditional":
+            try:
+                pane = self.query_one(
+                    "#ctor-trad-pane", TraditionalCloningPane,
+                )
+                pane._populate_library_tables()
+            except NoMatches:
+                pass
+        elif tab_id == "ctor-tab-gibson":
+            try:
+                pane = self.query_one(
+                    "#ctor-gib-pane", GibsonAssemblyPane,
+                )
+                pane._populate_library_table()
+            except NoMatches:
+                pass
+        else:
+            # Modular tab (gb_l0 / moclo_plant / …). Refresh the
+            # palette from parts_bin so a part loaded / saved while
+            # the user was on a different tab appears here too.
+            gid = tab_id.removeprefix("ctor-tab-")
+            if gid:
+                try:
+                    self._refresh_palette(gid)
+                except (NoMatches, AttributeError):
+                    pass
+
     # ── Tab id ↔ grammar id ──────────────────────────────────────────────
 
     def _gid_from_button(self, btn_id: str) -> str:
@@ -62959,6 +66335,13 @@ class ConstructorModal(ModalScreen):
         # because the history-recording path needs it too.)
         next_oh5 = str(parts[0].get("oh5") or "")
         next_oh3 = str(parts[-1].get("oh3") or "")
+        # Released insert body for the parts_bin entry's `sequence`
+        # field. Matches the Load Part convention: the body between
+        # (but not including) the level-up overhangs. Populated from
+        # the level-up digest probe below; falls back to "" when no
+        # clean release is possible (gb_text still carries the full
+        # plasmid for re-digest by `_assembly_fragment_from_source`).
+        next_sequence = ""
         try:
             level_up_frag = _assembly_fragment_from_source(
                 {"gb_text": gb_text, "name": new_rec.id or new_rec.name},
@@ -62973,6 +66356,16 @@ class ConstructorModal(ModalScreen):
         if isinstance(level_up_frag, dict):
             next_oh5 = str(level_up_frag.get("oh5") or next_oh5)
             next_oh3 = str(level_up_frag.get("oh3") or next_oh3)
+            # `_assembly_fragment_from_source` returns the body with
+            # overhangs already stripped (`seq_no_oh`), so storing it
+            # directly here matches the Load Part convention: the
+            # body is what sits between the 5'/3' sticky ends. Pre-
+            # 2026-05-24 this was hardcoded to "" which made MOD bin
+            # entries look incomplete next to TUs (which carry the
+            # body via Load Part), and prevented sequence-based
+            # downstream tooling from reading the body without a
+            # gb_text round-trip.
+            next_sequence = str(level_up_frag.get("sequence") or "")
         else:
             _log.warning(
                 "constructor: %r at level %d has no clean %s release "
@@ -62991,7 +66384,10 @@ class ConstructorModal(ModalScreen):
             "oh3":      next_oh3,
             "backbone": str(entry_vector.get("name") or backbone_role),
             "marker":   selection,
-            "sequence": "",  # the gb_text below is the source of truth for L1+
+            # Released insert body (overhangs stripped). Empty only
+            # when the level-up digest yielded no clean release —
+            # gb_text below stays authoritative in that case.
+            "sequence": next_sequence,
             "fwd_primer": "",
             "rev_primer": "",
             "fwd_tm":   0.0,
@@ -66310,6 +69706,25 @@ class PrimerDesignScreen(Screen):
             self._lib_view_mode = "primers"
             self._apply_lib_view_mode()
             return
+        # Warn the user before silently discarding any star-marks from
+        # the outgoing collection. `_refresh_library_table` clips
+        # `_lib_selected` against the NEW collection's primer count
+        # (line ~67441), which silently drops every mark from the old
+        # collection — confusing if the user spent time marking a
+        # batch for export and then clicked a collection row by
+        # accident.
+        n_marked = len(getattr(self, "_lib_selected", set()) or set())
+        if n_marked:
+            try:
+                self.app.notify(
+                    f"Switched collection — {n_marked} star-mark(s) "
+                    "from the previous collection were cleared "
+                    "(marks don't carry across collections).",
+                    severity="warning", timeout=5,
+                )
+            except Exception:
+                pass
+            self._lib_selected = set()
         _set_active_primer_collection_name(name)
         _settings_flush_sync()
         _restore_primers_from_active_primer_collection()
@@ -72666,8 +76081,32 @@ class NamePlasmidModal(ModalScreen):
         # display side has to escape.
         from rich.markup import escape as _md_escape
         cleaned_safe = _md_escape(cleaned)
+        # Detect leading / trailing whitespace separately from other
+        # cleaning (illegal chars, length cap). Trailing whitespace
+        # is the silent-cascade-breaker case (`'MAV 27 ….dna'` → name
+        # with trailing space → delete-cascade `==` miss against the
+        # parts_bin row). Surface it as a distinct warning chip so the
+        # user notices BEFORE saving, even though save will strip it
+        # for them anyway.
+        has_lead_ws = raw_value != raw_value.lstrip()
+        has_trail_ws = raw_value != raw_value.rstrip()
+        whitespace_warning = ""
+        if has_lead_ws or has_trail_ws:
+            sides = []
+            if has_lead_ws:
+                sides.append("leading")
+            if has_trail_ws:
+                sides.append("trailing")
+            whitespace_warning = (
+                f"[yellow]⚠ {' + '.join(sides)} whitespace will be "
+                f"stripped[/yellow] — saved as [b]{cleaned_safe}[/b]"
+            )
         # Cleaning-only mismatch (whitespace / illegal chars stripped).
         # Not an error — surface as info so the user can confirm.
+        # When the only diff is leading/trailing whitespace, the
+        # standalone `whitespace_warning` above already covers it;
+        # otherwise (illegal chars, length cap) the generic hint
+        # appended after status messages tells the user the final form.
         cleaning_hint = ""
         if cleaned != raw_value.strip():
             cleaning_hint = (
@@ -72722,7 +76161,12 @@ class NamePlasmidModal(ModalScreen):
             )
             save_btn.disabled = False
             return cleaned
-        if cleaning_hint:
+        if whitespace_warning:
+            # Leading/trailing-space-only case gets the dedicated
+            # warning chip (more prominent than the generic
+            # "Will save as" hint).
+            status.update(whitespace_warning)
+        elif cleaning_hint:
             status.update(
                 f"[yellow]Will save as[/yellow] [b]{cleaned_safe}[/b]"
             )
@@ -75242,13 +78686,28 @@ def _h_diff_plasmid(app, payload):
     """Pairwise alignment of the loaded record against another plasmid
     in the library. Body: ``{target_id, mode?, circular?}``.
 
-    `circular` (default `auto` — detected from the target's topology
-    annotation) drives the `_find_circular_alignment_offset` seed-kmer
-    rotation. Pass `false` to skip the rotation (matches the pre-0.8.4
-    behaviour); pass `true` to force it even when the target's
-    topology isn't annotated. Returns the full `_pairwise_align`
-    result plus `target_name` AND `rotation_offset` so an agent
-    can map back to original target coordinates.
+    `circular` (default ``auto`` — detected from the target's topology
+    annotation) gates the rotation picker. Pass ``false`` to skip
+    rotation; pass ``true`` to force it even when the target's
+    topology isn't annotated.
+
+    Runs the same `_pick_best_rotation` pipeline `_diff_align_worker`
+    uses (canvas_axis="query"): tries plain forward, plain RC,
+    query-rotation (forward + RC), target-rotation (forward + RC).
+    Picks whichever crosses ``_ROTATION_EARLY_STOP_PCT`` first or has
+    the highest overall identity. Returns the full result plus
+    rotation metadata so an agent can replicate the alignment:
+
+      * ``picked_rotation``  — ``"none"`` / ``"query"`` / ``"target"``.
+      * ``query_rotation``   — bp offset applied to the query (0 unless
+                               ``picked_rotation == "query"``).
+      * ``target_rotation``  — bp offset applied to the target (0 unless
+                               ``picked_rotation == "target"``).
+      * ``query_rc``         — bool: was the query reverse-complemented
+                               to find this alignment?
+      * ``rotation_offset``  — back-compat field: equals
+                               ``target_rotation`` (the legacy single-
+                               rotation API only rotated the target).
 
     Skips the UI and feeds an agent the same numbers
     `AlignmentScreen` surfaces — a "how similar are pUC19 and my new
@@ -75273,13 +78732,8 @@ def _h_diff_plasmid(app, payload):
         target_record = _gb_text_to_record(gb_text)
     except Exception as exc:
         return ({"error": f"target parse failed: {exc}"}, 500)
-    # Circular-alignment rotation (audit fix 2026-05-14): when the
-    # target is circular, the query's origin is rarely the same bp
-    # as the target's origin. Without rotation the global align pays
-    # gaps to slide the smaller offset back into register — exactly
-    # the GH #16 symptom Cory reported. Auto-detect from the
-    # target's topology annotation; agents can override with an
-    # explicit `circular` boolean.
+    # Auto-detect circular from topology annotation; agents can override
+    # with an explicit `circular` boolean.
     circ_raw = payload.get("circular")
     if circ_raw is None:
         target_annotations = getattr(target_record, "annotations",
@@ -75288,45 +78742,57 @@ def _h_diff_plasmid(app, payload):
     else:
         is_circular = bool(circ_raw)
     query_seq = str(rec.seq)
-    target_seq_raw = str(target_record.seq)
-    # Pre-cap both seqs at `_PAIRWISE_MAX_LEN` BEFORE the circular
-    # rotation step — `_find_circular_alignment_offset` doubles the
-    # target (`t + t`) so a 50 MB library entry would allocate 100 MB
-    # before we even reach `_pairwise_align`'s own cap. Mirrors the
-    # sibling endpoint `_h_align_plasmidsaurus_zip` which caps at the
-    # same constant.
+    target_seq = str(target_record.seq)
+    # Pre-cap both seqs at `_PAIRWISE_MAX_LEN` BEFORE the picker runs.
+    # `_pick_best_rotation` may double the target inside
+    # `_find_circular_alignment_offset` (t + t) — a 50 MB library entry
+    # would otherwise allocate 100 MB before reaching the alignment cap.
     if (len(query_seq) > _PAIRWISE_MAX_LEN
-            or len(target_seq_raw) > _PAIRWISE_MAX_LEN):
+            or len(target_seq) > _PAIRWISE_MAX_LEN):
         return ({
             "error": (
                 f"sequence too long for diff "
-                f"(query={len(query_seq):,}, target={len(target_seq_raw):,}, "
+                f"(query={len(query_seq):,}, target={len(target_seq):,}, "
                 f"cap={_PAIRWISE_MAX_LEN:,})"
             ),
         }, 413)
-    rotation_offset = 0
-    if is_circular and query_seq and target_seq_raw:
-        try:
-            rotation_offset = _find_circular_alignment_offset(
-                query_seq, target_seq_raw,
-            )
-        except Exception:
-            _log.exception("diff-plasmid: rotation offset probe failed")
-    target_seq = (target_seq_raw[rotation_offset:]
-                  + target_seq_raw[:rotation_offset]
-                  if rotation_offset else target_seq_raw)
+    # Use the same picker the UI workers use — INV-72 (2026-05-25)
+    # closes the agent/UI divergence: pre-sweep this endpoint ran
+    # bare `_pairwise_align` after a single `_find_circular_alignment_
+    # offset` call, so agents missed RC-orientation detection +
+    # the multi-rotation best-of-N pick that `_diff_align_worker`
+    # gained in `[INV-71]`. canvas_axis="query" matches the UI flow:
+    # the loaded record is the query, the picked library entry is
+    # the target.
     try:
-        result = _pairwise_align(query_seq, target_seq, mode=mode)
+        result = _pick_best_rotation(
+            query_seq, target_seq,
+            is_circular=is_circular,
+            mode=mode, canvas_axis="query",
+        )
     except ValueError as exc:
         return ({"error": f"alignment rejected: {exc}"}, 400)
     except Exception as exc:
+        _log.exception("diff-plasmid: pick_best_rotation raised")
         return ({"error": f"alignment failed: {exc}"}, 500)
+    picked = result.get("picked_rotation", "none")
+    target_rotation = int(result.get("target_rotation") or 0)
     return {
         "ok":              True,
         "target_id":       target_id,
         "target_name":     target_record.name or target_record.id or "",
         "circular":        is_circular,
-        "rotation_offset": rotation_offset,
+        # Back-compat: the legacy single-rotation API exposed
+        # `rotation_offset` as the bp the target was rotated by.
+        # Picker may instead rotate the query or pick "none" — in
+        # those cases `rotation_offset` is 0 and the new
+        # `query_rotation` / `picked_rotation` fields tell the full
+        # story.
+        "rotation_offset": target_rotation,
+        "picked_rotation": picked,
+        "query_rotation":  int(result.get("query_rotation") or 0),
+        "target_rotation": target_rotation,
+        "query_rc":        bool(result.get("query_rc", False)),
         "result":          result,
     }
 
@@ -75486,8 +78952,8 @@ def _h_align_plasmidsaurus_zip(app, payload):
     except Exception as exc:
         return ({"error": f"query parse failed: {exc}"}, 422)
     query_seq = str(query_record.seq)
-    target_seq_raw = str(target_record.seq)
-    if not query_seq or not target_seq_raw:
+    target_seq = str(target_record.seq)
+    if not query_seq or not target_seq:
         return ({"error": "query or target sequence is empty"}, 422)
     # Length-cap before kicking off the C-loop alignment. Even though
     # `_pairwise_align` enforces the same cap, surfacing it as 413
@@ -75495,7 +78961,7 @@ def _h_align_plasmidsaurus_zip(app, payload):
     if len(query_seq) > _PAIRWISE_MAX_LEN:
         return ({"error": f"query exceeds {_PAIRWISE_MAX_LEN:,} bp"},
                 413)
-    if len(target_seq_raw) > _PAIRWISE_MAX_LEN:
+    if len(target_seq) > _PAIRWISE_MAX_LEN:
         return ({"error": f"target exceeds {_PAIRWISE_MAX_LEN:,} bp"},
                 413)
     # Circular rotation: same auto-detect as `diff-plasmid`.
@@ -75506,25 +78972,22 @@ def _h_align_plasmidsaurus_zip(app, payload):
         is_circular = (target_annotations.get("topology") == "circular")
     else:
         is_circular = bool(circ_raw)
-    rotation_offset = 0
-    if is_circular:
-        try:
-            rotation_offset = _find_circular_alignment_offset(
-                query_seq, target_seq_raw,
-            )
-        except Exception:
-            _log.exception(
-                "align-plasmidsaurus-zip: rotation offset probe failed",
-            )
-    target_seq = (target_seq_raw[rotation_offset:]
-                  + target_seq_raw[:rotation_offset]
-                  if rotation_offset else target_seq_raw)
+    # INV-72 (2026-05-25): use the same picker the UI uses. Pre-sweep
+    # this endpoint ran bare `_pairwise_align` after a single
+    # `_find_circular_alignment_offset` call — agents missed the
+    # RC-orientation + multi-rotation best-of-N pick that `_align_worker`
+    # gained in `[INV-71]`. canvas_axis defaults to "target" (matches
+    # the UI: the read is the query, the library entry is the target).
     try:
-        result = _pairwise_align(query_seq, target_seq, mode=mode)
+        result = _pick_best_rotation(
+            query_seq, target_seq,
+            is_circular=is_circular,
+            mode=mode, canvas_axis="target",
+        )
     except ValueError as exc:
         return ({"error": f"alignment rejected: {exc}"}, 400)
     except Exception as exc:
-        _log.exception("align-plasmidsaurus-zip: alignment failed")
+        _log.exception("align-plasmidsaurus-zip: pick_best_rotation raised")
         return ({"error": f"alignment failed: {exc}"}, 500)
     # Sweep #26 (2026-05-23): post-alignment drift check. If the
     # target entry was deleted between resolve and alignment
@@ -75547,12 +79010,18 @@ def _h_align_plasmidsaurus_zip(app, payload):
                                               or target_record.id or ""):
             result = dict(result)
             result["_target_renamed_to"] = current_name
+    picked = result.get("picked_rotation", "none")
+    target_rotation = int(result.get("target_rotation") or 0)
+    query_rotation = int(result.get("query_rotation") or 0)
     _log_event(
         "alignment.agent",
         path=str(path), member=member,
         target=target_record.name or target_record.id or "",
         identity_pct=round(float(result.get("identity_pct") or 0), 1),
-        rotation=rotation_offset,
+        picked_rotation=picked,
+        query_rotation=query_rotation,
+        target_rotation=target_rotation,
+        query_rc=bool(result.get("query_rc", False)),
         mode=mode,
     )
     return {
@@ -75563,7 +79032,16 @@ def _h_align_plasmidsaurus_zip(app, payload):
         "target_id":       target_entry.get("id") or "",
         "target_name":     target_record.name or target_record.id or "",
         "circular":        is_circular,
-        "rotation_offset": rotation_offset,
+        # Back-compat: `rotation_offset` mirrors `target_rotation`
+        # (the legacy single-rotation API only ever rotated the target).
+        # New `picked_rotation` / `query_rotation` / `query_rc` fields
+        # carry the full picker decision so agents can replicate the
+        # alignment.
+        "rotation_offset": target_rotation,
+        "picked_rotation": picked,
+        "query_rotation":  query_rotation,
+        "target_rotation": target_rotation,
+        "query_rc":        bool(result.get("query_rc", False)),
         "result":          result,
     }
 
@@ -80632,7 +84110,7 @@ ConstructorModal { align: center middle; }
 .ctor-lane-btns   { height: 3; margin-top: 0; }
 .ctor-lane-btns Button { min-width: 5; margin-right: 1; }
 .ctor-filter-row  { height: 3; }
-.ctor-btns        { height: 3; margin-top: 1; }
+.ctor-btns        { height: 3; }
 .ctor-btns Button { margin-right: 1; }
 /* READY TO CLONE badge — shown next to the Save button when the
    lane validates AND a backbone is bound. Green background + bold
@@ -80662,7 +84140,7 @@ ConstructorModal { align: center middle; }
    auto-width inside a Horizontal grabs all remaining space and
    pushes the role columns off-screen). */
 .ctor-backbone-hdr    {
-    height: 1; margin-top: 1; padding: 0 1;
+    height: 1; padding: 0 1;
     color: $text-muted; background: $primary-darken-3;
 }
 .ctor-level-row           { height: 3; align: left middle; margin-bottom: 0; }
@@ -84806,14 +88284,34 @@ SpeciesPickerModal { align: center middle; }
         C loop can't be cancelled mid-flight, so a long alignment
         keeps running until completion; we just refuse to apply its
         result if the canvas has moved on.
+
+        Circular-target rotation (2026-05-24): when the target is
+        circular, plain global alignment paid edge gaps when the
+        target's origin didn't match the query's. The
+        `_pick_best_rotation` helper now tries plain + query-rot +
+        target-rot and keeps whichever has the highest overall
+        identity. For axis="query" (canvas == query), the helper
+        shifts aq/at back to the original query frame when
+        query-rot wins so segments land on the canvas's bp positions.
+        Matches the agent endpoint `_h_diff_plasmid` behaviour for
+        circular targets.
         """
         entry_counter = self._record_load_counter
         gen_at_entry  = self._alignments_generation
+        target_annotations = (
+            getattr(target_record, "annotations", None) or {}
+        )
+        target_is_circular = (
+            str(target_annotations.get("topology", "")).lower()
+            == "circular"
+        )
         try:
-            result = _pairwise_align(
+            result = _pick_best_rotation(
                 str(query_record.seq),
                 str(target_record.seq),
+                is_circular=target_is_circular,
                 mode="global",
+                canvas_axis="query",
             )
         except ValueError as exc:
             self.call_from_thread(
@@ -84821,7 +88319,17 @@ SpeciesPickerModal { align: center middle; }
             )
             return
         except Exception as exc:
-            _log.exception("Pairwise alignment worker raised")
+            # INV-73 (2026-05-25): name the records + lengths so a bug
+            # report carries enough context to reproduce without
+            # rummaging through UI snapshots.
+            _log.exception(
+                "Pairwise alignment worker raised: "
+                "query_id=%r query_len=%d target_id=%r target_len=%d",
+                getattr(query_record, "id", "?"),
+                len(str(getattr(query_record, "seq", "") or "")),
+                getattr(target_record, "id", "?"),
+                len(str(getattr(target_record, "seq", "") or "")),
+            )
             self.call_from_thread(
                 self.notify, f"Alignment failed: {exc}", severity="error",
             )
@@ -84895,7 +88403,7 @@ SpeciesPickerModal { align: center middle; }
     def _register_alignment(self, name: str, query_label: str,
                             target_label: str, target_record,
                             result: dict, *,
-                            axis: str = "target") -> None:
+                            axis: str = "target") -> "dict | None":
         """Append one alignment to the overlay band.
 
         Pre-computes the per-column segment list once at registration
@@ -84953,7 +88461,28 @@ SpeciesPickerModal { align: center middle; }
                 )
             except Exception:
                 pass
-            return
+            return None
+        # Length-mismatch guard. `_alignment_to_target_segments` and
+        # `_alignment_to_query_segments` walk paired columns and
+        # assume equal-length inputs; a corrupted result dict (or a
+        # stale schema mismatch that slipped past the hydrate gate)
+        # would raise a hard-to-trace ValueError downstream. Surface
+        # it as a user-visible notify and refuse to register instead.
+        if len(aq) != len(at):
+            _log.warning(
+                "_register_alignment: aligned string length mismatch "
+                "for %r (q=%d, t=%d); refusing to register",
+                name, len(aq), len(at),
+            )
+            try:
+                self.notify(
+                    f"Alignment for {name!r} has malformed paired "
+                    "strings (length mismatch) — not added to the map.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
+            return None
         if axis == "query":
             segs = _alignment_to_query_segments(aq, at)
         else:
@@ -84997,7 +88526,7 @@ SpeciesPickerModal { align: center middle; }
         try:
             pm = self.query_one("#plasmid-map", PlasmidMap)
         except NoMatches:
-            return
+            return entry
         # First overlay registration on a circular plasmid pins linear
         # topology. Subsequent registrations preserve whatever the user
         # has since chosen (we don't keep snapping back). The pinned
@@ -85011,6 +88540,7 @@ SpeciesPickerModal { align: center middle; }
             except Exception:
                 _log.exception("_register_alignment: persist map_mode failed")
         pm.set_alignments(self._alignments)
+        return entry
 
     def _persist_map_mode_for_active(self, mode: str) -> None:
         """Save the user's map-view preference (linear/circular) onto
@@ -85114,65 +88644,91 @@ SpeciesPickerModal { align: center middle; }
         rec_id = getattr(rec, "id", None)
         if not rec_id:
             return
-        try:
-            entries = _load_library()
-        except Exception:
-            _log.exception("_flush_active_alignments: load_library failed")
-            return
-        idx = next(
-            (i for i, e in enumerate(entries) if e.get("id") == rec_id),
-            -1,
-        )
-        if idx < 0:
-            return
-        # ── Merge: preserve hidden stored entries ────────────────────
-        # `existing` is the on-disk stored list. We mutate a copy and
-        # write that back, so any entry we don't touch (hidden ones,
-        # parse-failures) survives the flush. `existing_by_id` lets
-        # us update an in-memory alignment's stored slot by id in O(1).
-        existing = list(entries[idx].get("alignments") or [])
-        existing_pos: dict[str, int] = {}
-        for pos, e in enumerate(existing):
-            eid = e.get("id")
-            if eid:
-                existing_pos[eid] = pos
-        fresh: list[dict] = []
-        for align in self._alignments:
-            stored = _serialize_alignment_for_storage(
-                align,
-                source=align.get("_stored_source", "manual"),
+        # INV-73 (2026-05-25): hold `_cache_lock` across the entire
+        # read-modify-write. `_diff_align_worker`, `_align_worker`
+        # (Plasmidsaurus), `_multi_align_worker` run in distinct
+        # `@work` groups, so two flushes against the SAME library
+        # entry can interleave: A loads → B loads → A saves → B saves
+        # clobbers A's just-added alignment. RLock allows the inner
+        # `_load_library` / `_save_library` to re-enter without
+        # deadlock. Pre-fix this was a silent data-loss path for
+        # users running concurrent Alt+A + Plasmidsaurus workers.
+        with _cache_lock:
+            try:
+                entries = _load_library()
+            except Exception:
+                _log.exception(
+                    "_flush_active_alignments: load_library failed",
+                )
+                return
+            idx = next(
+                (i for i, e in enumerate(entries) if e.get("id") == rec_id),
+                -1,
             )
-            if stored is None:
-                continue
-            sid = stored.get("id")
-            if sid and sid in existing_pos:
-                # Update in-place: preserves list order so the manager
-                # modal's row order stays stable across flushes.
-                existing[existing_pos[sid]] = stored
-            else:
-                fresh.append(stored)
-        merged = existing + fresh
-        # Skip the save if nothing changed. Comparing full dicts is
-        # safer than the (id, visible) signature — catches result-data
-        # changes too (e.g., a re-run with refreshed alignment).
-        if merged == (entries[idx].get("alignments") or []):
-            return
-        entries[idx]["alignments"] = merged
-        try:
-            _save_library(entries, async_sync=True)
-        except (OSError, RuntimeError) as exc:
-            _log.exception(
-                "_flush_active_alignments: save failed for %r", rec_id,
+            if idx < 0:
+                return
+            # ── Merge: preserve hidden stored entries ────────────────
+            # `existing` is the on-disk stored list. We mutate a copy
+            # and write that back, so any entry we don't touch (hidden
+            # ones, parse-failures) survives the flush. `existing_by_id`
+            # lets us update an in-memory alignment's stored slot by
+            # id in O(1).
+            existing = list(entries[idx].get("alignments") or [])
+            existing_pos: dict[str, int] = {}
+            for pos, e in enumerate(existing):
+                eid = e.get("id")
+                if eid:
+                    existing_pos[eid] = pos
+            fresh: list[dict] = []
+            for align in self._alignments:
+                stored = _serialize_alignment_for_storage(
+                    align,
+                    source=align.get("_stored_source", "manual"),
+                )
+                if stored is None:
+                    continue
+                sid = stored.get("id")
+                if sid and sid in existing_pos:
+                    # Update in-place: preserves list order so the
+                    # manager modal's row order stays stable across
+                    # flushes.
+                    existing[existing_pos[sid]] = stored
+                else:
+                    fresh.append(stored)
+            merged = existing + fresh
+            # Skip the save if nothing changed. Comparing full dicts
+            # is safer than the (id, visible) signature — catches
+            # result-data changes too (e.g., a re-run with refreshed
+            # alignment).
+            if merged == (entries[idx].get("alignments") or []):
+                return
+            entries[idx]["alignments"] = merged
+            try:
+                _save_library(entries, async_sync=True)
+            except (OSError, RuntimeError) as exc:
+                _log.exception(
+                    "_flush_active_alignments: save failed for %r",
+                    rec_id,
+                )
+                _notify_save_failure(self, "Plasmid library", exc)
+                return
+            _log_event(
+                "alignments.persisted",
+                rec_id=rec_id,
+                n_total=len(merged),
+                n_visible=len(self._alignments),
+                n_hidden=len(merged) - len(self._alignments),
             )
-            _notify_save_failure(self, "Plasmid library", exc)
-            return
-        _log_event(
-            "alignments.persisted",
-            rec_id=rec_id,
-            n_total=len(merged),
-            n_visible=len(self._alignments),
-            n_hidden=len(merged) - len(self._alignments),
-        )
+        # Refresh the LibraryPanel's Seq cell for this entry so the
+        # status badge tracks the freshly-persisted alignment counts.
+        # Incremental cell update (cheap) — full repopulate would reset
+        # cursor + filter state on every plasmidsaurus / Alt+A / diff
+        # flush.
+        try:
+            lib = self.query_one("#library", LibraryPanel)
+            lib.refresh_seq_cell(rec_id)
+        except NoMatches:
+            pass
 
     def _hydrate_alignments_for_active(self) -> None:
         """Restore stored alignments from the active library entry
@@ -85256,16 +88812,26 @@ SpeciesPickerModal { align: center middle; }
                         stale_labels.append(
                             stored.get("label") or stored.get("target_label") or "?"
                         )
-            self._register_alignment(**args)
-            # Stamp the freshly-appended entry with its storage
-            # metadata so the next flush round-trips losslessly.
-            if self._alignments:
-                tail = self._alignments[-1]
-                tail["_stored_id"]      = stored.get("id", "")
-                tail["_stored_visible"] = bool(stored.get("visible", True))
-                tail["_stored_source"]  = stored.get("source", "manual")
-                tail["_stored_added"]   = stored.get("added", "")
-                tail["_stored_label"]   = stored.get("label", "")
+            # Use the return value rather than `self._alignments[-1]`
+            # so a register-refused (empty / mismatched aq+at)
+            # stored entry doesn't end up stamping `_stored_id` on
+            # the PREVIOUS entry. Pre-fix this corrupted the prior
+            # entry's storage metadata and caused deleted alignments
+            # to resurrect on the next `_flush_active_alignments`
+            # (the corrupted `_stored_id` mapped to the deleted
+            # entry's slot in `existing_pos`, so the flush re-emitted
+            # it under that id).
+            registered_entry = self._register_alignment(**args)
+            if registered_entry is not None:
+                registered_entry["_stored_id"]      = stored.get("id", "")
+                registered_entry["_stored_visible"] = bool(
+                    stored.get("visible", True),
+                )
+                registered_entry["_stored_source"]  = stored.get(
+                    "source", "manual",
+                )
+                registered_entry["_stored_added"]   = stored.get("added", "")
+                registered_entry["_stored_label"]   = stored.get("label", "")
                 registered += 1
         if registered:
             _log_event(
@@ -85624,6 +89190,14 @@ SpeciesPickerModal { align: center middle; }
             # the user reloaded the record.
             self._clear_alignments()
             self._hydrate_alignments_for_active()
+            # Refresh the Seq-column badge — visibility flips + deletes
+            # change the per-entry alignment count summary the badge
+            # surfaces in the LibraryPanel.
+            try:
+                lib = self.query_one("#library", LibraryPanel)
+                lib.refresh_seq_cell(rec_id)
+            except NoMatches:
+                pass
             self.notify(
                 f"Alignment manager saved ({len(updated)} stored).",
                 severity="information", timeout=3,
@@ -87226,54 +90800,109 @@ SpeciesPickerModal { align: center middle; }
         except NoMatches:
             pass
 
+    def _set_plasmid_status_fast(
+        self, entry_id: str, new_status: str,
+        *, notify: bool = True,
+    ) -> bool:
+        """Optimised status mutator for a single library entry.
+
+        Three speedups vs the pre-2026-05-24 status-change flow:
+
+          1. ``_save_library(async_sync=True)`` defers the 156-MB
+             collections.json mirror to a background worker. The
+             library write itself is small (~6 MB / 89 entries)
+             so the UI hang collapses from multi-second to <100 ms.
+          2. ``LibraryPanel.refresh_status_cell(entry_id)`` updates
+             just the Name + Status cells in place. Pre-fix the
+             whole table was rebuilt (`lib._repopulate()`), iterating
+             every entry and re-creating every Text cell — wasted
+             on a single-row status change.
+          3. Skip the work entirely when the status didn't actually
+             change (idempotent, common in bulk-align where many
+             samples may already be SEQUENCING).
+
+        Returns True on a successful save, False on validation /
+        save failure (caller can surface its own error). ``notify=
+        False`` suppresses the success toast — used by bulk-align
+        where N statuses change at once and a per-row toast would
+        spam the user.
+        """
+        new_status = _sanitize_plasmid_status(new_status)
+        # INV-73 (2026-05-25): hold `_cache_lock` for the entire RMW.
+        # Pre-fix this read-modify-write was unlocked: a bulk-align
+        # auto-tag concurrently flushing an alignment to the same
+        # entry could see the load → flush save → status save sequence
+        # clobber the alignment field, making the LibraryPanel Seq
+        # column ✓ vanish after the status change landed.
+        # `_flush_active_alignments` already holds the same RLock so
+        # the two paths serialize cleanly; RLock allows the inner
+        # `_save_library`/`_load_library` to re-enter without
+        # deadlock.
+        with _cache_lock:
+            entries = _load_library()
+            target_idx = -1
+            for i, e in enumerate(entries):
+                if e.get("id") == entry_id:
+                    target_idx = i
+                    break
+            if target_idx < 0:
+                if notify:
+                    self.notify("Library entry vanished.",
+                                 severity="warning")
+                return False
+            prev = _sanitize_plasmid_status(
+                entries[target_idx].get("status"),
+            )
+            if prev == new_status:
+                return True   # no-op
+            entries[target_idx]["status"] = new_status
+            try:
+                _save_library(entries, async_sync=True)
+            except (OSError, ValueError) as exc:
+                _notify_save_failure(self, "Plasmid library", exc)
+                return False
+        try:
+            lib = self.query_one("#library", LibraryPanel)
+            lib.refresh_status_cell(entry_id)
+            # INV-73 (2026-05-25): also refresh the Seq cell after a
+            # status change. The Seq cell reads from the same entry
+            # dict that may have just been overwritten by a different
+            # writer — keeping the two cells in render-sync prevents
+            # the "✓ vanishes on status shift" user-visible symptom
+            # even when the underlying alignments survived.
+            lib.refresh_seq_cell(entry_id)
+        except NoMatches:
+            pass
+        if notify:
+            label = new_status or "(none)"
+            self.notify(f"Status set: {label}")
+        return True
+
     @on(LibraryPanel.StatusRequested)
     def _library_status_requested(self, event: LibraryPanel.StatusRequested):
         """`s` key on a library row → open the status picker.
 
-        Persists through `_save_library` so the active-collection
-        mirror picks up the change. The plasmid table refreshes so
-        the new colour-coded badge + circle render immediately.
+        Persists through `_set_plasmid_status_fast` which defers the
+        slow active-collection mirror to a background worker and
+        does an incremental cell update instead of a full table
+        repopulate.
         """
         if event.entry_id is None:
             self.notify("Highlight a library row first.",
                          severity="warning")
             return
-        entry: "dict | None" = None
-        for e in _load_library():
-            if e.get("id") == event.entry_id:
-                entry = e
-                break
+        entry = _find_library_entry_by_id(event.entry_id)
         if entry is None:
             self.notify("Library entry not found.", severity="warning")
             return
         current = _sanitize_plasmid_status(entry.get("status"))
         name = str(entry.get("name") or entry.get("id") or "?")
+        entry_id = event.entry_id
 
         def _on_pick(new_status: "str | None") -> None:
             if new_status is None:
                 return  # cancel / no-op
-            new_status = _sanitize_plasmid_status(new_status)
-            entries = _load_library()
-            for e in entries:
-                if e.get("id") == event.entry_id:
-                    e["status"] = new_status
-                    break
-            else:
-                self.notify("Library entry vanished.",
-                             severity="warning")
-                return
-            try:
-                _save_library(entries)
-            except (OSError, ValueError) as exc:
-                _notify_save_failure(self, "Plasmid library", exc)
-                return
-            try:
-                lib = self.query_one("#library", LibraryPanel)
-                lib._repopulate()
-            except NoMatches:
-                pass
-            label = new_status or "(none)"
-            self.notify(f"Status set: {label}")
+            self._set_plasmid_status_fast(entry_id, new_status)
 
         self.push_screen(
             PlasmidStatusPickerModal(name, current),
@@ -87390,9 +91019,37 @@ SpeciesPickerModal { align: center middle; }
         the panel + title bar update without delay; the disk catches
         up off-thread.
         """
+        # Trim incoming name: trailing whitespace (often inherited
+        # from a `.dna` filename like `'MAV 27 ….dna'`) silently
+        # breaks the delete-cascade's strict `==` match later.
+        new_name = str(new_name or "").strip()
         entries = _load_library()
         old_name = ""
         cascade_grammar = ""
+        new_id = entry_id   # default: leave id unchanged if compute fails
+        # Pre-compute the new id derived from the renamed display name.
+        # Pre-2026-05-24 the rename flow left `id` immutable — that
+        # left "stale" ids in the library (e.g. after MAV 34 → MAV 33
+        # the entry still carried `id="MAV_34"`), which blocked the
+        # user from re-using the display name "MAV 34" for a new
+        # plasmid (`NamePlasmidModal` rejects id collisions). The new
+        # rule: `id == sanitize(name)` always; renames update both.
+        # Disambiguation: if the desired id is already taken by ANOTHER
+        # entry, append `_2`/`_3`/…. The renamed entry's own id is
+        # excluded from the collision set (a same-name rewrite that
+        # produces the same id leaves the id alone).
+        desired_id = re.sub(r"[^A-Za-z0-9_]+", "_", new_name).strip("_")
+        if desired_id:
+            existing_ids = {
+                (e.get("id") or "")
+                for e in entries
+                if isinstance(e, dict) and e.get("id") != entry_id
+            }
+            new_id = desired_id
+            suffix = 2
+            while new_id in existing_ids:
+                new_id = f"{desired_id}_{suffix}"
+                suffix += 1
         for e in entries:
             if e.get("id") == entry_id:
                 old_name = str(e.get("name") or entry_id)
@@ -87407,6 +91064,7 @@ SpeciesPickerModal { align: center middle; }
                     if len(parts_src) >= 2:
                         cascade_grammar = parts_src[1]
                 e["name"] = new_name
+                e["id"]   = new_id
                 # Re-serialize the stored gb_text with the new LOCUS name.
                 # If the gb_text can't be parsed for any reason, fall back
                 # to just updating the JSON `name` field — the library row
@@ -87424,9 +91082,9 @@ SpeciesPickerModal { align: center middle; }
                         re.sub(r"[^A-Za-z0-9_-]+", "_", new_name).strip("_")
                         [:_GB_LOCUS_NAME_MAX]
                     )
-                    rec.name = safe_locus or entry_id[:_GB_LOCUS_NAME_MAX] \
+                    rec.name = safe_locus or new_id[:_GB_LOCUS_NAME_MAX] \
                         or "PLASMID"
-                    rec.id   = entry_id   # don't let SeqIO rewrite the id
+                    rec.id   = new_id   # track display name (post-2026-05-24)
                     e["gb_text"] = _record_to_gb_text(rec)
                 except Exception:
                     _log.exception(
@@ -87469,8 +91127,12 @@ SpeciesPickerModal { align: center middle; }
             try:
                 bin_entries = _load_parts_bin()
                 n_updated = 0
+                # Same `.strip()`-tolerant match as the delete
+                # cascade so legacy whitespace-padded names stay in
+                # sync on rename too (PIT-36 / 2026-05-24).
+                old_name_t = (old_name or "").strip()
                 for b in bin_entries:
-                    if (b.get("name") or "") != old_name:
+                    if str(b.get("name") or "").strip() != old_name_t:
                         continue
                     if cascade_grammar and \
                             (b.get("grammar") or "gb_l0") != cascade_grammar:
@@ -87499,10 +91161,15 @@ SpeciesPickerModal { align: center middle; }
 
         # If this is the currently-loaded record, update the in-memory object
         # so the map, title bar, and every other bit of UI tracking `record.
-        # name` pick up the new name without a full reload.
+        # name` (and `record.id`) pick up the new name without a full reload.
         if (self._current_record is not None
                 and self._current_record.id == entry_id):
             self._current_record.name = new_name
+            # Update the id too (post-2026-05-24 invariant: id tracks
+            # display name). Without this, the next save would write
+            # the renamed entry under the OLD id, re-introducing the
+            # exact stale-id state the backfill exists to fix.
+            self._current_record.id = new_id
             # Update the display-name stash too so the title bar +
             # map header reflect the rename. Without this, the cached
             # `_tui_display_name` from the prior library load lingers

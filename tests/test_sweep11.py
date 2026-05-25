@@ -244,18 +244,21 @@ class TestFindLibraryEntryByIdHelper:
         assert sc._find_library_entry_by_id("nonexistent") is None
 
     def test_match_returns_deep_clone(self, tmp_path, monkeypatch):
+        # Test data uses `id == sanitize(name)` so the post-2026-05-24
+        # id-name backfill (PIT-36) is a no-op and lookup by id stays
+        # stable across the load.
         monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
         sc._library_cache = None
         sc._save_library([
-            {"id": "p1", "name": "P1", "gb_text": "LOCUS p1"},
-            {"id": "p2", "name": "P2", "gb_text": "LOCUS p2"},
+            {"id": "P1", "name": "P1", "gb_text": "LOCUS p1"},
+            {"id": "P2", "name": "P2", "gb_text": "LOCUS p2"},
         ])
-        e = sc._find_library_entry_by_id("p1")
+        e = sc._find_library_entry_by_id("P1")
         assert e is not None
         assert e["name"] == "P1"
         # Mutating the returned dict must NOT poison the cache.
         e["name"] = "MUTATED"
-        e2 = sc._find_library_entry_by_id("p1")
+        e2 = sc._find_library_entry_by_id("P1")
         assert e2 is not None
         assert e2["name"] == "P1"
 

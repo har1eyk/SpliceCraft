@@ -55,12 +55,37 @@ installs and the user-data directory location.
 - **Simulate** PCR + agarose gels (0.5–4% with the Helling-Goodman-
   Boyer mobility curve and form corrections).
 - **Align sequencing runs** from the Sequencing toolbar — drop in a
-  Plasmidsaurus `.zip`, browse a nested 4-tab view of the run (General
-  overview · per-Samples table · Quality metrics including k-mer +
-  contamination + coverage · Align), pick a sample + target plasmid;
-  the pairwise alignment lands as a sequencing-read lane on the
-  linear map right next to the rail, and the target's library entry
-  auto-tags to linear view for future opens.
+  Plasmidsaurus `.zip` and walk three numbered sub-tabs: **1. Pick
+  zip** (browse and pick the run archive), **2. Pick sample** (click
+  the row whose read you want), **3. Pick target + align** (pick the
+  library plasmid this sample belongs to, click Align). An optional
+  **QC** tab shows k-mer / contamination / coverage metrics. On
+  Align: the picked library plasmid loads onto the canvas and the
+  plasmidsaurus virtual plasmid lands as a blue alignment bar on its
+  linear view (origin of the library entry stays the absolute
+  reference; the read is rotated to match). Bar is labelled `<row#>
+  <gbk_basename>` and persists onto the target's library entry so
+  re-loading restores it. Target auto-tags to linear view for future
+  opens.
+- **Bulk-align a whole results folder** — on the **2. Pick sample**
+  tab, click **Bulk auto-align all samples** to match every sample
+  against the library by name (Plasmidsaurus filename → library
+  entry name) with sequence-similarity fallback. A confirm modal
+  lets you flip each row's action (align / add-as-new / skip) before
+  committing. Matched samples align onto their library entries;
+  unmatched samples can be added as new library entries with
+  provenance (`source: plasmidsaurus:<run>:<sample>`).
+- **Verification report** — on the **1. Pick zip** tab, click
+  **View verification report** to see every stored sequencing
+  alignment across the active library in one sortable table:
+  status badge (✓ verified / ⚠ near-match / ~ partial / ✗
+  divergent), identity %, coverage %, SNP and indel counts,
+  source. Click a row to load that plasmid onto the canvas with
+  the cursor positioned at the first variant.
+- **Library sequencing status badges** — the main LibraryPanel now
+  shows a **Seq** column per entry: at-a-glance ✓ / ⚠ / ~ / ✗
+  / — so you can see which constructs have been verified, which
+  have variants, and which haven't been sequenced.
 - **Log experiments** from the Experiments toolbar — full-screen
   lab-notebook workbench with a split-pane layout: entries list on
   the left (Updated · Title with horizontal scroll for long titles)

@@ -14,6 +14,36 @@
 
 ---
 
+## [0.9.22] — 2026-05-25
+
+**Alignment hardening sweep (INV-73)** — five real bugs closed after a parallel-agent audit on top of INV-72:
+
+- **Bulk-align now applies to every confirmed sample, not just the first.** Pre-fix the worker's stale-load guard treated the canvas swap to each target as an "external" load and aborted the rest of the batch after the first iteration — users confirming N rows in the modal saw only one plasmid get its alignment + status change. The worker now absorbs its own intentional canvas swaps into the load-counter check while still catching truly external swaps.
+- **LibraryPanel Seq column ✓ no longer vanishes when the plasmid status changes.** `_set_plasmid_status_fast` now holds `_cache_lock` for the full read-modify-write so a concurrent alignment flush can't have its alignment field clobbered by a status save built on a pre-flush snapshot. Status changes also incrementally refresh the Seq cell now (mirrors the Status cell refresh).
+- **Aligned plasmid display labels no longer carry the Plasmidsaurus prefix or underscores** — `RUN42_1_MAV34.gbk` now renders as `MAV34` in alignment rows. Matches the existing TUI convention of spaces over underscores in names.
+- **`_flush_active_alignments` is thread-safe.** Concurrent alignment workers (`_diff_align_worker`, `_align_worker`, `_multi_align_worker` — different `@work` groups) can no longer interleave their library writes and silently lose each other's alignments.
+- **`_extract_variants_from_alignment` capped at 10 000 variants** with a truncation sentinel so a fully-divergent 200 kb alignment can't blow memory in the VerificationReportModal. Callers filtering by `type=='snp'/'insertion'/'deletion'` skip the sentinel naturally.
+- **`_kmer_set` strong-match requires ≥ 50 canonical k-mers** so a 25 bp sample can't score a coincidental Jaccard 1.0 against a library entry that happens to contain a primer-length match region.
+- **`_deserialize_stored_alignment_args` validates rotation-picker fields** (`picked_rotation` ∈ {none, query, target}, non-negative rotation offsets, bool `query_rc`). Corrupted values coerce to safe defaults with a warning log.
+- **New `_coverage_pct_from_result` helper** centralises the coverage-percent clamp + zero-target guard so toast and verification report can't drift in display logic.
+
+**F9 / diagnostic bundle improvements:**
+
+- `events_summary.json` — last 200 structured `_log_event` lines extracted from rotating logs and shipped as JSON. Bug-reports can be parsed without regex against the raw log; rotated backups walked too.
+- `system_info.json` gains terminal + locale capture (`TERM`, `COLORTERM`, `LANG`, `LC_*`, etc.) and TTY flags so rendering bugs on `TERM=dumb` / `LANG=C` / piped stdout are visible in triage.
+
+**Event logger:**
+
+- `_bulk_align_worker` now emits `alignment.bulk.summary` (n_aligned / n_added / n_add_failed / n_failed / n_committed) — diagnostic bundle captures bulk-align outcomes even after the toast is dismissed.
+- `_align_worker` and `_diff_align_worker` exception logs now carry query/target ids + lengths + topology for reproducibility.
+- `_action_log` decorator leaves a `_log.debug` breadcrumb when `_log_event` itself fails (was silent before).
+
+**Pyright cleanup:** workspace pyright now reports **0 errors, 0 warnings**. `pyrightconfig.json` includes `tests/` with an `executionEnvironments` block that suppresses Textual-Widget generic-type narrowing issues (intentional in tests, not real bugs). Real bugs caught in pass: `test_smoke.py::_timed` unbound `result`, duplicate method name in `test_genbank_io.py`.
+
+**New tests (27 cases):** `TestVariantExtractionCap`, `TestExtractVariantsMixedAndDivergent`, `TestPickedRotationEnumValidation`, `TestCoveragePctHelper`, `TestKmerSetForStrongMatchThreshold`, `TestAlignmentQualityStatusBoundaries`, `TestFlushAlignmentsLocked`.
+
+---
+
 ## [0.9.21] — 2026-05-23
 
 _(auto-generated changelog — no notable commits found since the previous release)_

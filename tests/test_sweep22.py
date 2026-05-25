@@ -324,11 +324,45 @@ class TestMigrationCoverageEveryLoadPath:
             "_load_experiments", "_load_experiment_projects",
             "_load_gels",
         ]
+        # INV-73 (2026-05-25): walk the call graph one level to follow
+        # cache-refactor indirections. `_load_library` no longer
+        # inlines `_safe_load_json` — it routes through
+        # `_ensure_library_cache_populated_and_migrated` (INV-72 cache
+        # rewrite). The migration guarantee still holds; the test
+        # needs to follow the indirection so it doesn't fail on a
+        # legitimate refactor.
         for name in loaders:
             fn = getattr(sc, name, None)
             assert fn is not None, f"missing load helper: {name}"
             src = inspect.getsource(fn)
-            assert "_safe_load_json" in src, (
+            if "_safe_load_json" in src:
+                continue
+            # Follow one level of indirection: find any helper called
+            # in the body that itself routes through _safe_load_json.
+            found = False
+            for line in src.splitlines():
+                # crude but effective: any `_some_helper_name(` call
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                for tok in stripped.replace("(", " ").split():
+                    if not tok.startswith("_") or tok in {
+                        name, "_typed_clone", "_log", "_cache_lock",
+                    }:
+                        continue
+                    target = getattr(sc, tok, None)
+                    if target is None or not callable(target):
+                        continue
+                    try:
+                        sub_src = inspect.getsource(target)
+                    except (TypeError, OSError):
+                        continue
+                    if "_safe_load_json" in sub_src:
+                        found = True
+                        break
+                if found:
+                    break
+            assert found, (
                 f"{name} doesn't route through _safe_load_json — "
                 f"will silently skip migrations on schema bump. "
                 f"Add the call or document the exception."

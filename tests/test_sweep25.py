@@ -206,23 +206,26 @@ class TestReadonlyIterators:
                                                             isolated_library):
         """The point of the helper is to skip the deepcopy. Verify
         it returns the actual cached list (or a same-content list,
-        depending on cache state)."""
+        depending on cache state). Test data uses `id == sanitize(name)`
+        so the post-2026-05-24 id-name backfill (PIT-36) is a no-op."""
         sc._save_library([
-            {"id": "a", "name": "A", "size": 10},
-            {"id": "b", "name": "B", "size": 20},
+            {"id": "A", "name": "A", "size": 10},
+            {"id": "B", "name": "B", "size": 20},
         ])
         view = sc._iter_library_readonly()
         assert len(view) == 2
-        assert view[0]["id"] == "a"
+        assert view[0]["id"] == "A"
 
     def test_find_library_entry_by_name_returns_clone(self,
                                                        isolated_library):
-        """Helper must deepcopy on return (sacred invariant #17)."""
+        """Helper must deepcopy on return (sacred invariant #17).
+        Test data uses `id == sanitize(name)` so the id-name backfill
+        (PIT-36) is a no-op."""
         sc._save_library([
-            {"id": "a", "name": "Alpha", "size": 10, "extra": [1, 2]},
+            {"id": "Alpha", "name": "Alpha", "size": 10, "extra": [1, 2]},
         ])
         e = sc._find_library_entry_by_name("Alpha")
-        assert e is not None and e["id"] == "a"
+        assert e is not None and e["id"] == "Alpha"
         e["extra"].append(999)
         e2 = sc._find_library_entry_by_name("Alpha")
         assert e2 is not None and e2["extra"] == [1, 2], (

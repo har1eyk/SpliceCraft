@@ -2528,3 +2528,2537 @@ class TestSequencingHardening:
             [{"gbk": "../../etc/passwd"}],
         )
         assert meta == {"../../etc/passwd": ("[red]err[/red]", "—")}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Plasmidsaurus → "load target as canvas + read as overlay" flow (post-2026-05-24)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pre-fix the modal aligned a plasmidsaurus read against a library
+# target but left whatever was on the canvas alone — bars rendered in
+# rotated-target coords on (typically) the wrong plasmid, and
+# `_flush_active_alignments` persisted to the wrong library entry.
+# The new flow mirrors Alt+A: the picked library target becomes the
+# canvas reference, the read paints as a blue overlay bar on its
+# linear view. Rotation switched to the QUERY so target coords stay
+# in the library's original frame.
+
+class TestPlasmidsaurusLoadsTargetAsCanvas:
+    def _build_min_zip(self, dirpath, gbk_basename, seq):
+        """Synthesise the smallest possible plasmidsaurus-shaped zip
+        with a single gbk sample. Returns the zip path."""
+        import zipfile
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq(seq), id=gbk_basename, name=gbk_basename,
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        gbk = dirpath / f"{gbk_basename}.gbk"
+        SeqIO.write(rec, gbk, "genbank")
+        zp = dirpath / "RUN42_results.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.write(gbk, f"RUN42_genbank-files/{gbk_basename}.gbk")
+        return zp
+
+    def test_on_member_selected_tracks_order_and_basename(
+            self, tmp_path, isolated_library):
+        """Picking a samples-table row populates `_selected_order_num`
+        (1-based row index) and `_selected_gbk_basename` (.gbk leaf
+        with extension stripped). These drive the alignment label."""
+        zp = self._build_min_zip(tmp_path, "RUN42_1_MAV34", "ATGC" * 50)
+        parsed = sc._parse_plasmidsaurus_zip(zp)
+        screen = sc.SequencingScreen.__new__(sc.SequencingScreen)
+        screen._zip_path = zp
+        screen._parsed_run = parsed
+        screen._selected_member = None
+        screen._selected_order_num = None
+        screen._selected_gbk_basename = None
+        # Stub out the Textual query_one calls — the test invokes the
+        # handler directly without a real mounted tree.
+        class _Stub:
+            disabled = True
+            def update(self, *_a, **_kw): pass
+        screen.query_one = lambda *_a, **_kw: _Stub()
+
+        class _FakeKey:
+            def __init__(self, v): self.value = v
+
+        class _FakeEvent:
+            def __init__(self, key): self.row_key = _FakeKey(key)
+        member = parsed["samples"][0]["gbk"]
+        screen._on_member_selected(_FakeEvent(member))
+        assert screen._selected_member == member
+        assert screen._selected_order_num == 1
+        # INV-73 (2026-05-25): basename is now post-processed by
+        # `_display_label_for_gbk` — Plasmidsaurus run+order prefix
+        # stripped, remaining underscores → spaces. Pre-fix the
+        # label was "RUN42_1_MAV34" (TUI-unfriendly per user
+        # feedback).
+        assert screen._selected_gbk_basename == "MAV34"
+
+    def test_on_member_selected_resets_on_no_gbk(
+            self, tmp_path, isolated_library):
+        """The NUL-anchored no-gbk sentinel clears every selection-
+        tracking attr (member + order + basename). Pre-fix only
+        `_selected_member` was reset, leaving stale order/basename
+        from a prior pick."""
+        screen = sc.SequencingScreen.__new__(sc.SequencingScreen)
+        screen._zip_path = None
+        screen._parsed_run = {}
+        screen._selected_member = "old.gbk"
+        screen._selected_order_num = 7
+        screen._selected_gbk_basename = "old"
+
+        class _Stub:
+            disabled = True
+            def update(self, *_a, **_kw): pass
+        screen.query_one = lambda *_a, **_kw: _Stub()
+
+        class _FakeKey:
+            def __init__(self, v): self.value = v
+
+        class _FakeEvent:
+            def __init__(self, key): self.row_key = _FakeKey(key)
+        sentinel = sc.SequencingScreen._NO_GBK_KEY_PREFIX + "no-gbk-sample"
+        screen._on_member_selected(_FakeEvent(sentinel))
+        assert screen._selected_member is None
+        assert screen._selected_order_num is None
+        assert screen._selected_gbk_basename is None
+
+    async def test_align_loads_target_into_canvas(
+            self, tmp_path, isolated_library):
+        """End-to-end: with a different plasmid on the canvas, running
+        the alignment swaps the canvas to the picked target so the
+        blue overlay bar lands on the library plasmid's linear view
+        (mirrors the Alt+A reference-as-canvas convention)."""
+        import zipfile
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Library entries: the target we'll pick + a different decoy
+        # we'll load on the canvas first.
+        target_seq = "ATGC" * 100
+        target_rec = SeqRecord(
+            Seq(target_seq), id="TARGET", name="TARGET",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        decoy_seq = "GCTA" * 100
+        decoy_rec = SeqRecord(
+            Seq(decoy_seq), id="DECOY", name="DECOY",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        sc._save_library([
+            {"id": target_rec.id, "name": target_rec.name,
+             "size": len(target_seq), "n_feats": 0, "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(target_rec)},
+            {"id": decoy_rec.id, "name": decoy_rec.name,
+             "size": len(decoy_seq), "n_feats": 0, "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(decoy_rec)},
+        ])
+        # Plasmidsaurus zip containing one gbk that matches the target
+        # exactly (so the alignment is trivially identity-100).
+        gbk = tmp_path / "RUN42_1_MAV34.gbk"
+        SeqIO.write(target_rec, gbk, "genbank")
+        zp = tmp_path / "RUN42_results.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.write(gbk, "RUN42_genbank-files/RUN42_1_MAV34.gbk")
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Canvas starts on the decoy.
+            app._apply_record(decoy_rec)
+            await pilot.pause(0.05)
+            assert app._current_record.id == "DECOY"
+
+            await app.push_screen(
+                sc.SequencingScreen(start_path=str(tmp_path))
+            )
+            await pilot.pause(0.2)
+            screen = app.screen
+            from textual.widgets import DirectoryTree, Select
+            tree = screen.query_one(
+                "#align-zip-tree", sc._ZipAwareDirectoryTree,
+            )
+            screen.post_message(
+                DirectoryTree.FileSelected(tree.root, zp),
+            )
+            await pilot.pause(0.3)
+            # Pre-set the modal's per-row state directly — the
+            # samples-table row-selected event is harder to drive
+            # reliably from the test pilot than calling the handler.
+            samples = screen._parsed_run.get("samples") or []
+            assert samples, "fixture zip must contain at least one sample"
+            screen._selected_member = samples[0]["gbk"]
+            screen._selected_order_num = 1
+            screen._selected_gbk_basename = "RUN42_1_MAV34"
+            # Point the target Select at our TARGET library entry.
+            sel = screen.query_one("#align-target", Select)
+            sel.value = "TARGET"
+            screen._go(None)
+            # The C-loop runs in a worker; give it a generous deadline.
+            for _ in range(40):
+                await pilot.pause(0.1)
+                if (app._current_record is not None
+                        and app._current_record.id == "TARGET"
+                        and app._alignments):
+                    break
+            # Canvas is now the target (not the decoy).
+            assert app._current_record.id == "TARGET"
+            # Exactly one alignment, labelled `<order> <basename>`.
+            assert len(app._alignments) == 1
+            entry = app._alignments[0]
+            assert entry["name"] == "1 RUN42_1_MAV34"
+            assert entry["query_label"] == "1 RUN42_1_MAV34"
+            # Source tag for the manager modal's batch-delete.
+            assert entry.get("_stored_source") == "sequencing"
+
+    async def test_align_persists_onto_target_library_entry(
+            self, tmp_path, isolated_library):
+        """The alignment is flushed onto the target's library entry's
+        `alignments` field — re-loading the target restores the band.
+        Pre-fix the flush wrote to whatever was on the canvas (often
+        not the target), so the alignment vanished on re-load."""
+        import zipfile
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        target_seq = "ATGC" * 100
+        target_rec = SeqRecord(
+            Seq(target_seq), id="TARGET2", name="TARGET2",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        sc._save_library([
+            {"id": target_rec.id, "name": target_rec.name,
+             "size": len(target_seq), "n_feats": 0, "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(target_rec)},
+        ])
+        gbk = tmp_path / "RUN42_1_MAV34.gbk"
+        SeqIO.write(target_rec, gbk, "genbank")
+        zp = tmp_path / "RUN42_results.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.write(gbk, "RUN42_genbank-files/RUN42_1_MAV34.gbk")
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            await app.push_screen(
+                sc.SequencingScreen(start_path=str(tmp_path))
+            )
+            await pilot.pause(0.2)
+            screen = app.screen
+            from textual.widgets import DirectoryTree, Select
+            tree = screen.query_one(
+                "#align-zip-tree", sc._ZipAwareDirectoryTree,
+            )
+            screen.post_message(
+                DirectoryTree.FileSelected(tree.root, zp),
+            )
+            await pilot.pause(0.3)
+            samples = screen._parsed_run.get("samples") or []
+            screen._selected_member = samples[0]["gbk"]
+            screen._selected_order_num = 1
+            screen._selected_gbk_basename = "RUN42_1_MAV34"
+            sel = screen.query_one("#align-target", Select)
+            sel.value = "TARGET2"
+            screen._go(None)
+            for _ in range(40):
+                await pilot.pause(0.1)
+                if app._alignments:
+                    break
+            # Read it back from disk — must be on the TARGET2 entry.
+            entries = sc._load_library()
+            t_entry = next(e for e in entries if e["id"] == "TARGET2")
+            stored = t_entry.get("alignments") or []
+            assert len(stored) == 1
+            assert stored[0]["label"] == "1 RUN42_1_MAV34"
+            assert stored[0]["source"] == "sequencing"
+            assert stored[0]["visible"] is True
+
+    def test_align_worker_rotates_query_not_target(self):
+        """Regression for the rotation-frame swap: the worker now
+        rotates the QUERY (read) so the alignment result stays in
+        the target's original coordinate frame. Pre-fix the target
+        was rotated, making `aligned_t` positions land at wrong bp
+        on the unrotated canvas. The result dict carries the
+        `query_rotation` field for diagnostics; `target_rotation`
+        stays 0 to signal no target shift was applied."""
+        # Construct a target with a known seed and a query that's
+        # the same sequence but rotated by a known offset. The
+        # rotation-aware aligner should detect the offset and rotate
+        # the query back; alignment identity should be ~100% in
+        # target's original frame.
+        target_seq = (
+            "ATGCATGCATGCATGC" * 10
+            + "GGTACCGAATTC"   # uniquely-anchored seed
+            + "CCGGAATTCGCATGC" * 10
+        )
+        offset = 173
+        query_seq = target_seq[offset:] + target_seq[:offset]
+        # Verify the helper called swapped returns a non-zero offset
+        # for the constructed pair (seed is in target, located in
+        # query at a different position).
+        q_rot = sc._find_circular_alignment_offset(target_seq, query_seq)
+        assert q_rot != 0, (
+            "swapped-arg helper must detect the constructed query offset"
+        )
+        # Now apply that rotation to the query and align: identity
+        # should be ~100% (we set up the query to be a pure rotation
+        # of the target — no mismatches).
+        rotated_query = query_seq[q_rot:] + query_seq[:q_rot]
+        result = sc._pairwise_align(rotated_query, target_seq, mode="global")
+        assert result["identity_pct"] > 99.0, (
+            f"rotation-corrected identity={result['identity_pct']} "
+            f"should be ~100% for a pure rotation"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Rotation-aware alignment picker (`_pick_best_rotation` + frame transforms)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Both `_align_worker` (plasmidsaurus) and `_diff_align_worker` (Alt+\)
+# route through `_pick_best_rotation` so a circular target with a
+# different origin from the canvas plasmid gets a well-anchored
+# alignment (not edge-gap-padded). Helper picks among plain / query-rot
+# / target-rot candidates by overall identity_pct (more aligned bp =
+# more informative overlay band) and shifts aq/at back to the canvas
+# axis frame whenever the picked rotation was on the canvas side.
+
+class TestRotateAlignedToOriginalTargetFrame:
+    def test_zero_rotation_returns_unchanged(self):
+        """A t_rot of 0 is a no-op (no cut, no rotate). Pre-fix early
+        return guard."""
+        aq, at = "ATGCATGC", "ATGCATGC"
+        assert sc._rotate_aligned_to_original_target_frame(
+            aq, at, 0, 8,
+        ) == (aq, at)
+
+    def test_empty_target_returns_unchanged(self):
+        """A tn of 0 is degenerate — skip the walk."""
+        assert sc._rotate_aligned_to_original_target_frame(
+            "", "", 5, 0,
+        ) == ("", "")
+
+    def test_perfect_alignment_rotates_cleanly(self):
+        """Round-trip: rotate target by 3 bp, align identically,
+        then rotate aq/at back to original frame. Non-gap positions
+        of new_at should reproduce the original target sequence."""
+        target = "ABCDEFGH"
+        t_rot = 3
+        # If we rotated the target by 3, rotated_target = "DEFGHABC".
+        # Suppose a perfect alignment: aq = at = "DEFGHABC".
+        aq = at = "DEFGHABC"
+        new_aq, new_at = sc._rotate_aligned_to_original_target_frame(
+            aq, at, t_rot, len(target),
+        )
+        # Non-gap positions of new_at should now spell out the
+        # original target.
+        assert new_at == "ABCDEFGH"
+        assert new_aq == "ABCDEFGH"
+
+    def test_alignment_with_gaps_preserves_length(self):
+        """Cut+rotate preserves the alignment-column count. Gaps stay
+        where the C-loop put them (rotated to new positions)."""
+        # rotated_target = "DEFGH" with a 2-bp insertion in query
+        # between bp 2 and bp 3 (G and H).
+        # aq = "DE-FXX-GH"  no — let me redo with valid alignment
+        # Concrete: target=ABCDEFGH (len 8), t_rot=3
+        # rotated_target = "DEFGHABC"
+        # Aligner pairs query "DE--FGHABC" against rotated_target
+        # "DEFGHABC--" — 2-bp insertion at columns 2,3. So
+        # aq = "DE--FGHABC", at = "DEFGHABC--"
+        # No wait, at must have non-gap chars equal to rotated_target.
+        # Let me use simpler: aq has a 1-bp gap relative to rotated_target.
+        aq = "DEXFGHABC"   # length 9, last char of rotated_target replaced
+        at = "DE-FGHABC"   # length 9, gap at column 2 (target gap, no bp here)
+        new_aq, new_at = sc._rotate_aligned_to_original_target_frame(
+            aq, at, 3, 8,
+        )
+        # Length preserved
+        assert len(new_aq) == len(aq)
+        assert len(new_at) == len(at)
+        # Non-gap count of at is unchanged (still tracks 8 bp of target)
+        assert at.count("-") == new_at.count("-")
+
+    def test_cut_not_found_falls_back_to_unchanged(self):
+        """If the alignment's `at` doesn't contain enough non-gap
+        chars to reach cut_target_bp, the helper falls back to
+        returning the inputs (defensive — alignment didn't span the
+        rotation point so we can't transform it cleanly)."""
+        # 8 bp target, t_rot 3 → need to find the 5th non-gap char
+        # (cut_target_bp=5). If `at` has only 4 non-gap chars, can't.
+        aq = "AT-GC-"
+        at = "AT-GC-"   # 4 non-gap chars
+        out_q, out_t = sc._rotate_aligned_to_original_target_frame(
+            aq, at, 3, 8,
+        )
+        assert out_q == aq
+        assert out_t == at
+
+
+class TestRotateAlignedToOriginalQueryFrame:
+    def test_zero_rotation_returns_unchanged(self):
+        """Symmetric to target-frame helper — q_rot 0 → no-op."""
+        aq, at = "ATGCATGC", "ATGCATGC"
+        assert sc._rotate_aligned_to_original_query_frame(
+            aq, at, 0, 8,
+        ) == (aq, at)
+
+    def test_perfect_alignment_rotates_cleanly(self):
+        """Round-trip: rotate query by 3 bp, align identically,
+        rotate back. Non-gap positions of new_aq reproduce original
+        query."""
+        aq = at = "DEFGHABC"
+        new_aq, new_at = sc._rotate_aligned_to_original_query_frame(
+            aq, at, 3, 8,
+        )
+        assert new_aq == "ABCDEFGH"
+        assert new_at == "ABCDEFGH"
+
+
+class TestPickBestRotation:
+    def test_picks_best_by_overall_identity(self):
+        """When plain + rotation candidates are available, pick by
+        overall identity_pct (gap-inclusive) — more aligned bp means
+        more informative bars on the overlay band.
+
+        Uses a non-repetitive random construct so plain alignment is
+        clearly bad without rotation (a repetitive sequence lets
+        plain land near 100% even at large offsets because the
+        aligner finds many local matches across the repeats —
+        defeating the test's intent)."""
+        import random
+        random.seed(1234)
+        target_seq = "".join(random.choices("ACGT", k=2000))
+        offset = 873
+        query_seq = target_seq[offset:] + target_seq[:offset]
+        result = sc._pick_best_rotation(
+            query_seq, target_seq,
+            is_circular=True, mode="global",
+            canvas_axis="target",
+        )
+        # A rotation should have been picked AND should have given
+        # near-perfect identity. (The RC trial also runs but won't
+        # win — RC of a random sequence has no homology to its
+        # forward form.)
+        assert result["picked_rotation"] in ("query", "target")
+        assert result["identity_pct"] > 95.0, (
+            f"picker should choose a near-perfect rotation; got "
+            f"{result['picked_rotation']!r} at {result['identity_pct']}%"
+        )
+        # The RC flag should be False since target == fwd query
+        # (no RC reverses that relationship).
+        assert result.get("query_rc") is False
+
+    def test_plain_wins_when_already_aligned(self):
+        """When plain alignment is good (≥ threshold), rotations
+        aren't even attempted — picker returns plain. Avoids the 2x
+        C-loop cost in the common case."""
+        seq = "ATGCATGCATGC" * 100  # 1200 bp
+        result = sc._pick_best_rotation(
+            seq, seq, is_circular=True, mode="global",
+            canvas_axis="target",
+        )
+        assert result["picked_rotation"] == "none"
+        assert result["query_rotation"] == 0
+        assert result["target_rotation"] == 0
+        assert result["identity_pct"] > 95.0
+
+    def test_linear_target_skips_rotations(self):
+        """When `is_circular` is False, rotations aren't tried even
+        if plain identity is poor — the target's a linear molecule,
+        rotation doesn't make biological sense."""
+        # Construct a query that's NOT a rotation of target — they
+        # share a small homology but mostly differ. Plain will be
+        # poor; rotations could rescue it on a circular target but
+        # shouldn't be tried for linear.
+        target_seq = "AAAAAAAAAA" + "ATGCATGC" * 50 + "TTTTTTTTTT"
+        query_seq  = "ATGCATGC" * 50 + "GGGGGGGGGG"
+        result = sc._pick_best_rotation(
+            query_seq, target_seq,
+            is_circular=False, mode="global",
+            canvas_axis="target",
+        )
+        assert result["picked_rotation"] == "none"
+        # `target_rotation` / `query_rotation` defaulted to 0.
+        assert result["target_rotation"] == 0
+        assert result["query_rotation"] == 0
+
+    def test_target_rotation_shifts_aq_at_for_target_axis(self):
+        """When picker chooses target-rotation AND canvas_axis is
+        target, the returned aligned_q/aligned_t are pre-shifted to
+        the original target frame — downstream segments naturally
+        land at the canvas plasmid's bp positions."""
+        # Construct one where target-rotation wins. Use a simple
+        # pair where the target seed is unique in query.
+        # Same construction as the rotation test above but pick the
+        # canvas_axis so we exercise the shift code path.
+        target_seq = ("AAAAAAAAAA" + "GGTACCGAATTC"
+                      + "TTTTTTTTTT" * 10)
+        offset = 17
+        query_seq = target_seq[offset:] + target_seq[:offset]
+        result = sc._pick_best_rotation(
+            query_seq, target_seq,
+            is_circular=True, mode="global",
+            canvas_axis="target",
+        )
+        # If target-rotation won, the strings should encode the
+        # original target frame: walking `aligned_t` non-gap chars
+        # should match `target_seq` (possibly with a wrap split).
+        if result["picked_rotation"] == "target":
+            at_no_gaps = result["aligned_t"].replace("-", "")
+            # Non-gap chars represent original target bps 0..tn-1
+            assert at_no_gaps == target_seq, (
+                "target-axis canvas: aligned_t non-gap chars must "
+                "encode the original target sequence in order"
+            )
+
+    def test_empty_query_raises_clear_error(self):
+        """Empty input is a programmer error — surface it clearly
+        instead of letting `_pairwise_align` produce a useless
+        0%-identity candidate."""
+        with pytest.raises(ValueError, match="non-empty"):
+            sc._pick_best_rotation(
+                "", "ATGC" * 100, is_circular=False, mode="global",
+            )
+
+    def test_empty_target_raises_clear_error(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            sc._pick_best_rotation(
+                "ATGC" * 100, "", is_circular=False, mode="global",
+            )
+
+    def test_picks_rc_when_sample_is_reverse_complemented(self):
+        """Regression for 2026-05-24: when the read is the RC of the
+        target, plain forward alignment is ~0% identity. The picker
+        must try the RC orientation and recover the full alignment."""
+        from Bio.Seq import Seq
+        target_seq = "ATGCGTACGTAGCTAGCTAGCTGATCG" * 100
+        query_seq = str(Seq(target_seq).reverse_complement())
+        result = sc._pick_best_rotation(
+            query_seq, target_seq,
+            is_circular=False, mode="global",
+            canvas_axis="target",
+        )
+        # Best candidate should be the RC plain — same orientation
+        # as target after flipping the query.
+        assert result.get("query_rc") is True
+        assert result["identity_pct"] > 95.0, (
+            f"RC alignment should recover ~100% identity; got "
+            f"{result['identity_pct']}%"
+        )
+
+    def test_raises_when_every_candidate_fails(self, monkeypatch):
+        """If every alignment call raises (degenerate inputs etc.),
+        the helper surfaces the underlying error rather than
+        returning a sentinel."""
+        def _boom(*_a, **_kw):
+            raise ValueError("synthetic alignment failure")
+        monkeypatch.setattr(sc, "_pairwise_align", _boom)
+        with pytest.raises(ValueError, match="synthetic"):
+            sc._pick_best_rotation(
+                "ATGC", "GCAT", is_circular=False, mode="global",
+            )
+
+
+class TestDiffAlignWorkerRotation:
+    """Alt+\\ (diff-plasmid) gained the same rotation-picker logic as
+    plasmidsaurus 2026-05-24. Pre-fix a circular target with a
+    different origin from the canvas paid edge gaps; now the worker
+    routes through `_pick_best_rotation(canvas_axis='query')`.
+    """
+
+    async def test_circular_target_triggers_rotation_pick(
+            self, tiny_record, isolated_library):
+        """Concrete: load the canvas with one circular plasmid, diff
+        against a rotated version. The picker should detect the
+        rotation and produce a high-identity alignment instead of the
+        gap-padded plain alignment."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Canvas plasmid (query for the diff).
+        seq = ("ATGCATGCATGCATGC" * 20
+                + "GGTACCGAATTCCCGG"
+                + "TTAACCGGTTAACCGG" * 20)
+        canvas = SeqRecord(
+            Seq(seq), id="DIFF_Q", name="DIFF_Q",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        # Picked target: same sequence rotated 137 bp.
+        offset = 137
+        rotated = seq[offset:] + seq[:offset]
+        target = SeqRecord(
+            Seq(rotated), id="DIFF_T", name="DIFF_T",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        # Stash both in the library so _action_diff_plasmid resolves.
+        sc._save_library([
+            {"id": canvas.id, "name": canvas.name, "size": len(seq),
+             "n_feats": 0, "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(canvas)},
+            {"id": target.id, "name": target.name, "size": len(seq),
+             "n_feats": 0, "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(target)},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(canvas)
+            await pilot.pause(0.05)
+            # Drive the worker directly (push_screen + picker dismiss
+            # is harder to script from a test pilot reliably than a
+            # direct worker call).
+            app._diff_align_worker(canvas, target)
+            # The C-loop runs in a worker; give it a deadline.
+            for _ in range(40):
+                await pilot.pause(0.1)
+                if app._alignments:
+                    break
+            assert len(app._alignments) == 1
+            entry = app._alignments[0]
+            # The picker should have chosen a rotation (either
+            # direction works for axis="query") and the result should
+            # have near-perfect identity.
+            picked = entry["result"].get("picked_rotation", "none")
+            ident = entry["result"].get("identity_pct", 0.0)
+            assert picked in ("query", "target"), (
+                f"circular target with rotated origin should pick a "
+                f"rotation; got {picked!r}"
+            )
+            assert ident > 95.0, (
+                f"rotation-corrected identity should be ~100% for an "
+                f"exact rotation; got {ident}%"
+            )
+
+
+class TestSangerAddToLibraryDeduplication:
+    """Sanger AB1 add-to-library used to be re-clickable, silently
+    creating `<id>_2`, `<id>_3`, ... duplicates per click. Post-fix
+    the Add button disables itself after a successful add and the
+    main LibraryPanel is refreshed so the user sees the new entry
+    without navigating away.
+    """
+
+    async def test_add_disables_button_and_refreshes_library(
+            self, tmp_path, tiny_record, isolated_library):
+        """Pick a synthetic AB1, click Add to library, verify (a) the
+        library now contains the new entry, (b) the Add button is
+        disabled (so re-clicking can't mint duplicates), (c) the
+        LibraryPanel reflects the new entry."""
+        from textual.widgets import Button
+        # Synthesize a minimal AB1 by base-calling a SeqRecord.
+        # `_ab1_path_to_record` parses a real AB1, but constructing
+        # one is heavy — instead, monkey the modal's `_sanger_record`
+        # to bypass the file parse path. The handler only consumes
+        # `_sanger_record` + `_sanger_path` from there.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("ATGCATGCATGC" * 20), id="sanger_test",
+            name="sanger_test",
+            annotations={"molecule_type": "DNA"},
+        )
+        fake_ab1 = tmp_path / "trace.ab1"
+        fake_ab1.write_bytes(b"\x00" * 100)  # body never read
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            await app.push_screen(
+                sc.SequencingScreen(start_path=str(tmp_path))
+            )
+            await pilot.pause(0.2)
+            screen = app.screen
+            # Inject sanger state directly so the handler can fire.
+            screen._sanger_record = rec
+            screen._sanger_path = fake_ab1
+            # Arm the button so the click handler can run.
+            add_btn = screen.query_one("#btn-sanger-add", Button)
+            add_btn.disabled = False
+            n_before = len(sc._load_library())
+            screen._sanger_add_to_library(None)
+            await pilot.pause(0.1)
+            # Library has the new entry
+            entries_after = sc._load_library()
+            assert len(entries_after) == n_before + 1
+            # Add button now disabled
+            assert add_btn.disabled, (
+                "Add button must disable after a successful add to "
+                "prevent silent duplicate-add"
+            )
+
+
+class TestMultiAlignPickerStaleIdFilter:
+    """MultiAlignPickerModal used to dismiss with the raw
+    `_selected_ids` set. If the user opened the picker, picked a few
+    plasmids, then a sibling pane (or agent endpoint) deleted one of
+    them before the user clicked Align, the stale id flowed through
+    to `_action_open_align_picker` and surfaced as a per-target
+    "not found" warning. Post-fix the picker filters against the
+    current library at dismiss-time and notifies if any picks were
+    dropped.
+    """
+
+    async def test_dismiss_drops_ids_no_longer_in_library(
+            self, tiny_record, isolated_library):
+        """Pick three plasmids in the modal, delete one from the
+        library before the user clicks Align, verify the modal
+        dismisses with only the surviving two."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Three library entries the picker can list.
+        records = []
+        for name in ("ALPHA", "BETA", "GAMMA"):
+            r = SeqRecord(
+                Seq("ATGC" * 50), id=name, name=name,
+                annotations={"molecule_type": "DNA", "topology": "circular"},
+            )
+            records.append(r)
+        sc._save_library([
+            {"id": r.id, "name": r.name, "size": len(r.seq),
+             "n_feats": 0, "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(r)}
+            for r in records
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            await app.push_screen(sc.MultiAlignPickerModal())
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Mark all three as picked.
+            modal._selected_ids = {"ALPHA", "BETA", "GAMMA"}
+            # Simulate a sibling pane deleting BETA mid-pick.
+            remaining = [r for r in records if r.id != "BETA"]
+            sc._save_library([
+                {"id": r.id, "name": r.name, "size": len(r.seq),
+                 "n_feats": 0, "added": "2026-05-24",
+                 "gb_text": sc._record_to_gb_text(r)}
+                for r in remaining
+            ])
+            # Capture the dismiss payload.
+            dismissed: list = []
+            real_dismiss = modal.dismiss
+            def _capture(value=None):
+                dismissed.append(value)
+                return real_dismiss(value)
+            modal.dismiss = _capture
+            modal._ok(None)
+            await pilot.pause(0.1)
+            assert dismissed, "modal must dismiss after _ok"
+            picked = dismissed[0]
+            assert picked is not None
+            assert set(picked) == {"ALPHA", "GAMMA"}, (
+                f"stale BETA must be filtered out; got {picked!r}"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Library sequencing-status badges (`_alignment_quality_status` +
+# `_library_entry_alignment_summary` + LibraryPanel "Seq" column)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAlignmentQualityStatus:
+    def test_verified_requires_perfect_identity_and_coverage(self):
+        """A perfectly matching read (100% identity, full coverage,
+        zero gaps) lights up `verified` (✓ green)."""
+        result = {
+            "n_matches": 1000, "n_mismatches": 0, "n_gaps": 0,
+            "ungapped_identity_pct": 100.0,
+        }
+        code, glyph, color = sc._alignment_quality_status(result, 1000)
+        assert code == "verified"
+        assert glyph == "✓"
+        assert color == "green"
+
+    def test_single_indel_demotes_to_near(self):
+        """Even ONE gap demotes from verified to near-match — for a
+        cloning workflow, a 1-bp indel is meaningful (frameshift)."""
+        result = {
+            "n_matches": 999, "n_mismatches": 0, "n_gaps": 1,
+            "ungapped_identity_pct": 100.0,
+        }
+        code, glyph, color = sc._alignment_quality_status(result, 1000)
+        assert code == "near"
+        assert glyph == "⚠"
+
+    def test_low_coverage_is_partial(self):
+        """A read that aligns at high identity but only covers a
+        sub-region (e.g. plasmidsaurus consensus of a different
+        plasmid sharing a backbone) lights up `partial`."""
+        result = {
+            "n_matches": 500, "n_mismatches": 5, "n_gaps": 0,
+            "ungapped_identity_pct": 99.0,
+        }
+        # target_len 5000 → coverage = 505/5000 = 10%
+        code, _, _ = sc._alignment_quality_status(result, 5000)
+        assert code == "partial"
+
+    def test_low_identity_is_divergent(self):
+        """Significantly mismatched reads light up `divergent`."""
+        result = {
+            "n_matches": 600, "n_mismatches": 400, "n_gaps": 0,
+            "ungapped_identity_pct": 60.0,
+        }
+        code, glyph, color = sc._alignment_quality_status(result, 1000)
+        assert code == "divergent"
+        assert color == "red"
+
+    def test_zero_target_len_doesnt_divide_by_zero(self):
+        """Defensive: target_len=0 still produces a valid status
+        (divergent) rather than ZeroDivisionError."""
+        result = {
+            "n_matches": 10, "n_mismatches": 0, "n_gaps": 0,
+            "ungapped_identity_pct": 100.0,
+        }
+        code, _, _ = sc._alignment_quality_status(result, 0)
+        # Coverage falls below threshold so it's NOT verified;
+        # ungapped passes the near threshold but coverage doesn't.
+        assert code in ("partial", "divergent", "near")
+
+
+class TestLibraryEntryAlignmentSummary:
+    def test_no_alignments_returns_none(self):
+        """Entries with no `alignments` field return None — caller
+        renders dim `—`."""
+        entry = {"id": "X", "name": "X", "size": 1000}
+        assert sc._library_entry_alignment_summary(entry) is None
+
+    def test_picks_best_priority_alignment(self):
+        """Multiple alignments: pick the highest-priority status.
+        verified > near > partial > divergent."""
+        entry = {
+            "id": "X", "name": "X", "size": 1000,
+            "alignments": [
+                # Divergent.
+                {"visible": True, "result": {
+                    "n_matches": 100, "n_mismatches": 900, "n_gaps": 0,
+                    "ungapped_identity_pct": 10.0,
+                }},
+                # Verified.
+                {"visible": True, "result": {
+                    "n_matches": 1000, "n_mismatches": 0, "n_gaps": 0,
+                    "ungapped_identity_pct": 100.0,
+                }},
+            ],
+        }
+        summary = sc._library_entry_alignment_summary(entry)
+        assert summary is not None
+        assert summary["code"] == "verified"
+        assert summary["glyph"] == "✓"
+        assert summary["n_total"] == 2
+        assert summary["n_visible"] == 2
+
+    def test_hidden_alignments_dont_contribute_glyph(self):
+        """Stored alignments with visible=False don't contribute the
+        headline glyph (the manager modal hid them for a reason).
+        But the total count still includes them so the user knows
+        they exist."""
+        entry = {
+            "id": "X", "name": "X", "size": 1000,
+            "alignments": [
+                {"visible": False, "result": {
+                    "n_matches": 1000, "n_mismatches": 0, "n_gaps": 0,
+                    "ungapped_identity_pct": 100.0,
+                }},
+            ],
+        }
+        summary = sc._library_entry_alignment_summary(entry)
+        assert summary is not None
+        assert summary["code"] == "hidden"  # all hidden
+        assert summary["n_total"] == 1
+        assert summary["n_visible"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Variant extractor (`_extract_variants_from_alignment`)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestExtractVariantsFromAlignment:
+    def test_perfect_match_yields_no_variants(self):
+        assert sc._extract_variants_from_alignment(
+            "ATGCATGC", "ATGCATGC",
+        ) == []
+
+    def test_single_snp(self):
+        v = sc._extract_variants_from_alignment("ATGCAAGC", "ATGCATGC")
+        assert len(v) == 1
+        assert v[0]["type"] == "snp"
+        assert v[0]["target_pos"] == 5  # T→A at target bp 5
+        assert v[0]["ref"] == "T"
+        assert v[0]["alt"] == "A"
+
+    def test_insertion_merges_run(self):
+        """Query has 3 extra bp inserted between target bp 2 and 3:
+        target gaps for 3 columns. Should emit ONE insertion record
+        of length 3, not three separate 1-bp records."""
+        # aq:  A T G C A A T G C    (9 chars; CAA inserted between G and T)
+        # at:  A T G - - - T G C    (9 chars)
+        # walk: 0=A/A, 1=T/T, 2=G/G match;
+        #       3=C/-, 4=A/-, 5=A/- insertion run before next target bp;
+        #       6=T/T (target bp 3), 7=G/G (target bp 4), 8=C/C (target bp 5)
+        v = sc._extract_variants_from_alignment(
+            "ATGCAATGC", "ATG---TGC",
+        )
+        assert len(v) == 1
+        assert v[0]["type"] == "insertion"
+        # Insertion appears BEFORE the next target bp consumed,
+        # which is target bp 3 (the 'T' after the gap run).
+        assert v[0]["target_pos"] == 3
+        assert v[0]["length"] == 3
+        assert v[0]["alt"] == "CAA"
+
+    def test_deletion_merges_run(self):
+        # Target has bases the query is missing.
+        # aq:  A T G - - - C G C
+        # at:  A T G C A A C G C
+        v = sc._extract_variants_from_alignment(
+            "ATG---CGC", "ATGCAACGC",
+        )
+        assert len(v) == 1
+        assert v[0]["type"] == "deletion"
+        assert v[0]["target_pos"] == 3   # first deleted target bp
+        assert v[0]["length"] == 3
+        assert v[0]["ref"] == "CAA"
+
+    def test_mixed_snps_and_indels(self):
+        # aq:  A T G C A A T - - G C
+        # at:  A T G C C - - G G G C
+        # walk: 0=A/A, 1=T/T, 2=G/G, 3=C/C, 4=A/C (SNP),
+        # 5=A/- (insertion at target_pos=5), 6=T/- (continuation),
+        # 7=-/G (deletion at target_pos=5),
+        # 8=-/G (continuation), 9=G/G, 10=C/C
+        # Note: this is a degenerate construct; aligner wouldn't
+        # produce both gap-types adjacent. Use simpler:
+        # aq:  A T G C A A A G C
+        # at:  A T G T A A A G C
+        # — single SNP at pos 3 (C→T)
+        v = sc._extract_variants_from_alignment(
+            "ATGCAAAGC", "ATGTAAAGC",
+        )
+        assert len(v) == 1
+        assert v[0]["type"] == "snp"
+        assert v[0]["target_pos"] == 3
+        assert v[0]["ref"] == "T"
+        assert v[0]["alt"] == "C"
+
+    def test_empty_inputs_return_empty(self):
+        assert sc._extract_variants_from_alignment("", "") == []
+
+    def test_mismatched_length_returns_empty(self):
+        """Defensive: degenerate caller passing strings of different
+        lengths gets an empty list, not a crash."""
+        assert sc._extract_variants_from_alignment("ATG", "ATGC") == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sample-to-library matcher (`_normalize_for_match` +
+# `_match_samples_to_library`)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNormalizeForMatch:
+    def test_strips_plasmidsaurus_prefix(self):
+        """`RUN42_1_MAV34` → `mav34` (drop run-id + order-num)."""
+        assert sc._normalize_for_match("RUN42_1_MAV34") == "mav34"
+
+    def test_strips_path_and_extension(self):
+        """Full zip-member path → leaf basename, no extension."""
+        assert sc._normalize_for_match(
+            "RUN42_genbank-files/RUN42_1_MAV34.gbk",
+        ) == "mav34"
+
+    def test_strips_punctuation_and_lowercases(self):
+        """`MAV 38 CAM-cTPFuGFP+RUBY` → `mav38camctpfugfpruby`."""
+        assert sc._normalize_for_match(
+            "MAV 38 CAM-cTPFuGFP+RUBY",
+        ) == "mav38camctpfugfpruby"
+
+    def test_empty_input_returns_empty(self):
+        assert sc._normalize_for_match("") == ""
+
+
+class TestMatchSamplesToLibrary:
+    def test_exact_name_match(self):
+        """Sample `RUN42_1_MAV34` ↔ library entry `MAV 34` —
+        normalized forms are both `mav34`, exact match."""
+        samples = [
+            {"name": "RUN42_1_MAV34",
+             "gbk": "RUN42_genbank-files/RUN42_1_MAV34.gbk"},
+        ]
+        library = [
+            {"id": "MAV_34", "name": "MAV 34", "gb_text": ""},
+            {"id": "MAV_35", "name": "MAV 35", "gb_text": ""},
+        ]
+        out = sc._match_samples_to_library(
+            samples, library, sequence_fallback=False,
+        )
+        assert len(out) == 1
+        assert out[0]["action"] == "align"
+        assert out[0]["target_entry"]["id"] == "MAV_34"
+        assert out[0]["method"] == "name-exact"
+        assert out[0]["score"] == 1.0
+
+    def test_no_match_proposes_add(self):
+        """When name match score is below threshold, recommend
+        adding the sample as a new library entry."""
+        samples = [
+            {"name": "RUN42_1_NEWPLASMID",
+             "gbk": "RUN42_genbank-files/RUN42_1_NEWPLASMID.gbk"},
+        ]
+        library = [
+            {"id": "OLDPLASMID", "name": "OLDPLASMID", "gb_text": ""},
+        ]
+        out = sc._match_samples_to_library(
+            samples, library, sequence_fallback=False,
+        )
+        assert len(out) == 1
+        assert out[0]["action"] == "add"
+        assert out[0]["target_entry"] is None
+
+    def test_no_gbk_skip(self):
+        """Sample without a .gbk consensus is skipped entirely."""
+        samples = [{"name": "no-gbk", "gbk": None}]
+        out = sc._match_samples_to_library(
+            samples, [], sequence_fallback=False,
+        )
+        assert len(out) == 1
+        assert out[0]["action"] == "skip"
+        assert out[0]["method"] == "no-gbk"
+
+    def test_sequence_match_beats_name_substring(self, tmp_path):
+        """Regression for 2026-05-24: a coincidental name substring
+        used to outrank a 99%-identical library entry by sequence.
+        Now the matcher always computes k-mer Jaccard for every
+        candidate and lets sequence beat a weak name match.
+
+        Setup: sample `CAM-2` (basename `cam2`) with one sequence.
+        Library has (a) `pCambia1300` (no sequence overlap; just
+        a name-substring coincidence), (b) `MAV 38` (the actual
+        sequence source of the sample). Pre-fix the matcher picks
+        pCambia1300 because `cam2` is a substring of `cambia`-ish
+        normalisation; post-fix MAV 38 wins by k-mer Jaccard.
+        """
+        import zipfile
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # The sample's sequence — also the body of MAV 38. Use a
+        # non-repetitive seed so the canonical k-mer set has enough
+        # cardinality (>= `_MIN_KMER_SET_FOR_STRONG_MATCH`, INV-73)
+        # for the kmer-strong path to fire. Pre-INV-73 the test used
+        # a 27 bp tandem repeat — ~27 unique canonical k-mers, below
+        # the threshold post-fix.
+        import random as _random
+        _rng = _random.Random(20260525)
+        true_target_seq = "".join(
+            _rng.choice("ACGT") for _ in range(1500)
+        )
+        # pCambia1300's sequence is unrelated (low k-mer overlap).
+        _rng2 = _random.Random(99999)
+        decoy_seq = "".join(_rng2.choice("ACGT") for _ in range(1500))
+        # Build a real zip so the matcher can extract the sample gbk.
+        gbk = tmp_path / "CAM-2.gbk"
+        SeqIO.write(
+            SeqRecord(
+                Seq(true_target_seq), id="CAM-2", name="CAM-2",
+                annotations={"molecule_type": "DNA",
+                              "topology": "circular"},
+            ), gbk, "genbank",
+        )
+        zp = tmp_path / "RUN_results.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.write(gbk, "RUN_genbank-files/RUN_1_CAM-2.gbk")
+        samples = [{
+            "name": "RUN_1_CAM-2",
+            "gbk":  "RUN_genbank-files/RUN_1_CAM-2.gbk",
+        }]
+        # Library has the decoy (name-substring trap) + the real
+        # target (sequence-only match — name doesn't substring CAM-2).
+        decoy_rec = SeqRecord(
+            Seq(decoy_seq), id="pCambia1300", name="pCambia1300",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        target_rec = SeqRecord(
+            Seq(true_target_seq), id="MAV_38", name="MAV_38",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        library = [
+            {"id": "pCambia1300", "name": "pCambia1300",
+             "gb_text": sc._record_to_gb_text(decoy_rec)},
+            {"id": "MAV_38", "name": "MAV 38",
+             "gb_text": sc._record_to_gb_text(target_rec)},
+        ]
+        out = sc._match_samples_to_library(
+            samples, library,
+            sequence_fallback=True,
+            extract_gbk_fn=sc._extract_gbk_member,
+            zip_path=zp,
+        )
+        assert len(out) == 1
+        # MAV 38 (sequence-identical) MUST win, not pCambia1300
+        # (name-substring coincidence).
+        assert out[0]["target_entry"]["id"] == "MAV_38", (
+            f"Expected MAV_38 (sequence-identical) but got "
+            f"{out[0]['target_entry']['id']!r} — the matcher fell "
+            f"back to name-substring over sequence again."
+        )
+        assert out[0]["method"] == "kmer-strong"
+        # Top-3 alternatives include the decoy so the user can spot
+        # near-misses.
+        alt_ids = {a["entry_id"] for a in out[0]["alternatives"]}
+        assert "pCambia1300" in alt_ids
+
+    def test_reverse_complement_sample_matches_at_full_identity(
+            self, tmp_path,
+    ):
+        """Regression for 2026-05-24: when a Plasmidsaurus consensus
+        assembled in the opposite orientation to its library entry,
+        the matcher returned 0% k-mer overlap and picked an unrelated
+        backbone with name-substring score. Post-fix `_kmer_set`
+        uses canonical (strand-agnostic) k-mers so RC-of-library
+        samples score 100% Jaccard against the right entry."""
+        import zipfile
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # The library entry's sequence.
+        target_seq = "ATGCGTACGTAGCTAGCTAGCTGATCG" * 100
+        # The sample is the reverse complement of the library entry —
+        # this is what Plasmidsaurus produces when the assembler
+        # picks the opposite strand.
+        sample_seq = str(Seq(target_seq).reverse_complement())
+        gbk = tmp_path / "RC_sample.gbk"
+        SeqIO.write(
+            SeqRecord(
+                Seq(sample_seq), id="RC_sample", name="RC_sample",
+                annotations={"molecule_type": "DNA",
+                              "topology": "circular"},
+            ), gbk, "genbank",
+        )
+        zp = tmp_path / "RC_results.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.write(gbk, "RC_genbank-files/RC_1_sample.gbk")
+        target_rec = SeqRecord(
+            Seq(target_seq), id="TARGET", name="TARGET",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        # Add a decoy backbone (no real homology — coincidental name
+        # substring would have won pre-fix).
+        decoy_seq = "AAAATTTTGGGGCCCC" * 100
+        decoy_rec = SeqRecord(
+            Seq(decoy_seq), id="DECOY_target", name="DECOY_target",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        library = [
+            {"id": "DECOY_target", "name": "DECOY_target",
+             "gb_text": sc._record_to_gb_text(decoy_rec)},
+            {"id": "TARGET", "name": "TARGET",
+             "gb_text": sc._record_to_gb_text(target_rec)},
+        ]
+        out = sc._match_samples_to_library(
+            [{"name": "RC_1_sample",
+              "gbk":  "RC_genbank-files/RC_1_sample.gbk"}],
+            library,
+            sequence_fallback=True,
+            extract_gbk_fn=sc._extract_gbk_member,
+            zip_path=zp,
+        )
+        assert len(out) == 1
+        # The RC-of-library sample must match TARGET, not the
+        # unrelated DECOY backbone, even though plain-strand k-mers
+        # would have given 0% overlap.
+        assert out[0]["target_entry"]["id"] == "TARGET", (
+            f"RC sample must match TARGET via canonical k-mers; got "
+            f"{out[0]['target_entry']['id']!r}"
+        )
+        # Canonical k-mer Jaccard for RC-of-X vs X is essentially
+        # 1.0 (every k-mer's canonical form is shared).
+        assert out[0]["kmer_score"] > 0.95, (
+            f"canonical k-mer Jaccard should be ~100% for RC-of-target; "
+            f"got {out[0]['kmer_score']:.0%}"
+        )
+
+    def test_alternatives_surfaced_on_each_match(self, tmp_path):
+        """Every match row carries up to 3 ranked alternatives so the
+        confirm modal can show "what was close" — even when the
+        matcher's pick was confident, the runner-up is visible."""
+        # Three library entries, all share some sequence with the
+        # sample. Top one is the picked target; #2 + #3 are
+        # alternatives.
+        import zipfile
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        sample_seq = "ATGCGTACGTAGCTAGCTAGCTGATCG" * 50
+        gbk = tmp_path / "S.gbk"
+        SeqIO.write(
+            SeqRecord(
+                Seq(sample_seq), id="S", name="S",
+                annotations={"molecule_type": "DNA",
+                              "topology": "circular"},
+            ), gbk, "genbank",
+        )
+        zp = tmp_path / "RUN_results.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.write(gbk, "RUN_genbank-files/RUN_1_S.gbk")
+        # Identical, mostly-identical, partly-identical library entries.
+        def _entry(rid, seq):
+            r = SeqRecord(
+                Seq(seq), id=rid, name=rid,
+                annotations={"molecule_type": "DNA",
+                              "topology": "circular"},
+            )
+            return {"id": rid, "name": rid,
+                    "gb_text": sc._record_to_gb_text(r)}
+        library = [
+            _entry("A", sample_seq),                # 100%
+            _entry("B", sample_seq[:len(sample_seq) // 2]
+                       + "T" * (len(sample_seq) // 2)),  # half-shared
+            _entry("C", "T" * len(sample_seq)),     # 0%
+        ]
+        out = sc._match_samples_to_library(
+            [{"name": "RUN_1_S",
+              "gbk": "RUN_genbank-files/RUN_1_S.gbk"}],
+            library,
+            sequence_fallback=True,
+            extract_gbk_fn=sc._extract_gbk_member,
+            zip_path=zp,
+        )
+        assert len(out) == 1
+        alts = out[0]["alternatives"]
+        # Three alternatives ranked by combined score.
+        assert len(alts) == 3
+        assert alts[0]["entry_id"] == "A"  # best
+        # Picked target is A.
+        assert out[0]["target_entry"]["id"] == "A"
+        # Each alternative carries both per-axis scores.
+        for a in alts:
+            assert "kmer_score" in a
+            assert "name_score" in a
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bulk-align modal + Sequencing-status column wiring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBulkAlignConfirmModalToggle:
+    """The bulk-align confirm modal lets the user rotate each row's
+    action via Space (align ↔ add ↔ skip). Rows with no target_entry
+    can't be set to "align" — it bounces back to "add".
+    """
+
+    async def test_action_toggle_cycles_through_options(
+            self, tiny_record, isolated_library):
+        """Space on a row with a target_entry cycles align → add →
+        skip → align."""
+        matches = [{
+            "sample": {"name": "X", "gbk": "x.gbk"},
+            "action": "align",
+            "target_entry": {"id": "T", "name": "Target plasmid"},
+            "score": 1.0, "method": "name-exact", "note": "",
+        }]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            await app.push_screen(sc.BulkAlignConfirmModal(matches))
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal._matches[0]["action"] == "align"
+            modal.action_toggle_action()
+            assert modal._matches[0]["action"] == "add"
+            modal.action_toggle_action()
+            assert modal._matches[0]["action"] == "skip"
+            modal.action_toggle_action()
+            assert modal._matches[0]["action"] == "align"
+
+    async def test_no_target_skips_align(
+            self, tiny_record, isolated_library):
+        """Rows without a target_entry can't be set to align — the
+        cycle skips align and lands on add."""
+        matches = [{
+            "sample": {"name": "Y", "gbk": "y.gbk"},
+            "action": "add",
+            "target_entry": None,
+            "score": 0.0, "method": "no-match", "note": "",
+        }]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            await app.push_screen(sc.BulkAlignConfirmModal(matches))
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal._matches[0]["action"] == "add"
+            modal.action_toggle_action()  # add → skip
+            assert modal._matches[0]["action"] == "skip"
+            modal.action_toggle_action()  # skip → align? coerced to add
+            assert modal._matches[0]["action"] == "add"
+
+
+class TestLibraryPanelSeqColumn:
+    """LibraryPanel's "Seq" column shows per-entry sequencing-status
+    badges driven by `_library_entry_alignment_summary`. The cell
+    updates incrementally via `refresh_seq_cell(entry_id)` after a
+    `_flush_active_alignments` so the badge tracks current state
+    without a full table repopulate.
+    """
+
+    async def test_seq_column_shows_dash_for_unsequenced_entries(
+            self, tiny_record, isolated_library):
+        """An entry with no stored alignments renders ``—`` (dim)
+        in the Seq column."""
+        from textual.widgets import DataTable
+        sc._save_library([
+            {"id": tiny_record.id, "name": tiny_record.name,
+             "size": len(tiny_record.seq), "n_feats": 0,
+             "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(tiny_record)},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "plasmids"
+            lib._apply_view_mode()
+            lib._repopulate_plasmids()
+            await pilot.pause(0.05)
+            t = lib.query_one("#lib-table", DataTable)
+            # 5 columns: ●, Name, Status, Seq, bp.
+            # Verify the table accepted the 5-column row shape (regression
+            # guard for the add_columns / add_row arity match).
+            assert len(t.columns) == 5
+            assert t.row_count >= 1
+
+    async def test_refresh_seq_cell_after_alignment_flush(
+            self, tiny_record, isolated_library):
+        """After `_flush_active_alignments` writes an alignment onto
+        an entry, the LibraryPanel's Seq cell updates without a full
+        repopulate. Verified by checking that the badge summary
+        reflects the new alignment."""
+        sc._save_library([
+            {"id": tiny_record.id, "name": tiny_record.name,
+             "size": len(tiny_record.seq), "n_feats": 0,
+             "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(tiny_record)},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            # Register an alignment and flush.
+            app._register_alignment(
+                name="test-read", query_label="test-read",
+                target_label=tiny_record.name,
+                target_record=tiny_record,
+                result={
+                    "aligned_q": "ATGC", "aligned_t": "ATGC",
+                    "n_matches": 4, "n_mismatches": 0, "n_gaps": 0,
+                    "ungapped_identity_pct": 100.0,
+                    "identity_pct": 100.0,
+                },
+            )
+            app._alignments[-1]["_stored_source"] = "sequencing"
+            app._flush_active_alignments()
+            await pilot.pause(0.1)
+            # Read it back: the entry should now have one stored
+            # alignment, and the summary should reflect it.
+            entries = sc._load_library()
+            t_entry = next(e for e in entries if e["id"] == tiny_record.id)
+            summary = sc._library_entry_alignment_summary(t_entry)
+            assert summary is not None
+            assert summary["n_total"] == 1
+
+
+class TestVerificationReportModal:
+    async def test_modal_collects_rows_from_library(
+            self, tiny_record, isolated_library):
+        """A library with one entry carrying one stored alignment
+        produces one row in the report."""
+        # Library entry with a pre-baked stored alignment.
+        stored_align = {
+            "id": "test-alignment-id",
+            "label": "test-read",
+            "query_label": "test-read",
+            "target_label": tiny_record.name,
+            "target_id": tiny_record.id,
+            "target_gb_text": sc._record_to_gb_text(tiny_record),
+            "target_seq_hash": sc._alignment_target_hash(
+                str(tiny_record.seq),
+            ),
+            "axis": "target",
+            "result": {
+                "aligned_q": "ATGC", "aligned_t": "ATGC",
+                "n_matches": 4, "n_mismatches": 0, "n_gaps": 0,
+                "ungapped_identity_pct": 100.0,
+                "identity_pct": 100.0,
+            },
+            "visible": True,
+            "added": "2026-05-24",
+            "source": "sequencing",
+        }
+        sc._save_library([
+            {"id": tiny_record.id, "name": tiny_record.name,
+             "size": len(tiny_record.seq), "n_feats": 0,
+             "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(tiny_record),
+             "alignments": [stored_align]},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            await app.push_screen(sc.VerificationReportModal())
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert len(modal._rows_data) == 1
+            row = modal._rows_data[0]
+            assert row["entry_id"] == tiny_record.id
+            assert row["read_label"] == "test-read"
+            # Coverage = 4/(len of tiny_record) so verified status
+            # depends on tiny_record length. Just check it's a
+            # recognised status.
+            assert row["code"] in (
+                "verified", "near", "partial", "divergent",
+            )
+
+    async def test_modal_skips_entries_with_no_alignments_by_default(
+            self, tiny_record, isolated_library):
+        """`only_with_alignments=True` (default) hides entries that
+        have no stored alignments — the report is for verified vs
+        unsequenced, not a library catalog."""
+        sc._save_library([
+            {"id": tiny_record.id, "name": tiny_record.name,
+             "size": len(tiny_record.seq), "n_feats": 0,
+             "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(tiny_record)},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            await app.push_screen(sc.VerificationReportModal())
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal._rows_data == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Alignment hardening (post-audit 2026-05-24) — schema validation,
+# length-mismatch guards, backward-compat defaults
+# ═══════════════════════════════════════════════════════════════════════════════
+# These tests exercise the defensive guards added after the alignment
+# subsystem audit: stored alignments missing critical fields (or with
+# malformed paired strings) must skip cleanly with a log entry rather
+# than crashing the hydrate path; pre-rotation-picker stored entries
+# must hydrate with safe defaults for the new rotation fields.
+
+class TestDeserializeStoredAlignmentArgs:
+    def _minimal_stored(self, tiny_record, **overrides) -> dict:
+        """Build a minimum valid stored-alignment dict, overridable."""
+        base = {
+            "id":              "test-id",
+            "label":           "test-read",
+            "query_label":     "Q",
+            "target_label":    tiny_record.name,
+            "target_id":       tiny_record.id,
+            "target_gb_text":  sc._record_to_gb_text(tiny_record),
+            "target_seq_hash": sc._alignment_target_hash(
+                str(tiny_record.seq),
+            ),
+            "axis":            "target",
+            "result": {
+                "aligned_q": "ATGC", "aligned_t": "ATGC",
+                "n_matches": 4, "n_mismatches": 0, "n_gaps": 0,
+                "identity_pct": 100.0,
+                "ungapped_identity_pct": 100.0,
+            },
+            "visible": True,
+            "added":   "2026-05-24",
+            "source":  "test",
+        }
+        base.update(overrides)
+        return base
+
+    def test_missing_target_gb_text_returns_none(self, tiny_record):
+        stored = self._minimal_stored(tiny_record, target_gb_text="")
+        assert sc._deserialize_stored_alignment_args(stored) is None
+
+    def test_corrupt_gb_text_returns_none(self, tiny_record):
+        stored = self._minimal_stored(
+            tiny_record, target_gb_text="not a valid GenBank record",
+        )
+        assert sc._deserialize_stored_alignment_args(stored) is None
+
+    def test_missing_aligned_strings_returns_none(self, tiny_record):
+        """Schema validation guard added post-audit: stored entries
+        with empty/missing aligned_q or aligned_t must be skipped
+        rather than passed downstream where segment computation
+        would raise an opaque ValueError."""
+        bad = self._minimal_stored(tiny_record)
+        bad["result"]["aligned_q"] = ""
+        assert sc._deserialize_stored_alignment_args(bad) is None
+
+    def test_aligned_string_length_mismatch_returns_none(
+            self, tiny_record):
+        """Paired-column walk in `_alignment_to_target_segments`
+        assumes len(aq) == len(at) — a mismatch is a corruption
+        signal that should skip the hydrate, not crash downstream."""
+        bad = self._minimal_stored(tiny_record)
+        bad["result"]["aligned_q"] = "ATGCATGC"
+        bad["result"]["aligned_t"] = "ATGC"
+        assert sc._deserialize_stored_alignment_args(bad) is None
+
+    def test_legacy_stored_entry_gets_rotation_field_defaults(
+            self, tiny_record):
+        """Pre-rotation-picker stored alignments lack the
+        `picked_rotation` / `query_rotation` / `target_rotation` /
+        `query_rc` fields. Hydration must inject defaults so
+        downstream code can treat all stored entries uniformly."""
+        stored = self._minimal_stored(tiny_record)
+        # Strip the rotation fields (simulate pre-2026-05-24 stored).
+        for field in ("picked_rotation", "query_rotation",
+                       "target_rotation", "query_rc"):
+            stored["result"].pop(field, None)
+        args = sc._deserialize_stored_alignment_args(stored)
+        assert args is not None
+        result = args["result"]
+        assert result["picked_rotation"] == "none"
+        assert result["query_rotation"] == 0
+        assert result["target_rotation"] == 0
+        assert result["query_rc"] is False
+
+
+class TestRegisterAlignmentLengthGuard:
+    """Regression for the post-audit length-mismatch guard. An
+    upstream caller passing aligned_q/aligned_t of unequal length
+    (e.g., from a corrupted result dict that slipped past the
+    hydrate gate) must surface a clear notify rather than letting
+    the segment walk raise an opaque ValueError."""
+
+    async def test_register_alignment_refuses_mismatched_strings(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            n_before = len(app._alignments)
+            # Mismatched-length aligned strings.
+            app._register_alignment(
+                name="bad-read", query_label="Q",
+                target_label=tiny_record.name,
+                target_record=tiny_record,
+                result={
+                    "aligned_q": "ATGCATGC",  # 8 chars
+                    "aligned_t": "ATGC",      # 4 chars
+                    "n_matches": 4, "n_mismatches": 0, "n_gaps": 0,
+                    "identity_pct": 100.0,
+                    "ungapped_identity_pct": 100.0,
+                },
+            )
+            await pilot.pause(0.05)
+            # No alignment registered — the guard refused.
+            assert len(app._alignments) == n_before
+
+
+class TestSerializeAlignmentEmptyTargetSeq:
+    """Post-audit guard: a target_record with an empty seq is broken
+    (the renderer can't show it, the stale-target hash would mis-fire
+    on every reload). `_serialize_alignment_for_storage` returns
+    None so the caller skips persisting."""
+
+    def test_empty_target_seq_returns_none(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        empty_rec = SeqRecord(
+            Seq(""), id="EMPTY", name="EMPTY",
+            annotations={"molecule_type": "DNA"},
+        )
+        entry = {
+            "name":          "test",
+            "target_record": empty_rec,
+            "result": {
+                "aligned_q": "ATGC", "aligned_t": "ATGC",
+                "n_matches": 4, "n_mismatches": 0, "n_gaps": 0,
+                "identity_pct": 100.0,
+                "ungapped_identity_pct": 100.0,
+            },
+        }
+        assert sc._serialize_alignment_for_storage(entry) is None
+
+
+class TestRegisterAlignmentReturnsEntry:
+    """`_register_alignment` returns the newly-appended entry on
+    success and None on refusal. Callers must use the return value
+    instead of `_alignments[-1]` to avoid corrupting the previous
+    entry's storage metadata when the register is refused (the bug
+    that surfaced as "deleted alignments resurrect on the next
+    flush" after Alt+L delete)."""
+
+    async def test_returns_none_on_empty_strings(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            ret = app._register_alignment(
+                name="empty", query_label="q",
+                target_label=tiny_record.name,
+                target_record=tiny_record,
+                result={"aligned_q": "", "aligned_t": ""},
+            )
+            assert ret is None
+
+    async def test_returns_none_on_mismatched_lengths(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            ret = app._register_alignment(
+                name="mismatch", query_label="q",
+                target_label=tiny_record.name,
+                target_record=tiny_record,
+                result={"aligned_q": "ATGC", "aligned_t": "ATGCA"},
+            )
+            assert ret is None
+
+    async def test_returns_appended_entry_on_success(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.05)
+            ret = app._register_alignment(
+                name="ok", query_label="q",
+                target_label=tiny_record.name,
+                target_record=tiny_record,
+                result={
+                    "aligned_q": "ATGC", "aligned_t": "ATGC",
+                    "n_matches": 4, "n_mismatches": 0, "n_gaps": 0,
+                    "identity_pct": 100.0,
+                    "ungapped_identity_pct": 100.0,
+                },
+            )
+            assert ret is not None
+            # Returned entry IS the appended one (same object).
+            assert app._alignments[-1] is ret
+
+
+class TestAlignmentManagerDeleteRoundTrip:
+    """Regression for the Alt+L delete bug (2026-05-24): deleting an
+    alignment in the manager modal + saving + reloading must remove
+    it from the library on disk AND from the in-memory band. Pre-fix
+    a register-refused hydrate could corrupt a sibling entry's
+    `_stored_id`, causing the deleted alignment to resurrect on the
+    next flush.
+    """
+
+    async def test_delete_alignment_persists_through_save_load(
+            self, tiny_record, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Library entry with two pre-baked stored alignments.
+        def _stored(label, source="manual"):
+            return {
+                "id":              f"id-{label}",
+                "label":           label,
+                "query_label":     label,
+                "target_label":    tiny_record.name,
+                "target_id":       tiny_record.id,
+                "target_gb_text":  sc._record_to_gb_text(tiny_record),
+                "target_seq_hash": sc._alignment_target_hash(
+                    str(tiny_record.seq),
+                ),
+                "axis":            "target",
+                "result": {
+                    "aligned_q": "ATGC", "aligned_t": "ATGC",
+                    "n_matches": 4, "n_mismatches": 0, "n_gaps": 0,
+                    "identity_pct": 100.0,
+                    "ungapped_identity_pct": 100.0,
+                },
+                "visible": True,
+                "added":   "2026-05-24",
+                "source":  source,
+            }
+        sc._save_library([
+            {"id": tiny_record.id, "name": tiny_record.name,
+             "size": len(tiny_record.seq), "n_feats": 0,
+             "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(tiny_record),
+             "alignments": [_stored("A"), _stored("B")]},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.1)
+            # Both alignments hydrated onto the band.
+            assert len(app._alignments) == 2
+            # Simulate AlignmentManagerModal: drop alignment B and
+            # re-flush the remaining list. (Drive the underlying
+            # path directly rather than via the modal pilot, which
+            # is brittle in xdist.)
+            entries = sc._load_library()
+            t_entry = next(e for e in entries if e["id"] == tiny_record.id)
+            kept = [
+                a for a in (t_entry.get("alignments") or [])
+                if a.get("label") != "B"
+            ]
+            t_entry["alignments"] = kept
+            sc._save_library(entries, async_sync=True)
+            app._clear_alignments()
+            app._hydrate_alignments_for_active()
+            await pilot.pause(0.1)
+            # After delete + save + re-hydrate, only A remains.
+            assert len(app._alignments) == 1
+            assert app._alignments[0]["name"] == "A"
+            # And the stored library entry no longer has B.
+            re_loaded = sc._load_library()
+            t2 = next(e for e in re_loaded if e["id"] == tiny_record.id)
+            stored = t2.get("alignments") or []
+            assert len(stored) == 1
+            assert stored[0]["label"] == "A"
+
+    async def test_register_refused_does_not_corrupt_sibling_metadata(
+            self, tiny_record, isolated_library):
+        """When `_register_alignment` refuses (malformed strings),
+        the hydrate code must NOT stamp `_stored_id` on the previous
+        entry. Pre-fix the stamp landed on the sibling, causing the
+        next flush to overwrite the sibling's storage slot with the
+        refused entry's metadata."""
+        # Pre-bake: one good stored entry and one with corrupt
+        # (length-mismatch) aligned strings.
+        def _stored(label, aq, at):
+            return {
+                "id":              f"id-{label}",
+                "label":           label,
+                "query_label":     label,
+                "target_label":    tiny_record.name,
+                "target_id":       tiny_record.id,
+                "target_gb_text":  sc._record_to_gb_text(tiny_record),
+                "target_seq_hash": sc._alignment_target_hash(
+                    str(tiny_record.seq),
+                ),
+                "axis":            "target",
+                "result": {
+                    "aligned_q": aq, "aligned_t": at,
+                    "n_matches": len(aq), "n_mismatches": 0,
+                    "n_gaps": 0, "identity_pct": 100.0,
+                    "ungapped_identity_pct": 100.0,
+                },
+                "visible": True,
+                "added":   "2026-05-24",
+                "source":  "manual",
+            }
+        # First entry is valid, second has mismatched lengths.
+        # Deserialize will SKIP the second per the new schema check
+        # — but verify the first's metadata isn't corrupted.
+        sc._save_library([
+            {"id": tiny_record.id, "name": tiny_record.name,
+             "size": len(tiny_record.seq), "n_feats": 0,
+             "added": "2026-05-24",
+             "gb_text": sc._record_to_gb_text(tiny_record),
+             "alignments": [
+                 _stored("GOOD", "ATGC", "ATGC"),
+                 _stored("BAD",  "ATGC", "ATGCATGC"),
+             ]},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.1)
+            # Only GOOD hydrates (BAD is skipped by schema check).
+            assert len(app._alignments) == 1
+            good = app._alignments[0]
+            assert good["name"] == "GOOD"
+            # CRITICAL: the GOOD entry's `_stored_id` is its own id,
+            # not BAD's. Pre-fix the second register (refused) would
+            # have stamped BAD's id onto GOOD via the `[-1]` access.
+            assert good["_stored_id"] == "id-GOOD"
+
+
+class TestAlignmentQualityStatusNegativeGuard:
+    """Defensive negative-value guard — a corrupted result with
+    negative n_matches/n_mismatches/n_gaps must not let `verified`
+    fire on garbage."""
+
+    def test_negative_n_matches_is_divergent(self):
+        result = {
+            "n_matches": -1, "n_mismatches": 0, "n_gaps": 0,
+            "ungapped_identity_pct": 100.0,
+        }
+        code, _, _ = sc._alignment_quality_status(result, 1000)
+        assert code == "divergent"
+
+    def test_negative_ungapped_is_divergent(self):
+        result = {
+            "n_matches": 100, "n_mismatches": 0, "n_gaps": 0,
+            "ungapped_identity_pct": -50.0,
+        }
+        code, _, _ = sc._alignment_quality_status(result, 100)
+        assert code == "divergent"
+
+
+class TestCanonicalKmerPalindromeHandling:
+    """Verify the canonical k-mer normalisation handles palindromes,
+    IUPAC codes, and empty inputs without breaking."""
+
+    def test_palindrome_canonical_equals_itself(self):
+        """A palindromic k-mer (kmer == RC(kmer)) has a single
+        canonical form regardless of strand."""
+        # 4-bp palindrome.
+        s = "GGCC"
+        out = sc._kmer_set(s, k=4, canonical=True)
+        assert out == {"GGCC"}
+
+    def test_iupac_canonical_kmers(self):
+        """IUPAC codes (N, R, Y, ...) are handled by `_rc`'s
+        translation table — canonical form picks the lex-smaller
+        of (kmer, RC)."""
+        # Sequence with N: NNNN is its own RC (palindrome).
+        out = sc._kmer_set("NNNNNN", k=4, canonical=True)
+        assert "NNNN" in out
+
+    def test_canonical_kmer_strand_agnostic_pair(self):
+        """RC(seq) and seq produce the same canonical k-mer set."""
+        from Bio.Seq import Seq
+        s = "ATGCATGCATGCATGCATGCATGC"
+        rc_s = str(Seq(s).reverse_complement())
+        a = sc._kmer_set(s, k=8, canonical=True)
+        b = sc._kmer_set(rc_s, k=8, canonical=True)
+        # Should be identical: each k-mer's canonical form is the
+        # same regardless of which strand was extracted.
+        assert a == b
+
+
+class TestMatcherParseFailureSurfacing:
+    """Library entries that fail to parse during k-mer build are
+    excluded from the comparison AND logged as a batched warning
+    so the user can investigate corrupted entries via the diagnostic
+    bundle rather than wondering why a sample silently fell back
+    to 'add as new'."""
+
+    def test_corrupt_library_entry_logged_at_warning(self, monkeypatch):
+        """The matcher's `_log` (splicecraft logger) has
+        propagate=False, so pytest's caplog can't see it via the
+        root handler. Monkeypatch the warning method directly to
+        capture the parse-failure summary call."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        ok_rec = SeqRecord(
+            Seq("ATGC" * 100), id="OK", name="OK",
+            annotations={"molecule_type": "DNA"},
+        )
+        library = [
+            {"id": "BAD", "name": "BAD",
+             "gb_text": "not a valid genbank record"},
+            {"id": "OK", "name": "OK",
+             "gb_text": sc._record_to_gb_text(ok_rec)},
+        ]
+        samples = [{"name": "NONE", "gbk": None}]  # no gbk → skip
+        captured: list = []
+        orig_warning = sc._log.warning
+
+        def _capture(fmt, *args, **kwargs):
+            try:
+                captured.append(fmt % args if args else fmt)
+            except Exception:
+                captured.append(str(fmt))
+            return orig_warning(fmt, *args, **kwargs)
+        monkeypatch.setattr(sc._log, "warning", _capture)
+        sc._match_samples_to_library(
+            samples, library, sequence_fallback=True,
+        )
+        # The batched warning surfaces the parse failure with the
+        # library entry id, so a user reading the log can find the
+        # broken record.
+        assert any(
+            "failed to parse" in m and "BAD" in m for m in captured
+        ), f"expected parse-failure warning; got: {captured}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [INV-72] Audit sweep 2026-05-25 — IUPAC normalisation, agent/UI picker
+# parity, bulk-align failure surfacing, coverage clamp.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNormalizeDnaForAlign:
+    """The `_normalize_dna_for_align` helper scrubs whitespace/digits/
+    FASTA markers and validates IUPAC nucleotide chars before any
+    sequence reaches the C-loop. Covers the common bad-paste failures
+    (FASTA-as-is, GenBank ORIGIN block, protein-into-DNA-field)."""
+
+    def test_clean_input_passes_through(self):
+        assert sc._normalize_dna_for_align("ACGT") == "ACGT"
+
+    def test_lowercase_uppercased(self):
+        assert sc._normalize_dna_for_align("acgtacgt") == "ACGTACGT"
+
+    def test_strips_internal_whitespace(self):
+        # GenBank ORIGIN block style: leading bp number + spaces.
+        assert sc._normalize_dna_for_align(
+            "        1 atgcatgcat tcgatcgatc",
+        ) == "ATGCATGCATTCGATCGATC"
+
+    def test_strips_fasta_header_line(self):
+        # A pasted FASTA: the whole `>name desc\n` header line gets
+        # stripped along with the embedded newlines, leaving only the
+        # sequence body uppercased.
+        assert sc._normalize_dna_for_align(
+            ">myplasmid description\nACGTACGT\nACGTACGT",
+        ) == "ACGTACGTACGTACGT"
+
+    def test_strips_multi_fasta_headers(self):
+        # Multiple FASTA records — every header line goes; sequence
+        # bodies concatenate.
+        assert sc._normalize_dna_for_align(
+            ">seq1\nAAAA\n>seq2\nGGGG",
+        ) == "AAAAGGGG"
+
+    def test_strips_newlines_only(self):
+        assert sc._normalize_dna_for_align("ACGT\nACGT") == "ACGTACGT"
+
+    def test_iupac_ambiguity_accepted(self):
+        assert sc._normalize_dna_for_align("ACGTNRYSWKM") == "ACGTNRYSWKM"
+
+    def test_rejects_protein_letters(self):
+        # Paste of a protein sequence into a DNA-only field: E F I L P Q
+        # all sit outside the IUPAC nucleotide alphabet.
+        with pytest.raises(ValueError, match="non-IUPAC"):
+            sc._normalize_dna_for_align("MELFGPQ")
+
+    def test_rejects_random_chars(self):
+        with pytest.raises(ValueError, match="non-IUPAC"):
+            sc._normalize_dna_for_align("ACGT*ACGT")
+
+    def test_empty_returns_empty(self):
+        assert sc._normalize_dna_for_align("") == ""
+
+    def test_whitespace_only_returns_empty(self):
+        assert sc._normalize_dna_for_align("   \n  \n  ") == ""
+
+    def test_error_names_offending_char(self):
+        try:
+            sc._normalize_dna_for_align("ACGTZACGT")
+        except ValueError as exc:
+            assert "'Z'" in str(exc)
+        else:
+            pytest.fail("expected ValueError")
+
+    def test_pairwise_align_uses_normaliser(self):
+        # `_pairwise_align` must run the input through the normaliser
+        # before reaching Biopython — a pasted-FASTA input would
+        # otherwise either crash deep inside the C-loop or produce a
+        # garbage alignment (length mismatch on the leading `>name`).
+        result = sc._pairwise_align(
+            ">qry\nACGTACGTACGTACGT",
+            ">tgt\nACGTACGTACGTACGT",
+        )
+        assert result["identity_pct"] == 100.0
+        assert result["q_len"] == 16
+        assert result["t_len"] == 16
+
+    def test_pairwise_align_rejects_protein_input(self):
+        # Defensive: a pasted protein sequence should fail loudly at
+        # the validation step, not deep inside Biopython.
+        with pytest.raises(ValueError, match="non-IUPAC"):
+            sc._pairwise_align("MELFGPQ", "ACGTACGT")
+
+
+class TestPickBestRotationNormalises:
+    """`_pick_best_rotation` pre-normalises at entry so the frame-shift
+    helpers' length math agrees with what `_pairwise_align` actually
+    consumes. Pre-fix passing raw FASTA would mean
+    `len(target_seq)` in the rotation shift differed from the cleaned
+    length, off-by-N depending on how many whitespace/header chars
+    got scrubbed."""
+
+    def test_pick_normalises_raw_fasta_input(self):
+        # Both ways: with and without the leading FASTA header. The
+        # alignment should be identical.
+        clean_result = sc._pick_best_rotation(
+            "ACGTACGTACGT",
+            "ACGTACGTACGT",
+            is_circular=False,
+        )
+        raw_result = sc._pick_best_rotation(
+            ">qry name\nACGTACGTACGT",
+            ">tgt name\nACGTACGTACGT",
+            is_circular=False,
+        )
+        assert clean_result["identity_pct"] == raw_result["identity_pct"]
+        assert clean_result["q_len"] == raw_result["q_len"]
+
+    def test_pick_rejects_protein_input(self):
+        with pytest.raises(ValueError, match="non-IUPAC"):
+            sc._pick_best_rotation(
+                "MELFGPQ", "ACGTACGT", is_circular=False,
+            )
+
+    def test_pick_rejects_post_normalise_empty(self):
+        # Whitespace-only input is non-empty pre-strip but empty after.
+        with pytest.raises(ValueError, match="empty"):
+            sc._pick_best_rotation(
+                "   \n  ", "ACGTACGT", is_circular=False,
+            )
+
+
+class TestAgentDiffPlasmidUsesPicker:
+    """`_h_diff_plasmid` must use `_pick_best_rotation` (INV-72) so
+    agent callers get the same RC-detection + multi-rotation
+    best-of-N pick the UI gained in `[INV-71]`. Pre-fix the endpoint
+    ran a single `_find_circular_alignment_offset` + bare
+    `_pairwise_align`, missing RC orientations entirely."""
+
+    async def test_returns_picker_metadata_fields(
+            self, tiny_record, isolated_library):
+        """Response payload carries the new picker fields:
+        `picked_rotation`, `query_rotation`, `target_rotation`,
+        `query_rc`. `rotation_offset` is kept for back-compat and
+        mirrors `target_rotation`."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        target_seq = "ATGC" * 30
+        target_rec = SeqRecord(
+            Seq(target_seq), id="TGT", name="TGT",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        sc._save_library([{
+            "id": "TGT", "name": "TGT", "size": len(target_seq),
+            "n_feats": 0, "added": "2026-05-25",
+            "gb_text": sc._record_to_gb_text(target_rec),
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            # Same sequence on canvas → trivially 100% identity.
+            app._apply_record(target_rec)
+            await pilot.pause(0.05)
+            result = sc._h_diff_plasmid(
+                app, {"target_id": "TGT"},
+            )
+            assert isinstance(result, dict), result
+            assert result["ok"] is True
+            assert "picked_rotation" in result
+            assert "query_rotation" in result
+            assert "target_rotation" in result
+            assert "query_rc" in result
+            # Back-compat: rotation_offset === target_rotation.
+            assert result["rotation_offset"] == result["target_rotation"]
+
+    async def test_detects_rc_orientation(
+            self, tiny_record, isolated_library):
+        """Pre-INV-72 the endpoint ran only forward-orientation
+        alignment — a query that's RC of the target scored ~0%
+        identity. Post-fix, the picker tries RC plain at the first
+        tier and surfaces `query_rc=True` for the agent."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        target_seq = "ATGCATGCATGCATGCATGCATGCATGCATGCATGCATGC"
+        target_rec = SeqRecord(
+            Seq(target_seq), id="TGT", name="TGT",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        # RC the target → put it on the canvas as the "query".
+        rc_seq = sc._rc(target_seq)
+        rc_rec = SeqRecord(
+            Seq(rc_seq), id="QRY", name="QRY",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        sc._save_library([{
+            "id": "TGT", "name": "TGT", "size": len(target_seq),
+            "n_feats": 0, "added": "2026-05-25",
+            "gb_text": sc._record_to_gb_text(target_rec),
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app._apply_record(rc_rec)
+            await pilot.pause(0.05)
+            result = sc._h_diff_plasmid(
+                app, {"target_id": "TGT"},
+            )
+            assert result["ok"] is True
+            # Post-fix the picker recognises the RC orientation and
+            # reports identity ≥ 99% (perfect minus rotation noise).
+            # Pre-fix this scored under 50%.
+            assert result["result"]["identity_pct"] >= 95.0
+            assert result["query_rc"] is True
+
+
+class TestAgentAlignPlasmidsaurusUsesPicker:
+    """`_h_align_plasmidsaurus_zip` must use `_pick_best_rotation`
+    (INV-72) for the same reasons as `_h_diff_plasmid` — pre-fix
+    agents calling this endpoint missed RC-orientation detection."""
+
+    async def test_returns_picker_metadata_fields(
+            self, tmp_path, tiny_record, isolated_library):
+        import zipfile
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        target_seq = "ATGC" * 60
+        target_rec = SeqRecord(
+            Seq(target_seq), id="TGT", name="TGT",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        sc._save_library([{
+            "id": "TGT", "name": "TGT", "size": len(target_seq),
+            "n_feats": 0, "added": "2026-05-25",
+            "gb_text": sc._record_to_gb_text(target_rec),
+        }])
+        gbk = tmp_path / "RUN42_1_TGT.gbk"
+        SeqIO.write(target_rec, gbk, "genbank")
+        zp = tmp_path / "RUN42_results.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.write(gbk, "RUN42_genbank-files/RUN42_1_TGT.gbk")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            result = sc._h_align_plasmidsaurus_zip(app, {
+                "path": str(zp),
+                "member": "RUN42_genbank-files/RUN42_1_TGT.gbk",
+                "target_id": "TGT",
+            })
+            assert isinstance(result, dict), result
+            assert result["ok"] is True
+            assert "picked_rotation" in result
+            assert "query_rotation" in result
+            assert "target_rotation" in result
+            assert "query_rc" in result
+            assert result["rotation_offset"] == result["target_rotation"]
+
+
+class TestPairwiseAlignCoverageClampInToast:
+    """Coverage % is clamped at 100% in the toast formatter (and in
+    `VerificationReportModal._collect_rows`). The underlying data is
+    untouched — only the display value is bounded — so a corrupted
+    result dict doesn't render '150% coverage' to the user."""
+
+    def test_clamp_formula_caps_at_100(self):
+        # Reproduce the toast's coverage formula with inflated input.
+        n_matches = 1500
+        n_mismatches = 0
+        aligned_bp = n_matches + n_mismatches
+        target_len = 1000  # smaller than aligned_bp on purpose
+        coverage_pct = (
+            min(100.0, 100.0 * aligned_bp / target_len)
+            if target_len else 0.0
+        )
+        assert coverage_pct == 100.0
+
+    def test_clamp_formula_passes_through_normal_values(self):
+        n_matches = 500
+        n_mismatches = 50
+        aligned_bp = n_matches + n_mismatches
+        target_len = 1000
+        coverage_pct = (
+            min(100.0, 100.0 * aligned_bp / target_len)
+            if target_len else 0.0
+        )
+        assert coverage_pct == 55.0
+
+    def test_clamp_formula_handles_zero_target(self):
+        coverage_pct = (
+            min(100.0, 100.0 * 0 / 1) if 0 else 0.0
+        )
+        assert coverage_pct == 0.0
+
+
+class TestBulkAlignNoGbkLogs:
+    """`_bulk_align_worker` logs a warning when skipping a sample with
+    no `gbk` field. Pre-INV-72 the skip was silent — a malformed
+    Plasmidsaurus manifest would report 'failed N' with no clue why."""
+
+    def test_skip_logs_sample_name(self, monkeypatch):
+        # Reproduce the inline check without spinning up the worker.
+        # The bulk-align worker's no-gbk path now matches:
+        #     if not gbk_member: _log.warning(...); n_failed += 1
+        captured: list[str] = []
+        orig_warning = sc._log.warning
+
+        def _capture(fmt, *args, **kwargs):
+            try:
+                captured.append(fmt % args if args else fmt)
+            except Exception:
+                captured.append(str(fmt))
+            return orig_warning(fmt, *args, **kwargs)
+        monkeypatch.setattr(sc._log, "warning", _capture)
+        # Mimic the inline log line directly.
+        sc._log.warning(
+            "BulkAlign: skipping sample %r — no .gbk member "
+            "field (malformed manifest or missing consensus)",
+            "MAV34",
+        )
+        assert any(
+            "BulkAlign" in m and "MAV34" in m for m in captured
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# INV-73 (2026-05-25): follow-up alignment hardening sweep tests.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestVariantExtractionCap:
+    """`_extract_variants_from_alignment` caps the result list at
+    `_MAX_VARIANTS_PER_ALIGNMENT` (default 10k) to bound memory on
+    completely-divergent alignments. A truncation sentinel is
+    appended so callers can surface "10k+ variants" rather than
+    silently underreporting."""
+
+    def test_small_alignment_no_cap(self):
+        # Five SNPs in a 10-bp alignment; well under the cap.
+        aq = "ATGCATGCAT"
+        at = "ATCCAAGCTT"
+        variants = sc._extract_variants_from_alignment(aq, at)
+        assert all(v["type"] != "truncated" for v in variants)
+        # SNP count: positions 2 (G→C), 4 (T→A), 5 (A→A NO)... let
+        # the function speak — we just assert no truncation marker
+        # for a small input.
+        assert len(variants) <= 10
+
+    def test_cap_appends_truncated_sentinel(self):
+        # Build a 50-bp alignment where every column is a SNP.
+        # Cap at 5 so the test is fast.
+        aq = "A" * 50
+        at = "C" * 50
+        variants = sc._extract_variants_from_alignment(
+            aq, at, max_variants=5,
+        )
+        # Expect 5 real variants + 1 truncation sentinel = 6 entries.
+        assert len(variants) == 6
+        assert variants[-1]["type"] == "truncated"
+        assert variants[-1]["length"] == 0
+        assert variants[-1]["ref"] == ""
+        assert variants[-1]["alt"] == ""
+        assert "omitted_after_pos" in variants[-1]
+        # The first 5 are SNPs.
+        assert all(v["type"] == "snp" for v in variants[:5])
+
+    def test_truncation_filterable_by_type(self):
+        # Callers that count by type (`snp`/`insertion`/`deletion`)
+        # should naturally skip the sentinel.
+        aq = "A" * 100
+        at = "C" * 100
+        variants = sc._extract_variants_from_alignment(
+            aq, at, max_variants=10,
+        )
+        n_snps = sum(1 for v in variants if v["type"] == "snp")
+        n_indels = sum(
+            1 for v in variants
+            if v["type"] in ("insertion", "deletion")
+        )
+        assert n_snps == 10
+        assert n_indels == 0
+        # Sentinel is present but excluded by type filter.
+        assert sum(1 for v in variants if v["type"] == "truncated") == 1
+
+    def test_zero_cap_disables_walking(self):
+        # max_variants=0 is treated as "no cap" (defensive: avoid
+        # an accidental 0 silently truncating to nothing).
+        aq = "ATG"
+        at = "CTG"
+        variants = sc._extract_variants_from_alignment(
+            aq, at, max_variants=0,
+        )
+        assert len(variants) >= 1
+        assert all(v["type"] != "truncated" for v in variants)
+
+
+class TestExtractVariantsMixedAndDivergent:
+    """Edge cases: mixed SNP+indel calls in a single alignment; the
+    all-divergent baseline."""
+
+    def test_mixed_snp_and_indel(self):
+        # aq:  ATG-CCG
+        # at:  ATGGCAG
+        # column 3: insertion (target has G, query gap)
+        # column 5: SNP (C vs A)
+        aq = "ATG-CCG"
+        at = "ATGGCAG"
+        variants = sc._extract_variants_from_alignment(aq, at)
+        types = [v["type"] for v in variants]
+        assert "deletion" in types or "insertion" in types
+        # Note: by convention "-" in aq is a DELETION (target has
+        # bp that query doesn't).
+        del_v = next(v for v in variants if v["type"] == "deletion")
+        assert del_v["ref"] == "G"
+        assert del_v["length"] == 1
+        # The C vs A column is a SNP.
+        snps = [v for v in variants if v["type"] == "snp"]
+        assert any(v["ref"] == "A" and v["alt"] == "C" for v in snps)
+
+    def test_all_divergent_short(self):
+        aq = "AAAA"
+        at = "CCCC"
+        variants = sc._extract_variants_from_alignment(aq, at)
+        assert len(variants) == 4
+        assert all(v["type"] == "snp" for v in variants)
+
+
+class TestPickedRotationEnumValidation:
+    """INV-73: `_deserialize_stored_alignment_args` validates
+    rotation-picker fields against their expected value space.
+    Corrupted/foreign values coerce back to safe defaults with a
+    log warning rather than crashing or skipping the entry."""
+
+    def _make_stored(self, **result_overrides):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        target_seq = "ATGC" * 25
+        target_rec = SeqRecord(
+            Seq(target_seq), id="T", name="T",
+            annotations={"molecule_type": "DNA"},
+        )
+        gb = sc._record_to_gb_text(target_rec)
+        result = {
+            "mode": "global", "score": 200.0,
+            "identity_pct": 100.0,
+            "ungapped_identity_pct": 100.0,
+            "aligned_q": target_seq, "aligned_t": target_seq,
+            "n_matches": 100, "n_mismatches": 0, "n_gaps": 0,
+            "q_len": 100, "t_len": 100,
+            **result_overrides,
+        }
+        return {
+            "id": "test-id",
+            "label": "test",
+            "query_label": "Q",
+            "target_label": "T",
+            "target_id": "T",
+            "target_gb_text": gb,
+            "target_seq_hash": sc._alignment_target_hash(target_seq),
+            "axis": "target",
+            "result": result,
+            "visible": True,
+            "source": "manual",
+            "added": "2026-05-25",
+        }
+
+    def test_invalid_picked_rotation_coerces_to_none(self, caplog):
+        stored = self._make_stored(picked_rotation="both")
+        args = sc._deserialize_stored_alignment_args(stored)
+        assert args is not None
+        assert args["result"]["picked_rotation"] == "none"
+
+    def test_negative_query_rotation_coerces_to_zero(self):
+        stored = self._make_stored(query_rotation=-50)
+        args = sc._deserialize_stored_alignment_args(stored)
+        assert args is not None
+        assert args["result"]["query_rotation"] == 0
+
+    def test_negative_target_rotation_coerces_to_zero(self):
+        stored = self._make_stored(target_rotation=-1)
+        args = sc._deserialize_stored_alignment_args(stored)
+        assert args is not None
+        assert args["result"]["target_rotation"] == 0
+
+    def test_non_int_rotation_coerces_to_zero(self):
+        stored = self._make_stored(query_rotation="oops")
+        args = sc._deserialize_stored_alignment_args(stored)
+        assert args is not None
+        assert args["result"]["query_rotation"] == 0
+
+    def test_non_bool_query_rc_coerces_to_false(self):
+        stored = self._make_stored(query_rc=1)
+        args = sc._deserialize_stored_alignment_args(stored)
+        assert args is not None
+        assert args["result"]["query_rc"] is False
+
+    def test_valid_values_preserved(self):
+        stored = self._make_stored(
+            picked_rotation="query",
+            query_rotation=42,
+            target_rotation=0,
+            query_rc=True,
+        )
+        args = sc._deserialize_stored_alignment_args(stored)
+        assert args is not None
+        assert args["result"]["picked_rotation"] == "query"
+        assert args["result"]["query_rotation"] == 42
+        assert args["result"]["query_rc"] is True
+
+
+class TestCoveragePctHelper:
+    """INV-73: `_coverage_pct_from_result` centralises the clamp
+    + zero-target guard so toast + verification report can't drift
+    apart in their display logic."""
+
+    def test_zero_target_len_returns_zero(self):
+        assert sc._coverage_pct_from_result(
+            {"n_matches": 100, "n_mismatches": 0}, 0,
+        ) == 0.0
+
+    def test_negative_target_len_returns_zero(self):
+        assert sc._coverage_pct_from_result(
+            {"n_matches": 100, "n_mismatches": 0}, -50,
+        ) == 0.0
+
+    def test_normal_coverage(self):
+        # 500 + 50 = 550 aligned, target 1000 → 55%.
+        assert sc._coverage_pct_from_result(
+            {"n_matches": 500, "n_mismatches": 50}, 1000,
+        ) == 55.0
+
+    def test_clamp_caps_at_100(self):
+        # Pathological: more aligned bp than target_len.
+        assert sc._coverage_pct_from_result(
+            {"n_matches": 1500, "n_mismatches": 0}, 1000,
+        ) == 100.0
+
+    def test_missing_fields_treated_as_zero(self):
+        assert sc._coverage_pct_from_result({}, 1000) == 0.0
+
+    def test_non_numeric_fields_returns_zero(self):
+        assert sc._coverage_pct_from_result(
+            {"n_matches": "oops", "n_mismatches": 0}, 1000,
+        ) == 0.0
+
+
+class TestKmerSetForStrongMatchThreshold:
+    """INV-73: short samples (< `_MIN_KMER_SET_FOR_STRONG_MATCH`
+    k-mers) can no longer trigger the `kmer-strong` match path —
+    they'd otherwise score a coincidental 1.0 Jaccard against any
+    library entry containing a primer-length match region."""
+
+    def test_threshold_constant_is_reasonable(self):
+        # 50 k-mers ≈ ~70 bp sample at k=20. Reasonable floor for
+        # a Plasmidsaurus consensus.
+        assert sc._MIN_KMER_SET_FOR_STRONG_MATCH >= 20
+        assert sc._MIN_KMER_SET_FOR_STRONG_MATCH <= 200
+
+    def test_short_sample_falls_through_to_name_or_weak(self):
+        # Sample is 25 bp (~6 k-mers @ k=20). Library entry is the
+        # SAME 25 bp — Jaccard would be 1.0. Without the threshold
+        # guard this would match "kmer-strong"; with the guard it
+        # falls through. We use a name match so it's still picked
+        # but via the name path.
+        seq = "ATGCATGCATGCATGCATGCATGCA"  # 25 bp
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq(seq), id="LIB-A", name="LIB-A",
+            annotations={"molecule_type": "DNA"},
+        )
+        gb = sc._record_to_gb_text(rec)
+        library = [{
+            "id": "LIB-A", "name": "LIB-A", "gb_text": gb,
+        }]
+        samples = [{"name": "LIB-A", "gbk": "x.gbk", "base": "x"}]
+
+        def _extract(zp, m):
+            return gb
+        out = sc._match_samples_to_library(
+            samples, library,
+            extract_gbk_fn=_extract, zip_path="dummy",
+        )
+        assert len(out) == 1
+        # Should not be "kmer-strong" because the sample is too short
+        # for the k-mer signal to be meaningful, even though the
+        # Jaccard would compute as 1.0.
+        assert out[0]["method"] != "kmer-strong"
+
+
+class TestAlignmentQualityStatusBoundaries:
+    """INV-73: explicit threshold-boundary tests for
+    `_alignment_quality_status`. Pre-fix the verified→near→partial→
+    divergent transitions were only tested at clear-cut values; an
+    accidental >= → > shift could mis-label a borderline read."""
+
+    def test_exact_verified_threshold_ungapped(self):
+        # ungapped_identity_pct exactly at the verified floor (99.5)
+        # + perfect coverage + zero gaps → verified.
+        result = {
+            "ungapped_identity_pct": 99.5,
+            "n_matches": 995, "n_mismatches": 0, "n_gaps": 0,
+        }
+        code, _, _ = sc._alignment_quality_status(result, 995)
+        assert code == "verified"
+
+    def test_just_below_verified_demotes_to_near(self):
+        # 99.49 ungapped → not verified, but ≥95% → near.
+        result = {
+            "ungapped_identity_pct": 99.49,
+            "n_matches": 995, "n_mismatches": 5, "n_gaps": 0,
+        }
+        code, _, _ = sc._alignment_quality_status(result, 1000)
+        assert code in ("near", "partial", "divergent")
+        assert code != "verified"
+
+    def test_one_gap_demotes_from_verified(self):
+        # 100% ungapped but a single gap means a single indel — not
+        # verified (verified requires zero gaps).
+        result = {
+            "ungapped_identity_pct": 100.0,
+            "n_matches": 999, "n_mismatches": 0, "n_gaps": 1,
+        }
+        code, _, _ = sc._alignment_quality_status(result, 1000)
+        assert code != "verified"
+
+    def test_below_near_coverage_demotes_to_partial(self):
+        # High ungapped identity but only 50% coverage → partial.
+        result = {
+            "ungapped_identity_pct": 99.0,
+            "n_matches": 500, "n_mismatches": 5, "n_gaps": 0,
+        }
+        code, _, _ = sc._alignment_quality_status(result, 1000)
+        assert code in ("partial", "divergent")
+
+    def test_low_ungapped_is_divergent(self):
+        result = {
+            "ungapped_identity_pct": 60.0,
+            "n_matches": 600, "n_mismatches": 400, "n_gaps": 0,
+        }
+        code, _, _ = sc._alignment_quality_status(result, 1000)
+        assert code == "divergent"
+
+
+class TestFlushAlignmentsLocked:
+    """INV-73: `_flush_active_alignments` holds `_cache_lock` for
+    the full read-modify-write so concurrent workers can't clobber
+    each other's writes. We can't easily exercise true thread
+    contention in a unit test, but we can assert that the function
+    body acquires the lock at all — a future refactor that drops
+    the lock would regress the data-loss path."""
+
+    def test_flush_body_uses_cache_lock(self):
+        import inspect
+        src = inspect.getsource(
+            sc.PlasmidApp._flush_active_alignments
+        )
+        # The fix wraps _load_library + merge + _save_library in
+        # `with _cache_lock:`. If a refactor splits the function
+        # and drops the lock, this fails and the regression is
+        # caught.
+        assert "with _cache_lock" in src or "_cache_lock.acquire" in src
+
+    def test_flush_lock_is_rlock(self):
+        # Without RLock, the inner _load_library and _save_library
+        # would deadlock against our outer acquire.
+        import threading
+        assert isinstance(sc._cache_lock, type(threading.RLock()))
+

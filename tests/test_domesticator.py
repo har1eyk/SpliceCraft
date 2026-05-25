@@ -7052,31 +7052,33 @@ class TestAssemblyFragmentFromSourceGbTextFallback:
             self, isolated_library, isolated_parts_bin):
         """A parts-bin entry without `gb_text` whose name matches a
         library entry's `id` recovers the gb_text via the fallback —
-        Constructor assembly works without reloading the part."""
-        # Build a real GB TU plasmid: BsaI sites flank an Esp3I-
-        # released body (matches the splicecraft GB grammar's
-        # secondary=BsaI, primary=Esp3I parity for L1 release).
+        Constructor assembly works without reloading the part.
+
+        Test data uses `id == name == sanitize(name)` so the post-
+        2026-05-24 id-name backfill (PIT-36) is a no-op. Pre-fix
+        the test used distinct id/name values which the backfill
+        rewrote, breaking the parts-bin cross-reference."""
         tu_seq = _build_gb_tu_seq(oh5="GGAG", oh3="CGCT")
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         rec = SeqRecord(
-            Seq(tu_seq), id="my_tu_id", name="my_tu_name",
+            Seq(tu_seq), id="my_tu", name="my_tu",
             annotations={"topology": "circular", "molecule_type": "DNA"},
         )
         gb_text = sc._record_to_gb_text(rec)
         # Library entry — has gb_text.
         sc._save_library([{
-            "id":      "my_tu_id",
-            "name":    "my_tu_name",
+            "id":      "my_tu",
+            "name":    "my_tu",
             "size":    len(tu_seq),
             "n_feats": 0,
             "gb_text": gb_text,
         }])
         # Parts bin entry — NO gb_text (pre-2026-05-13 shape).
-        # name field intentionally set to the library's id so the
-        # cross-reference can find it.
+        # name field set to the library's id/name so the cross-
+        # reference can find it via either lookup arm.
         sc._save_parts_bin([{
-            "name":     "my_tu_id",
+            "name":     "my_tu",
             "type":     "TU",
             "position": "TU",
             "oh5":      "GGAG",
@@ -7090,7 +7092,7 @@ class TestAssemblyFragmentFromSourceGbTextFallback:
         # Fetch the parts-bin entry as-loaded.
         part_entry = next(
             p for p in sc._load_parts_bin()
-            if p.get("name") == "my_tu_id"
+            if p.get("name") == "my_tu"
         )
         assert "gb_text" not in part_entry or not part_entry.get("gb_text")
         # Drive the fragment extraction at source_level=1 — would have
@@ -8305,11 +8307,15 @@ class TestPersistedAssemblyMetadata:
             self, isolated_library, isolated_parts_bin):
         """If the library already contains an entry whose id matches
         the assembly's safe-id, `_persist_assembly` must append a
-        numeric suffix rather than overwriting the existing entry."""
+        numeric suffix rather than overwriting the existing entry.
+
+        Test data uses `id == name` so the post-2026-05-24 id-name
+        backfill (PIT-36) is a no-op and the existing id stays put
+        for the disambiguation loop to find."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         sc._save_library([{
-            "id": "MyTU", "name": "older",
+            "id": "MyTU", "name": "MyTU",
             "size": 100, "n_feats": 0, "source": "test",
             "added": "2026-01-01", "gb_text": "LOCUS x 100 bp DNA\n//\n",
         }])
@@ -8328,6 +8334,66 @@ class TestPersistedAssemblyMetadata:
         ids = [e.get("id") for e in sc._load_library()]
         assert "MyTU"   in ids
         assert "MyTU_2" in ids
+
+    def test_persist_assembly_always_writes_parts_bin_with_grammar(
+            self, isolated_library, isolated_parts_bin):
+        """Hard rule from PIT-37 (2026-05-24): every modular
+        Constructor save (GB / MoClo / any future grammar tab)
+        writes a parts_bin entry tagged with the active `grammar:
+        gid`. Non-modular tabs (Traditional, Gibson) intentionally
+        skip parts_bin — covered by their respective save tests."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("AAAA" * 50), id="MyTU", name="MyTU")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "alpha1_vec",
+                            "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[{"name": "P", "oh5": "GGAG", "oh3": "CGCT",
+                     "level": 0}],
+            backbone_role="Alpha1",
+        )
+        bin_entries = sc._load_parts_bin()
+        assert len(bin_entries) == 1
+        bin_e = bin_entries[0]
+        assert bin_e["grammar"] == "gb_l0"
+        # Name + level tag the entry so it appears in the right
+        # grammar's palette under the right type/level tab.
+        assert bin_e["name"] == "MyTU"
+        assert bin_e["level"] == 1   # source_level=0 → target_level=1 → TU
+
+    def test_persist_assembly_populates_bin_sequence_body(
+            self, isolated_library, isolated_parts_bin):
+        """L1+ bin entries now carry the released insert body in
+        `bin_entry["sequence"]` (was hardcoded to "" pre-2026-05-24).
+        Mirrors the Load Part convention so MOD/TU bin rows look
+        consistent regardless of origin. When the level-up digest
+        finds no clean release, sequence falls back to "" — that's
+        the bench-fake-plasmid case in this test (no IIS sites)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("AAAA" * 50), id="MyTU", name="MyTU")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=0,
+            entry_vector={"name": "alpha1_vec",
+                            "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[{"name": "P", "oh5": "GGAG", "oh3": "CGCT",
+                     "level": 0}],
+            backbone_role="Alpha1",
+        )
+        bin_e = sc._load_parts_bin()[0]
+        # `sequence` key must exist (even if empty for digest-failure
+        # paths) — the assertion is that the field is no longer
+        # hardcoded to "" at the dict-construction site.
+        assert "sequence" in bin_e
 
     def test_persist_mod_to_next_stores_level_3(
             self, isolated_library, isolated_parts_bin):

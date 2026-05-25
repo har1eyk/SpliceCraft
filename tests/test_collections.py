@@ -24,15 +24,18 @@ class TestCollectionsPersistence:
         assert sc._load_collections() == []
 
     def test_save_load_round_trip(self):
+        # Test data uses `id == sanitize(name)` so the embedded-
+        # plasmid id-name backfill (PIT-36) is a no-op on reload.
         sample = [
             {"name": "yeast", "description": "S. cerevisiae plasmids",
-             "plasmids": [{"id": "P1", "name": "yp1", "size": 100,
+             "plasmids": [{"id": "P1", "name": "P1", "size": 100,
                            "gb_text": "FAKE"}]},
             {"name": "ecoli", "description": "E. coli toolkit",
              "plasmids": []},
         ]
         sc._save_collections(sample)
         sc._collections_cache = None  # force a cold reload from disk
+        sc._collections_backfill_done = False
         out = sc._load_collections()
         assert len(out) == 2
         assert out[0]["name"] == "yeast"
@@ -129,13 +132,15 @@ class TestCollectionsModalFlows:
     async def test_load_replaces_library(self):
         # Library starts with one record; collection holds two different
         # records — Load must end with the library == collection's plasmids.
-        sc._save_library([{"id": "OLD", "name": "old", "size": 1,
+        # Test data uses `id == name` so the post-2026-05-24 id-name
+        # backfill (PIT-36) is a no-op and lookup-by-id stays stable.
+        sc._save_library([{"id": "old", "name": "old", "size": 1,
                            "gb_text": "GB"}])
         sc._save_collections([{
             "name": "newset",
             "plasmids": [
-                {"id": "A", "name": "a", "size": 100, "gb_text": "GB"},
-                {"id": "B", "name": "b", "size": 200, "gb_text": "GB"},
+                {"id": "A", "name": "A", "size": 100, "gb_text": "GB"},
+                {"id": "B", "name": "B", "size": 200, "gb_text": "GB"},
             ],
         }])
         app = sc.PlasmidApp()
@@ -338,7 +343,9 @@ class TestMainCollectionMigration:
 
     def test_ensure_default_creates_main_with_existing_library(self):
         # Library has content, collections.json doesn't exist yet.
-        sc._save_library([{"id": "A", "name": "a", "size": 1, "gb_text": "GB"}])
+        # Test data uses `id == sanitize(name)` so the post-2026-05-24
+        # id-name backfill (PIT-36) is a no-op on the seeded entry.
+        sc._save_library([{"id": "A", "name": "A", "size": 1, "gb_text": "GB"}])
         assert sc._load_collections() == []
         sc._ensure_default_collection()
         colls = sc._load_collections()

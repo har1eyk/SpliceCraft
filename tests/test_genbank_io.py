@@ -292,7 +292,7 @@ class TestFeatLabelFallback:
                        qualifiers={"label": ["many    spaces   here"]})
         assert sc._feat_label(f) == "many spaces here"
 
-    def test_whitespace_only_label_falls_back(self):
+    def test_whitespace_only_label_falls_back_to_gene_qualifier(self):
         from Bio.SeqFeature import SeqFeature, FeatureLocation
         f = SeqFeature(FeatureLocation(0, 10), type="CDS",
                        qualifiers={"label": ["\n\n\t  "],
