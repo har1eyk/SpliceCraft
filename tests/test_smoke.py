@@ -1712,8 +1712,18 @@ class TestApplyRecordInPlaceSemantics:
             # Switch to B — A's stack should be stashed
             app._apply_record(rec_b, clear_undo=True)
             assert app._undo_stack == []
-            assert "pUC19_MINI" in app._stashed_undo_stacks or \
-                   tiny_record.id in app._stashed_undo_stacks
+            # Sweep #33 (2026-05-26): stash key is now
+            # "<record.id>:<12-hex sha256(seq)>" so two records
+            # with the same id but different sequence don't
+            # collide. Match by prefix.
+            assert any(
+                k.startswith(tiny_record.id + ":")
+                for k in app._stashed_undo_stacks
+            ), (
+                f"expected a stash key prefixed with "
+                f"{tiny_record.id!r}; got "
+                f"{list(app._stashed_undo_stacks)!r}"
+            )
             # Switch back to A — A's stack must be restored
             app._apply_record(tiny_record, clear_undo=True)
             assert len(app._undo_stack) == 1
@@ -1743,12 +1753,21 @@ class TestApplyRecordInPlaceSemantics:
                 app._undo_stack.append((f"{pid}_SEQ", 0, rec))
             # Stash capacity is 3. A was swapped out first → evicted.
             # B, C, D survive; E is live.
-            assert "PID_A" not in app._stashed_undo_stacks
-            assert "PID_B" in app._stashed_undo_stacks
-            assert "PID_C" in app._stashed_undo_stacks
-            assert "PID_D" in app._stashed_undo_stacks
-            assert "PID_E" not in app._stashed_undo_stacks
-            assert app._current_undo_key == "PID_E"
+            # Sweep #33 (2026-05-26): stash keys are now
+            # "<id>:<seq-hash>" — match by id prefix.
+            def _stashed_ids() -> set[str]:
+                return {
+                    k.split(":", 1)[0]
+                    for k in app._stashed_undo_stacks
+                }
+            stashed = _stashed_ids()
+            assert "PID_A" not in stashed, stashed
+            assert "PID_B" in stashed, stashed
+            assert "PID_C" in stashed, stashed
+            assert "PID_D" in stashed, stashed
+            assert "PID_E" not in stashed, stashed
+            assert app._current_undo_key is not None
+            assert app._current_undo_key.startswith("PID_E:")
 
     async def test_mark_dirty_after_in_place_update_flips_unsaved(
         self, tiny_record, isolated_library
@@ -6733,6 +6752,333 @@ class TestShiftClickFeatureExtend:
                 f"{modal._members[c_idx]!r}"
             )
 
+    async def test_mark_merge_folds_marked_rows_in_order(
+            self, isolated_library):
+        """Sweep #32: click col-0 (■/□) on rows to mark them, then
+        the Merge button folds all marked rows in `rel_start`
+        order (not click order). Falls back to legacy "selected
+        + next" pair-merge when fewer than 2 marks. Marks clear
+        after a successful merge."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["a"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["b"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(150, 200, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["c"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(200, 250, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["d"],
+                                    "feature_group": ["gid"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            modal.query_one(
+                "#btn-featedit-edit", Button,
+            ).action_press()
+            await pilot.pause(0.05)
+            # Mark rows 0 (a), 1 (b), 2 (c) — three contiguous.
+            modal._toggle_mark(0)
+            modal._toggle_mark(1)
+            modal._toggle_mark(2)
+            assert len(modal._marked_ids) == 3
+            # Merge folds the 3 marked rows in rel_start order.
+            modal._on_merge_rows()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Picks up the post-merge rename prompt — dismiss
+            # it without changing the label.
+            if isinstance(app.screen, sc.GroupNamePromptModal):
+                app.screen.dismiss(None)
+                await pilot.pause(0.05)
+            assert len(modal._members) == 2, (
+                f"got {[m['label'] for m in modal._members]!r}"
+            )
+            # First member spans a→c (rel 0..150 relative to
+            # original a start at bp 50 → group anchor).
+            assert modal._members[0]["label"] == "a"
+            assert modal._members[0]["rel_start"] == 0
+            assert modal._members[0]["rel_end"] == 150
+            assert modal._members[1]["label"] == "d"
+            # Marks cleared after merge.
+            assert modal._marked_ids == set()
+
+    async def test_mark_merge_falls_back_to_pair_when_no_marks(
+            self, isolated_library):
+        """Sweep #32: with zero marks set, Merge behaves like
+        before — folds the selected row with the row below."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["a"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["b"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(150, 200, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["c"],
+                                    "feature_group": ["gid"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            modal.query_one(
+                "#btn-featedit-edit", Button,
+            ).action_press()
+            await pilot.pause(0.05)
+            assert modal._marked_ids == set()
+            modal._selected_idx = 0
+            modal._on_merge_rows()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            if isinstance(app.screen, sc.GroupNamePromptModal):
+                app.screen.dismiss(None)
+                await pilot.pause(0.05)
+            # a+b merged, c untouched.
+            assert len(modal._members) == 2
+            assert modal._members[0]["rel_end"] == 100
+
+    async def test_prune_marks_drops_stale_ids_on_remove(
+            self, isolated_library):
+        """Sweep #32: marks live on `id(row_dict)`. When a row
+        is removed, its dict's id can be recycled by a future
+        allocation — `_prune_marks` clears stale ids on every
+        refresh so a re-used id from a future row can't silently
+        reactivate an old mark."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["a"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["b"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(150, 200, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["c"],
+                                    "feature_group": ["gid"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            modal.query_one(
+                "#btn-featedit-edit", Button,
+            ).action_press()
+            await pilot.pause(0.05)
+            modal._toggle_mark(1)
+            assert len(modal._marked_ids) == 1
+            modal._selected_idx = 1
+            modal._on_remove_row()
+            await pilot.pause(0.05)
+            # The removed row's id is gone; mark count should
+            # drop to 0 via `_prune_marks`.
+            assert modal._marked_ids == set()
+
+    async def test_plasmidmap_bp_to_angle_handles_zero_length(
+            self, isolated_library):
+        """Sweep #33 adversarial audit: `_bp_to_angle` used to
+        do `% self._total` + `/ self._total` unguarded.
+        On a 0-bp record the modulo + division raised
+        ZeroDivisionError mid-render. Fix returns 0.0 as a
+        neutral placeholder when total <= 0; the caller's
+        bp-walk short-circuits since `bp < 0` is never true."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq(""), id="EMPTY", name="EMPTY",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # Should NOT raise — pre-fix this would
+            # ZeroDivisionError.
+            angle = pm._bp_to_angle(0)
+            assert isinstance(angle, float)
+            # Map render should also not crash.
+            pm.render()
+
+    async def test_crash_recovery_path_uses_wide_hash(
+            self, isolated_library):
+        """Sweep #33: crash-recovery file suffix was 6 hex
+        (24-bit space → ~50% birthday collision at ~4k
+        records). Bumped to 12 hex (48-bit). Verify the path
+        actually carries the wider suffix."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="X1", name="X1",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            path = app._autosave_path(rec)
+            assert path is not None
+            # Suffix shape: <safeid>-<12 hex>.gb
+            stem = path.stem  # drops .gb
+            suffix = stem.rsplit("-", 1)[-1]
+            assert len(suffix) == 12, (
+                f"crash-recovery hash should be 12 hex chars; "
+                f"got {suffix!r} (len={len(suffix)})"
+            )
+
+    async def test_undo_stash_key_disambiguates_same_id(
+            self, isolated_library):
+        """Sweep #33: pre-fix the stash key was record.id alone,
+        so two records with the same LOCUS name silently
+        overwrote each other's undo history when the user
+        toggled between them. Fix appends a 12-hex sha256 of
+        the sequence so distinct records can't collide."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec_a = SeqRecord(
+            Seq("ATGC" * 25), id="SAME", name="SAME",
+            annotations={"molecule_type": "DNA",
+                         "topology": "circular"},
+        )
+        rec_b = SeqRecord(
+            Seq("GGGG" * 25), id="SAME", name="SAME",
+            annotations={"molecule_type": "DNA",
+                         "topology": "circular"},
+        )
+        app = _build_app(rec_a, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Force an undo entry, then capture the stash key
+            # by re-applying the record (which triggers the
+            # stash → load path).
+            app._apply_record(rec_a, clear_undo=True)
+            await pilot.pause(0.05)
+            key_a = app._current_undo_key
+            assert key_a is not None
+            assert ":" in key_a, (
+                f"key should be 'id:hash' shape; got {key_a!r}"
+            )
+            # Reload as rec_b (same id, different seq) — must
+            # yield a different stash key.
+            app._apply_record(rec_b, clear_undo=True)
+            await pilot.pause(0.05)
+            key_b = app._current_undo_key
+            assert key_b != key_a, (
+                f"distinct records with same id must NOT share "
+                f"stash key; both got {key_a!r}"
+            )
+
+    async def test_markup_safe_color_strips_rich_brackets(
+            self, isolated_library):
+        """Sweep #34: a malicious `.gb` file with a hand-crafted
+        `color="[red]X[/red]"` qualifier used to round-trip
+        through `_markup_safe_color` unchanged, then break out
+        of `f"[bold {color}]..."` interpolation and corrupt
+        the rendered label. Fix drops any colour value
+        containing `[` or `]` and falls back to the palette."""
+        # Direct unit test on the helper.
+        out = sc._markup_safe_color("[red]EXPLOIT[/red]")
+        assert "[" not in out and "]" not in out, (
+            f"markup brackets leaked through: {out!r}"
+        )
+        # Normal values pass through.
+        assert sc._markup_safe_color("#FF6347") == "#FF6347"
+        assert sc._markup_safe_color("red") == "red"
+
+    async def test_detect_selection_marker_word_boundary(
+            self, isolated_library):
+        """Sweep #34: pre-fix `_detect_selection_marker` did
+        a bare substring match — a CDS labelled `category` or
+        `blast` would falsely return Chloramphenicol /
+        Ampicillin (because `cat` and `bla` are
+        substrings). Fix tokenises labels on non-alnum
+        boundaries so the match needs an isolated word."""
+        # `category` should NOT match `cat` keyword.
+        gb_no_match = (
+            "LOCUS       X 100 bp DNA circular UNK 26-MAY-2026\n"
+            "FEATURES             Location/Qualifiers\n"
+            '     CDS             1..99\n'
+            '                     /label="category"\n'
+            'ORIGIN\n'
+            '        1 ' + ('a' * 60) + '\n'
+            '       61 ' + ('a' * 40) + '\n'
+            '//\n'
+        )
+        assert sc._detect_selection_marker(gb_no_match) is None, (
+            "'category' (substring) should NOT match cat keyword"
+        )
+        # `cat` as a standalone token SHOULD match.
+        gb_match = (
+            "LOCUS       X 100 bp DNA circular UNK 26-MAY-2026\n"
+            "FEATURES             Location/Qualifiers\n"
+            '     CDS             1..99\n'
+            '                     /label="cat"\n'
+            'ORIGIN\n'
+            '        1 ' + ('a' * 60) + '\n'
+            '       61 ' + ('a' * 40) + '\n'
+            '//\n'
+        )
+        assert sc._detect_selection_marker(gb_match) == "Chloramphenicol"
+        # `kanR-cat-tet` (compound label) — still matches cat.
+        gb_compound = (
+            "LOCUS       X 100 bp DNA circular UNK 26-MAY-2026\n"
+            "FEATURES             Location/Qualifiers\n"
+            '     CDS             1..99\n'
+            '                     /label="kanR-cat-tet"\n'
+            'ORIGIN\n'
+            '        1 ' + ('a' * 60) + '\n'
+            '       61 ' + ('a' * 40) + '\n'
+            '//\n'
+        )
+        assert sc._detect_selection_marker(gb_compound) in (
+            "Kanamycin", "Chloramphenicol", "Tetracycline",
+        ), "compound label should match one of the keywords"
+
     async def test_apply_group_edit_skips_restriction_rescan(
             self, isolated_library):
         """Sweep #31 perf-fix: `_apply_group_edit` used to clear
@@ -7342,6 +7688,164 @@ class TestShiftClickFeatureExtend:
             assert modal.query_one("#btn-ged-entry-clear", Button).disabled
             # Initially no vector assigned — modal state reflects that.
             assert modal._entry_vector is None
+
+    async def test_grammar_editor_rejects_bad_overhang_length(
+            self, isolated_library):
+        """Sweep #33 adversarial audit: pre-fix `_gather()`
+        validated overhang BASES (IUPAC allowed) but NEVER
+        checked overhang LENGTH. A user could save a custom
+        grammar with empty / 1-bp / 3-bp / 5-bp overhangs;
+        downstream assembly silently produced wrong results
+        because the junction validator compared empty strings
+        as a match. Fix tightens to exactly-4-bp ACGT-only."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="x", name="x",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Open the editor in "create new" mode so the
+            # form is editable.
+            app.push_screen(sc.GrammarEditorModal(""))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.GrammarEditorModal)
+            from textual.widgets import Input, TextArea, Static
+            modal.query_one(
+                "#ged-name", Input,
+            ).value = "test-grammar"
+            modal.query_one(
+                "#ged-enzyme", Input,
+            ).value = "BsaI"
+            modal.query_one(
+                "#ged-site", Input,
+            ).value = "GGTCTC"
+            modal.query_one(
+                "#ged-spacer", Input,
+            ).value = "N"
+            modal.query_one(
+                "#ged-pad", Input,
+            ).value = "GG"
+            # Three rejection cases: empty, 3-bp, 5-bp.
+            for bad_overhang, expected_in_status in (
+                ("",      "must be exactly 4 bp"),
+                ("AAT",   "must be exactly 4 bp"),
+                ("AATGG", "must be exactly 4 bp"),
+                ("NATG",  "must use ACGT only"),
+            ):
+                modal.query_one(
+                    "#ged-positions", TextArea,
+                ).text = (
+                    f"Promoter | promoter | GGAG | {bad_overhang}"
+                )
+                result = modal._gather()
+                assert result is None, (
+                    f"overhang {bad_overhang!r} should have been "
+                    f"refused but `_gather` returned {result!r}"
+                )
+                status_text = str(modal.query_one(
+                    "#ged-status", Static,
+                ).render())
+                assert expected_in_status in status_text, (
+                    f"status should mention {expected_in_status!r}; "
+                    f"got {status_text!r}"
+                )
+
+    async def test_grammar_editor_rejects_overhang_collision(
+            self, isolated_library):
+        """Sweep #33: two positions sharing the same 5'
+        overhang silently produced ambiguous chains. Fix adds
+        collision detection across the position table."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="x", name="x",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.GrammarEditorModal(""))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            from textual.widgets import Input, TextArea, Static
+            modal.query_one(
+                "#ged-name", Input,
+            ).value = "dup-overhang"
+            modal.query_one(
+                "#ged-enzyme", Input,
+            ).value = "BsaI"
+            modal.query_one(
+                "#ged-site", Input,
+            ).value = "GGTCTC"
+            modal.query_one(
+                "#ged-spacer", Input,
+            ).value = "N"
+            modal.query_one(
+                "#ged-pad", Input,
+            ).value = "GG"
+            # Pos 1 and Pos 2 both have 5' overhang "AATG".
+            modal.query_one(
+                "#ged-positions", TextArea,
+            ).text = (
+                "Promoter | promoter | AATG | GGAG\n"
+                "CDS      | CDS      | AATG | GCTT"
+            )
+            result = modal._gather()
+            assert result is None
+            status_text = str(modal.query_one(
+                "#ged-status", Static,
+            ).render())
+            assert "reuses 5' overhang" in status_text
+
+    async def test_grammar_editor_rejects_self_cycle(
+            self, isolated_library):
+        """Sweep #33: a position whose 5' overhang equals its
+        3' overhang self-cycles in the assembly digraph. Fix
+        refuses these at validation time."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="x", name="x",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.GrammarEditorModal(""))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            from textual.widgets import Input, TextArea, Static
+            modal.query_one(
+                "#ged-name", Input,
+            ).value = "self-cycle"
+            modal.query_one(
+                "#ged-enzyme", Input,
+            ).value = "BsaI"
+            modal.query_one(
+                "#ged-site", Input,
+            ).value = "GGTCTC"
+            modal.query_one(
+                "#ged-spacer", Input,
+            ).value = "N"
+            modal.query_one(
+                "#ged-pad", Input,
+            ).value = "GG"
+            modal.query_one(
+                "#ged-positions", TextArea,
+            ).text = "CDS | CDS | AATG | AATG"
+            result = modal._gather()
+            assert result is None
+            status_text = str(modal.query_one(
+                "#ged-status", Static,
+            ).render())
+            assert "identical 5' and 3' overhangs" in status_text
 
     async def test_grammar_editor_persists_entry_vector_pick(
             self, isolated_library):

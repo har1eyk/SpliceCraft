@@ -209,6 +209,92 @@ def test_linear_record_not_detected():
     assert result is None
 
 
+def test_wrap_feature_backbone_marker_still_detected():
+    """Sweep #35 (2026-05-26): a backbone marker that spans the origin
+    (CompoundLocation: `join(tail..end, 0..head)`) used to silently
+    flatten to `(0, total)` because `_detect_entry_vector_role`
+    called `int(loc.start)` / `int(loc.end)` directly. BioPython
+    returns `min(parts.start)=0` and `max(parts.end)=total` for a
+    two-part wrap, so the marker appeared to cover the whole
+    plasmid → `_fragment_has_backbone_marker` fired on BOTH digest
+    fragments → `sum(marked) != 1` ambiguous → detection skipped.
+    Post-fix the marker routes through `_feat_bounds`, which encodes
+    a wrap as `end < start` and slots correctly into one fragment.
+    """
+    from Bio.SeqFeature import (SeqFeature, FeatureLocation,
+                                  CompoundLocation)
+    from Bio.SeqRecord import SeqRecord
+    from Bio.Seq import Seq
+    gb_l0 = sc._all_grammars()["gb_l0"]
+    rec = _build_acceptor(
+        oh5_inner="GGAG", oh3_inner="CGCT",
+        oh5_outer="GGAG", oh3_outer="GTCA",
+        inner_enzyme_site="GGTCTC",
+        outer_enzyme_site="CGTCTC",
+    )
+    # Sanity baseline: the linear (non-wrap) version classifies cleanly.
+    baseline = sc._detect_entry_vector_role(rec, gb_l0)
+    assert baseline == ("Alpha1", "strict"), (
+        f"Sanity check failed before wrap: got {baseline}"
+    )
+    # Rotate the sequence so the backbone's rep_origin straddles the
+    # new origin (position 0). The biology is identical (circular
+    # plasmids are rotation-invariant) but the rep_origin now lives
+    # in a wrap-encoded CompoundLocation. Pick the rotation point
+    # inside the rep_origin so the feature genuinely crosses 0.
+    orig = next(
+        (f for f in rec.features if f.type == "rep_origin"),
+        None,
+    )
+    assert orig is not None, "_build_acceptor must place a rep_origin"
+    orig_start = int(orig.location.start)
+    orig_end   = int(orig.location.end)
+    orig_mid   = (orig_start + orig_end) // 2
+    total      = len(rec.seq)
+    rot        = orig_mid
+    rotated_seq = str(rec.seq)[rot:] + str(rec.seq)[:rot]
+    new_rec = SeqRecord(
+        Seq(rotated_seq), id=rec.id, name=rec.name,
+        annotations=dict(rec.annotations),
+    )
+    # Shift each feature by `-rot`; features whose original interval
+    # crossed `rot` become wrap CompoundLocations.
+    for f in rec.features:
+        fs, fe = int(f.location.start), int(f.location.end)
+        new_fs = (fs - rot) % total
+        new_fe = (fe - rot) % total
+        if new_fs < new_fe:
+            new_loc = FeatureLocation(new_fs, new_fe,
+                                       strand=f.location.strand)
+        else:
+            # Wrap: tail [new_fs, total) + head [0, new_fe).
+            new_loc = CompoundLocation([
+                FeatureLocation(new_fs, total,
+                                 strand=f.location.strand),
+                FeatureLocation(0, new_fe,
+                                 strand=f.location.strand),
+            ])
+        new_rec.features.append(SeqFeature(
+            new_loc, type=f.type,
+            qualifiers=dict(f.qualifiers),
+        ))
+    # Confirm the rep_origin is now a wrap (CompoundLocation) — if
+    # it isn't, the test isn't exercising the bug we care about.
+    new_rep = next(
+        (f for f in new_rec.features if f.type == "rep_origin"),
+        None,
+    )
+    assert new_rep is not None
+    assert isinstance(new_rep.location, CompoundLocation), (
+        "Test rotation did not produce a wrap-spanning rep_origin"
+    )
+    result = sc._detect_entry_vector_role(new_rec, gb_l0)
+    assert result == ("Alpha1", "strict"), (
+        f"Wrap-spanning backbone marker must still resolve to "
+        f"Alpha1/strict; got {result}"
+    )
+
+
 def test_record_without_backbone_marker_rejected():
     """Sacred — backbone-marker exclusion is how the stuffer is
     identified. Without a marker, the detector can't safely pick

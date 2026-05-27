@@ -356,6 +356,102 @@ class TestDeleteUpdateFeatureStaleLoadGuard:
         assert "canvas reloaded" in payload["error"]
 
 
+class TestDeleteUpdateFeatureTOCTOUSignature:
+    """Sweep #32 (2026-05-26) adversarial audit: delete/update
+    feature handlers used to do a bounds check + access inside
+    `_apply` on the UI thread, but the agent's `idx` was captured
+    on the worker thread. A concurrent `_apply` from another
+    request could insert a feature, shifting indices, before
+    this request's `_apply` ran — the bounds check then passed
+    against the post-insert state but `pm._feats[idx]` referred
+    to a DIFFERENT feature than the agent saw. Silent
+    cross-feature corruption. Fix captures a signature
+    (start/end/type/label) in a pre-flight UI-thread call and
+    re-verifies inside `_apply`; mismatch → 409 Conflict."""
+
+    def _make_racy_app(self, tiny_app):
+        """Wrap `call_from_thread` so the SECOND call (the
+        `_apply` closure, after the pre-flight signature
+        capture) sees a record with a NEW feature injected at
+        idx 0 — simulating a concurrent agent request that
+        inserted a row mid-handler."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        orig_call = tiny_app.call_from_thread
+        call_n = [0]
+        shadow = SeqFeature(
+            FeatureLocation(0, 1, strand=1),
+            type="shadow",
+            qualifiers={"label": ["injected"]},
+        )
+        def racy_call(fn, *args, **kwargs):
+            call_n[0] += 1
+            if call_n[0] == 2:
+                # Inject shadow BEFORE the queued `_apply` runs.
+                # The mock's `query_one("#plasmid-map", ...)`
+                # re-reads `_feats` from the record on every
+                # call, so this shift is observable in `_apply`.
+                tiny_app._current_record.features = (
+                    [shadow]
+                    + list(tiny_app._current_record.features)
+                )
+            return orig_call(fn, *args, **kwargs)
+        tiny_app.call_from_thread = racy_call
+        return tiny_app
+
+    def test_delete_feature_detects_signature_drift(self, tiny_app):
+        app = self._make_racy_app(tiny_app)
+        result = sc._h_delete_feature(app, {"idx": 0})
+        assert isinstance(result, tuple), result
+        payload, status = result
+        assert status == 409, (status, payload)
+        assert "changed under us" in payload["error"], payload
+
+    def test_update_feature_detects_signature_drift(self, tiny_app):
+        app = self._make_racy_app(tiny_app)
+        result = sc._h_update_feature(
+            app, {"idx": 0, "label": "should-not-apply"},
+        )
+        assert isinstance(result, tuple), result
+        payload, status = result
+        assert status == 409
+        assert "changed under us" in payload["error"]
+
+
+class TestReplaceSequenceSizeCap:
+    """Sweep #32 adversarial audit: `_h_replace_sequence` used
+    to be capped only on the input `bases` field (1 MB via
+    `_sanitize_bases`). A 100 MB pre-loaded record could be
+    extended by ~1 MB on every call, growing unbounded. Result
+    sequence cap (50 MB) blocks the bloat path."""
+
+    def test_replace_refuses_when_result_too_large(self, tiny_app):
+        # Build a record near the 50 MB cap. The mock app's
+        # `_seq_len` returns `len(rec.seq)`; rec.seq is a Bio
+        # Seq. Patch it to look 50 MB without allocating.
+        from unittest.mock import MagicMock
+        original_seq = tiny_app._current_record.seq
+        big_n = 50 * 1024 * 1024
+        tiny_app._current_record = MagicMock(
+            seq=MagicMock(__len__=lambda self: big_n),
+        )
+        # Asking to append 1 KB at the end → final = 50 MB + 1 KB
+        result = sc._h_replace_sequence(tiny_app, {
+            "start": big_n,
+            "end":   big_n,
+            "bases": "A" * 1024,
+            "force": True,
+        })
+        # Restore for the rest of the test suite.
+        tiny_app._current_record.seq = original_seq
+        # Expect 413 Payload Too Large with the cap details.
+        assert isinstance(result, tuple), result
+        payload, status = result
+        assert status == 413, (status, payload)
+        assert "result sequence too large" in payload["error"]
+        assert payload["limit_bp"] == 50 * 1024 * 1024
+        assert payload["final_bp"] > 50 * 1024 * 1024
+
+
 class TestSaveHandler:
     def test_refuses_when_no_record(self):
         app = MockApp(record=None)

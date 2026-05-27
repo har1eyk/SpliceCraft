@@ -234,6 +234,70 @@ class TestPickerDeleteEdges:
             # Nothing got deleted.
             assert {p["name"] for p in projs} == {"A", "B"}
 
+    async def test_do_delete_holds_cache_lock_across_rmw(
+            self, monkeypatch,
+    ):
+        """Sweep #35 (2026-05-26): the full read→save→promote→mirror
+        sequence in `_do_delete` runs under `_cache_lock`. Pre-fix,
+        each helper acquired the lock individually and released
+        between steps — a concurrent agent endpoint adding a new
+        project between our load and save would have its addition
+        silently overwritten by the `remaining` list computed pre-add.
+
+        Verification strategy: monkeypatch `_save_experiment_projects`
+        so that DURING the save call, a sibling thread tries
+        non-blocking acquire of `_cache_lock`. If the outer
+        `with _cache_lock:` is in place, the sibling thread can't
+        get the lock (it's held by `_do_delete`'s thread). If the
+        outer lock isn't held, the sibling acquires immediately —
+        which would be the bug signature.
+        """
+        import threading as _threading
+
+        sc._save_experiment_projects([
+            {"name": "A", "description": "", "experiments": [], "saved": ""},
+            {"name": "B", "description": "", "experiments": [], "saved": ""},
+        ])
+        sibling_could_acquire: list[bool] = []
+        orig_save = sc._save_experiment_projects
+
+        def _detect(entries):
+            # Probe from a separate thread — non-blocking acquire
+            # tells us whether `_cache_lock` is currently held by
+            # the caller (the `_do_delete` thread).
+            def _probe():
+                got = sc._cache_lock.acquire(blocking=False)
+                sibling_could_acquire.append(got)
+                if got:
+                    sc._cache_lock.release()
+            t = _threading.Thread(target=_probe)
+            t.start()
+            t.join(timeout=2.0)
+            return orig_save(entries)
+
+        monkeypatch.setattr(sc, "_save_experiment_projects", _detect)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            modal = sc.ExperimentProjectsPickerModal()
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause()
+            modal._do_delete("A")
+            await pilot.pause()
+        assert sibling_could_acquire, (
+            "Detector never fired — `_save_experiment_projects` was "
+            "not called from `_do_delete`."
+        )
+        # Sibling MUST NOT have been able to acquire — the outer
+        # `with _cache_lock:` in `_do_delete` should keep it locked.
+        assert not any(sibling_could_acquire), (
+            "Sibling thread acquired `_cache_lock` during the "
+            "_do_delete RMW — the outer lock is missing or "
+            "released too early."
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Mirror sync (sacred contract: every `_save_experiments` updates active)

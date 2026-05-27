@@ -3745,6 +3745,108 @@ class TestMatchSamplesToLibrary:
             assert "name_score" in a
 
 
+class TestLibraryKmerCacheEviction:
+    """Sweep #35 (2026-05-26): the library-side k-mer cache is bounded
+    by `_LIBRARY_KMER_CACHE_MAX` with FIFO eviction. Pre-fix the cache
+    grew without bound between `_save_library` invalidations — a user
+    running many bulk-aligns on a 200+ entry library across long
+    sessions could accumulate hundreds of MB of resident k-mer sets.
+    Sibling caches (`_RESTR_SCAN_CACHE`, `_ENZYME_CUTS_CACHE`,
+    `_BLAST_DB_CACHE`, `_GB_PARSE_CACHE`) all have explicit caps; the
+    library kmer cache was the outlier.
+    """
+
+    def test_cache_size_stays_at_or_below_cap(self, tmp_path,
+                                                monkeypatch):
+        import zipfile
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Tiny cap so we don't need a huge library to trigger eviction.
+        monkeypatch.setattr(sc, "_LIBRARY_KMER_CACHE_MAX", 2)
+        # Start with a clean cache so prior tests don't pre-fill us
+        # over the cap.
+        sc._invalidate_library_kmer_cache()
+        # Build five library entries with distinct sequences so each
+        # one hashes to a unique key. Random non-repetitive bodies of
+        # at least 1.5 kb so the canonical k-mer set sits above
+        # `_MIN_KMER_SET_FOR_STRONG_MATCH` (INV-73) — otherwise the
+        # matcher takes the name-only path and never touches the
+        # kmer cache.
+        import random as _random
+        bodies = []
+        for seed in (101, 202, 303, 404, 505):
+            rng = _random.Random(seed)
+            bodies.append("".join(
+                rng.choice("ACGT") for _ in range(1500)
+            ))
+        library = []
+        for i, body in enumerate(bodies):
+            rec = SeqRecord(
+                Seq(body), id=f"LIB_{i}", name=f"LIB_{i}",
+                annotations={"molecule_type": "DNA",
+                              "topology": "circular"},
+            )
+            library.append({
+                "id": f"LIB_{i}",
+                "name": f"LIB_{i}",
+                "gb_text": sc._record_to_gb_text(rec),
+            })
+        # Sample shares the first library entry's sequence so the
+        # name match is weak (no shared substring) and the matcher
+        # falls through to sequence — computing kmer sets for ALL
+        # library entries en route.
+        gbk = tmp_path / "sample.gbk"
+        SeqIO.write(
+            SeqRecord(
+                Seq(bodies[0]), id="SAMPLE", name="SAMPLE",
+                annotations={"molecule_type": "DNA",
+                              "topology": "circular"},
+            ), gbk, "genbank",
+        )
+        zp = tmp_path / "ko_results.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.write(gbk, "KO_genbank-files/KO_1_sample.gbk")
+        sc._match_samples_to_library(
+            [{"name": "KO_1_sample",
+              "gbk":  "KO_genbank-files/KO_1_sample.gbk"}],
+            library,
+            sequence_fallback=True,
+            extract_gbk_fn=sc._extract_gbk_member,
+            zip_path=zp,
+        )
+        # Five entries computed, cap=2 → exactly the two most-recent
+        # insertions survive. Library iteration order matches the
+        # input list, so the survivors are LIB_3 + LIB_4 (the
+        # eviction pops the oldest at each over-cap insert).
+        assert len(sc._LIBRARY_KMER_CACHE) <= 2, (
+            f"Cache should be bounded by {sc._LIBRARY_KMER_CACHE_MAX}; "
+            f"got {len(sc._LIBRARY_KMER_CACHE)} entries"
+        )
+        # Most-recent two entry IDs survive (FIFO).
+        survivor_ids = {eid for (eid, _gb_hash)
+                         in sc._LIBRARY_KMER_CACHE}
+        assert "LIB_4" in survivor_ids, survivor_ids
+        assert "LIB_3" in survivor_ids, survivor_ids
+
+    def test_cache_hit_does_not_reset_eviction_order(self, monkeypatch):
+        """FIFO eviction is insertion-order, not access-order. A cache
+        hit (re-reading an already-cached entry) MUST NOT bump it to
+        the front, otherwise frequent reads of the oldest entry keep
+        it permanently alive and starve newer entries."""
+        monkeypatch.setattr(sc, "_LIBRARY_KMER_CACHE_MAX", 2)
+        sc._invalidate_library_kmer_cache()
+        # Manually populate so we control the insertion order without
+        # going through the full matcher pipeline.
+        sc._LIBRARY_KMER_CACHE[("OLD", "h0")] = {"AAAA", "ACGT"}
+        sc._LIBRARY_KMER_CACHE[("NEW", "h1")] = {"GGGG", "TTTT"}
+        # Read the OLD entry — should NOT bump it past NEW.
+        assert sc._LIBRARY_KMER_CACHE.get(("OLD", "h0")) == {"AAAA", "ACGT"}
+        # Insertion order is still [OLD, NEW] — verify by checking
+        # `next(iter(...))` returns OLD (the candidate for eviction).
+        assert next(iter(sc._LIBRARY_KMER_CACHE)) == ("OLD", "h0")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Bulk-align modal + Sequencing-status column wiring
 # ═══════════════════════════════════════════════════════════════════════════════

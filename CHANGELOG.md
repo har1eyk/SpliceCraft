@@ -14,6 +14,12 @@
 
 ---
 
+## [0.9.29] — 2026-05-27
+
+_(auto-generated changelog — no notable commits found since the previous release)_
+
+---
+
 ## [0.9.28] — 2026-05-26
 
 _(auto-generated changelog — no notable commits found since the previous release)_
@@ -26,7 +32,53 @@ _(auto-generated changelog — no notable commits found since the previous relea
 
 ---
 
-## [unreleased] — sweeps #28 + #29 + #30 + #31
+## [unreleased] — sweeps #28 + #29 + #30 + #31 + #32 + #33 + #34 + #35
+
+### Sweep #35: adversarial audit findings — wrap-feature classifier, k-mer cache cap, delete-RMW lock + 5 hygiene fixes
+
+#### Bug fixes
+
+- **Auto-detect now recognises entry vectors whose backbone marker (rep_origin, KanR, AmpR, etc.) spans the origin.** Previously a wrap-spanning marker (encoded as a `CompoundLocation` of two parts) silently flattened to "covers the whole plasmid" inside `_detect_entry_vector_role` because BioPython returns `min(parts.start)=0` and `max(parts.end)=total` when you call `int(loc.start)` / `int(loc.end)` directly. Both fragments of any 2-cut digest tested positive for the marker → ambiguous → detection skipped. Now feature bounds route through `_feat_bounds` (sacred invariant #9, already wrap-aware for `_rebuild_record_with_edit`), so the marker slots into exactly one fragment and the classifier reaches the right answer. Symptom: rotating an acceptor plasmid in a 3rd-party editor before importing used to randomly break α/Ω auto-bind; now rotation is invariant the way it should be.
+- **Bulk-align no longer accumulates hundreds of MB of resident k-mer sets on a long-running session.** The library-side k-mer cache (`_LIBRARY_KMER_CACHE`, keyed by `(entry_id, gb_hash)`) was invalidated on every `_save_library` but had no size cap between saves. A user running 5+ bulk-aligns on a 200-entry library without editing the library accumulated ~200 MB of resident k-mer sets per run — every other sibling cache (`_RESTR_SCAN_CACHE`, `_ENZYME_CUTS_CACHE`, `_BLAST_DB_CACHE`, `_GB_PARSE_CACHE`) has an explicit LRU cap; this one was the outlier. Now capped at 1024 entries with FIFO eviction (oldest insertion wins). Cache hits don't bump position so a frequent re-read of an old entry can't keep it permanently alive at the cost of newer entries.
+- **Deleting an experiment project is now atomic against a concurrent agent endpoint that adds a project.** The four-step `_do_delete` sequence (load → save remaining → flip active pointer → mirror experiments) used to take `_cache_lock` inside each individual helper but drop it between steps. An agent endpoint `/create-experiment-project` firing between the load and save would have its new project silently overwritten by the `remaining` list (which was computed pre-add). Now the entire RMW runs under one outer `with _cache_lock:` so the sequence is serialized — `_cache_lock` is an RLock so the inner helpers re-enter freely. Bounded blast radius (single-user app + file lock keeps cross-process out), but agent + UI in-process races were real.
+
+#### Hardening
+
+- **Pre-update snapshot manifest now writes atomically.** The `pre_update_backups/<id>/manifest.json` file that gates snapshot validity at restore time was being written via bare `Path.write_text()`. The staging-dir + atomic-rename gate (`os.replace`) protected the visible snapshot from a truncated manifest in practice, but the layout drifted from the rest of the four-layer data-safety net — every other on-disk artifact in the app routes through `_atomic_write_text` or `_safe_save_json`. Now consistent across the board.
+- **Shrink guard spills raw bytes when the prior file isn't JSON-extractable.** If `<file>.json` is valid JSON but the schema is mangled (hand-edited file, future schema we don't recognise yet, corrupted envelope) the shrink guard used to silently skip — `existing_count` stayed at 0 → no warning fired → no spill → the user lost track of what was in the prior file beyond the `.bak.<ts>` rotation. Now a parseable-but-not-extractable prior file (or genuinely invalid JSON) drops a raw byte-level copy into `lost_entries/<file>-raw-<ts>.json` so forensic recovery has something to `cat` / `grep` even if the timestamped rotation has been pruned.
+- **Plasmidsaurus zip handle stays closed on any future-maintainer additions.** The dict/tuple setup between `zipfile.ZipFile(...)` and the existing `try/finally` block was exception-free in practice but sat in an unguarded window — wiring in a per-zip lookup that could raise would have leaked the handle until GC ran. Setup moved inside the try so the closure guarantee is tight regardless of future changes.
+- **Agent `/list-primers` rejects non-integer `limit` / `offset` and clamps to `[0, 10_000]` at the boundary.** Python list slicing already tolerated out-of-range slice indices, so pre-fix `int(1e308)` didn't actually DoS — but it's tidier to validate at the JSON parse boundary than rely on slice clamping for safety. Booleans now filtered out explicitly (Python's `bool` is a subclass of `int`).
+- **Parts bin `markers_redetected` flag now writes atomically.** A torn flag file from a crashed write would otherwise pass the "exists" check at next launch (suppressing the idempotent re-detection) while containing garbage that confuses diagnostic tools.
+- **5 new regression tests:** wrap-spanning rep_origin must still classify (`test_wrap_feature_backbone_marker_still_detected`), k-mer cache stays at or below cap after a 5-entry sequence-fallback match (`test_cache_size_stays_at_or_below_cap`), cache hit doesn't reset eviction order (`test_cache_hit_does_not_reset_eviction_order`), `_do_delete` holds `_cache_lock` for the full RMW so a sibling thread probing non-blocking acquire can never succeed mid-call (`test_do_delete_holds_cache_lock_across_rmw`).
+
+### Sweep #34: zero-length vs full-circle feature spans + selection-marker word boundaries + Rich-markup color sanitiser
+
+#### Bug fixes
+
+- **A hand-edited GenBank file with a zero-length feature (start == end) no longer paints a full-circle arc over the backbone.** The arc-span formula `(end_a - start_a) % TWO_PI or TWO_PI` mapped both 0-bp features AND legitimate full-circle features (start=0, end=total) to a 2π sweep — so a malformed CDS with `1..1` rendered as a backbone-spanning band, hiding everything else underneath it. Now disambiguated: a 0-bp feature gets a minimum-visible tick (~1 step of the circle) so you can still see + click it; a genuine full-circle feature still gets the full 2π. Applies to both restriction-site overlays and feature lanes.
+- **Selection-marker detection no longer false-positives on substring collisions.** A CDS labelled `"category"` used to match the `"cat"` keyword and silently report Chloramphenicol as the marker — same false-positive vector with `"bla"` inside `"blast"` and `"smr"` inside `"smrt-seq"`. Detection now tokenises on non-alphanumeric separators so the match needs an isolated word; real labels (`cat`, `bla`, `kanR-cat-tet`) still resolve cleanly.
+
+#### Hardening
+
+- **Rich-markup injection via a hand-crafted color qualifier is now blocked.** A `.gb` file with `color="[red]X[/red]"` used to round-trip through the color helper unchanged and break out of the `f"[bold {color}]..."` interpolation, corrupting the rendered label (or whatever else followed in the markup). Brackets in a color value now drop the value entirely — the palette default fills in.
+
+### Sweep #33: empty-record canvas guard
+
+#### Bug fixes
+
+- **Loading an empty record (NCBI returned a placeholder, a `.gb` import with no sequence, an aggressive in-modal delete-all) no longer crashes the plasmid map.** `_bp_to_angle(bp)` did `2π × (bp - origin) % total / total` without checking `total > 0` — an empty record produced `ZeroDivisionError` and `nan` propagated through to `math.cos` / `math.sin`, leaving the backbone unrendered and ticks at invalid coords. Now returns 0.0 (top of circle) as a neutral placeholder; the caller's draw loop already short-circuits on `total == 0` so the placeholder never actually paints anything visible.
+
+### Sweep #32: save-failure surfacing + worker watchdog + dangling-collection toast
+
+#### Bug fixes
+
+- **Save failures now show a clear save-failed dialog instead of silently losing the rotating backup generation.** When the timestamped `.bak.<timestamp>` rotation couldn't be written (disk full, permission denied, read-only mount), `_safe_save_json` used to log a warning + continue — so the new data overwrote the previous-good file without the multi-generation rollback being in place. Now an OSError on rotation aborts the save BEFORE the new data lands, with the OS-level cause surfaced to the user via the standard save-failed flow. The legacy single-generation `.bak` written first remains as a safety net, and the existing on-disk file stays put.
+- **Active-collection pointer that dangles after another session deletes the collection now pops a startup toast.** Pre-fix the library panel just came up empty with no explanation — `_restore_library_from_active_collection` silently no-op'd when the pointer named a non-existent collection. Now the dangling name gets stashed at startup; `PlasmidApp.on_mount` reads + clears it once the toast system is online and surfaces a warning with the collection name so the user knows why their workspace looks empty + can pick a different collection from the library panel.
+
+#### New features
+
+- **Soft watchdog on slow C-extension workers.** pyhmmer's `hmmscan`, primer3-py's `design_primers`, and the in-process BLAST search are synchronous library calls that release the GIL but can't be hard-cancelled mid-run — a hung sub-binary (malformed HMM database, primer3 deadlock, BLAST DB I/O wait) used to stare the user down behind a spinner with no feedback. The new `_worker_watchdog` context manager fires a UI notification after 60 s saying the operation is taking longer than usual and the sub-process may be hung. Nothing gets killed; the user just knows what's happening and can Ctrl+C if it never resolves. Wired up at four call sites: HMMscan run, BLAST DB build, BLAST search, Primer3 design.
+- **Multi-row merge in Add Feature / Edit Feature members tables.** Click the first column on any row to toggle a MARK (□ / ■). Press **Merge** with 2+ rows marked and they fold together in `rel_start` order in one shot — gone are the days of "merge adjacent pair, repeat 4 times" for a 5-segment cassette. With fewer than 2 rows marked, Merge falls back to the legacy "selected row + next row" behaviour, so the existing single-pair flow still works exactly as before. Marks survive Add / Split / Remove (rows that no longer exist get pruned automatically).
 
 ### Sweep #31: edit-modal stability + per-row picker integrity + group-save perf
 
