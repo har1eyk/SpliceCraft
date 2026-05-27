@@ -79,7 +79,7 @@ def test_gff3_apply_to_loaded_rejects_length_mismatch(tmp_path):
     rec = _make_circular_record()
     other_text = (
         "##gff-version 3\n"
-        f"##sequence-region plasmid 1 99\n"
+        "##sequence-region plasmid 1 99\n"
         "plasmid\tSpliceCraft\tregion\t1\t99\t.\t+\t.\tID=plasmid\n"
     )
     p = tmp_path / "mismatch.gff3"

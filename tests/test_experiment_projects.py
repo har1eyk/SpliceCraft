@@ -18,8 +18,6 @@ Covers the data layer that backs the experiment-projects modal:
 """
 from __future__ import annotations
 
-import pytest
-
 import splicecraft as sc
 
 

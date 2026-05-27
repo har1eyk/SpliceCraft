@@ -17,8 +17,6 @@ Covers the data layer that backs the parts-bin picker UI:
 """
 from __future__ import annotations
 
-import pytest
-
 import splicecraft as sc
 
 

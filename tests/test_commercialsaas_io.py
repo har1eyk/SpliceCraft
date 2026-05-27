@@ -642,11 +642,8 @@ class TestHistoryViewerModal:
                 tbl = lib.query_one("#lib-table", DataTable)
             except Exception:
                 pytest.skip("library panel layout differs in this build")
-            # Find the row index of "seeded" (other rows may have been
-            # auto-loaded by the app).
-            for i in range(tbl.row_count):
-                key = list(tbl.rows.keys())[i] if hasattr(tbl, 'rows') else None
-                # Use cursor moves to land on the seeded row.
+            # Use cursor moves to land on the seeded row (other rows may
+            # have been auto-loaded by the app).
             tbl.move_cursor(row=0)
             await pilot.pause()
             # Trigger the action directly (bypasses keyboard simulation
@@ -911,8 +908,8 @@ class TestHistoryScreenHardening:
         """Pushing a HistoryScreen with a 200-deep chain must mount
         without tripping CPython's recursion limit. Smoke for
         `_build_tree`'s iterative shape."""
-        from textual.widgets import Tree as _TreeWidget
         from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from textual.widgets import Tree as _TreeWidget
         root = self._make_chain(200)
         app = _build_app(tiny_record, isolated_library=None)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -971,7 +968,6 @@ class TestHistoryScreenHardening:
     async def test_expand_and_collapse_actions_no_error(self, tiny_record):
         """Pressing `e` / `c` while the tree has focus drives the
         expand-all / collapse-all helpers without raising."""
-        from textual.widgets import Tree as _TreeWidget
         from tests.test_smoke import _build_app, TERMINAL_SIZE
         root = self._make_chain(5)
         app = _build_app(tiny_record, isolated_library=None)
@@ -2137,7 +2133,7 @@ class TestAugmentHelperUnit:
     def test_color_stamped_from_synthesized_packet(self):
         data = self._build_dna_with_one_primer()
         rec = self._make_synthetic_rec("ATGAAACGCGGGAAATAACCC" * 5)
-        extras = sc._augment_dna_record_from_packets(rec, data)
+        sc._augment_dna_record_from_packets(rec, data)
         # CDS picked up the first <Segment> colour.
         cds = rec.features[0]
         assert cds.qualifiers["ApEinfo_revcolor"][0].lower() == "#33ccff"

@@ -685,16 +685,7 @@ class TestIntronAwareTranslation:
         # NB exons stored in ascending genomic order:
         #   genomic[4:13]  → 3' end of spliced CDS (last exon)
         #   genomic[17:26] → 5' end of spliced CDS (first exon)
-        rc_spliced = (
-            "GAAA"          # padding 0..4
-            + "TTTACAAAA"   # exon 2 of spliced, on bottom: AAAATTTGT
-                              # wait — let me just compute and use
-        )
-        # Cleanest: build by hand using sc._IUPAC_COMP.
-        spliced_top = "ATGGGGAAATTTTGTAAA"
-        # Place spliced_top.reverse_complement() on the bottom strand,
-        # then construct exons in ascending genomic order.
-        rc = spliced_top.translate(sc._IUPAC_COMP)[::-1]
+        # Build by hand using sc._IUPAC_COMP.
         # exon-1 (5' of CDS = end of genomic span) = first 9 chars of
         # spliced_top → bottom strand bases at the END of the genomic
         # span. Layout: [pad 4][rc of exon-2 = "TTTACAAAA"][intron

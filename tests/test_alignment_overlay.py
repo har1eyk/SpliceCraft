@@ -1509,7 +1509,7 @@ class TestSequencingScreen:
         style zip via `_on_zip_picked` enables the dependent sub-tabs,
         populates the Samples + Quality tables, and writes the run
         metadata summary."""
-        from textual.widgets import TabPane, DataTable, Static
+        from textual.widgets import TabPane, DataTable
         from textual.widgets import DirectoryTree
         import zipfile
         from Bio import SeqIO
@@ -1606,7 +1606,7 @@ class TestSequencingScreen:
         """Clicking a sample row marks that sample's .gbk as the
         alignment query, updates the query indicator on the Align
         tab, and flips the Align button to enabled."""
-        from textual.widgets import (DataTable, Button, Static,
+        from textual.widgets import (DataTable, Button,
                                        DirectoryTree)
         import zipfile
         from Bio import SeqIO
@@ -4277,8 +4277,6 @@ class TestAlignmentManagerDeleteRoundTrip:
 
     async def test_delete_alignment_persists_through_save_load(
             self, tiny_record, isolated_library):
-        from Bio.Seq import Seq
-        from Bio.SeqRecord import SeqRecord
         # Library entry with two pre-baked stored alignments.
         def _stored(label, source="manual"):
             return {

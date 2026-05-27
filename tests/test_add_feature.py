@@ -402,7 +402,6 @@ class TestAnnotateWithFeature:
         `PlasmidMap._parse` reads it back so the dict-side
         strand is 2 and the double-arrow rendering survives.
         Same for `_apply_feature_edit` (edit-path)."""
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()

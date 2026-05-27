@@ -2145,7 +2145,6 @@ class TestProteinSaveRoundTrip:
         """Sacred — the SynthesisScreen's `_save_lock` must be an
         RLock so DNA `_commit_save` and protein `_commit_protein_save`
         serialise their SeqRecord build + library hand-off."""
-        import threading
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
@@ -2555,7 +2554,6 @@ class TestSynthesisCloneFragmentFlow:
     """End-to-end integration guard for the Clone Fragment handoff."""
 
     async def test_clone_saves_and_opens_parts_bin(self, isolated_library):
-        from Bio.Seq import Seq
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
@@ -2758,7 +2756,6 @@ class TestSynthesisRenderExceptNarrowed:
         # Look at the lines around the three known render-path sites.
         # Pre-fix used ``except Exception:``; post-fix uses
         # ``except (AttributeError, TypeError):``.
-        lines = src.split("\n")
         # The render-path sites are inside SynthesisEditor +
         # ProteinEditor. Walk the file and assert that within those
         # class bodies, no plain ``except Exception:`` lurks at the

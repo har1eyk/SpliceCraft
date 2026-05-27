@@ -21,9 +21,6 @@ See CLAUDE.md invariant #51 for the full inventory.
 """
 from __future__ import annotations
 
-import threading
-import time
-
 import splicecraft as sc
 
 

@@ -287,7 +287,6 @@ class TestOverhangAtSeam:
         assert err is None
         merged = sc._ligate_fragments(frags[0], frags[1])
         assert merged is not None
-        product_aatt = merged["top_seq"].count("AATT")
         # Religating restores the site → AATT count survives.
         # The merged is LINEAR (before close-circular), so it has
         # one fewer cut than the original. Count must equal
@@ -691,7 +690,6 @@ class TestEntryVectorOpsImmutability:
         )
         full = outer_cassette + "ATCGAT" * 50
         rec = _make_circular_record(full)
-        from Bio.SeqFeature import FeatureLocation
         rec.features.append(SeqFeature(
             FeatureLocation(len(outer_cassette) + 50, len(outer_cassette) + 200),
             type="rep_origin",

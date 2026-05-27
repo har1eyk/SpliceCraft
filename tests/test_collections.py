@@ -792,7 +792,6 @@ class TestBulkImportFolder:
         return Path(__file__).parent
 
     def test_imports_all_dna_fixtures(self):
-        from pathlib import Path
         folder = self._fixtures_dir()
         # Skip if the FFE fixtures are missing (fresh-clone case).
         if not list(folder.glob("FFE*.dna")):

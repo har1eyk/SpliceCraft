@@ -155,8 +155,7 @@ class TestFixSites:
         assert sc._mut_translate(fixed) == sc._mut_translate(dna)
 
     def test_removes_bsai_both_strands(self):
-        # GGTCTC forward or GAGACC (rc) inside the CDS
-        dna = sc._codon_optimize("MASGGTCTCREEEE", sc._CODON_BUILTIN_K12)
+        # GGTCTC forward or GAGACC (rc) inside the CDS.
         # Synthesize a CDS that deliberately contains a BsaI site by hand
         # (optimize won't produce one on K12 typically). Easier: seed manually.
         seed = "ATGGCGAGTGGTCTCCGTGAGGAGGAGGAGTAA"
@@ -826,8 +825,7 @@ class TestLibrarySourceWrapFeature:
         from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
 
         # 120 nt plasmid; CDS spans origin: nt 100..120 + 1..10 = 30 nt.
-        seq = "A" * 100 + "ATG" + "GCT" * 5 + "GC" + ("GCT" * 2) + "TAA" + "A"
-        # Actually build a known wrap CDS cleanly:
+        # Build a known wrap CDS cleanly:
         cds = "ATG" + ("GCT" * 8) + "TAA"   # 30 nt = 10 codons
         padding = "N" * 90
         plasmid = cds[15:] + padding + cds[:15]  # wrap: last 15 at start, first 15 at end

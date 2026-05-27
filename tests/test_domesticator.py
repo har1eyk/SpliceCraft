@@ -988,7 +988,6 @@ class TestFeatsForDomesticator:
         # tiny_record has CDS + misc_feature only (no explicit source) — the
         # fixture doesn't add one, so this just checks real features survive.
         feats = sc._feats_for_domesticator(tiny_record)
-        labels = [f["label"] for f in feats]
         # CDS + misc_feature should both be present; source (if any) skipped
         assert len(feats) >= 2
         for f in feats:
@@ -4352,7 +4351,6 @@ class TestDomesticatorSavePersistsSimulations:
         # same construction path by calling the simulator directly and
         # comparing to what _save built. The surest check is to replay
         # the full flow with the parts-bin Save wiring.
-        entries = sc._load_parts_bin()
         # No persistence callback here; just assert the dismissal result
         # format by re-running the simulator — if the constants match,
         # the saved dict would carry the same primed/cloned seq.
@@ -7378,7 +7376,6 @@ class TestCloneAssemblyIntoEntryVector:
         # one signature from each: the unique CDS bases.
         mod_seq = str(mod.seq).upper()
         cds_a = "ATGAAA" * 6  # TU_a's CDS
-        cds_b = "ATGCCC" * 6  # TU_b's CDS (parts_b not used here, use a/a)
         assert (cds_a in mod_seq) or (cds_a in sc._rc(mod_seq))
 
     def test_assembly_fragment_extracts_overhangs(self):
@@ -8768,7 +8765,6 @@ class TestEverySaveIsAFullPlasmid:
         # uses the user's entry vector". The library entry's gb_text
         # MUST be a parseable circular SeqRecord with the part as a
         # feature.
-        from textual.app import App
         sc._save_parts_bin([])
         sc._save_library([])
 

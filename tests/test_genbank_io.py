@@ -217,7 +217,7 @@ class TestParseRobustness:
         assert pm._n_skipped == 0
 
     def test_unknown_position_is_skipped_not_crashed(self, tiny_record):
-        from Bio.SeqFeature import SeqFeature, FeatureLocation, UnknownPosition
+        from Bio.SeqFeature import SeqFeature
         from copy import deepcopy
         rec = deepcopy(tiny_record)
         # Feature with an unknown end coordinate — real-world rare but legal.
@@ -328,7 +328,7 @@ class TestParseClamping:
         assert pm._n_clamped == 1
 
     def test_negative_start_clamped_to_zero(self):
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.SeqFeature import SeqFeature
         rec = self._make_record(400)
         # Direct construction: Biopython usually rejects negatives, so
         # simulate via a custom location object that returns negatives.
@@ -351,7 +351,7 @@ class TestParseClamping:
             FeatureLocation(10, 100, strand=1), type="gene",
             qualifiers={"label": ["ok"]}))
         pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
-        feats = pm._parse(rec)
+        pm._parse(rec)
         assert pm._n_clamped == 0
 
 

@@ -155,7 +155,6 @@ class TestCodonTable:
 
     def test_matches_biopython_standard_table(self):
         """Translate each of the 64 codons with Biopython and compare."""
-        from Bio.Seq import Seq
         from Bio.Data.CodonTable import standard_dna_table
         for codon, sc_aa in sc._CODON_TABLE.items():
             if sc_aa == "*":

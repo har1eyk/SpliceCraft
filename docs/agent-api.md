@@ -36,7 +36,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-90+ endpoints across:
+~120 endpoints across:
 
 - **Records** — get / set sequence, add / update / delete features,
   list features, find ORFs, transfer annotations, apply GFF3 features

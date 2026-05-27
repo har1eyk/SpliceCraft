@@ -14,6 +14,22 @@
 
 ---
 
+## [0.9.31] — 2026-05-27
+
+### Tidy: test suite cleanup + doc freshness
+
+#### Hardening
+
+- **Test suite now runs warning-free.** Removed the malformed GenBank fixture in `TestConstructorMultiGrammarTabs::test_per_role_entry_vector_banner` whose hand-built LOCUS line had wrong column spacing AND declared 2500 bp while supplying only 60 bp of sequence — Biopython emitted 14 `BiopythonParserWarning`s per run. Fixture now uses a column-correct LOCUS line that declares 60 bp matching the actual ORIGIN block. Zero parser warnings across all 4136 passing tests.
+- **80 stale references removed from test files** across 27 test modules: unused imports (e.g. `from textual.events import MouseMove`, `from copy import deepcopy`, top-level `import pytest` in test files that don't use the decorator), unused local variables (`extras = ...` then never read, `pane = await self._setup_lane(...)` then never referenced), and one f-string with no placeholders. All edits verified by re-running `pyflakes` (down to 8 documented-intentional findings: `# noqa: F401` markers and the `_IUPAC_RE`/`_PATTERN_CACHE` public-API re-exports). No test semantics changed; side-effect-only calls were preserved as bare statements.
+
+#### Docs
+
+- **`CLAUDE.md` line-count stale → fresh.** The "Near-single-file architecture" line claimed `splicecraft.py` (~65k lines) but the file has grown to ~105k. Updated.
+- **`docs/agent-api.md` endpoint count stale → fresh.** The inventory header said "90+ endpoints" but the agent surface is now 119 endpoints. Updated to "~120 endpoints across:". `/tools` remains the live source of truth.
+
+---
+
 ## [0.9.30] — 2026-05-27
 
 ### Sweep #41: CDS frame-break warning — `⚠` next to feature name when more than one stop forms

@@ -20,11 +20,8 @@ Covers:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-import sys
-from pathlib import Path
 
 import pytest
 
@@ -556,7 +553,7 @@ class TestScreenMount:
             await pilot.pause()
             scr = app.screen
             from textual.widgets import TabbedContent, DataTable, TabPane
-            tabs = scr.query_one("#exp-tabs", TabbedContent)
+            scr.query_one("#exp-tabs", TabbedContent)
             # Entries table is always-visible in the left pane.
             scr.query_one("#exp-entries-table", DataTable)
             # Compose + Attachments are disabled until an entry exists.

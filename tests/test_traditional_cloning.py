@@ -877,7 +877,7 @@ class TestSimulateTraditionalCloning:
             modal = sc.ConstructorModal()
             await app.push_screen(modal)
             await pilot.pause(); await pilot.pause(0.05)
-            pane = await self._setup_lane(pilot, modal, app)
+            await self._setup_lane(pilot, modal, app)
             modal.query_one("#btn-trad-simulate", Button).press()
             await pilot.pause(); await pilot.pause(0.2)
             save_fwd = modal.query_one("#btn-trad-save-fwd", Button)
@@ -1185,8 +1185,6 @@ class TestSimulateTraditionalCloning:
             )
             donor_idx = next(i for i, e in enumerate(entries)
                               if e.get("name") == "pDonor")
-            vec_idx = next(i for i, e in enumerate(entries)
-                            if e.get("name") == "pVec")
             # Pick donor + Add.
             modal.query_one(
                 "#trad-source-table", DataTable,
@@ -1798,9 +1796,9 @@ class TestConstructorMultiGrammarTabs:
             ("Omega2", "FFE5_test"),
         ):
             sc._set_entry_vector("gb_l0", {
-                "name":   name, "size": 2500, "source": "test",
+                "name":   name, "size": 60, "source": "test",
                 "gb_text": (
-                    f"LOCUS       {name}_locus  2500 bp DNA circular SYN 01-JAN-2026\n"
+                    f"LOCUS       {name}_locus           60 bp    DNA     circular SYN 01-JAN-2026\n"
                     "FEATURES             Location/Qualifiers\n"
                     "ORIGIN\n        1 " + "a" * 60 + "\n//\n"
                 ),
@@ -1845,7 +1843,6 @@ class TestConstructorMultiGrammarTabs:
             await pilot.pause()
             await pilot.pause(0.1)
             calls: list[tuple] = []
-            real_select = modal._select_backbone
 
             def _spy(gid, role):
                 calls.append((gid, role))

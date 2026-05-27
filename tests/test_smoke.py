@@ -233,7 +233,6 @@ class TestMapSequenceResize:
         test — closer to end-to-end than the original PR #8's fake
         `_MouseEvent`, and necessary because Textual's `Pilot` API
         doesn't expose `mouse_move`."""
-        from textual.events import MouseMove
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -562,7 +561,6 @@ class TestLibraryRename:
         """If another entry already has the target name, the rename is
         refused with an error notification and the library is unchanged."""
         # Seed the library with two entries: tiny_record and a fake second
-        from copy import deepcopy
         from Bio.SeqRecord import SeqRecord
         from Bio.Seq import Seq
         second = SeqRecord(
@@ -1697,7 +1695,6 @@ class TestApplyRecordInPlaceSemantics:
         switch back to A — A's undo history must be restored (not reset
         to empty as it was before per-plasmid stacks were introduced)."""
         from copy import deepcopy
-        from Bio.SeqRecord import SeqRecord
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -2724,7 +2721,6 @@ class TestTypeIISCutRegionHighlight:
         # Walk the rendered Text spans and bin each character +
         # style by position. Spans are RLE — track current x as
         # we go.
-        rendered = text.plain
         # The top strand should appear before the bottom strand;
         # find both lines that contain the recognition `GGTCTC`.
         # The Text renders as plain text concatenated with style
@@ -3669,7 +3665,6 @@ class TestSearchInputWidget:
         # Drive the populate path directly: `_populate_node` is
         # what receives the directory listing and writes the tree
         # nodes, and our override is what reorders.
-        from pathlib import Path
         files = sorted(
             tmp_path.iterdir(),
             key=lambda p: (
@@ -4150,7 +4145,6 @@ class TestOriginRotationCascade:
             await pilot.pause()
             await pilot.pause(0.1)
             pm = app.query_one("#plasmid-map", sc.PlasmidMap)
-            sp = app.query_one("#seq-panel", sc.SequencePanel)
             scroll = app.query_one("#seq-scroll")
             # Manually scroll the seq panel down so we can verify the
             # rotation snaps it back to the top.
@@ -4516,7 +4510,6 @@ class TestEnsureCursorVisibleShowsLanes:
             await pilot.pause(0.05)
 
             scroll = app.query_one("#seq-scroll")
-            scroll_y_before = scroll.scroll_y
 
             # Scroll up via Up arrow until cursor is at the top of viewport.
             for _ in range(40):
@@ -5239,7 +5232,6 @@ class TestShiftClickFeatureExtend:
             await pilot.pause(0.05)
             pm      = app.query_one("#plasmid-map", sc.PlasmidMap)
             seq_pnl = app.query_one("#seq-panel",   sc.SequencePanel)
-            sidebar = app.query_one("#sidebar",     sc.FeatureSidebar)
             if len(pm._feats) < 2:
                 pytest.skip("need ≥2 features")
             anchor = pm._feats[0]
@@ -7156,8 +7148,6 @@ class TestShiftClickFeatureExtend:
         gate that swallows the first click on a non-focused
         widget. The strand picker uses this subclass so a
         single physical click registers."""
-        from textual.events import MouseDown
-        from textual.geometry import Offset
         rec = sc._make_demo_record()
         app = _build_app(rec, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -7678,7 +7668,7 @@ class TestShiftClickFeatureExtend:
             await pilot.pause(0.1)
             modal = app.screen
             assert isinstance(modal, sc.GrammarEditorModal)
-            from textual.widgets import Button, Static
+            from textual.widgets import Button
             # Buttons exist + are enabled (even though the rest of
             # the built-in form is disabled).
             for bid in ("btn-ged-entry-lib", "btn-ged-entry-file"):
@@ -8935,7 +8925,7 @@ class TestShiftClickFeatureExtend:
             f"## [0.9.29] — 2026-05-27\n\n{stub}\n\n---\n"
         )
         assert not sc._changelog_section_has_real_content(
-            f"## [0.9.29] — 2026-05-27\n\n---\n"
+            "## [0.9.29] — 2026-05-27\n\n---\n"
         )
         assert not sc._changelog_section_has_real_content("")
         # Real bullet → real content.
@@ -9972,7 +9962,6 @@ class TestShiftClickFeatureExtend:
         # Pure-handler unit test: with selected_idx == -1, the helper
         # must return False rather than computing a span from a
         # phantom anchor.
-        app = sc.PlasmidApp()
         # Build a minimal mock with the bits the helper queries.
         class StubSeqPanel:
             _seq = "X" * 200
@@ -9989,8 +9978,6 @@ class TestShiftClickFeatureExtend:
             _total = 200
         # Stitch via query_one indirection — too invasive without a
         # full mount. Just exercise the early-return:
-        _fn = sc.PlasmidApp._extend_selection_to
-        result = getattr(_fn, "__wrapped__", _fn)
         # The unbound method needs `self` with .query_one — easier to
         # just assert via the integration tests above. This unit
         # check is a placeholder noting the helper exists.
@@ -11178,12 +11165,12 @@ class TestUpdateDataSafety:
     def test_restore_latest_picks_most_recent(self):
         self._seed_user_data()
         # Older
-        old = sc._create_pre_update_snapshot("0.0.0-old")
+        sc._create_pre_update_snapshot("0.0.0-old")
         import time
         # `_list_pre_update_snapshots` sorts by mtime; force a
         # measurable gap so the ordering is unambiguous on fast FS.
         time.sleep(0.02)
-        new = sc._create_pre_update_snapshot("0.0.0-new")
+        sc._create_pre_update_snapshot("0.0.0-new")
         # Modify data after both snapshots.
         for attr in sc._USER_DATA_FILE_ATTRS:
             p = getattr(sc, attr, None)
@@ -11476,12 +11463,11 @@ class TestUpdateDataSafetyHardening:
         # Take a real snapshot, then corrupt the file inside it. The
         # subsequent restore must NOT overwrite the user's live file
         # with the corrupted snapshot data.
-        seeded = self._seed_user_data()
+        self._seed_user_data()
         snap = sc._create_pre_update_snapshot("0.0.0-test")
         # Corrupt the snapshot's library copy AFTER the manifest's
         # sha256 was computed.
         copy_path = snap / sc._LIBRARY_FILE.name
-        original_in_snap = copy_path.read_text(encoding="utf-8")
         copy_path.write_text("CORRUPTED", encoding="utf-8")
         # Modify the live file to a known value so we can detect
         # whether restore wrongly overwrote it.
@@ -12217,8 +12203,6 @@ class TestFutureProofingFeatures:
         # file and verify it survives a save → load round-trip.
         # Without this, plugins added in a future SpliceCraft would
         # silently lose their state on the first re-save.
-        import json as _json
-        from copy import deepcopy
         original = [{
             "id": "round-trip-test",
             "name": "RT",
@@ -12914,7 +12898,6 @@ class TestRobustnessHardening:
     def test_drain_reports_leftover_when_timeout_exceeds(self):
         # Slow thread that exceeds the timeout — leftover list
         # should contain its name.
-        import time as _time
         evt = sc.threading.Event()
 
         def slow():
@@ -12932,7 +12915,6 @@ class TestRobustnessHardening:
     def test_drain_skips_daemon_threads(self):
         # Daemon threads die with the process; drain skips them
         # entirely so a long-running daemon doesn't hold up shutdown.
-        import time as _time
         evt = sc.threading.Event()
 
         def dt():

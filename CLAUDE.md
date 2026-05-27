@@ -21,7 +21,7 @@ The user's plasmid library + collections + primers + parts live in `~/.local/sha
 
 ---
 
-Bioinformatician + Claude. **Near-single-file architecture** — `splicecraft.py` (~65k lines) + extracted biology module `splicecraft_biology.py` + stdlib-only sidecar `splicecraft_cli.py`. Single-file constraint is intentional (greppable); biology extraction is the first deliberate exception (pure functions/constants, no `PlasmidApp` coupling). See `CONTRIBUTING.md` three-test rule.
+Bioinformatician + Claude. **Near-single-file architecture** — `splicecraft.py` (~105k lines) + extracted biology module `splicecraft_biology.py` + stdlib-only sidecar `splicecraft_cli.py`. Single-file constraint is intentional (greppable); biology extraction is the first deliberate exception (pure functions/constants, no `PlasmidApp` coupling). See `CONTRIBUTING.md` three-test rule.
 
 ## What is SpliceCraft?
 

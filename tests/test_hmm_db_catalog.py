@@ -26,14 +26,8 @@ from __future__ import annotations
 
 import gzip
 import io
-import json
-import os
-import shutil
-import socket
 import threading
 import urllib.error
-from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -272,7 +266,6 @@ class TestDiskSpace:
 
     def test_defaults_when_no_size_known(self, tmp_path, monkeypatch):
         # `expected_bytes=None` → defaults to 5 GB reserve.
-        captured: dict = {}
         def _stub_du(_path):
             class _U:
                 total = 10 * 1024 * 1024 * 1024 * 1024

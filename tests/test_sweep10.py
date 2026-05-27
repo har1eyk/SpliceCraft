@@ -10,7 +10,6 @@ See CLAUDE.md invariant #50 for the full inventory.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest

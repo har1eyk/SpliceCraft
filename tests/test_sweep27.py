@@ -597,7 +597,6 @@ class TestCrashInjectionSafeSaveJson:
         # We arrange for the kill to land between the bak-copy step
         # and the os.replace step by injecting a sleep.
         def child(path_str: str, entries):
-            import os as _os
             import time as _time
             import splicecraft as _sc
             _sc._authorize_writes(reason="crash test child")
