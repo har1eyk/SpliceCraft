@@ -25,6 +25,77 @@ import splicecraft as sc
 # _simulate_pcr — primer-binding model + amplicon enumeration
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class TestPcrPrimerSourceToggle:
+    """Sweep #37 (2026-05-27): the PCR pane's primer-source toggle
+    lets the user pick primers from the saved library or type
+    them free-form. Verifies the option builder + the default
+    source mode."""
+
+    def test_build_primer_library_options_empty_library(
+            self, monkeypatch,
+    ):
+        import splicecraft as sc
+        monkeypatch.setattr(sc, "_load_primers", lambda: [])
+        ss = sc.SimulatorScreen("ATCG" * 200, [], "p", "circular")
+        opts = ss._build_primer_library_options()
+        assert len(opts) == 1
+        label, value = opts[0]
+        assert "empty" in label.lower()
+        assert value == ""
+
+    def test_build_primer_library_options_real_entries(
+            self, monkeypatch,
+    ):
+        import splicecraft as sc
+        def _stub():
+            return [
+                {"name": "p1", "sequence": "ATCGATCGATCG", "type": "Fwd"},
+                {"name": "p2", "sequence": "GCTAGCTAGCTA", "type": ""},
+                # Empty + non-ACGT entries get dropped.
+                {"name": "broken", "sequence": "XXXX"},
+                {"name": "noseq",  "sequence": ""},
+            ]
+        monkeypatch.setattr(sc, "_load_primers", _stub)
+        ss = sc.SimulatorScreen("ATCG" * 200, [], "p", "circular")
+        opts = ss._build_primer_library_options()
+        assert len(opts) == 2
+        # Sequence is the value (so the Select handler can write
+        # it straight into the Input without an extra lookup).
+        assert {v for _label, v in opts} == {
+            "ATCGATCGATCG", "GCTAGCTAGCTA",
+        }
+        # Name + type tag both surface in the label.
+        first_label = opts[0][0]
+        assert "p1" in first_label
+        assert "Fwd" in first_label
+
+    def test_build_primer_library_options_dedupes_by_sequence(
+            self, monkeypatch,
+    ):
+        """Two entries with the same sequence collapse to one
+        option so the dropdown doesn't carry visual duplicates."""
+        import splicecraft as sc
+        def _stub():
+            return [
+                {"name": "first",  "sequence": "AAACCCGGGTTT"},
+                {"name": "second", "sequence": "AAACCCGGGTTT"},
+            ]
+        monkeypatch.setattr(sc, "_load_primers", _stub)
+        ss = sc.SimulatorScreen("ATCG" * 200, [], "p", "circular")
+        opts = ss._build_primer_library_options()
+        assert len(opts) == 1
+        # First-wins (matches `_dedupe_primers_by_sequence`).
+        assert "first" in opts[0][0]
+
+    def test_default_source_mode_is_custom(self):
+        """Existing free-text UX is preserved by default — the
+        library Select only appears when the user explicitly
+        switches to Library mode."""
+        import splicecraft as sc
+        ss = sc.SimulatorScreen("ATCG" * 200, [], "p", "circular")
+        assert ss._pcr_source_mode == "custom"
+
+
 class TestSimulatePcrBasics:
     """Forward/reverse exact-match binding on linear and circular templates."""
 

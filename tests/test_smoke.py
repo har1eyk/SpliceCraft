@@ -8894,6 +8894,59 @@ class TestShiftClickFeatureExtend:
         assert "older releases" not in out.lower()
         assert "mirrored on github" in out.lower()
 
+    def test_build_whats_new_body_drops_auto_stub_only_sections(self):
+        """Sweep #36 (2026-05-27): if a release shipped without a
+        hand-written changelog and got the auto-stub
+        `_(auto-generated changelog — no notable commits found
+        since the previous release)_`, the WhatsNew modal must
+        skip it and reach for the next real version. 0.9.27 /
+        0.9.28 / 0.9.29 all went out with auto-stubs (the user
+        relabelled 0.9.29 to recover, but the other two are
+        permanently empty in any sdist already on PyPI)."""
+        stub = sc._WHATS_NEW_AUTO_STUB_MARKER
+        md = (
+            f"## [0.9.30] — 2026-05-28\n\n### Bug fixes\n"
+            f"- Real bullet content\n\n---\n\n"
+            f"## [0.9.29] — 2026-05-27\n\n{stub}\n\n---\n\n"
+            f"## [0.9.28] — 2026-05-26\n\n{stub}\n\n---\n\n"
+            f"## [0.9.27] — 2026-05-25\n\n{stub}\n\n---\n\n"
+            f"## [0.9.26] — 2026-05-25\n\n### Bug fixes\n"
+            f"- Older real bullet\n"
+        )
+        out = sc._build_whats_new_body(md, current_version="0.9.30",
+                                         max_versions=3)
+        # The two real versions show up.
+        assert "Real bullet content" in out
+        assert "Older real bullet" in out
+        # The auto-stub marker never appears in the rendered body.
+        assert stub not in out
+        # And neither do the empty version headings.
+        assert "0.9.29" not in out
+        assert "0.9.28" not in out
+        assert "0.9.27" not in out
+
+    def test_changelog_section_has_real_content(self):
+        """`_changelog_section_has_real_content` strips the heading,
+        the auto-stub marker, and `---` separators; if anything's
+        left, it's real content."""
+        stub = sc._WHATS_NEW_AUTO_STUB_MARKER
+        # Empty + stub-only body → no real content.
+        assert not sc._changelog_section_has_real_content(
+            f"## [0.9.29] — 2026-05-27\n\n{stub}\n\n---\n"
+        )
+        assert not sc._changelog_section_has_real_content(
+            f"## [0.9.29] — 2026-05-27\n\n---\n"
+        )
+        assert not sc._changelog_section_has_real_content("")
+        # Real bullet → real content.
+        assert sc._changelog_section_has_real_content(
+            "## [0.9.30] — 2026-05-28\n\n- Real bullet\n"
+        )
+        # Sub-heading + bullet → real content.
+        assert sc._changelog_section_has_real_content(
+            "## [0.9.30] — 2026-05-28\n\n### Bug fixes\n- Foo\n"
+        )
+
     def test_primer_tm_safe_bounds(self):
         """`_primer_tm_safe` returns None for too-short / too-long
         inputs and a positive float for a typical primer."""
@@ -13798,3 +13851,691 @@ class TestUpdateAvailableModal:
                       if e == "update.notify.suppressed"
                       and k.get("reason") == "test_flag"]
         assert suppressed
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EditSeqDialog (Ctrl+E) — sweep #39 unified insert / replace / delete / copy
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestEditSeqDialog:
+    """Sweep #39 (2026-05-27): the Ctrl+E sequence-edit modal grew a
+    mode-toggle row (Insert / Replace / Delete / Copy), a multi-line
+    `TextArea` instead of the single `Input`, paste sanitization
+    (whitespace / FASTA headers / U→T), and a live-preview line
+    describing what OK will actually do.
+    """
+
+    def test_sanitize_strips_whitespace_and_fasta_headers(self):
+        modal = sc.EditSeqDialog("insert", "", 0, 0, total=100)
+        # FASTA-style paste with header + multi-line bases.
+        raw = (
+            ">my_fragment some annotation here\n"
+            "ATCG  ATCG\n"
+            "atcg\tATCG\n"
+            "  GGCC  \n"
+        )
+        cleaned = modal._sanitize_pasted_sequence(raw)
+        assert cleaned == "ATCGATCGATCGATCGGGCC"
+
+    def test_sanitize_drops_position_numbers(self):
+        """Pasted "60 ATCG ATCG" (NCBI-style numbered FASTA) drops
+        the leading position number so the user can paste raw NCBI
+        text without manually stripping."""
+        modal = sc.EditSeqDialog("insert", "", 0, 0, total=100)
+        raw = (
+            "  1 ATCG ATCG\n"
+            "  9 GGCC GGCC\n"
+        )
+        cleaned = modal._sanitize_pasted_sequence(raw)
+        assert cleaned == "ATCGATCGGGCCGGCC"
+
+    def test_sanitize_rna_to_dna(self):
+        """``U`` (uracil) → ``T`` (thymine) so an RNA paste lands
+        on the DNA canvas without manual replacement."""
+        modal = sc.EditSeqDialog("insert", "", 0, 0, total=100)
+        assert modal._sanitize_pasted_sequence(
+            "AUGC uugc",
+        ) == "ATGCTTGC"
+
+    def test_init_demotes_region_modes_when_no_region(self):
+        """Caller asks for ``replace`` but provides ``start == end``
+        (no region selected). Modal demotes to ``insert`` so the
+        opening state is something the user can confirm."""
+        for mode in ("replace", "delete", "copy"):
+            modal = sc.EditSeqDialog(mode, "", 5, 5, total=100)
+            assert modal._mode == "insert", (
+                f"region-required mode {mode!r} should demote to "
+                f"insert when start==end"
+            )
+
+    def test_init_keeps_insert_when_region_present(self):
+        """Caller passes ``insert`` with a region (e.g. user had
+        selection but action_edit_seq chose insert anyway) — modal
+        respects the caller's pick."""
+        modal = sc.EditSeqDialog("insert", "ATCG", 5, 9, total=100)
+        assert modal._mode == "insert"
+        assert modal._has_region is True
+
+    async def test_modal_mounts_with_default_mode_radio_set(
+            self, tiny_record, isolated_library,
+    ):
+        """Insert + Replace radio buttons reflect the initial mode."""
+        from textual.widgets import RadioButton
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.EditSeqDialog("replace", "ATCG", 5, 9, total=120)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.EditSeqDialog)
+            replace_btn = modal.query_one(
+                "#edit-mode-replace", RadioButton,
+            )
+            insert_btn = modal.query_one(
+                "#edit-mode-insert", RadioButton,
+            )
+            assert replace_btn.value is True
+            assert insert_btn.value is False
+
+    async def test_delete_mode_dismisses_as_replace_with_empty(
+            self, tiny_record, isolated_library,
+    ):
+        """Delete dispatches as ``("", "replace", s, e)`` so the
+        existing ``_edit_dialog_result`` handles it without any new
+        branch (replace-with-empty is delete)."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result_holder = []
+            modal = sc.EditSeqDialog("replace", "ATCG", 5, 9, total=120)
+            app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal._mode = "delete"
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert result_holder, "callback did not fire"
+            assert result_holder[0] == ("", "replace", 5, 9), (
+                f"Delete must dismiss as ('', 'replace', s, e); "
+                f"got {result_holder[0]!r}"
+            )
+
+    async def test_copy_mode_invokes_clipboard_and_dismisses_none(
+            self, tiny_record, isolated_library, monkeypatch,
+    ):
+        """Copy mode performs the clipboard write itself and
+        dismisses with ``None`` — the caller's
+        ``_edit_dialog_result`` short-circuits on None."""
+        clipboard_calls = []
+        def _stub_copy(app, text, label="copy"):
+            clipboard_calls.append((text, label))
+            return ("clipboard", None)
+        monkeypatch.setattr(
+            sc, "_copy_to_clipboard_with_fallback", _stub_copy,
+        )
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result_holder = []
+            modal = sc.EditSeqDialog("replace", "ATCGATCG", 5, 13,
+                                        total=120)
+            app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal._mode = "copy"
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert clipboard_calls == [("ATCGATCG", "seq.edit-modal")], (
+                f"Copy must call the clipboard helper with the "
+                f"existing region bases; got {clipboard_calls!r}"
+            )
+            assert result_holder == [None], (
+                f"Copy must dismiss with None; got {result_holder!r}"
+            )
+
+    async def test_insert_with_sanitized_paste_dispatches_clean(
+            self, tiny_record, isolated_library,
+    ):
+        """Pasting a multi-line FASTA with U → DNA sanitizes through
+        to the dispatch payload."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result_holder = []
+            modal = sc.EditSeqDialog("insert", "", 10, 10, total=120)
+            app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            from textual.widgets import TextArea
+            ta = modal.query_one("#edit-input-area", TextArea)
+            ta.text = (
+                ">my_seq\n"
+                "AUGC AUGC\n"
+                "GGCC\n"
+            )
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert result_holder == [
+                ("ATGCATGCGGCC", "insert", 10, 10),
+            ], result_holder
+
+    async def test_replace_mode_in_modal_switch_then_submit(
+            self, tiny_record, isolated_library,
+    ):
+        """Open in Insert mode (cursor only), switch to Replace via
+        the radio, type a sequence — Replace-with-empty-region was
+        demoted to Insert on __init__, but switching back to Replace
+        on a modal opened WITH a region should preserve the region."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result_holder = []
+            modal = sc.EditSeqDialog("replace", "TTTT", 20, 24,
+                                        total=120)
+            app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Flip to Insert.
+            modal._mode = "insert"
+            modal._apply_mode_visibility()
+            # And back to Replace.
+            modal._mode = "replace"
+            modal._apply_mode_visibility()
+            from textual.widgets import TextArea
+            modal.query_one("#edit-input-area", TextArea).text = "GGGG"
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert result_holder == [
+                ("GGGG", "replace", 20, 24),
+            ], result_holder
+
+    async def test_region_required_mode_without_region_shows_error(
+            self, tiny_record, isolated_library,
+    ):
+        """Open in Insert (cursor only), flip to Delete (which
+        normally requires a region) via direct state mutation, click
+        OK — should refuse and show an error rather than dismissing
+        with garbage."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result_holder = []
+            modal = sc.EditSeqDialog("insert", "", 5, 5, total=120)
+            app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal._mode = "delete"
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # No dismiss — modal still up.
+            assert not result_holder, (
+                f"Region-required mode without region must NOT "
+                f"dismiss; got {result_holder!r}"
+            )
+            assert isinstance(app.screen, sc.EditSeqDialog), (
+                "Modal must stay open and show an error"
+            )
+
+    def test_sanitize_does_not_strip_in_sequence_digits(self):
+        """Sweep #39 hardening (2026-05-27): tighter digit strip.
+        The pre-hardening sanitiser ran `re.sub(r"\\d+", "", ...)`
+        globally — `"ATCG12345TGCA"` collapsed to `"ATCGTGCA"`
+        silently, losing the embedded digits. Validation never saw
+        them, so a paste with stray digits (legacy GenBank quirks,
+        copy-paste from a numbered list) silently corrupted the
+        sequence. Post-hardening: in-sequence digits are LEFT IN
+        so the IUPAC validator catches them and the user sees the
+        problem loud rather than silent."""
+        modal = sc.EditSeqDialog("insert", "", 0, 0, total=100)
+        raw = "ATCG12345TGCA"
+        cleaned = modal._sanitize_pasted_sequence(raw)
+        # Digits survive sanitization; validation upstream rejects.
+        assert "1" in cleaned and "5" in cleaned
+        assert cleaned == "ATCG12345TGCA"
+
+    def test_sanitize_leading_position_number_only_with_whitespace(
+            self,
+    ):
+        """Leading-position-number strip is anchored to
+        ``^\\d+\\s+`` — requires whitespace after the digits, so
+        NCBI's ``"60 ATCG ATCG"`` strips, but ``"60ATCG"`` (no
+        space) does not. The latter is almost certainly a typo /
+        accidental paste, and we want it surfaced via validation."""
+        modal = sc.EditSeqDialog("insert", "", 0, 0, total=100)
+        # NCBI-style: strips cleanly.
+        assert modal._sanitize_pasted_sequence(
+            "60 ATCG ATCG",
+        ) == "ATCGATCG"
+        # No whitespace after digits: digits preserved, validation
+        # will reject.
+        assert modal._sanitize_pasted_sequence(
+            "60ATCGATCG",
+        ) == "60ATCGATCG"
+
+    async def test_dismiss_is_idempotent(
+            self, tiny_record, isolated_library,
+    ):
+        """Sweep #39 hardening: a real-terminal click-cycle can post
+        two ``Button.Pressed`` events for one physical click (see
+        sweep #36's `_InstantPressButton` doc). Without the dismiss
+        guard, the second event would re-dispatch the
+        ``_edit_dialog_result`` callback — committing the same edit
+        twice + leaving two undo snapshots. The dismiss override
+        flips ``self._dismissed = True`` on the first call so the
+        second is a no-op."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result_holder = []
+            modal = sc.EditSeqDialog("insert", "", 10, 10, total=120)
+            app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal.dismiss(("AAAA", "insert", 10, 10))
+            modal.dismiss(("BBBB", "insert", 10, 10))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Only ONE callback fires; the second dismiss is a no-op.
+            assert len(result_holder) == 1, (
+                f"Second dismiss must be ignored; got "
+                f"{len(result_holder)} callbacks: {result_holder!r}"
+            )
+            assert result_holder[0] == ("AAAA", "insert", 10, 10)
+
+    async def test_oversized_paste_is_refused_at_cap(
+            self, tiny_record, isolated_library,
+    ):
+        """Sweep #39 hardening: a paste larger than
+        ``_MAX_INPUT_BP`` (200 kbp) is refused with a clear status
+        message rather than committed. Pre-hardening a 50 MB paste
+        of valid IUPAC would flow through to the canvas-rebuild +
+        the restriction-scan worker, freezing the UI for tens of
+        seconds. Cap aligns with ``_MAX_FEATURE_SEQ_LEN``."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result_holder = []
+            modal = sc.EditSeqDialog("insert", "", 5, 5, total=120)
+            app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            from textual.widgets import TextArea
+            # Just past the cap.
+            big = "A" * (modal._MAX_INPUT_BP + 100)
+            modal.query_one("#edit-input-area", TextArea).text = big
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert not result_holder, (
+                f"Over-cap paste must NOT dismiss; got "
+                f"{result_holder!r}"
+            )
+            assert isinstance(app.screen, sc.EditSeqDialog)
+
+    async def test_at_cap_paste_succeeds(
+            self, tiny_record, isolated_library,
+    ):
+        """Paste exactly AT the cap commits cleanly — the cap is
+        inclusive of the limit, not a strict less-than."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result_holder = []
+            modal = sc.EditSeqDialog("insert", "", 5, 5, total=120)
+            app.push_screen(modal, lambda r: result_holder.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            from textual.widgets import TextArea
+            at_cap = "A" * modal._MAX_INPUT_BP
+            modal.query_one("#edit-input-area", TextArea).text = at_cap
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert result_holder == [
+                (at_cap, "insert", 5, 5),
+            ], (
+                f"Paste at the cap should commit; got "
+                f"{result_holder!r}"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stop-codon styling (sweep #40) — '*' renders red across every AA painter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestStopCodonStyling:
+    """Sweep #40 (2026-05-27): every place that paints AA letters
+    (main canvas CDS row, synthesis editor AA+DNA grid, synthesis
+    editor AA-only row, mutagenesis preview AA-only mode) renders
+    the stop codon ``"*"`` in red, regardless of the feature's
+    palette colour. Red is the canonical "STOP" colour in every
+    external protein viewer (UCSC, Geneious, SnapGene, ExPASy);
+    burying a premature stop inside the feature's palette colour
+    would let it hide in plain sight.
+    """
+
+    def test_constants_exposed(self):
+        assert sc._STOP_AA_CHAR == "*"
+        assert sc._STOP_AA_COLOR == "red"
+
+    def test_paint_cds_aa_uses_red_for_stop(self):
+        """`_paint_cds_aa` writes ``(letter, style)`` tuples into
+        the row array. The style for ``*`` letters must contain
+        ``red``; other AAs use the feature's palette colour."""
+        # Build a 30 bp CDS encoding 'M' 'K' 'L' '*' '*' '*' '*' '*'
+        # '*' '*' — 10 codons total, last 7 are stops.
+        # ATG = M, AAA = K, CTG = L, TAA = *, TAA = *, ...
+        # That gives an aa string of "MKL*******".
+        seq = "ATGAAACTG" + ("TAA" * 7)
+        # Feature with palette colour = "blue" (anything not red).
+        f = {
+            "type": "CDS",
+            "start": 0,
+            "end": len(seq),
+            "strand": 1,
+            "color": "blue",
+            "codon_start": 1,
+        }
+        arr: list = [(" ", "")] * len(seq)
+        sc._paint_cds_aa(arr, f, 0, len(seq), seq, None)
+        # Codon midpoints are at i*3 + 1 (forward strand,
+        # codon_start=1 → cs_off=0). aa[0] at bp 1, aa[1] at bp 4,
+        # aa[2] at bp 7, aa[3] at bp 10, ..., aa[9] at bp 28.
+        # First three (M, K, L) — blue.
+        for i in range(3):
+            ch, style = arr[1 + i * 3]
+            assert ch == "MKL"[i], f"slot {i}: got {ch!r}"
+            assert "blue" in style and "red" not in style, (
+                f"non-stop AA {ch!r} should NOT be red; got {style!r}"
+            )
+        # Codons 3..9 — stops — must be red.
+        for i in range(3, 10):
+            ch, style = arr[1 + i * 3]
+            assert ch == "*", f"slot {i}: expected '*', got {ch!r}"
+            assert "red" in style, (
+                f"stop codon at slot {i} must be red; got {style!r}"
+            )
+
+    def test_paint_cds_aa_preserves_decorator_for_stop(self):
+        """When the feature is the active AA highlight (cursor on
+        AA), the style carries ``reverse bold``. Stop codon must
+        keep ``reverse`` + ``bold`` while swapping the fg to red."""
+        seq = "ATGTAA"   # M*
+        f = {
+            "type": "CDS", "start": 0, "end": 6, "strand": 1,
+            "color": "blue", "codon_start": 1,
+        }
+        arr: list = [(" ", "")] * 6
+        sc._paint_cds_aa(arr, f, 0, 6, seq, f)   # f is its own highlight
+        # M at bp 1, * at bp 4.
+        m_ch, m_style = arr[1]
+        stop_ch, stop_style = arr[4]
+        assert m_ch == "M"
+        assert "reverse" in m_style and "bold" in m_style
+        assert "blue" in m_style and "red" not in m_style
+        assert stop_ch == "*"
+        assert "reverse" in stop_style and "bold" in stop_style
+        assert "red" in stop_style and "blue" not in stop_style
+
+    def test_paint_cds_aa_handles_reverse_strand_stop(self):
+        """Reverse-strand CDS — stops still render red. Forward
+        strand of seq has the RC of the CDS. Build a CDS where
+        translating the reverse strand yields 'M*' so the stop
+        appears at the EXPECTED bp coordinate (per `_paint_cds_aa`
+        reverse-strand math: aa_bp = virt_e - cs_off - 3*ci - 2)."""
+        # Reverse-strand CDS: bottom strand read 5'→3' is "ATGTAA".
+        # Top strand is RC of that: "TTACAT".
+        seq = "TTACAT"
+        f = {
+            "type": "CDS", "start": 0, "end": 6, "strand": -1,
+            "color": "blue", "codon_start": 1,
+        }
+        arr: list = [(" ", "")] * 6
+        sc._paint_cds_aa(arr, f, 0, 6, seq, None)
+        # Find the '*' slot — should exist and have red style.
+        stop_slots = [
+            (i, sty) for i, (ch, sty) in enumerate(arr) if ch == "*"
+        ]
+        assert len(stop_slots) == 1, (
+            f"Expected exactly one '*' painted; got {stop_slots!r}"
+        )
+        _i, stop_style = stop_slots[0]
+        assert "red" in stop_style, (
+            f"Reverse-strand stop must be red; got {stop_style!r}"
+        )
+
+    def test_no_stops_keeps_feature_color(self):
+        """No '*' codons in the CDS → no red in any painted cell."""
+        # ATGAAA = M K — no stops.
+        seq = "ATGAAA"
+        f = {
+            "type": "CDS", "start": 0, "end": 6, "strand": 1,
+            "color": "blue", "codon_start": 1,
+        }
+        arr: list = [(" ", "")] * 6
+        sc._paint_cds_aa(arr, f, 0, 6, seq, None)
+        for ch, sty in arr:
+            if ch != " ":
+                assert "red" not in sty, (
+                    f"Non-stop AA {ch!r} should not be red; "
+                    f"got {sty!r}"
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CDS premature-stop warning glyph (sweep #41)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPrematureStopWarning:
+    """Sweep #41 (2026-05-27): a CDS whose translation produces
+    MORE THAN ONE stop codon gets a ``⚠`` prepended to its rendered
+    label in the seq panel + plasmid map. The flag is computed in
+    ``PlasmidMap._parse`` from ``_cds_aa_list``, stamped on the
+    feature dict as ``_premature_stops``, and surfaced by the
+    render-only helper ``_feat_decorated_label``. Frame repair /
+    undo automatically clears the warning because every
+    ``_apply_record`` re-parses (and ``_cds_aa_list`` is cached on
+    the sequence hash + CDS bounds).
+    """
+
+    def test_constants_exposed(self):
+        assert sc._PREMATURE_STOP_GLYPH == "⚠"
+        # Single-cell glyph (no U+FE0F variation selector).
+        assert len(sc._PREMATURE_STOP_GLYPH) == 1
+
+    def test_decorated_label_clean_when_no_flag(self):
+        f = {"label": "lacZ", "type": "CDS"}
+        assert sc._feat_decorated_label(f) == "lacZ"
+
+    def test_decorated_label_prepends_glyph(self):
+        f = {
+            "label": "lacZ", "type": "CDS",
+            "_premature_stops": 2,
+        }
+        assert sc._feat_decorated_label(f) == "⚠lacZ"
+
+    def test_decorated_label_falsy_count_does_not_prepend(self):
+        """``_premature_stops`` of 0 should NOT trigger the
+        decoration — the helper checks truthiness so a falsy 0
+        leaves the label clean."""
+        f = {"label": "lacZ", "_premature_stops": 0}
+        assert sc._feat_decorated_label(f) == "lacZ"
+
+    def test_decorated_label_fallback_to_type(self):
+        """Feature without an explicit label falls back to
+        ``f["type"]`` — the existing behaviour preserved through
+        the decorator."""
+        f = {"type": "misc_feature"}
+        assert sc._feat_decorated_label(f) == "misc_feature"
+        f["_premature_stops"] = 1
+        assert sc._feat_decorated_label(f) == "⚠misc_feature"
+
+    # Constants used by the frame-break tests below — a body designed
+    # so a single-base insertion in frame produces multiple premature
+    # stops in the shifted reading. `"GCTAAA"` repeats are chosen
+    # because frame +1 over `ATG GCT AAA GCT AAA ...` reads
+    # `ATG CGC TAA AGC TAA AGC TAA ...` — every other shifted codon
+    # is `TAA` (stop), so a short CDS already trips ≥2 stops post-
+    # shift.
+    _IN_FRAME_BODY = "ATG" + ("GCTAAA" * 3) + "TAA"
+    # Insert a single C at position 3 to frameshift the rest.
+    _BROKEN_BODY   = _IN_FRAME_BODY[:3] + "C" + _IN_FRAME_BODY[3:]
+
+    async def test_parse_stamps_premature_stops_on_broken_cds(
+            self, tiny_record, isolated_library,
+    ):
+        """Build a record with a CDS broken by a single-base
+        insertion (frame shift → premature stops). ``_parse`` must
+        stamp ``_premature_stops`` on the feature dict so renderers
+        pick up the warning."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        broken = self._BROKEN_BODY
+        seq = broken + ("N" * 50)
+        rec = SeqRecord(
+            Seq(seq), id="BREAK", name="BREAK",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        rec.features = [
+            SeqFeature(
+                FeatureLocation(0, len(broken), strand=1),
+                type="CDS",
+                qualifiers={"label": ["broken"]},
+            ),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            cds_feats = [f for f in pm._feats if f.get("type") == "CDS"]
+            assert cds_feats, "Test setup: expected at least one CDS"
+            broken_feat = cds_feats[0]
+            assert broken_feat.get("_premature_stops", 0) >= 1, (
+                f"Broken-frame CDS must carry _premature_stops; "
+                f"got {broken_feat.get('_premature_stops')!r}"
+            )
+            # And the decorator surfaces the ⚠.
+            assert sc._feat_decorated_label(broken_feat).startswith(
+                sc._PREMATURE_STOP_GLYPH,
+            )
+
+    async def test_parse_does_not_flag_in_frame_cds(
+            self, tiny_record, isolated_library,
+    ):
+        """A canonical in-frame CDS (M + N codons + terminal stop)
+        must NOT carry the premature-stop flag. The decorator
+        keeps the clean label."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # ATG + 9 codons of GCC (=A) + TAA. 33 bp, one terminal stop.
+        body = "ATG" + ("GCC" * 9) + "TAA"
+        seq = body + ("N" * 50)
+        rec = SeqRecord(
+            Seq(seq), id="CLEAN", name="CLEAN",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        rec.features = [
+            SeqFeature(
+                FeatureLocation(0, len(body), strand=1),
+                type="CDS",
+                qualifiers={"label": ["clean"]},
+            ),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            cds_feats = [f for f in pm._feats if f.get("type") == "CDS"]
+            assert cds_feats, "Test setup: expected at least one CDS"
+            clean = cds_feats[0]
+            assert not clean.get("_premature_stops"), (
+                f"In-frame CDS must NOT carry _premature_stops; "
+                f"got {clean.get('_premature_stops')!r}"
+            )
+            assert sc._feat_decorated_label(clean) == "clean"
+
+    async def test_flag_clears_after_frame_repair(
+            self, tiny_record, isolated_library,
+    ):
+        """Frame repair (or undo) re-runs ``_parse`` against the
+        repaired sequence; the flag clears automatically because
+        the stop count drops back to ≤1. We simulate by mutating
+        the record's sequence + features in place and re-parsing."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        in_frame = self._IN_FRAME_BODY
+        broken   = self._BROKEN_BODY
+        rec = SeqRecord(
+            Seq(broken + ("N" * 30)),
+            id="X", name="X",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        rec.features = [
+            SeqFeature(
+                FeatureLocation(0, len(broken), strand=1),
+                type="CDS",
+                qualifiers={"label": ["test"]},
+            ),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            cds = next(
+                f for f in pm._feats if f.get("type") == "CDS"
+            )
+            # Initial broken state.
+            assert cds.get("_premature_stops"), (
+                f"Broken-frame baseline expected the flag; "
+                f"got {cds!r}"
+            )
+            # Repair: rebuild the record with the in-frame body.
+            repaired = SeqRecord(
+                Seq(in_frame + ("N" * 30)),
+                id="X", name="X",
+                annotations={"molecule_type": "DNA",
+                              "topology": "circular"},
+            )
+            repaired.features = [
+                SeqFeature(
+                    FeatureLocation(0, len(in_frame), strand=1),
+                    type="CDS",
+                    qualifiers={"label": ["test"]},
+                ),
+            ]
+            new_feats = pm._parse(repaired)
+            cds_after = next(
+                f for f in new_feats if f.get("type") == "CDS"
+            )
+            assert not cds_after.get("_premature_stops"), (
+                f"Repaired CDS must clear the warning; got "
+                f"{cds_after.get('_premature_stops')!r}"
+            )
+            assert sc._feat_decorated_label(cds_after) == "test"

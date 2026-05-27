@@ -14,25 +14,63 @@
 
 ---
 
+## [0.9.30] — 2026-05-27
+
+### Sweep #41: CDS frame-break warning — `⚠` next to feature name when more than one stop forms
+
+#### New features
+
+- **A frame-breaking edit on a CDS surfaces a `⚠` next to the feature label.** When a CDS edit (insertion / deletion via Ctrl+E whose length isn't a multiple of 3) shifts the reading frame, the shifted codons often hit one or more premature stops mid-protein. The warning glyph appears at the start of the feature's label in BOTH the seq panel and the circular plasmid map — painted in red on top of the feature's palette colour so it pops. The check fires whenever the translation produces more than one `*` codon (more than the natural terminal stop). Auto-clears the instant frame is repaired (any edit that brings the stop count back to ≤1) or you Ctrl+Z the breaking edit — the next `_apply_record` re-parses, recomputes the count, and the decoration drops away.
+- **Render-only decoration — does NOT pollute the on-disk label.** The warning is computed at parse time and stamped as `f["_premature_stops"]` on the in-memory feature dict; the underlying `f["label"]` is untouched, so .gb export, library save, undo snapshots, and feature-edit modal display all see the clean label. Re-importing a .gb the user just saved with a broken CDS still flags it (count re-runs from the imported sequence).
+- **Universal Unicode glyph** — `⚠` (U+26A0, Warning Sign) without the U+FE0F variation selector, so it renders as a single text cell on every monospaced terminal font (DejaVu Sans Mono, Cascadia, Menlo, Consolas) rather than the 2-cell emoji form that would break the label's centered layout in narrow feature bars.
+- **8 new tests** (`TestPrematureStopWarning` in `tests/test_smoke.py`) covering the glyph constant, the `_feat_decorated_label` clean / decorated / falsy-count / type-fallback paths, `_parse` stamping the flag on a frame-broken CDS, `_parse` NOT flagging a clean in-frame CDS, the warning surfacing through the label decorator, and the flag auto-clearing on a repair re-parse.
+
+### Sweep #40: stop codons render red everywhere
+
+#### New features
+
+- **Every `*` in a translated protein view is now red.** Main canvas seq panel's CDS AA row, synthesis editor's AA+DNA grid, synthesis editor's AA-only row, mutagenesis preview's AA-only mode — all of them now paint the stop codon `*` with a hardcoded red foreground, regardless of the feature's palette colour. Red is the canonical "STOP" colour in every external protein viewer (UCSC Genome Browser, Geneious, SnapGene, ExPASy); a premature stop mid-protein used to hide in plain sight inside whatever the user picked for the CDS colour. Cursor / selection / highlight decorators are preserved — the override is fg-only.
+- **5 new tests** (`TestStopCodonStyling` in `tests/test_smoke.py`): `_paint_cds_aa` paints stops red on forward + reverse strands, preserves the `reverse bold` decorator for highlighted stops, leaves non-stop AAs in the feature's palette colour, and the no-stops case never paints anything red.
+
+### Sweep #39: unified sequence-edit modal (Ctrl+E) — insert / replace / delete / copy in one dialog
+
+#### New features
+
+- **Ctrl+E is now an "operations" dialog, not just an insert/replace prompt.** The dialog grew a mode-toggle row at the top: **Insert**, **Replace**, **Delete**, **Copy**. Initial mode follows context — selection → Replace, cursor only → Insert — but you can flip in-modal without closing + re-opening. Delete and Copy don't take input (the textarea hides), they just operate on the selection. Copy writes to the system clipboard via the existing OSC52 / xclip / pbcopy / file-fallback chain and dismisses without touching the canvas; Delete dispatches as a replace-with-empty so the existing canvas-mutation path commits it as one undo step.
+- **Multi-line `TextArea` replaces the single-line `Input`.** Paste a 5 kb fragment, paste a multi-line FASTA, paste an NCBI-numbered "  60 ATCG ATCG" block — they all work. On submit, the dialog sanitises: drops FASTA header lines (`>foo bar`), strips all whitespace + newlines, removes leading digit position numbers, upper-cases, and U→T (RNA paste → DNA). The cleaned-up sequence is what gets validated against the IUPAC alphabet and what lands in the canvas.
+- **Live preview line** under the mode row says exactly what OK will do: *"→ Insert 1,234 bp at position 5,678"* / *"→ Replace 50 bp (5..54) with 1,234 bp"* / *"→ Delete 50 bp (5..54)"* / *"→ Copy 50 bp (5..54) to clipboard"*. Updates as you type or flip modes — no more "guess what this dialog will do when I hit OK".
+- **Ctrl+S and Ctrl+Enter submit** in addition to clicking OK, so a keyboard-driven flow stays on the keyboard. Esc cancels (unchanged).
+
+#### Hardening
+
+- **Region-required modes refuse to submit without a region.** Replace / Delete / Copy with no selection (cursor-only) refuses with a clear status line — picking one of these modes when there's no selection shows the warning in the preview line too, so the user can switch back to Insert. Caller `action_edit_seq` defaults cursor-only to Insert mode now (was Replace-single-base), since Insert is the only mode that genuinely works with just a cursor.
+- **Tightened the sanitiser's digit handling.** The original implementation ran `re.sub(r"\d+", "", text)` globally, which silently corrupted any paste containing in-sequence digits (e.g., `"ATCG12345TGCA"` → `"ATCGTGCA"`) without ever surfacing the data loss to validation. Post-hardening: only line-leading position numbers anchored to `^\d+\s+` (the NCBI-numbered-FASTA case) get stripped; in-sequence digits survive to validation and the user sees a clear `Invalid: '1' '2' '3' …` error instead of silently shrinking bases.
+- **Input length cap.** Pastes are now capped at 200 kbp (matches `_MAX_FEATURE_SEQ_LEN`). A 50 MB paste of valid IUPAC would previously flow all the way through to canvas-rebuild + the restriction-scan worker, freezing the UI for tens of seconds. Live status line surfaces the cap as you paste; submit refuses with the actual measured size + a suggestion to save the fragment as a feature or library entry.
+- **One-shot dismiss guard.** A real-terminal click-cycle can post two `Button.Pressed` events for one physical click (the focus-transition + click-cycle interaction sweep #36's `_InstantPressButton` doc covers). Without the guard, the second event would re-dispatch the caller's `_edit_dialog_result` — committing the same edit twice + stacking two undo snapshots. `dismiss` is now idempotent: the first call flips `self._dismissed = True`, the second is a no-op.
+- **OK + Cancel migrated to `_InstantPressButton`** so a single physical click registers on first try (same focus-transition workaround sweep #36 applied to `ColorPickerModal`).
+- **16 tests total** (`TestEditSeqDialog` in `tests/test_smoke.py`): the original 11 + 5 hardening tests covering in-sequence digit preservation, whitespace-anchored leading-position-number strip, double-dismiss idempotency, over-cap paste refusal, at-cap paste acceptance.
+
+### Sweep #38: per-row color picker no longer needs two saves to commit
+
+#### Bug fixes
+
+- **Clicking a color cell in the members table opens exactly one picker now.** Pre-fix a single physical click on the color column of a row was firing Textual's `DataTable.CellSelected` event TWICE (~50 ms apart on a real terminal — verified via `featedit.per_row.opened` events in the user log), so two `ColorPickerModal` instances stacked on top of each other. User picked a swatch, clicked Save — the top picker dismissed and the new color landed on the row correctly — but the SECOND picker was still on the stack, opened with the row's old current_color. The user saw it as "the preview reverted to the original color" and clicked the swatch + Save again, dismissing the duplicate. The bug presented as "needs two saves to set the color" even though the first save had already persisted the right value. Fixed with a re-entrancy guard in `_on_cell_selected` on both `FeatureEditModal` and `AddFeatureModal`: if this modal is no longer the topmost screen when the event arrives (because we already pushed a picker / rename / strand modal), the duplicate dispatch is dropped. Same fix protects the per-row label rename + per-row strand picker — all three were vulnerable to the same double-fire.
+
+### Sweep #37: pull primers from the library in the PCR tab
+
+#### New features
+
+- **PCR tab now has a Library/Custom source toggle.** Open Simulator → PCR. A new **Source** dropdown at the top of the PCR pane lets you flip between **Custom (free text)** — the existing behaviour, you type primer sequences free-form — and **From primer library** — each primer slot becomes a Select dropdown populated from your saved primer library, with name + type tag + sequence preview. Pick forward + reverse from the library and click Run — no more re-typing primers you've already saved. Empty library shows a non-selectable "(primer library is empty — save primers first)" placeholder so the picker still mounts cleanly. Library entries dedupe by sequence so the dropdown doesn't carry visual duplicates. Switching modes preserves whatever's in the slot — flip Custom → Library and your previously-typed primer stays in the Input under the hood; flip Library → Custom and your previously-picked sequence is still there for you to edit.
+
+### Sweep #36: color picker single-click
+
+#### Bug fixes
+
+- **Color picker buttons now register on a single physical click.** Picking a swatch + clicking "Auto (clear override)" / Save / Apply / Cancel used to take two clicks each because every button in `ColorPickerModal` was a plain `Button` — the Textual focus-transition gate ate the first click while focus shifted onto the modal, only the second click actually dispatched. User-reported: clearing the color override felt sticky and slow. All five action buttons + the 20 curated swatches now use `_InstantPressButton` (same drop-in pattern that sweep #31 applied to `StrandPickerModal`) so a single mouse-down fires `Pressed` immediately, bypassing the gate.
+
+---
+
 ## [0.9.29] — 2026-05-27
-
-_(auto-generated changelog — no notable commits found since the previous release)_
-
----
-
-## [0.9.28] — 2026-05-26
-
-_(auto-generated changelog — no notable commits found since the previous release)_
-
----
-
-## [0.9.27] — 2026-05-25
-
-_(auto-generated changelog — no notable commits found since the previous release)_
-
----
-
-## [unreleased] — sweeps #28 + #29 + #30 + #31 + #32 + #33 + #34 + #35
 
 ### Sweep #35: adversarial audit findings — wrap-feature classifier, k-mer cache cap, delete-RMW lock + 5 hygiene fixes
 
@@ -129,10 +167,6 @@ _(auto-generated changelog — no notable commits found since the previous relea
 - **Scroll + focus preservation on row mutation.** The members table no longer snaps back to the top after Add/Split/Merge/Remove. `_refresh_table` captures `scroll_y` before the clear-then-add-row rebuild and restores it after. Each structural button also calls `_focus_members_table()` so keyboard focus returns to the table — keeps your hands on the keyboard for chained ops (split → split → split). User-reported "scrolling to the top on each row add".
 - **27 + 24 new tests** in `tests/test_add_feature.py`: `_split_member` unit tests (9 — simple split, metadata inheritance onto head + tail, tail label cleared, pos == rs / pos == re / out-of-range / invalid idx rejected, mid-list split, returns new list not mutation); `_merge_members` (8 — two-row merge, three-row full merge, non-adjacent rejected, < 2 selected rejected, duplicate idx rejected, invalid idx rejected, overlapping rows can merge, preserves unselected rows); `_entry_from_members` (5 — 1 row → solo, 2 rows → group, solo inherits row metadata, empty members raises, round-trip via `_solo_row_from_entry`); AddFeatureModal table integration (9 — table seeded on mount, 1-row save → solo, 2-row save → group, sequence auto-sync, `_MAX_GROUP_MEMBERS` cap on add, split refused on width < 2, last row remove refused, malformed prefill falls back to solo, 1000-member paste-bomb prefill falls back to solo).
 
----
-
-## [unreleased] — sweeps #28 + #29
-
 ### Sweep #29: feature library group entries — multi-part cassettes
 
 - **Synthesis editor: Enter on a feature opens the edit dialog.** Press Enter while the cursor sits inside a feature's bp range and the FeatureEditModal pops up for that feature — same UX as Enter on the main-canvas seq panel. Smallest-enclosing rule matches the canvas convention (a tiny sub-feature inside a parent CDS wins focus), and the binding is scoped to the editor's scroll container via an explicit `has_focus` guard so Enter pressed in the library search / table / button row can never accidentally open the modal. Saves write back via `_feats = list(_feats); _feats[idx] = updated` (reassignment, not in-place) so the chunk cache invalidates cleanly — same pattern as the `add_feature` fix below.
@@ -214,6 +248,18 @@ _(auto-generated changelog — no notable commits found since the previous relea
 ### New invariant
 
 - **[INV-84]** HMM database registry: every cross-internet helper goes through `_hmm_db_build_url_opener` (bounded redirects + explicit SSL) + `_hmm_db_assert_content_type_ok` + URL credential redaction; every persisted catalog entry passes through `_normalise_hmm_db_entry` so a hand-edited `hmm_db_catalog.json` can't smuggle un-sanitised ids or URLs into the live runtime.
+
+---
+
+## [0.9.28] — 2026-05-26
+
+_(auto-generated changelog — no notable commits found since the previous release)_
+
+---
+
+## [0.9.27] — 2026-05-25
+
+_(auto-generated changelog — no notable commits found since the previous release)_
 
 ---
 

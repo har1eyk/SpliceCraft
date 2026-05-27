@@ -283,20 +283,110 @@ def _insert_changelog_section(section: str) -> None:
     CHANGELOG.write_text(new_text, encoding="utf-8")
 
 
+_AUTO_STUB_MARKER = (
+    "_(auto-generated changelog — no notable commits found "
+    "since the previous release)_"
+)
+
+
+def _promote_unreleased_to_version(version: str) -> bool:
+    """Sweep #36 (2026-05-27): if the maintainer has been keeping a
+    `## [unreleased]` block updated with the real changelog content,
+    relabel that heading to `## [<version>] — <today>` so the rich
+    content becomes the new version's body. Returns True if a
+    promotion happened, False otherwise.
+
+    Why this exists: the prior flow auto-generated a fresh section
+    from `git log` commit subjects, but the user often accumulates
+    bullet-pointed `[unreleased]` content as they go and forgets to
+    hand-copy it into the new version heading before releasing.
+    Result: 0.9.27 / 0.9.28 / 0.9.29 all shipped with the
+    "no notable commits found" auto-stub even though substantial
+    work had landed. Auto-promotion makes the `[unreleased]` pocket
+    the source of truth.
+
+    Only the FIRST `## [unreleased]` heading is promoted — any
+    later ones (legacy duplicates from manual edits) stay put so
+    the maintainer can fold them in by hand.
+    """
+    import datetime as _dt
+    text = CHANGELOG.read_text(encoding="utf-8")
+    # Anchor: heading starts at col 0, matches `## [unreleased]`
+    # case-insensitively to allow `[Unreleased]` too.
+    m = re.search(
+        r"^## \[unreleased\][^\n]*$",
+        text, flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if m is None:
+        return False
+    today = _dt.date.today().isoformat()
+    new_heading = f"## [{version}] — {today}"
+    new_text = text[:m.start()] + new_heading + text[m.end():]
+    CHANGELOG.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def _changelog_section_body(version: str) -> str:
+    """Return the body of `## [<version>]` (everything between that
+    heading and the next `## [` heading) so callers can inspect it.
+    Empty string if the heading isn't present.
+    """
+    if not CHANGELOG.is_file():
+        return ""
+    text = CHANGELOG.read_text(encoding="utf-8")
+    head_re = re.compile(
+        rf"^## \[{re.escape(version)}\][^\n]*$",
+        re.MULTILINE,
+    )
+    m = head_re.search(text)
+    if not m:
+        return ""
+    tail = text[m.end():]
+    next_head = re.search(r"^## \[", tail, flags=re.MULTILINE)
+    return tail[:next_head.start()] if next_head else tail
+
+
+def _section_has_real_content(body: str) -> bool:
+    """Return True if *body* contains real changelog content (real
+    bullet points or sub-headings), False if it's empty / blank /
+    just the auto-stub marker. Drives the empty-stub refusal in
+    `_ensure_changelog_entry`.
+
+    Heuristic: strip the heading-trailing `---`, blank lines, and
+    the auto-stub marker; if anything substantive remains, accept.
+    `_draft_changelog_section`'s commit-bullet body has real `*`
+    bullets and passes; the no-notable-commits body strips to
+    empty and fails.
+    """
+    text = body
+    text = text.replace(_AUTO_STUB_MARKER, "")
+    text = re.sub(r"^---\s*$", "", text, flags=re.MULTILINE)
+    text = text.strip()
+    return bool(text)
+
+
 def _ensure_changelog_entry(version: str) -> None:
     """Make sure `CHANGELOG.md` carries a heading for the new version.
-    If the maintainer has hand-written one, leave it alone. Otherwise
-    auto-generate a section from `git log <previous tag>..HEAD` so the
-    in-app What's New modal renders the current release on every
-    install — no stale section, no missed update.
 
-    Looks for an exact `## [<version>]` heading (matches the format
-    used everywhere else in the file). Missing CHANGELOG.md falls
-    through with a friendlier message than ``FileNotFoundError``.
+    Resolution order (sweep #36, 2026-05-27):
+      1. If `## [<version>]` already exists, leave it alone — the
+         maintainer hand-wrote it.
+      2. Else, if `## [unreleased]` exists, relabel it. The pocket
+         is the source of truth for "what shipped this release".
+      3. Else, auto-generate a section from `git log
+         <previous tag>..HEAD` so the in-app What's New modal at
+         least lists the commits since the previous release.
 
-    The auto-written CHANGELOG.md is added to the release commit
-    downstream (see `add_targets` in `main()`), so the file on disk
-    and the modal stay in lockstep.
+    After resolution, asserts the section body has real content
+    (anything beyond the no-notable-commits auto-stub). If it
+    doesn't, aborts with a clear message asking the maintainer to
+    populate the section first — the "0.9.29 shipped with an
+    empty stub" failure mode triggered this guard.
+
+    Missing `CHANGELOG.md` falls through with a friendlier
+    message than ``FileNotFoundError``. The resulting file is
+    added to the release commit downstream (see `add_targets` in
+    `main()`), so the file on disk and the modal stay in lockstep.
     """
     if not CHANGELOG.is_file():
         _die(f"{CHANGELOG.name} not found at {CHANGELOG}. "
@@ -304,13 +394,43 @@ def _ensure_changelog_entry(version: str) -> None:
     text = CHANGELOG.read_text(encoding="utf-8")
     needle = f"## [{version}]"
     if needle in text:
+        if not _section_has_real_content(
+            _changelog_section_body(version)
+        ):
+            _die(
+                f"{CHANGELOG.name} has a hand-written `{needle}` "
+                f"heading but its body contains no real content "
+                f"(only the no-notable-commits stub or blanks). "
+                f"Populate it with the actual bug-fix / feature "
+                f"bullets before re-running release.py."
+            )
         return
-    section = _draft_changelog_section(version)
-    _insert_changelog_section(section)
-    print(
-        f"  ↳ auto-generated `{needle}` section in {CHANGELOG.name} "
-        "(no hand-written entry was present)"
-    )
+    if _promote_unreleased_to_version(version):
+        print(
+            f"  ↳ promoted `## [unreleased]` → `{needle}` in "
+            f"{CHANGELOG.name} (the pocket had queued content)"
+        )
+    else:
+        section = _draft_changelog_section(version)
+        _insert_changelog_section(section)
+        print(
+            f"  ↳ auto-generated `{needle}` section in "
+            f"{CHANGELOG.name} (no hand-written entry, no "
+            f"`[unreleased]` pocket)"
+        )
+    if not _section_has_real_content(
+        _changelog_section_body(version)
+    ):
+        _die(
+            f"{CHANGELOG.name} section for `{needle}` ended up "
+            f"empty (no `[unreleased]` content, no commits since "
+            f"the previous tag). Either: (a) hand-write the "
+            f"section with bullets describing what's in this "
+            f"release, or (b) add bullets under a "
+            f"`## [unreleased]` heading and re-run release.py. "
+            f"Refusing to ship a What's New modal with no real "
+            f"content."
+        )
 
 
 def _bump_version_in_file(path: Path, pattern: re.Pattern[str],
