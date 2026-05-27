@@ -14,6 +14,34 @@
 
 ---
 
+## [0.9.34] — 2026-05-27
+
+### Alignment Manager: New Align button + identity color tiers
+
+#### New features
+
+- **"New Align…" button in the Alignment Manager.** You can now kick off pairwise alignments without leaving the manager modal. Click New Align, the multi-target picker comes up, mark however many library plasmids you want as targets (Space toggles selection), confirm — the worker runs every alignment, and the manager re-opens automatically with the new rows in the table. Press Save & Close to commit them to the band; the linear plasmid map updates immediately. Pending edits made in the manager BEFORE clicking New Align (visibility flips, deletions) are saved first so the New Align chain never silently drops curation work.
+- **Manager opens on plasmids with zero stored alignments.** Pre-fix the modal refused to launch if the plasmid had no alignments yet — you had to know about Alt+A as a separate workflow. Now Alt+L always opens, and the empty-list case is the natural entry point for the New Align button.
+- **Identity % cells are color-coded.** The Alignment Manager's Identity column and the Verification Report's identity cell now color the percentage by quality tier:
+  - **100.0% (strict, no rounding)** → light blue
+  - **≥ 90%** → green
+  - **≥ 80%** → yellow
+  - **≥ 51%** → orange
+  - **≥ 11%** → red
+  - **≤ 10%** → gray
+  - Non-numeric → neutral white
+  Lets you scan a long list and spot the dodgy alignments at a glance. Strict 100% means a literal `n_matches == aligned_len` from the pairwise aligner — a 99.999% read does NOT promote to light blue.
+
+#### Hardening
+
+- **15 new tests** in `tests/test_alignment_overlay.py`:
+  * `TestIdentityPctColor` (12 cases) — covers each tier boundary including the strict-100 cutoff, None handling, non-numeric fallback.
+  * `TestAlignmentManagerNewAlignButton` (2 cases) — dismiss payload format (`{"_new_align": True, "alignments": [...]}`), pending visibility edits surface to the caller for save-first.
+  * `TestAlignmentManagerOpensOnEmptyStorage` (1 case) — modal accepts an empty list and renders zero rows; the caller-side empty-stored gate is removed.
+- The `_multi_align_worker` gained an optional `on_complete` callback fired after the summary + flush. The New Align chain uses it to re-open the manager; existing callers (Alt+A) pass it as None for a no-op so behavior is unchanged.
+
+---
+
 ## [0.9.33] — 2026-05-27
 
 ### Alignment Manager: mark rows + delete marked

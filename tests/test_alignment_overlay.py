@@ -1374,6 +1374,146 @@ class TestAlignmentManagerMarkAndDeleteMarked:
                 )
 
 
+class TestIdentityPctColor:
+    """Color tiers picked 2026-05-27 to match the user's sequencing-QC
+    grading: light blue STRICT 100, then green / yellow / orange /
+    red / gray as identity drops."""
+
+    def test_strict_hundred_is_light_blue(self):
+        assert sc._identity_pct_color(100.0) == "bright_cyan"
+
+    def test_just_under_hundred_falls_to_green(self):
+        # User-required strictness: 99.999% is NOT light blue.
+        assert sc._identity_pct_color(99.999) == "green"
+
+    def test_ninety_is_green(self):
+        assert sc._identity_pct_color(90.0) == "green"
+
+    def test_eighty_is_yellow(self):
+        assert sc._identity_pct_color(80.0) == "yellow"
+
+    def test_eighty_nine_nine_is_yellow(self):
+        assert sc._identity_pct_color(89.999) == "yellow"
+
+    def test_fifty_one_is_orange(self):
+        assert sc._identity_pct_color(51.0) == "dark_orange"
+
+    def test_fifty_falls_to_red(self):
+        assert sc._identity_pct_color(50.0) == "red"
+
+    def test_eleven_is_red(self):
+        assert sc._identity_pct_color(11.0) == "red"
+
+    def test_ten_is_gray(self):
+        assert sc._identity_pct_color(10.0) == "grey50"
+
+    def test_zero_is_gray(self):
+        assert sc._identity_pct_color(0.0) == "grey50"
+
+    def test_none_is_neutral_white(self):
+        assert sc._identity_pct_color(None) == "white"
+
+    def test_non_numeric_is_neutral_white(self):
+        assert sc._identity_pct_color("bogus") == "white"  # type: ignore[arg-type]
+
+
+class TestAlignmentManagerNewAlignButton:
+    """`AlignmentManagerModal` gained a "New Align…" button 2026-05-27.
+    Clicking it dismisses with a sentinel dict so the caller can chain
+    the picker modal and re-open the manager with the new rows once
+    workers complete."""
+
+    @staticmethod
+    def _make_stored(label):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("T" * 80), id="T_TARGET", name="T_TARGET",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        return {
+            "id":              f"id-{label}",
+            "label":           label,
+            "query_label":     "Q",
+            "target_label":    "T",
+            "target_id":       "T_TARGET",
+            "target_gb_text":  sc._record_to_gb_text(rec),
+            "target_seq_hash": sc._alignment_target_hash("T" * 80),
+            "axis":            "query",
+            "result":          {"aligned_q": "A" * 80,
+                                "aligned_t": "T" * 80,
+                                "identity_pct": 99.0},
+            "visible":         True,
+            "added":           "2026-05-27",
+            "source":          "manual",
+        }
+
+    async def test_new_align_dismisses_with_sentinel_payload(
+            self, tiny_record, isolated_library):
+        stored = [self._make_stored("a"), self._make_stored("b")]
+        captured: list = []
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal, callback=captured.append)
+            await pilot.pause(); await pilot.pause(0.05)
+            modal._new_align(None)
+            await pilot.pause(); await pilot.pause(0.05)
+            assert captured, "dismiss callback did not fire"
+            payload = captured[0]
+            assert isinstance(payload, dict)
+            assert payload.get("_new_align") is True
+            # Pending edits surfaced under "alignments" so the caller
+            # can save them before chaining the picker.
+            pending = payload.get("alignments")
+            assert isinstance(pending, list)
+            assert [a["label"] for a in pending] == ["a", "b"]
+            # _marked flag stripped (transient, never reaches disk).
+            for row in pending:
+                assert "_marked" not in row
+
+    async def test_new_align_preserves_pending_mark_edits_in_payload(
+            self, tiny_record, isolated_library):
+        """Pending mark edits made BEFORE clicking New Align stay on
+        the alignment dicts (the caller still uses them to decide
+        what to persist), but the `_marked` flag itself is stripped
+        so it doesn't leak to disk."""
+        stored = [self._make_stored("a"), self._make_stored("b")]
+        captured: list = []
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal, callback=captured.append)
+            await pilot.pause(); await pilot.pause(0.05)
+            # Hide row B before pressing New Align — should land on
+            # disk via the caller's persist hook.
+            modal._alignments[1]["visible"] = False
+            modal._new_align(None)
+            await pilot.pause(); await pilot.pause(0.05)
+            pending = captured[0]["alignments"]
+            row_b = next(r for r in pending if r["label"] == "b")
+            assert row_b["visible"] is False
+
+
+class TestAlignmentManagerOpensOnEmptyStorage:
+    """Pre-2026-05-27 the manager refused to open if the plasmid had
+    no stored alignments — the user had to know about Alt+A
+    separately. Now the manager opens with an empty table and the
+    "New Align…" button starts the workflow from there."""
+
+    async def test_manager_can_be_constructed_with_empty_list(self):
+        # The modal itself accepts an empty list — table renders zero
+        # rows, buttons remain functional. Caller's gate (the empty
+        # `stored` early-return) was the previous block; that's been
+        # removed in `action_open_alignment_manager`.
+        modal = sc.AlignmentManagerModal([], plasmid_label="empty")
+        assert modal._alignments == []
+
+
 class TestAlignmentManagerBandRefreshAfterDelete:
     """2026-05-27 user report: deleting alignments via Alt+L doesn't
     update the lane bars on the linear viewer. Pin the band-refresh
