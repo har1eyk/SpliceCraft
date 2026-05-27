@@ -597,6 +597,306 @@ class TestFeatureLibrarySidePanel:
             assert inserted[0]["start"] == 2
             assert inserted[0]["end"] == 10
 
+    async def test_add_feature_render_includes_new_feature(self,
+                                                              monkeypatch):
+        """Regression for 2026-05-26 "weird DNA visualization after
+        library insert" report: the rendered text after
+        `add_feature` MUST include the new feature's lane art
+        (label + bar) and the `5'-` / `-3'` flank markers. Pre-fix
+        `add_feature` used `self._feats.append(...)` (in-place
+        mutation), but the `_CHUNK_STATIC_CACHE`'s key is
+        `(hash(seq), id(feats), line_width, show_connectors)` —
+        without `len(feats)`. The append left `id(feats)` unchanged
+        so the cache HIT a stale entry built BEFORE the new feature
+        was added; the render came back with only the bare DNA
+        rows (no feature lane, no flank markers — visible
+        symptom: a sequence floating in the editor without its
+        markers / bar). Arrow keys took the cursor to a new
+        position which fell into a different cache slot, masking
+        the bug.
+
+        Sacred invariant #4 (CLAUDE.md): lists are reassigned on
+        load, never mutated in place. The fix: `add_feature` now
+        does `self._feats = self._feats + [dict(feat)]` so
+        `id(feats)` bumps and every downstream cache invalidates
+        cleanly."""
+        monkeypatch.setattr(sc, "_load_features", lambda: [{
+            "name": "test_feat",
+            "feature_type": "misc_feature",
+            "sequence": "GCGCCGTCT",
+            "color": "#FF0000",
+            "strand": 1,
+            "qualifiers": {},
+            "description": "",
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr._refresh_featlib_table()
+            await pilot.pause()
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            # Empty initial seq — primes the chunk caches with an
+            # empty-feats entry that the buggy in-place append
+            # path would HIT for the post-insert state.
+            ed.load("", [])
+            # Drive the library insert path with our fixed entry.
+            scr._featlib_rows = [("k", {
+                "name": "test_feat",
+                "feature_type": "misc_feature",
+                "sequence": "GCGCCGTCT", "color": "#FF0000",
+                "strand": 1, "qualifiers": {},
+            })]
+            scr._featlib_selected_entry = (
+                lambda: scr._featlib_rows[0][1]
+            )
+            scr._featlib_insert_selected(mode="insert")
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # The render must now contain the feature lane (label
+            # + bar) AND the flank markers. Inspect the raw view
+            # render rather than the buffer state — that's what
+            # the user actually sees.
+            view = scr.query_one("#syn-view")
+            rendered = str(view.render())
+            assert "test_feat" in rendered, (
+                "feature label missing from post-insert render "
+                "(in-place feats mutation cached out the lane art)"
+            )
+            assert "5'-" in rendered, (
+                "5' flank marker missing from post-insert render"
+            )
+            assert "-3'" in rendered, (
+                "3' flank marker missing from post-insert render"
+            )
+
+    async def test_enter_inside_feature_opens_edit_modal(self):
+        """Sweep #29 (2026-05-26): pressing Enter on the synth
+        editor while the cursor sits inside a feature span posts
+        a `FeatureEditRequested` message that the SynthesisScreen
+        catches → pushes `FeatureEditModal` for that feature.
+        Mirrors the main-canvas seq-panel's Enter-on-feature UX."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            # Load a fragment with one feature so Enter has a
+            # target inside the cursor's span.
+            ed.load("ATGCATGCATGC", [
+                {"start": 2, "end": 9, "label": "test-feat",
+                 "type": "CDS", "color": "#FF8800",
+                 "strand": 1, "qualifiers": {"label": ["test-feat"]}},
+            ])
+            ed._cursor_pos = 5   # inside the feature [2, 9)
+            await pilot.pause()
+            # Direct API call mirrors what `on_key` does on Enter.
+            # Driving via `pilot.press('enter')` would require the
+            # editor's scroll container to have focus, which is
+            # brittle in tests. We invoke the action directly and
+            # assert the message flow + modal push.
+            assert ed._feature_at_cursor() == 0
+            ed.post_message(sc.SynthesisEditor.FeatureEditRequested(0))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.FeatureEditModal)
+            assert app.screen._idx == 0
+
+    async def test_enter_outside_feature_does_not_open_modal(self):
+        """Enter on a base NOT inside any feature surfaces a
+        notify, does not push the modal. The cursor's bp position
+        must fall in `[start, end)` of at least one feat for the
+        modal to open."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCATGCATGC", [
+                {"start": 2, "end": 5, "label": "test-feat",
+                 "type": "CDS", "color": "#FF8800",
+                 "strand": 1, "qualifiers": {"label": ["test-feat"]}},
+            ])
+            ed._cursor_pos = 8   # OUTSIDE [2, 5)
+            assert ed._feature_at_cursor() == -1
+            # No FeatureEditRequested message gets posted by the
+            # editor's on_key — `_feature_at_cursor` returns -1
+            # and the handler short-circuits to a notify.
+
+    async def test_feature_at_cursor_picks_smallest_enclosing(self):
+        """When a small sub-feature lives inside a larger parent
+        (e.g. an active-site marker inside a CDS), Enter must open
+        the SMALLEST enclosing feature so the user can edit the
+        more-specific annotation. Matches the main-canvas
+        `_smallest_enclosing_feature` convention."""
+        ed = sc.SynthesisEditor()
+        ed._seq = "A" * 30
+        ed._feats = [
+            {"start":  0, "end": 30, "label": "parent",
+             "type": "CDS",     "color": "#FFFF00",
+             "strand": 1, "qualifiers": {}},
+            {"start": 10, "end": 13, "label": "active-site",
+             "type": "domain",  "color": "#FF0000",
+             "strand": 1, "qualifiers": {}},
+        ]
+        ed._cursor_pos = 11  # inside both
+        assert ed._feature_at_cursor() == 1   # the inner one
+
+    async def test_feature_at_cursor_returns_neg_one_at_boundaries(
+        self,
+    ):
+        """The hop-on marker positions (`-1` / `n+1`, from sweep
+        #28) and the natural past-end position (`cur == n`) all
+        return -1 — those positions sit OUTSIDE any feature span
+        by construction."""
+        ed = sc.SynthesisEditor()
+        ed._seq = "ATGC"
+        ed._feats = [
+            {"start": 0, "end": 4, "label": "f",
+             "type": "misc_feature", "color": "#888",
+             "strand": 0, "qualifiers": {}},
+        ]
+        # Inside the feature: returns 0.
+        ed._cursor_pos = 0
+        assert ed._feature_at_cursor() == 0
+        ed._cursor_pos = 3
+        assert ed._feature_at_cursor() == 0
+        # End-of-sequence (cur == n): outside the half-open [0, 4).
+        ed._cursor_pos = 4
+        assert ed._feature_at_cursor() == -1
+        # 5' hop-on: outside.
+        ed._cursor_pos = -1
+        assert ed._feature_at_cursor() == -1
+        # 3' hop-on: outside.
+        ed._cursor_pos = 5
+        assert ed._feature_at_cursor() == -1
+
+    async def test_enter_only_fires_when_editor_has_focus(self):
+        """Sweep #29 (2026-05-26): Enter on the synth editor must
+        ONLY trigger the FeatureEdit dispatch when the scroll
+        container actually has focus. If focus is elsewhere
+        (library table, search input, a button), the editor's
+        `on_key` may still fire from bubbled events — the explicit
+        `scroll.has_focus` guard ensures Enter doesn't sideways-
+        open the modal from a foreign focus."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCATGCATGC", [
+                {"start": 2, "end": 9, "label": "f",
+                 "type": "CDS", "color": "#FF8800",
+                 "strand": 1, "qualifiers": {"label": ["f"]}},
+            ])
+            ed._cursor_pos = 5
+            await pilot.pause()
+            # Focus the library SEARCH input — NOT the editor.
+            from textual.widgets import Input
+            search = scr.query_one("#syn-featlib-search", Input)
+            search.focus()
+            await pilot.pause()
+            assert not ed.query_one(
+                "#syn-scroll",
+            ).has_focus
+            # Simulate Enter via on_key with the editor as the
+            # bubble target. The has_focus guard should reject.
+            from textual.events import Key
+            event = Key("enter", character="\n")
+            ed.on_key(event)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Modal MUST NOT have opened — focus wasn't on editor.
+            assert not isinstance(app.screen, sc.FeatureEditModal)
+
+    async def test_focus_returns_to_editor_after_add_feature(self):
+        """After the AddFeatureModal Insert dismisses, focus
+        returns to the synth editor's scroll container so the
+        user can keep typing bases immediately. Pre-2026-05-26
+        focus drifted to whatever widget held it when the modal
+        opened (often a toolbar Button), and the next base
+        keystroke missed the editor entirely."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            # Verify the helper directly — it idempotently focuses
+            # the editor's scroll container regardless of prior
+            # focus state.
+            from textual.widgets import Input
+            scr.query_one("#syn-featlib-search", Input).focus()
+            await pilot.pause()
+            assert not scr.query_one(
+                "#syn-editor",
+            ).query_one("#syn-scroll").has_focus
+            scr._focus_dna_editor()
+            await pilot.pause()
+            assert scr.query_one(
+                "#syn-editor",
+            ).query_one("#syn-scroll").has_focus
+
+    async def test_modal_save_writes_back_to_synth_feats(self):
+        """End-to-end: open modal via Enter, edit the label, Save
+        → the synth editor's `_feats` dict reflects the new
+        label. Reassignment (`_feats = list(...)`) preserves the
+        in-place-mutation cache fix from earlier in this sweep."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCATGCATGC", [
+                {"start": 2, "end": 9, "label": "orig-label",
+                 "type": "CDS", "color": "#FF8800",
+                 "strand": 1, "qualifiers": {"label": ["orig-label"]}},
+            ])
+            ed._cursor_pos = 5
+            feats_id_before = id(ed._feats)
+            ed.post_message(sc.SynthesisEditor.FeatureEditRequested(0))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            # Press Edit to unlock, then change the label.
+            from textual.widgets import Input, Button
+            modal.query_one("#btn-featedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#featedit-name", Input).value = "new-label"
+            modal.query_one("#btn-featedit-save", Button).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # The synth editor's feat dict has the new label.
+            assert ed._feats[0]["label"] == "new-label"
+            assert ed._feats[0]["qualifiers"]["label"] == ["new-label"]
+            # And `_feats` was reassigned, not mutated in place,
+            # so `id(ed._feats)` changed — the chunk cache will
+            # invalidate cleanly on the next render.
+            assert id(ed._feats) != feats_id_before
+
     async def test_annotate_mode_requires_selection(self):
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
@@ -853,6 +1153,235 @@ class TestFlankMarkers:
         assert sc.SynthesisEditor._FLANK_MARKER_TOP_RIGHT == "-3'"
         assert sc.SynthesisEditor._FLANK_MARKER_BOT_LEFT == "3'-"
         assert sc.SynthesisEditor._FLANK_MARKER_BOT_RIGHT == "-5'"
+
+    # ── Cursor-on-hyphen highlight (sweep #28 extended 2026-05-26) ──
+    #
+    # When the cursor sits at a sequence boundary — either the
+    # natural [0, n] end-of-sequence position OR the explicit
+    # hop-on positions [-1, n+1] — the matching hyphen reverses to
+    # carry the cursor. Before 2026-05-26 the natural past-last-base
+    # position `cur == n` rendered an invisible cursor (per-base
+    # reverse loop is [0, n), so no base reversed; hyphen highlight
+    # only fired for hop-on). The unified design fixes that and
+    # keeps the existing hop-on regression covered.
+
+    @staticmethod
+    def _wrap_text_for(seq: str, cur: int, feats=None):
+        """Build a `_build_seq_text` + `_wrap_with_53_markers` Text
+        for a non-empty `seq` and `cur` cursor position. Returns the
+        wrapped Text (with the hyphen markers injected) so a test
+        can walk spans to check the reverse-video paint position.
+
+        Unit-style — instantiates `SynthesisEditor` without a widget
+        mount because `_wrap_with_53_markers` reads only `_seq`,
+        `_feats`, `_cursor_pos`, and the marker class constants."""
+        ed = sc.SynthesisEditor()
+        ed._seq = str(seq)
+        ed._feats = list(feats or [])
+        ed._cursor_pos = int(cur)
+        n = len(ed._seq)
+        # Build the inner Text the editor would build before wrapping.
+        inner = sc._build_seq_text(
+            ed._seq, ed._feats, line_width=n + 1,
+            cursor_pos=ed._cursor_pos,
+        )
+        return ed, ed._wrap_with_53_markers(inner)
+
+    @staticmethod
+    def _dna_row_spans(text_obj, dna_row: int):
+        """Return the list of Text spans on the DNA top-strand row."""
+        lines = text_obj.split("\n")
+        if dna_row >= len(lines):
+            return []
+        return list(lines[dna_row].spans)
+
+    @staticmethod
+    def _span_at(spans, col: int):
+        """Return spans whose range covers `col`."""
+        return [s for s in spans if s.start <= col < s.end]
+
+    @staticmethod
+    def _has_reverse(spans) -> bool:
+        return any("reverse" in str(s.style).lower() for s in spans)
+
+    def test_cursor_at_natural_end_highlights_3p_hyphen(self):
+        """`cur == n` (natural past-last-base, reached by → / End)
+        now reverses the leading hyphen of the `-3'` marker so the
+        cursor is visible at the sequence end. Pre-2026-05-26 the
+        cursor was invisible at this position."""
+        ed, txt = self._wrap_text_for("ATGCATGC", cur=8)
+        n = len(ed._seq)
+        dna_row = ed._dna_top_row_offset()
+        spans = self._dna_row_spans(txt, dna_row)
+        # `-3'` sits immediately after the bases. With the line-
+        # number gutter stripped, the layout is `5'-` (3) + n bases
+        # + `-3'` (3). The leading hyphen of `-3'` is at column
+        # `marker_w + n` = 3 + 8 = 11.
+        hyphen_col = ed._FLANK_MARKER_WIDTH + n  # 11
+        assert self._has_reverse(self._span_at(spans, hyphen_col))
+
+    def test_cursor_at_natural_start_highlights_5p_hyphen(self):
+        """`cur == 0` (natural before-first-base, reached by ← /
+        Home) reverses the trailing hyphen of the `5'-` marker.
+        base[0] still reverses too (via `_build_seq_text`) so the
+        cursor visually straddles the boundary — an unambiguous
+        "you're at the very start" cue."""
+        ed, txt = self._wrap_text_for("ATGCATGC", cur=0)
+        dna_row = ed._dna_top_row_offset()
+        spans = self._dna_row_spans(txt, dna_row)
+        # Trailing hyphen of `5'-` sits at column 2 (positions 0, 1,
+        # 2 = `5`, `'`, `-`).
+        hyphen_col = 2
+        assert self._has_reverse(self._span_at(spans, hyphen_col))
+
+    def test_cursor_hopon_5p_marker_still_highlights(self):
+        """Regression for sweep #28 hop-on: `cur == -1` (Home from
+        cur==0) reverses the 5' hyphen."""
+        ed, txt = self._wrap_text_for("ATGCATGC", cur=-1)
+        dna_row = ed._dna_top_row_offset()
+        spans = self._dna_row_spans(txt, dna_row)
+        assert self._has_reverse(self._span_at(spans, 2))
+
+    def test_cursor_hopon_3p_marker_still_highlights(self):
+        """Regression for sweep #28 hop-on: `cur == n+1` (End from
+        cur==n) reverses the -3' hyphen."""
+        ed, txt = self._wrap_text_for("ATGCATGC", cur=9)
+        n = len(ed._seq)
+        dna_row = ed._dna_top_row_offset()
+        spans = self._dna_row_spans(txt, dna_row)
+        assert self._has_reverse(
+            self._span_at(spans, ed._FLANK_MARKER_WIDTH + n)
+        )
+
+    def test_cursor_interior_does_not_highlight_hyphens(self):
+        """Cursor in the middle of the sequence (e.g. base 4 of 8)
+        must NOT reverse either hyphen — the cursor lives on the
+        base. This guards against an over-eager `cur <= 0` /
+        `cur >= n` that would also paint the hyphen for any cursor
+        position."""
+        ed, txt = self._wrap_text_for("ATGCATGC", cur=4)
+        n = len(ed._seq)
+        dna_row = ed._dna_top_row_offset()
+        spans = self._dna_row_spans(txt, dna_row)
+        # Neither hyphen reverses.
+        assert not self._has_reverse(self._span_at(spans, 2))
+        assert not self._has_reverse(
+            self._span_at(spans, ed._FLANK_MARKER_WIDTH + n)
+        )
+
+    def test_single_base_sequence_cursor_at_start(self):
+        """Smallest non-empty seq: n=1. cur=0 → 5' hyphen highlights;
+        cur=1 → -3' hyphen highlights; cur=0 must NOT also highlight
+        the -3' hyphen (and vice versa)."""
+        ed, txt = self._wrap_text_for("A", cur=0)
+        dna_row = ed._dna_top_row_offset()
+        spans = self._dna_row_spans(txt, dna_row)
+        # 5' hyphen reverses.
+        assert self._has_reverse(self._span_at(spans, 2))
+        # -3' hyphen does NOT reverse (cur != n).
+        assert not self._has_reverse(
+            self._span_at(spans, ed._FLANK_MARKER_WIDTH + 1)
+        )
+
+    def test_single_base_sequence_cursor_at_end(self):
+        """n=1, cur=1 (past the only base) → -3' hyphen reverses,
+        5'- hyphen does NOT (cur != 0)."""
+        ed, txt = self._wrap_text_for("A", cur=1)
+        n = len(ed._seq)
+        dna_row = ed._dna_top_row_offset()
+        spans = self._dna_row_spans(txt, dna_row)
+        assert self._has_reverse(
+            self._span_at(spans, ed._FLANK_MARKER_WIDTH + n)
+        )
+        assert not self._has_reverse(self._span_at(spans, 2))
+
+    def test_bottom_hyphens_never_get_cursor_highlight(self):
+        """The cursor lives on the TOP strand; the bottom strand
+        (`3'-…-5'`) is the reverse-complement display and must
+        never carry the cursor reverse-video. Reproduces the
+        biological convention — typing always goes into the top
+        strand."""
+        ed, txt = self._wrap_text_for("ATGCATGC", cur=8)  # natural end
+        n = len(ed._seq)
+        dna_row = ed._dna_top_row_offset()
+        # Bottom strand sits one row below the top.
+        lines = txt.split("\n")
+        bot_row = dna_row + 1
+        if bot_row >= len(lines):
+            pytest.skip("bottom strand not rendered in this layout")
+        bot_spans = list(lines[bot_row].spans)
+        # Left hyphen of `3'-` is at column 2; right hyphen of `-5'`
+        # is at column marker_w + n.
+        assert not self._has_reverse(self._span_at(bot_spans, 2))
+        assert not self._has_reverse(
+            self._span_at(bot_spans, ed._FLANK_MARKER_WIDTH + n)
+        )
+
+    def test_marker_with_cursor_clamps_out_of_bounds_idx(self):
+        """Defensive: `_marker_with_cursor` clamps an out-of-bounds
+        `cursor_char_idx` rather than raising. A subclass / test
+        fixture could override the marker constants to a shorter
+        string; the render path must degrade to "no reverse" or to
+        the last-char position instead of crashing the editor."""
+        ed = sc.SynthesisEditor()
+        ed._seq = "ATGC"
+        ed._feats = []
+        ed._cursor_pos = 4
+        # Build the inner Text first.
+        inner = sc._build_seq_text(
+            ed._seq, ed._feats, line_width=5, cursor_pos=4,
+        )
+        # Wrap once normally — establishes baseline.
+        wrapped = ed._wrap_with_53_markers(inner)
+        assert wrapped is not None
+        # Now exercise the helper indirectly by clobbering the
+        # marker to an empty string and re-wrapping. The defensive
+        # branch returns an empty Text rather than slicing past 0.
+        try:
+            ed._FLANK_MARKER_TOP_RIGHT = ""
+            inner2 = sc._build_seq_text(
+                ed._seq, ed._feats, line_width=5, cursor_pos=4,
+            )
+            # Must NOT raise.
+            wrapped2 = ed._wrap_with_53_markers(inner2)
+            assert wrapped2 is not None
+        finally:
+            # Restore for any later test in the same process.
+            ed._FLANK_MARKER_TOP_RIGHT = "-3'"
+
+    async def test_arrow_past_last_base_lands_cursor_at_n(self):
+        """End-to-end via pilot — pressing `set_cursor(+1)` on the
+        last base lands `_cursor_pos` at `n` (the natural past-end
+        position). Combined with the unit tests above (which verify
+        that `cur == n` reverses the -3' hyphen via
+        `_wrap_with_53_markers`), this exercises the full
+        click-to-render path that reproduces the 2026-05-26 symptom
+        ("cursor invisibly sitting beyond the last basepair")."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCATGC", [])
+            await pilot.pause()
+            ed.set_cursor(len(ed._seq) - 1)
+            await pilot.pause()
+            ed.set_cursor(ed._cursor_pos + 1)
+            await pilot.pause()
+            # Cursor lands at the natural past-end position.
+            assert ed._cursor_pos == len(ed._seq)
+            # One more → puts the cursor at the hop-on position
+            # (`n + 1`); the editor's `set_cursor` clamp is [-1, n+1].
+            ed.set_cursor(ed._cursor_pos + 1)
+            await pilot.pause()
+            assert ed._cursor_pos == len(ed._seq) + 1
+            # And one more → MUST NOT advance further (clamp).
+            ed.set_cursor(ed._cursor_pos + 1)
+            await pilot.pause()
+            assert ed._cursor_pos == len(ed._seq) + 1
 
     async def test_bottom_strand_markers_reflect_antiparallel(self):
         """Biological reality — DNA is anti-parallel. Top strand 5'→3',

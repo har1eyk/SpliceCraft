@@ -794,6 +794,41 @@ class TestSweep26WrapFeatsIdx:
         src = inspect.getsource(sc.PlasmidMap._draw_linear_flag)
         assert "_wrap_feats_idx" in src
 
+    def test_linear_flag_selected_style_does_not_use_reverse(self):
+        """2026-05-26 regression: the linear-flag selection
+        highlight used to set the body / head style to `"reverse "
+        + color`, but reverse on the `█` body glyph swaps FG and
+        BG so the cell renders with the default terminal text
+        colour on a colour BG — and `█` covers the entire cell,
+        hiding the BG. Visually the body cells outside the label
+        area lost the feature colour, so the selected bar appeared
+        to "shrink to the label width" (user-reported when
+        clicking the translated CDS bar in the seq panel). Fix
+        uses `"bold " + color` instead, keeping the FG colour
+        visible. This test guards against re-introducing `reverse`
+        on the body style without first picking a non-`█` glyph
+        for the body."""
+        import inspect
+        src = inspect.getsource(sc.PlasmidMap._draw_linear_flag)
+        # The buggy pattern must not be present in the body /
+        # head style line. We allow `"reverse"` to appear in OTHER
+        # contexts (alignment band, etc.) — assert specifically
+        # that the `is_sel` ternary doesn't compose reverse + color
+        # for the feature body / head style.
+        assert '"reverse " + color' not in src, (
+            "linear-flag selected style must not use reverse + "
+            "color on the `█` body glyph (renders as default-colour "
+            "block; bar appears to shrink). Use `bold + color` "
+            "instead, or switch the body glyph to a partial-fill "
+            "char (▓ / ▒) before re-introducing reverse."
+        )
+        # The fix uses bold + color.
+        assert '"bold " + color' in src, (
+            "linear-flag selected style should be `'bold ' + color`"
+            " — see the comment block above the assignment for "
+            "rationale."
+        )
+
 
 class TestSweep26AlignmentDriftDetection:
     """M21 — `_h_align_plasmidsaurus_zip` re-checks the target

@@ -223,6 +223,100 @@ class TestMoveCopyCommit:
         assert any("same" in m.lower()
                    for sev, m in app._notify_log)
 
+    def test_copy_same_source_and_target_duplicates_in_place(self, app):
+        """Copy mode + src==tgt is the duplicate-in-place flow.
+        Each marked entry gets a " COPY" / " COPY 2" suffix; the
+        originals stay intact under their original names + ids."""
+        sc._save_collections([
+            {"name": "Eden", "plasmids": [
+                {"id": "eden_0", "name": "plasmid_0", "size": 100,
+                 "gb_text": "x"},
+                {"id": "eden_1", "name": "plasmid_1", "size": 200,
+                 "gb_text": "y"},
+            ]},
+        ])
+        sc._library_cache = None
+        sc._collections_cache = None
+        app._move_copy_commit(
+            source="Eden", target="Eden",
+            entry_ids=["eden_0", "eden_1"], mode="copy",
+        )
+        colls = sc._load_collections()
+        eden = next(c for c in colls if c["name"] == "Eden")
+        names = [p["name"] for p in eden["plasmids"]]
+        ids   = [p["id"]   for p in eden["plasmids"]]
+        # Originals untouched.
+        assert "plasmid_0" in names
+        assert "plasmid_1" in names
+        assert "eden_0" in ids
+        assert "eden_1" in ids
+        # Duplicates landed with COPY suffix.
+        assert "plasmid_0 COPY" in names
+        assert "plasmid_1 COPY" in names
+        # Duplicate ids are also unique (suffix increment).
+        assert ids.count("eden_0") == 1
+        assert ids.count("eden_1") == 1
+        # No "same — nothing to do" warning.
+        assert not any("nothing to do" in m.lower()
+                        for sev, m in app._notify_log)
+        # A success-style information toast was posted.
+        assert any("duplicated" in m.lower()
+                    for sev, m in app._notify_log)
+
+    def test_copy_same_target_repeated_duplicates_increment_suffix(
+            self, app):
+        """A second duplicate-in-place call must produce a 'COPY 2'
+        rather than re-using 'COPY'."""
+        sc._save_collections([
+            {"name": "Eden", "plasmids": [
+                {"id": "eden_0", "name": "p", "size": 100, "gb_text": "x"},
+            ]},
+        ])
+        sc._library_cache = None
+        sc._collections_cache = None
+        # First duplication: yields "p COPY".
+        app._move_copy_commit(
+            source="Eden", target="Eden",
+            entry_ids=["eden_0"], mode="copy",
+        )
+        sc._library_cache = None
+        sc._collections_cache = None
+        # Second duplication of the SAME original: must yield
+        # "p COPY 2" (the first COPY is already in the target set).
+        app._move_copy_commit(
+            source="Eden", target="Eden",
+            entry_ids=["eden_0"], mode="copy",
+        )
+        colls = sc._load_collections()
+        eden = next(c for c in colls if c["name"] == "Eden")
+        names = [p["name"] for p in eden["plasmids"]]
+        assert "p" in names
+        assert "p COPY" in names
+        assert "p COPY 2" in names
+
+    def test_copy_same_target_active_mirror_restages(
+            self, app, tmp_path, monkeypatch):
+        """Duplicate-in-place inside the ACTIVE collection must
+        re-stage `plasmid_library.json` so the LibraryPanel sees
+        the new entries on next repopulate."""
+        eden_ids = _seed_two_collections(eden_n=2, ffe_n=0)
+        # Eden is active by `_seed_two_collections`.
+        app._move_copy_commit(
+            source="Eden", target="Eden",
+            entry_ids=eden_ids, mode="copy",
+        )
+        # plasmid_library.json was re-mirrored from the updated Eden.
+        mirror = json.loads(sc._LIBRARY_FILE.read_text("utf-8"))
+        entries, _err = sc._extract_entries(mirror, "Plasmid library")
+        assert _err is None
+        assert entries is not None
+        names = [e["name"] for e in entries]
+        # Originals + copies all present.
+        assert "plasmid_0" in names
+        assert "plasmid_1" in names
+        assert "plasmid_0 COPY" in names
+        assert "plasmid_1 COPY" in names
+
     def test_invalid_mode_refused(self, app):
         _seed_two_collections(eden_n=1, ffe_n=0)
         app._move_copy_commit(

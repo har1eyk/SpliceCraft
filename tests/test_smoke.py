@@ -6120,6 +6120,807 @@ class TestShiftClickFeatureExtend:
             assert not modal.query_one("#featedit-strand", RadioSet).disabled
             assert not modal.query_one("#btn-featedit-save", Button).disabled
 
+    async def test_edit_modal_color_picker_buttons_locked_until_edit(
+            self, isolated_library):
+        """Regression for 2026-05-26 "make sure we can also change
+        color of the feature via the edit modal" report: the
+        `Pick Color` + `Auto` buttons start DISABLED (along with
+        all other inputs) and unlock only when the user presses
+        `Edit`. The `_on_pick_color` handler also gates on
+        `self._editing` so a programmatic press won't bypass."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 200, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            pick_btn = modal.query_one(
+                "#btn-featedit-color", Button,
+            )
+            auto_btn = modal.query_one(
+                "#btn-featedit-color-clear", Button,
+            )
+            # Read-only by default.
+            assert pick_btn.disabled is True
+            assert auto_btn.disabled is True
+            # Press Edit.
+            modal.query_one("#btn-featedit-edit", Button).action_press()
+            await pilot.pause()
+            # Both unlock together with the other inputs.
+            assert pick_btn.disabled is False
+            assert auto_btn.disabled is False
+
+    async def test_edit_modal_pick_color_round_trips_through_picker(
+            self, isolated_library):
+        """End-to-end: open the edit modal, press Edit, press Pick
+        Color → ColorPickerModal opens, dismiss with a hex →
+        edit modal's `_color` lands as the bare hex string (not
+        the wrapping dict). Pre-2026-05-26 the callback's `if
+        color is None:` check missed the dict payload, so
+        `self._color` was set to the whole `{"color": "...",
+        "set_default": False}` dict — the swatch + save payload
+        then carried garbage and the renderer fell back to the
+        type-default colour."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 200, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            modal.query_one("#btn-featedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one(
+                "#btn-featedit-color", Button,
+            ).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # ColorPickerModal is now on top.
+            assert isinstance(app.screen, sc.ColorPickerModal)
+            # Dismiss with a chosen hex. Mirrors the picker's
+            # Save-button payload shape.
+            app.screen.dismiss({
+                "color": "#ABCDEF",
+                "set_default": False,
+            })
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Back on FeatureEditModal — `_color` is the bare hex.
+            assert isinstance(app.screen, sc.FeatureEditModal)
+            assert app.screen._color == "#ABCDEF"
+            # Save → the feature's qualifiers carry the new color.
+            modal = app.screen
+            modal.query_one("#btn-featedit-save", Button).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            target = next(f for f in app._current_record.features
+                           if f.type == "CDS")
+            assert target.qualifiers.get(
+                "ApEinfo_fwdcolor",
+            ) == ["#ABCDEF"]
+            assert target.qualifiers.get(
+                "ApEinfo_revcolor",
+            ) == ["#ABCDEF"]
+
+    async def test_edit_modal_color_auto_clears_qualifier(
+            self, isolated_library):
+        """Pressing `Auto` while editing sets `_color = None`. On
+        Save the three historical color qualifier names are
+        popped so the renderer falls back to the type-default
+        palette colour."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        # Start with an explicit color on the feature.
+        rec.features = [
+            SeqFeature(
+                FeatureLocation(50, 200, strand=1), type="CDS",
+                qualifiers={
+                    "label": ["lacZ"],
+                    "ApEinfo_fwdcolor": ["#FF8800"],
+                    "ApEinfo_revcolor": ["#FF8800"],
+                },
+            ),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            modal.query_one("#btn-featedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one(
+                "#btn-featedit-color-clear", Button,
+            ).action_press()
+            await pilot.pause()
+            assert modal._color is None
+            modal.query_one(
+                "#btn-featedit-save", Button,
+            ).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            target = next(f for f in app._current_record.features
+                           if f.type == "CDS")
+            assert "ApEinfo_fwdcolor" not in target.qualifiers
+            assert "ApEinfo_revcolor" not in target.qualifiers
+
+    async def test_edit_modal_per_row_color_pick_in_group_saves(
+            self, isolated_library):
+        """Regression for 2026-05-26 user report: opening the
+        edit modal on a feature that's a member of a multi-segment
+        group, picking a colour for a NON-selected row via the
+        per-row picker, and pressing Save silently no-op'd. The
+        validator at the Save chokepoint was called with
+        `_members_span_int()` (the opened feature's span) instead
+        of the group's span (`max(rel_end)`), so every row whose
+        `rel_end` exceeded the cursor feature's length tripped
+        the half-open check → ValueError → Save returned without
+        dispatching → the user's per-row colour pick evaporated."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["seg1"],
+                                    "feature_group": ["abc123"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["seg2"],
+                                    "feature_group": ["abc123"]}),
+            SeqFeature(FeatureLocation(150, 200, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["seg3"],
+                                    "feature_group": ["abc123"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            assert len(modal._members) == 3
+            from textual.widgets import Button
+            modal.query_one(
+                "#btn-featedit-edit", Button,
+            ).action_press()
+            await pilot.pause(0.05)
+            modal._open_per_row_color_picker(1)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            picker = app.screen
+            assert isinstance(picker, sc.ColorPickerModal)
+            picker._set_pending("#00FF00")
+            picker._save(None)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert modal._members[1]["color"] == "#00FF00"
+            modal.query_one(
+                "#btn-featedit-save", Button,
+            ).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            seg2 = next(
+                f for f in app._current_record.features
+                if f.qualifiers.get("label") == ["seg2"]
+            )
+            assert seg2.qualifiers.get(
+                "ApEinfo_fwdcolor",
+            ) == ["#00FF00"], (
+                f"per-row colour pick was dropped on Save; "
+                f"seg2 quals = {dict(seg2.qualifiers)!r}"
+            )
+            # 2026-05-26 hardening: non-picked siblings (seg1 and
+            # seg3) must NOT have a colour qualifier — earlier
+            # versions wrote the palette-ref (`color(N)`) string
+            # the parser stamped on un-coloured features, which
+            # then filtered to None on the next picker open and
+            # surfaced as "Auto" — user-perceived as "the colour
+            # I picked turned into Auto" on every sibling row.
+            seg1 = next(
+                f for f in app._current_record.features
+                if f.qualifiers.get("label") == ["seg1"]
+            )
+            seg3 = next(
+                f for f in app._current_record.features
+                if f.qualifiers.get("label") == ["seg3"]
+            )
+            assert seg1.qualifiers.get(
+                "ApEinfo_fwdcolor",
+            ) is None, (
+                f"seg1 (non-picked) got palette-ref pollution: "
+                f"{dict(seg1.qualifiers)!r}"
+            )
+            assert seg3.qualifiers.get(
+                "ApEinfo_fwdcolor",
+            ) is None, (
+                f"seg3 (non-picked) got palette-ref pollution: "
+                f"{dict(seg3.qualifiers)!r}"
+            )
+
+    async def test_edit_modal_per_row_arrowless_strand_persists(
+            self, isolated_library):
+        """Regression for 2026-05-26 user report: "i hit enter to
+        go into the arrow picker, i choose arrowless, and nothing
+        happens". `_on_save` built the non-edit-idx payload with
+        `int(m.get("strand", 1) or 1)` — `0 or 1` is 1, so a
+        per-row arrowless pick on any non-selected member of a
+        group got silently coerced back to forward at save time,
+        and the canvas re-rendered with `▶` on the row the user
+        expected to be `▒`. Same defect on the table refresh:
+        `int(x or 1)` showed `▶ top` for strand=0 in the cell."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["seg1"],
+                                    "feature_group": ["abc123"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["seg2"],
+                                    "feature_group": ["abc123"]}),
+            SeqFeature(FeatureLocation(150, 200, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["seg3"],
+                                    "feature_group": ["abc123"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            modal.query_one(
+                "#btn-featedit-edit", Button,
+            ).action_press()
+            await pilot.pause(0.05)
+            # Open strand picker on row 1 (NON-selected).
+            modal._open_per_row_strand_picker(1)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            picker = app.screen
+            assert isinstance(picker, sc.StrandPickerModal)
+            picker._none(None)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert modal._members[1]["strand"] == 0
+            modal.query_one(
+                "#btn-featedit-save", Button,
+            ).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            seg2 = next(
+                f for f in app._current_record.features
+                if f.qualifiers.get("label") == ["seg2"]
+            )
+            # BioPython's strand=None encodes "no strand" /
+            # arrowless. The `or 1` falsy-coercion bug turned
+            # this into strand=1 (forward) at save time.
+            assert seg2.location.strand is None, (
+                f"per-row Arrowless pick was lost; seg2 strand "
+                f"= {seg2.location.strand} (expected None)"
+            )
+
+    async def test_edit_modal_remove_row_to_one_member_persists(
+            self, isolated_library):
+        """Regression for 2026-05-26 user report: "removing
+        sub-features does not save once saved. features remain
+        as they were before." The dispatch branch `if
+        len(self._members) >= 2` was the only path that emitted
+        `edit_group`; reducing the table down to 1 member fell
+        through to the legacy 1-row `action="save"` path which
+        mutates the cursor feature in-place and leaves every
+        other group member on the canvas — exactly what the
+        user saw ("old ones still lingering"). Fix: also take
+        the group dispatch branch whenever the modal opened on
+        a feature that's already in a group, regardless of the
+        post-edit member count, so the swap actually drops the
+        removed siblings."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 200, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["a"],
+                                    "feature_group": ["gid1"]}),
+            SeqFeature(FeatureLocation(200, 300, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["b"],
+                                    "feature_group": ["gid1"]}),
+            SeqFeature(FeatureLocation(300, 400, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["c"],
+                                    "feature_group": ["gid1"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            modal.query_one(
+                "#btn-featedit-edit", Button,
+            ).action_press()
+            await pilot.pause(0.05)
+            # Remove row 2 (c), then remove row 1 (b) — down to
+            # 1 member (just `a`). Direct method call avoids
+            # event-queue timing issues across two presses.
+            modal._selected_idx = 2
+            modal._on_remove_row()
+            await pilot.pause(0.05)
+            modal._selected_idx = 1
+            modal._on_remove_row()
+            await pilot.pause(0.05)
+            assert len(modal._members) == 1
+            # Save → must dispatch `edit_group` (not legacy
+            # `save`), even though only 1 member remains.
+            modal.query_one(
+                "#btn-featedit-save", Button,
+            ).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Canvas: only `a` should remain in the group; the
+            # deleted siblings b and c must be gone.
+            labels = [
+                f.qualifiers.get("label", [""])[0]
+                for f in app._current_record.features
+                if f.qualifiers.get("feature_group") == ["gid1"]
+            ]
+            assert labels == ["a"], (
+                f"removed siblings linger on canvas; group "
+                f"labels = {labels!r}"
+            )
+            # Sidebar / map / seq panel are repainted from
+            # `pm._feats` inside `_apply_group_edit`, so the
+            # group-feature count in the parsed list must also
+            # match.
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm_group = [
+                f for f in pm._feats
+                if f.get("feature_group") == "gid1"
+            ]
+            assert len(pm_group) == 1, (
+                f"plasmid map still shows removed members: "
+                f"{[f.get('label') for f in pm_group]}"
+            )
+
+    async def test_collect_group_members_preserves_arrowless_strand(
+            self, isolated_library):
+        """Sweep #31 audit finding: `_collect_group_members_for
+        _modal` pre-coerced every member's strand via
+        `int(... or 1)`, silently turning every arrowless
+        sub-feature into a forward arrow at modal-open time.
+        Critical because the validator's own normalisation
+        couldn't see the original 0 — the data was already
+        corrupt by the time it ran. The fix routes through
+        `_coerce_strand` which preserves 0."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        # Three group members with mixed strands including
+        # arrowless (BioPython encodes "no strand" as None on
+        # the location).
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["fwd"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=None),
+                        type="misc_feature",
+                        qualifiers={"label": ["arrow_less"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(150, 200, strand=-1),
+                        type="misc_feature",
+                        qualifiers={"label": ["rev"],
+                                    "feature_group": ["gid"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            strands_by_label = {
+                m["label"]: m["strand"] for m in modal._members
+            }
+            assert strands_by_label["arrow_less"] == 0, (
+                f"arrowless member was coerced to "
+                f"{strands_by_label['arrow_less']} at modal-open"
+            )
+            assert strands_by_label["fwd"] == 1
+            assert strands_by_label["rev"] == -1
+
+    async def test_apply_feature_edit_refuses_grouped_feature(
+            self, isolated_library):
+        """Sweep #31 audit finding: `_apply_feature_edit` (the
+        legacy single-feature edit path) didn't check
+        `feature_group` on the target. Direct callers like the
+        agent HTTP API could mutate one feature in-place,
+        leaving the OTHER group members with stale metadata —
+        silent group desync. Fix: refuse the edit + notify the
+        user to use the atomic Save path."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["a"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["b"],
+                                    "feature_group": ["gid"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Direct call — bypasses FeatureEditModal's
+            # group-aware dispatch, simulating an agent HTTP
+            # endpoint or other future caller.
+            app._apply_feature_edit({
+                "action": "save",
+                "idx": 0,
+                "label": "renamed",
+                "color": "#FF0000",
+            })
+            await pilot.pause(0.05)
+            # The target feature should be UNCHANGED — the
+            # legacy path refused to mutate a grouped feature.
+            a = next(f for f in app._current_record.features
+                     if f.qualifiers.get("label") == ["a"])
+            assert a.qualifiers.get(
+                "ApEinfo_fwdcolor",
+            ) is None, (
+                f"grouped feature was mutated by legacy save: "
+                f"{dict(a.qualifiers)!r}"
+            )
+
+    async def test_per_row_color_picker_identity_survives_row_removal(
+            self, isolated_library):
+        """Sweep #31 staleness fix: the per-row color picker
+        captures the target row's identity (`id(m)`) at open
+        time. If the user does Remove Row before the picker
+        confirms, the captured `row_idx` could point at a
+        DIFFERENT row by the time the callback fires — without
+        the identity check the WRONG member gets re-coloured.
+        Fix: re-find the row by identity in the live members
+        list; if not found, no-op + status message."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["a"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["b"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(150, 200, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["c"],
+                                    "feature_group": ["gid"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Button
+            modal.query_one(
+                "#btn-featedit-edit", Button,
+            ).action_press()
+            await pilot.pause(0.05)
+            # Capture identity of row 1 ("b").
+            b_dict_id = id(modal._members[1])
+            assert modal._members[1]["label"] == "b"
+            # Open color picker on row 1.
+            modal._open_per_row_color_picker(1)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            picker = app.screen
+            assert isinstance(picker, sc.ColorPickerModal)
+            # SIMULATE the user removing row 0 ("a") while the
+            # picker is open — by directly mutating the parent
+            # modal's members list (pilot can't show two modals
+            # at once for a single screen, so we model the
+            # race by mutating between open and dismiss).
+            new_members = list(modal._members)
+            new_members.pop(0)  # drop "a"
+            modal._members = new_members
+            modal._selected_idx = 0
+            # Confirm a color on the picker. Captured row_idx
+            # was 1 — now points at "c". Without the identity
+            # check, "c" would get the new colour. With the
+            # fix, the callback re-finds "b" at its new index
+            # (0) and updates THAT.
+            picker.dismiss({
+                "color": "#FF00FF", "set_default": False,
+            })
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            # "b" should have got the color, "c" should still
+            # be at its palette-ref / None default.
+            b_idx = next(
+                i for i, m in enumerate(modal._members)
+                if m["label"] == "b"
+            )
+            c_idx = next(
+                i for i, m in enumerate(modal._members)
+                if m["label"] == "c"
+            )
+            assert id(modal._members[b_idx]) == b_dict_id
+            assert modal._members[b_idx]["color"] == "#FF00FF", (
+                f"identity-captured row 'b' did not receive "
+                f"the colour; b={modal._members[b_idx]!r}"
+            )
+            assert modal._members[c_idx]["color"] != "#FF00FF", (
+                f"colour landed on the WRONG row 'c': "
+                f"{modal._members[c_idx]!r}"
+            )
+
+    async def test_apply_group_edit_skips_restriction_rescan(
+            self, isolated_library):
+        """Sweep #31 perf-fix: `_apply_group_edit` used to clear
+        the restriction overlay cache and dispatch a full enzyme
+        rescan on every save. The sequence doesn't change during
+        a group edit (only feature metadata), so the overlay is
+        still valid. Fix: preserve `self._restr_cache` and skip
+        the rescan — saves 100–300 ms on a dense plasmid per
+        save. Test the contract by asserting the cache survives
+        the apply path."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(50, 100, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["a"],
+                                    "feature_group": ["gid"]}),
+            SeqFeature(FeatureLocation(100, 150, strand=1),
+                        type="misc_feature",
+                        qualifiers={"label": ["b"],
+                                    "feature_group": ["gid"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Pre-seed the restriction cache with a real-shaped
+            # synthetic feature so the seq-panel render path
+            # doesn't crash. Cache entries are dicts shaped like
+            # canvas features (the painter touches `color`,
+            # `type`, `start`, `end`, `strand`).
+            sentinel = {
+                "start": 10, "end": 16, "strand": 1,
+                "type": "resite", "label": "EcoRI",
+                "color": "#888888",
+                "_sweep31_sentinel": True,
+            }
+            app._restr_cache = [sentinel]
+            app._show_restr = True
+            app._apply_group_edit({
+                "action":   "edit_group",
+                "idx":      0,
+                "group_id": "gid",
+                "members":  [
+                    {"rel_start": 0, "rel_end": 50,
+                     "feature_type": "misc_feature",
+                     "label": "a-renamed", "color": None,
+                     "strand": 1, "qualifiers": {},
+                     "description": ""},
+                    {"rel_start": 50, "rel_end": 100,
+                     "feature_type": "misc_feature",
+                     "label": "b-renamed", "color": None,
+                     "strand": 1, "qualifiers": {},
+                     "description": ""},
+                ],
+            })
+            await pilot.pause(0.05)
+            # Cache should survive — sequence didn't change so
+            # the overlay is still valid.
+            assert app._restr_cache == [sentinel], (
+                f"restriction cache was cleared by a non-"
+                f"sequence-changing group edit: "
+                f"{app._restr_cache!r}"
+            )
+
+    async def test_instant_press_button_fires_on_mouse_down(
+            self, isolated_library):
+        """Sweep #31: `_InstantPressButton` posts `Pressed` on
+        mouse-DOWN rather than waiting for the Click cycle.
+        Works around Textual's real-terminal focus-transition
+        gate that swallows the first click on a non-focused
+        widget. The strand picker uses this subclass so a
+        single physical click registers."""
+        from textual.events import MouseDown
+        from textual.geometry import Offset
+        rec = sc._make_demo_record()
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(
+                sc.StrandPickerModal(current_strand=1),
+            )
+            await pilot.pause()
+            await pilot.pause(0.05)
+            picker = app.screen
+            assert isinstance(picker, sc.StrandPickerModal)
+            # Send a mouse-DOWN to a NON-focused button (Reverse).
+            rev_btn = picker.query_one(
+                "#btn-strand-rev", sc._InstantPressButton,
+            )
+            assert isinstance(rev_btn, sc._InstantPressButton), (
+                "strand picker should use _InstantPressButton"
+            )
+            # Click via pilot — verify the picker dismisses.
+            await pilot.click("#btn-strand-rev")
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert not isinstance(
+                app.screen, sc.StrandPickerModal,
+            ), "picker still open after single click"
+
+    async def test_apply_feature_edit_color_parity_with_annotate(
+            self, isolated_library):
+        """Parity guard: `_apply_feature_edit` must validate
+        `new_color` the same way `_annotate_with_feature_impl`
+        does so the create + edit flows can't drift. Specifically:
+        non-string colors / empty / whitespace-only values
+        clear the qualifiers (treat as Auto); valid strings get
+        stripped + written to both qualifiers. Pre-hardening the
+        edit path coerced any non-None value via `str()`, so
+        `new_color=""` left an empty-string qualifier on the
+        feature, and `new_color="  "` left a whitespace
+        qualifier — both of which would visually map to "no
+        color" in the renderer but persist as junk in the .gb
+        export."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(
+            Seq("A" * 1000), id="L", name="L",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        rec.features = [
+            SeqFeature(
+                FeatureLocation(100, 400, strand=1), type="CDS",
+                qualifiers={
+                    "label": ["lacZ"],
+                    "ApEinfo_fwdcolor": ["#aaaaaa"],
+                    "ApEinfo_revcolor": ["#aaaaaa"],
+                },
+            ),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Valid color (with leading/trailing whitespace) →
+            # qualifiers updated to stripped form.
+            app._apply_feature_edit({
+                "idx": 0, "color": "  #ABC123  ",
+            })
+            await pilot.pause(0.05)
+            f = next(f for f in app._current_record.features
+                      if f.type == "CDS")
+            assert f.qualifiers["ApEinfo_fwdcolor"] == ["#ABC123"]
+            assert f.qualifiers["ApEinfo_revcolor"] == ["#ABC123"]
+            # Empty string → qualifiers cleared (Auto color).
+            app._apply_feature_edit({
+                "idx": 0, "color": "",
+            })
+            await pilot.pause(0.05)
+            f = next(f for f in app._current_record.features
+                      if f.type == "CDS")
+            assert "ApEinfo_fwdcolor" not in f.qualifiers
+            assert "ApEinfo_revcolor" not in f.qualifiers
+            # Re-set a color so we can verify whitespace also clears.
+            app._apply_feature_edit({
+                "idx": 0, "color": "#FF0000",
+            })
+            await pilot.pause(0.05)
+            app._apply_feature_edit({
+                "idx": 0, "color": "   \t  ",
+            })
+            await pilot.pause(0.05)
+            f = next(f for f in app._current_record.features
+                      if f.type == "CDS")
+            assert "ApEinfo_fwdcolor" not in f.qualifiers
+            assert "ApEinfo_revcolor" not in f.qualifiers
+            # Non-string types are rejected (treated as Auto).
+            app._apply_feature_edit({
+                "idx": 0, "color": "#00FF00",
+            })
+            await pilot.pause(0.05)
+            for bad in (123, ["#ff0000"], {"hex": "#ff0000"}, True):
+                app._apply_feature_edit({"idx": 0, "color": bad})
+                await pilot.pause(0.05)
+                f = next(f for f in app._current_record.features
+                          if f.type == "CDS")
+                assert "ApEinfo_fwdcolor" not in f.qualifiers, (
+                    f"non-string color {bad!r} should clear qualifier"
+                )
+
     async def test_feature_edit_modal_save_applies_edits(
             self, isolated_library):
         """End-to-end: open the modal, press Edit, change the label,
@@ -7814,6 +8615,407 @@ class TestShiftClickFeatureExtend:
         out = scr._body_text(60)
         assert out is not None
         assert "wrapCDS" not in str(out) or True  # rendering may abbreviate
+
+    def test_alignment_body_rows_fit_within_chunk_w(self):
+        """Regression for the 2026-05-26 "2 bp overflow" report: every
+        data row produced by `_body_text(chunk_w)` must be at most
+        `chunk_w` cells wide so the rightmost characters don't wrap
+        onto the next visual line. Pre-fix, the chunk width was
+        sourced from `body.content_size.width` which excluded the
+        border but NOT the scrollbar gutter, leaving the rendered
+        rows 2 chars wider than the actual drawable area.
+
+        The per-chunk coordinate header is informational — not
+        column-aligned with the data rows — and can legitimately
+        exceed `chunk_w` on degenerate (very narrow) chunks. Skip
+        header lines here; their width is exercised separately."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq as _Seq
+        target_seq = "ATGC" * 60   # 240 bp
+        target_rec = SeqRecord(_Seq(target_seq), id="t", name="t")
+        result = sc._pairwise_align(target_seq, target_seq)
+        scr = sc.AlignmentScreen("q", "t", target_rec, result)
+        # Sweep multiple realistic chunk widths (narrow, mid, wide).
+        for chunk_w in (40, 60, 100, 157, 200):
+            out = scr._body_text(chunk_w)
+            assert out is not None
+            for line in out.plain.split("\n"):
+                # Coordinate-header lines start with "target " or
+                # "query-only" — they're labels, not column-aligned
+                # rows. Annotation lane, target, match track,
+                # query: all MUST be exactly chunk_w or fewer
+                # cells. Pre-fix the alignment rows came in at
+                # chunk_w + 2 invisible extra chars from the wrap
+                # reflow. The blank line between chunks is empty.
+                if line.startswith("target ") or line.startswith("query-only"):
+                    continue
+                assert len(line) <= chunk_w, (
+                    f"line of width {len(line)} exceeds chunk_w="
+                    f"{chunk_w}: {line!r}"
+                )
+
+    def test_alignment_body_gap_chunk_header_shows_bracket(self):
+        """Regression for the 2026-05-26 "why does it say target ?..?"
+        report: when a chunk is entirely target-gap (the query has
+        bases that don't align to any target base across all
+        `chunk_w` columns), the header now surfaces the BRACKETING
+        target bp coordinates with a `query-only` label instead of
+        bare `?..?`.
+
+        Construct a synthetic alignment dict so the chunk_w slicing
+        deterministically yields at least one all-gap chunk.
+        Pre-fix the header rendered as `target bp ?..?`."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq as _Seq
+        # 10 target bases + 50 cols of target gap + 10 target bases.
+        # At chunk_w=20 → chunk 0: cols 0–19 (10 target + 10 gap),
+        # chunk 1: cols 20–39 (20 cols of pure target gap — the
+        # case under test), chunk 2: cols 40–59 (20 cols of gap),
+        # chunk 3: cols 60–69 (final 10 target bases).
+        target_seq = "ATGCATGCAT" + "ATGCATGCAT"  # 20 bp target
+        aligned_t = "ATGCATGCAT" + "-" * 50 + "ATGCATGCAT"
+        aligned_q = "ATGCATGCAT" + "A" * 50 + "ATGCATGCAT"
+        target_rec = SeqRecord(_Seq(target_seq), id="t", name="t")
+        result = {
+            "aligned_q": aligned_q,
+            "aligned_t": aligned_t,
+            "q_len": 70, "t_len": 20,
+            "identity_pct": 28.5,
+            "ungapped_identity_pct": 100.0,
+            "score": 20.0,
+            "n_matches": 20, "n_mismatches": 0, "n_gaps": 50,
+        }
+        scr = sc.AlignmentScreen("q", "t", target_rec, result)
+        out = scr._body_text(20)
+        plain = out.plain
+        # Pre-fix sentinel: the bare `?..?` header must NOT appear.
+        assert "?..?" not in plain
+        assert "target bp ?" not in plain
+        # Normal head chunk: covers target bp 1–10.
+        assert "target bp 1..10" in plain
+        # Gap chunk(s): bracket bp 10 (preceding) → bp 11 (next).
+        assert "target bp 10→11" in plain
+        # And the label makes the chunk type explicit.
+        assert "query-only" in plain
+
+    def test_alignment_body_gap_at_head_renders_target_start(self):
+        """Head-only edge case: the very first chunk is entirely
+        target gap (the query has leading bases that don't align).
+        No preceding target bp exists, so the header reads
+        `target start→bp N · query-only head (…)` rather than the
+        ambiguous `?` form."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq as _Seq
+        target_seq = "ATGCATGCAT"
+        # 25 cols of target gap then 10 target bases.
+        aligned_t = "-" * 25 + "ATGCATGCAT"
+        aligned_q = "A" * 25 + "ATGCATGCAT"
+        target_rec = SeqRecord(_Seq(target_seq), id="t", name="t")
+        result = {
+            "aligned_q": aligned_q, "aligned_t": aligned_t,
+            "q_len": 35, "t_len": 10,
+            "identity_pct": 28.5,
+            "ungapped_identity_pct": 100.0,
+            "score": 10.0,
+            "n_matches": 10, "n_mismatches": 0, "n_gaps": 25,
+        }
+        scr = sc.AlignmentScreen("q", "t", target_rec, result)
+        out = scr._body_text(20)
+        plain = out.plain
+        assert "?..?" not in plain
+        assert "target start" in plain
+        assert "query-only head" in plain
+
+    def test_arrowless_feature_strand_round_trips_through_parse(self):
+        """Regression for 2026-05-26 "Arrowless picks strand=0 but
+        seq panel still shows ▶" report.
+
+        Round-trip: `_annotate_with_feature_impl` saves a strand=0
+        feature as a BioPython `FeatureLocation(strand=None)`.
+        Re-extracting via `PlasmidMap._parse` (the canonical
+        feature-dict builder used by both the map and the seq panel,
+        which share the dict reference) previously did
+        `getattr(loc, "strand", 1) or 1` → `None or 1 == 1`, so the
+        arrowless feature came back as forward and rendered with a
+        `▶` arrowhead instead of the `▒` block. The fix maps None →
+        0 to honour the GenBank convention of "no strand info = no
+        direction".
+
+        Tests `_parse` directly via a synthetic record (cheaper than
+        spinning up the full PlasmidMap widget)."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq as _Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+        # Three features: one explicit forward, one explicit reverse,
+        # and one arrowless (strand=None) — the case under test.
+        fwd_feat = SeqFeature(
+            FeatureLocation(0, 30, strand=1),
+            type="CDS", qualifiers={"label": ["fwd"]},
+        )
+        rev_feat = SeqFeature(
+            FeatureLocation(30, 60, strand=-1),
+            type="CDS", qualifiers={"label": ["rev"]},
+        )
+        none_feat = SeqFeature(
+            FeatureLocation(60, 90, strand=None),
+            type="misc_feature", qualifiers={"label": ["arrowless"]},
+        )
+        rec = SeqRecord(_Seq("A" * 100), id="t", name="t",
+                        features=[fwd_feat, rev_feat, none_feat])
+        # Spin up a bare PlasmidMap to access `_parse`. `_parse` is a
+        # regular method — it reads `record.features` and doesn't
+        # depend on the widget being mounted.
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        by_label = {f["label"]: f for f in feats}
+        assert by_label["fwd"]["strand"] == 1
+        assert by_label["rev"]["strand"] == -1
+        # The fix: arrowless lands as 0, not 1.
+        assert by_label["arrowless"]["strand"] == 0, (
+            "Arrowless feature (loc.strand=None) must parse as "
+            "strand=0; pre-fix it coerced to 1 (forward) via "
+            "`getattr(loc, 'strand', 1) or 1`."
+        )
+
+    def test_add_feature_modal_sticky_picks_inherited(self):
+        """Regression for 2026-05-26 "user added choices persistent
+        so when going back to the modal it doesnt reset to default"
+        request: a fresh `AddFeatureModal()` with no explicit
+        prefill picks up the previous session's feature_type /
+        strand / color via the class-level `_LAST_USER_PICKS`
+        dict (set by `_capture_sticky_picks` on every dismiss
+        path)."""
+        # Simulate "previous session" by directly seeding the
+        # class-level dict — same shape as `_capture_sticky_picks`
+        # writes. Snapshot + restore so the test doesn't leak
+        # state into other tests in the same process.
+        prev = dict(sc.AddFeatureModal._LAST_USER_PICKS)
+        try:
+            sc.AddFeatureModal._LAST_USER_PICKS = {
+                "feature_type": "promoter",
+                "strand": -1,
+                "color": "#ff8800",
+            }
+            m = sc.AddFeatureModal()
+            assert m._prefill.get("feature_type") == "promoter"
+            assert m._prefill.get("strand") == -1
+            assert m._prefill.get("color") == "#ff8800"
+            # `_color` mirrors `_prefill["color"]` after init so the
+            # swatch refresh fires with the right initial value.
+            assert m._color == "#ff8800"
+        finally:
+            sc.AddFeatureModal._LAST_USER_PICKS = prev
+
+    def test_add_feature_modal_explicit_prefill_overrides_sticky(self):
+        """Explicit `prefill` (e.g. Import-from-plasmid, parts-bin
+        "Add as new") MUST win over the sticky picks — the caller
+        asked for those specific values, and silently overriding
+        them with the user's last session would surprise them."""
+        prev = dict(sc.AddFeatureModal._LAST_USER_PICKS)
+        try:
+            sc.AddFeatureModal._LAST_USER_PICKS = {
+                "feature_type": "promoter",
+                "strand": -1,
+                "color": "#ff8800",
+            }
+            m = sc.AddFeatureModal(prefill={
+                "name": "explicit",
+                "feature_type": "terminator",
+                "strand": 1,
+                "color": "#00ff00",
+                "sequence": "ATGC",
+            })
+            assert m._prefill["name"] == "explicit"
+            assert m._prefill["feature_type"] == "terminator"
+            assert m._prefill["strand"] == 1
+            assert m._prefill["color"] == "#00ff00"
+            # Sequence flows through too (the explicit caller wins
+            # on every field, not just the sticky ones).
+            assert m._prefill["sequence"] == "ATGC"
+        finally:
+            sc.AddFeatureModal._LAST_USER_PICKS = prev
+
+    def test_add_feature_modal_empty_sticky_uses_cold_defaults(self):
+        """When `_LAST_USER_PICKS` is empty (first-ever open of the
+        modal in a fresh process), the constructor must NOT
+        crash and must produce an empty prefill — the compose()
+        defaults (CDS / Forward / Auto color) kick in normally."""
+        prev = dict(sc.AddFeatureModal._LAST_USER_PICKS)
+        try:
+            sc.AddFeatureModal._LAST_USER_PICKS = {}
+            m = sc.AddFeatureModal()
+            # `_prefill` is the (possibly-empty) source for compose()
+            # defaults. With nothing sticky and no caller prefill, it
+            # stays empty.
+            assert m._prefill == {}
+            assert m._color is None
+        finally:
+            sc.AddFeatureModal._LAST_USER_PICKS = prev
+
+    def test_add_feature_modal_corrupt_sticky_falls_back_to_cold(self):
+        """Defensive: a future change (or a buggy test) could plant
+        nonsense in `_LAST_USER_PICKS` — non-string feature_type,
+        out-of-range strand, non-string color. The init MUST drop
+        those invalid keys (not silently propagate them into the
+        form's compose() radios / select), so the user lands on
+        cold defaults instead of a partially-broken state where
+        no radio is checked because the prefill strand was 99."""
+        prev = dict(sc.AddFeatureModal._LAST_USER_PICKS)
+        try:
+            sc.AddFeatureModal._LAST_USER_PICKS = {
+                # Each value is invalid in a different way.
+                "feature_type": 123,           # not a str
+                "strand": 99,                  # out of {-1, 0, 1, 2}
+                "color": ["#ff0000"],          # not a str
+            }
+            m = sc.AddFeatureModal()
+            assert "feature_type" not in m._prefill
+            assert "strand"       not in m._prefill
+            assert "color"        not in m._prefill
+            assert m._color is None
+            # Empty / whitespace-only string forms also rejected.
+            sc.AddFeatureModal._LAST_USER_PICKS = {
+                "feature_type": "   ",
+                "strand":       None,
+                "color":        "",
+            }
+            m2 = sc.AddFeatureModal()
+            assert m2._prefill == {}
+            assert m2._color is None
+        finally:
+            sc.AddFeatureModal._LAST_USER_PICKS = prev
+
+    def test_add_feature_modal_sticky_strips_whitespace(self):
+        """Sticky values are stored stripped (in case a future
+        capture path picks up a value with leading / trailing
+        whitespace from a custom Input). The prefill consumes
+        the canonical form."""
+        prev = dict(sc.AddFeatureModal._LAST_USER_PICKS)
+        try:
+            sc.AddFeatureModal._LAST_USER_PICKS = {
+                "feature_type": "  promoter  ",
+                "strand": 0,
+                "color": "  #abc123  ",
+            }
+            m = sc.AddFeatureModal()
+            assert m._prefill["feature_type"] == "promoter"
+            assert m._prefill["strand"] == 0
+            assert m._prefill["color"] == "#abc123"
+            assert m._color == "#abc123"
+        finally:
+            sc.AddFeatureModal._LAST_USER_PICKS = prev
+
+    def test_add_feature_modal_cancel_does_not_overwrite_sticky(
+        self,
+    ):
+        """Sticky picks update only on COMMIT (Save / Insert /
+        Annotate). A cancelled session represents picks the user
+        DID NOT commit to — overwriting the previously-saved sticky
+        picks with the cancelled form's values would lose useful
+        state (e.g. the user opened the modal to glance at an
+        existing feature, changed the type while exploring, then
+        Esc'd; their last real `feature_type` choice should
+        survive)."""
+        prev = dict(sc.AddFeatureModal._LAST_USER_PICKS)
+        try:
+            sc.AddFeatureModal._LAST_USER_PICKS = {
+                "feature_type": "promoter",
+                "strand": -1,
+                "color": "#ff0000",
+            }
+            m = sc.AddFeatureModal()
+            # Simulate a cancel dismiss without going through the
+            # widget tree: directly call `dismiss(None)`. The
+            # override should skip the capture for non-commit
+            # results.
+            # We can't actually call super().dismiss(None) without
+            # mounting the screen, so we exercise the GUARD path:
+            # invoke the override and assert the sticky dict
+            # didn't change.
+            try:
+                m.dismiss(None)
+            except Exception:
+                # super().dismiss may raise without an app mounted —
+                # that's fine; we only care that the capture didn't
+                # mutate the dict before the super call.
+                pass
+            assert sc.AddFeatureModal._LAST_USER_PICKS == {
+                "feature_type": "promoter",
+                "strand": -1,
+                "color": "#ff0000",
+            }
+            # Same for a dict result whose action isn't in the
+            # commit set (e.g., a future "preview" action).
+            try:
+                m.dismiss({"action": "preview", "entry": {}})
+            except Exception:
+                pass
+            assert sc.AddFeatureModal._LAST_USER_PICKS == {
+                "feature_type": "promoter",
+                "strand": -1,
+                "color": "#ff0000",
+            }
+        finally:
+            sc.AddFeatureModal._LAST_USER_PICKS = prev
+
+    def test_feat_bounds_preserves_arrowless(self):
+        """`_feat_bounds` is the wrap-aware variant used by the
+        primer-design path. Same `or 1` bug pre-2026-05-26."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+        none_feat = SeqFeature(
+            FeatureLocation(10, 25, strand=None),
+            type="misc_feature",
+        )
+        result = sc._feat_bounds(none_feat, total=100)
+        assert result is not None
+        s, e, strand = result
+        assert (s, e) == (10, 25)
+        assert strand == 0, (
+            "loc.strand=None must round-trip as strand=0 (arrowless), "
+            "not 1 (forward)."
+        )
+
+    def test_alignment_body_gap_at_tail_renders_target_end(self):
+        """Tail-only edge case: the very last chunk is entirely
+        target gap (the query has trailing bases that don't align).
+        No following target bp exists, so the header reads
+        `target bp N→end · query-only tail (…)`."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq as _Seq
+        target_seq = "ATGCATGCAT"
+        aligned_t = "ATGCATGCAT" + "-" * 25
+        aligned_q = "ATGCATGCAT" + "A" * 25
+        target_rec = SeqRecord(_Seq(target_seq), id="t", name="t")
+        result = {
+            "aligned_q": aligned_q, "aligned_t": aligned_t,
+            "q_len": 35, "t_len": 10,
+            "identity_pct": 28.5,
+            "ungapped_identity_pct": 100.0,
+            "score": 10.0,
+            "n_matches": 10, "n_mismatches": 0, "n_gaps": 25,
+        }
+        scr = sc.AlignmentScreen("q", "t", target_rec, result)
+        out = scr._body_text(20)
+        plain = out.plain
+        assert "?..?" not in plain
+        assert "→end" in plain
+        assert "query-only tail" in plain
+
+    def test_alignment_scrollbar_constant_matches_widget_tree(self):
+        """The `_SCROLLBAR_RESERVED` constant on AlignmentScreen
+        encodes the empirical 2-cell gap between
+        `body.content_size.width` and the inner Static's actual
+        drawable width on Textual 8.2.6. The value was measured
+        against a real 171×43 session widget tree (2026-05-26).
+        If a Textual upgrade changes the scrollbar metrics this
+        test fires and tells you to re-measure."""
+        assert hasattr(sc.AlignmentScreen, "_SCROLLBAR_RESERVED")
+        assert isinstance(sc.AlignmentScreen._SCROLLBAR_RESERVED, int)
+        assert sc.AlignmentScreen._SCROLLBAR_RESERVED >= 1
+        # Cap: more than 4 cells of scrollbar would be a bug.
+        assert sc.AlignmentScreen._SCROLLBAR_RESERVED <= 4
 
     def test_list_gbk_members_in_zip(self, tmp_path):
         import zipfile

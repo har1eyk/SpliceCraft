@@ -463,6 +463,112 @@ class TestBlastDbSizeCap:
 
 class TestBlastModalIntegration:
 
+    async def test_modal_is_full_screen(
+            self, tiny_record, isolated_library):
+        """Regression for 2026-05-26 "not enough space for the hmm
+        elements" report: the modal MUST render at near-full-screen
+        size (98%×96%) like AlignmentScreen so the HMM picker +
+        Manage button + banner + query + results all fit without
+        cramping, and so future TabbedContent layers have room to
+        land. Pre-fix the modal was a 96-cell-wide centered dialog
+        (90% height capped at 44) and the HMM section's three rows
+        visually collided.
+
+        Uses `dlg.region` (the screen-aligned outer box) rather
+        than `dlg.size` (the inner content area, which is reduced
+        by `padding: 1 2` + `border: solid`)."""
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            dlg = modal.query_one("#blast-dlg")
+            region = dlg.region
+            # 98% of 171 = 167.58 → 167; 96% of 43 = 41.28 → 41.
+            # Pre-fix outer width was 96 cells flat (no `%`), so
+            # any width ≥ 150 confirms the `width: 98%` rule took
+            # effect. Height likewise: pre-fix outer was 38 cells.
+            assert region.width  >= 150, (
+                f"#blast-dlg outer width {region.width} too "
+                f"narrow — the modal must be near-full-screen "
+                f"(98%)."
+            )
+            assert region.height >= 39, (
+                f"#blast-dlg outer height {region.height} too "
+                f"short — the modal must be near-full-screen "
+                f"(96%)."
+            )
+
+    async def test_modal_uses_tabbed_content_for_future_growth(
+            self, tiny_record, isolated_library):
+        """Regression / scaffold guard: the BLAST modal hosts its
+        body inside a `TabbedContent` with a `tab-blast-hmm`
+        `TabPane`. Pre-tab structure (2026-05-26) the body was a
+        bare `ScrollableContainer` directly under `#blast-dlg`,
+        so adding a sibling search tool (pairwise align, ORF
+        finder, …) required restructuring the modal. The tab
+        scaffold means a new tool drops in as a single new
+        `TabPane`. This test catches a regression where the
+        tabbed shell gets accidentally removed by a refactor."""
+        from textual.widgets import TabbedContent, TabPane
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            tabs = modal.query_one("#blast-tabs", TabbedContent)
+            assert tabs is not None
+            pane = modal.query_one("#tab-blast-hmm", TabPane)
+            assert pane is not None
+            # The existing controls live inside the tab pane
+            # (queryable by ID anywhere in the DOM, but the
+            # parent chain must include the TabPane so a future
+            # refactor can't accidentally hoist them back out).
+            query = modal.query_one("#blast-query")
+            ancestor_ids = {
+                w.id for w in query.ancestors
+                if getattr(w, "id", None)
+            }
+            assert "tab-blast-hmm" in ancestor_ids
+            assert "blast-tabs" in ancestor_ids
+
+    async def test_modal_hidden_path_input_reserves_no_space(
+            self, tiny_record, isolated_library):
+        """Pre-fix the `.-hidden` class on `#blast-hmm-path` had no
+        CSS rule so the "hidden" back-compat Input actually
+        rendered, eating 3 rows of layout right between the HMM
+        Select and the six-frame Checkbox. Now `.-hidden` on this
+        Input is scoped to `display: none` so the widget reserves
+        no layout space — the worker / legacy tests can still
+        `query_one("#blast-hmm-path")` to read the path, the user
+        just doesn't see it."""
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            inp = modal.query_one("#blast-hmm-path", sc.Input)
+            # The Input still exists (back-compat: legacy tests +
+            # workers query it for the path value).
+            assert inp is not None
+            # …but the widget MUST NOT reserve layout space.
+            # `display = False` means width / height are both 0.
+            assert inp.region.height == 0, (
+                "#blast-hmm-path must be display:none (reserves "
+                "zero layout rows) so the HMM section's three "
+                "rows don't visually collide. Got region.height="
+                f"{inp.region.height}."
+            )
+
     async def test_run_returns_engine_results_not_phase2_stub(
             self, tiny_record, isolated_library):
         # Seed a collection with one plasmid containing a recognisable
