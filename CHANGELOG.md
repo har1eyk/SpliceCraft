@@ -14,6 +14,24 @@
 
 ---
 
+## [0.9.33] — 2026-05-27
+
+### Alignment Manager: mark rows + delete marked
+
+#### New features
+
+- **Mark rows for bulk delete instead of nuking everything.** The Alignment Manager (Alt+L) used to give you one bulk option — a destructive "Delete All" button that wiped every stored alignment for the plasmid. Now Space toggles a transient × mark on the cursor row, and the bulk button is "Delete Marked" — only marked rows go. Mark a few bad lanes, delete them, leave the rest untouched. Marks are session-only (the × never lands on disk).
+- **Visibility toggle moved to `v`** so Space's new mark binding doesn't collide. Existing Hide All / Show All buttons untouched — they still flip the persistent `visible` flag in bulk. Delete (the keybinding) still removes the cursor row instantly.
+- **Status bar shows marked count.** Modal footer now reads "N stored (X visible, Y hidden) · Z marked" so you can see your selection at a glance before pressing Delete Marked. If you press the button with nothing marked, you get a toast hint instead of a silent no-op.
+
+#### Hardening
+
+- **6 new tests** in `tests/test_alignment_overlay.py`:
+  * `TestAlignmentManagerMarkAndDeleteMarked` (5 cases) — default-off mark, toggle flips only cursor row, Delete Marked respects the selection, Delete Marked with nothing marked is a no-op, `_marked` flag stripped from the dismiss payload before reaching disk.
+  * `TestAlignmentManagerBandRefreshAfterDelete` (1 case) — full round-trip pins down the user-reported "delete doesn't update band" flow: seed two alignments on disk, hydrate, open modal, mark + Delete Marked + Save & Close, verify the band updated to one alignment AND the library entry on disk matches. Passes — the band-refresh path works under the test harness.
+
+---
+
 ## [0.9.32] — 2026-05-27
 
 ### Alignment overlay name + cross-collection persistence fix

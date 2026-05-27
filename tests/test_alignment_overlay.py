@@ -1247,6 +1247,207 @@ class TestAlignmentManagerModal:
             assert captured[-1] == ("cancel", None)
 
 
+class TestAlignmentManagerMarkAndDeleteMarked:
+    """2026-05-27 user feedback: there was no way to bulk-delete a
+    subset of lanes — the only bulk option was the all-or-nothing
+    "Delete All" button. Replaced with a transient mark concept:
+    Space marks the cursor row (× column), "Delete Marked" wipes
+    only marked rows. Visibility toggle moved to `v` so Space's
+    new mark binding doesn't collide."""
+
+    @staticmethod
+    def _make_stored(label, id_=""):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("T" * 80), id="T_TARGET", name="T_TARGET",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        return {
+            "id":              id_ or f"id-{label}",
+            "label":           label,
+            "query_label":     "Q",
+            "target_label":    "T",
+            "target_id":       "T_TARGET",
+            "target_gb_text":  sc._record_to_gb_text(rec),
+            "target_seq_hash": sc._alignment_target_hash("T" * 80),
+            "axis":            "query",
+            "result":          {"aligned_q": "A" * 80,
+                                "aligned_t": "T" * 80,
+                                "identity_pct": 99.0},
+            "visible":         True,
+            "added":           "2026-05-27",
+            "source":          "manual",
+        }
+
+    async def test_mark_default_off_for_all_rows(
+            self, tiny_record, isolated_library):
+        stored = [self._make_stored("a"), self._make_stored("b")]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal)
+            await pilot.pause(); await pilot.pause(0.05)
+            for row in modal._alignments:
+                assert row.get("_marked") is False
+
+    async def test_toggle_mark_flips_only_cursor_row(
+            self, tiny_record, isolated_library):
+        stored = [self._make_stored("a"), self._make_stored("b"),
+                  self._make_stored("c")]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal)
+            await pilot.pause(); await pilot.pause(0.05)
+            from textual.widgets import DataTable
+            t = modal.query_one("#alnmgr-table", DataTable)
+            t.move_cursor(row=1)
+            modal.action_toggle_mark()
+            assert modal._alignments[0]["_marked"] is False
+            assert modal._alignments[1]["_marked"] is True
+            assert modal._alignments[2]["_marked"] is False
+            # Toggle again → off.
+            modal.action_toggle_mark()
+            assert modal._alignments[1]["_marked"] is False
+
+    async def test_delete_marked_only_removes_marked_rows(
+            self, tiny_record, isolated_library):
+        stored = [self._make_stored("keep1"), self._make_stored("dropme"),
+                  self._make_stored("keep2"), self._make_stored("dropme2")]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal)
+            await pilot.pause(); await pilot.pause(0.05)
+            modal._alignments[1]["_marked"] = True
+            modal._alignments[3]["_marked"] = True
+            modal._delete_marked(None)
+            assert [a["label"] for a in modal._alignments] == [
+                "keep1", "keep2",
+            ]
+
+    async def test_delete_marked_with_nothing_marked_is_noop(
+            self, tiny_record, isolated_library):
+        stored = [self._make_stored("a"), self._make_stored("b")]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal)
+            await pilot.pause(); await pilot.pause(0.05)
+            modal._delete_marked(None)
+            # All rows survive.
+            assert len(modal._alignments) == 2
+
+    async def test_save_strips_marked_flag_from_dismiss_payload(
+            self, tiny_record, isolated_library):
+        """`_marked` is a UI-only selector — must not reach disk via
+        the dismiss callback (caller's `_save_library` would persist
+        it into the JSON otherwise)."""
+        stored = [self._make_stored("a"), self._make_stored("b")]
+        captured: list = []
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal, callback=captured.append)
+            await pilot.pause(); await pilot.pause(0.05)
+            modal._alignments[0]["_marked"] = True
+            modal._save_and_close(None)
+            await pilot.pause(); await pilot.pause(0.05)
+            assert captured, "dismiss callback never fired"
+            payload = captured[0]
+            assert payload is not None
+            assert len(payload) == 2
+            for row in payload:
+                assert "_marked" not in row, (
+                    f"_marked flag leaked through dismiss: {row!r}"
+                )
+
+
+class TestAlignmentManagerBandRefreshAfterDelete:
+    """2026-05-27 user report: deleting alignments via Alt+L doesn't
+    update the lane bars on the linear viewer. Pin the band-refresh
+    path so a Delete + Save & Close cycle clears the in-memory band
+    AND re-hydrates only what's left on disk."""
+
+    async def test_delete_via_modal_then_save_updates_band(
+            self, tiny_record, isolated_library):
+        # Seed: tiny_record's library entry has TWO stored alignments.
+        stored_a = TestAlignmentManagerMarkAndDeleteMarked._make_stored("keep")
+        stored_b = TestAlignmentManagerMarkAndDeleteMarked._make_stored("dropme")
+        sc._save_library([{
+            "id": tiny_record.id, "name": tiny_record.name,
+            "size": len(tiny_record.seq), "n_feats": 0,
+            "added": "2026-05-27",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+            "alignments": [stored_a, stored_b],
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            app._apply_record(tiny_record)
+            await pilot.pause(0.1)
+            assert len(app._alignments) == 2, (
+                "hydrate should restore both stored alignments to "
+                "the band"
+            )
+            # Drive the modal: mark the dropme row, delete marked,
+            # save & close. Use the same callback the app wires up so
+            # the band-refresh happens.
+            modal = sc.AlignmentManagerModal(
+                [stored_a, stored_b], plasmid_label=tiny_record.name,
+            )
+            rec_id = tiny_record.id
+            captured = []
+
+            def _on_done(updated):
+                captured.append(updated)
+                if updated is None:
+                    return
+                entries2 = sc._load_library()
+                idx = next(
+                    (i for i, e in enumerate(entries2)
+                     if e.get("id") == rec_id), -1,
+                )
+                if idx < 0:
+                    return
+                entries2[idx]["alignments"] = updated
+                sc._save_library(entries2, async_sync=True)
+                app._clear_alignments()
+                app._hydrate_alignments_for_active()
+
+            app.push_screen(modal, callback=_on_done)
+            await pilot.pause(); await pilot.pause(0.05)
+            # Mark the second row + delete marked + save.
+            modal._alignments[1]["_marked"] = True
+            modal._delete_marked(None)
+            modal._save_and_close(None)
+            await pilot.pause(); await pilot.pause(0.1)
+            assert captured and captured[0] is not None
+            # In-memory band should now have 1 alignment (keep).
+            assert len(app._alignments) == 1, (
+                f"band must refresh after delete + save; "
+                f"got {len(app._alignments)} alignments still on band"
+            )
+            assert app._alignments[0]["name"] == "keep"
+            # And the library entry on disk matches.
+            entries = sc._load_library()
+            t_entry = next(e for e in entries if e["id"] == rec_id)
+            stored = t_entry.get("alignments") or []
+            assert len(stored) == 1
+            assert stored[0]["label"] == "keep"
+
+
 class TestAlignmentSurvivesZoomAndPan:
     """Regression guards for the user-reported "the alignment disappears
     when I zoom or pan" complaint. The intended behaviour:
