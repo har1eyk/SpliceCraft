@@ -57,12 +57,27 @@ def _iupac_pattern(site: str) -> "re.Pattern[str]":
     # `"GAATTC"` produce identical regex objects but pre-fix occupied
     # two separate slots — wasting one cap unit per mixed-case
     # variant. Normalize to uppercase before lookup AND store.
+    #
+    # 2026-05-27 (audit-5 restriction M3): reject unknown characters
+    # instead of silently letting them into the regex. Pre-fix any
+    # char not in `_IUPAC_RE` fell through to `c` itself — a custom
+    # enzyme site like ``"GAATU"`` (RNA U typo) compiled to a literal
+    # ``U`` pattern that never matched DNA, and a stray regex
+    # metacharacter (``*``, ``(``, ``?``) became part of the pattern.
+    # User-defined enzyme sites are an attack surface; validate here.
     key = site.upper()
     pat = _PATTERN_CACHE.get(key)
     if pat is not None:
         _PATTERN_CACHE.move_to_end(key)
         return pat
-    pat = re.compile("".join(_IUPAC_RE.get(c, c) for c in key))
+    bad = [c for c in key if c not in _IUPAC_RE]
+    if bad:
+        raise ValueError(
+            f"recognition site {site!r} contains non-IUPAC "
+            f"character(s) {', '.join(repr(c) for c in bad[:6])}"
+            f"{' (truncated)' if len(bad) > 6 else ''}"
+        )
+    pat = re.compile("".join(_IUPAC_RE[c] for c in key))
     _PATTERN_CACHE[key] = pat
     if len(_PATTERN_CACHE) > _PATTERN_CACHE_MAX:
         _PATTERN_CACHE.popitem(last=False)

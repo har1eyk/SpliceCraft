@@ -174,11 +174,17 @@ class TestSimulatePcrInputValidation:
                                   "GCATGCATGCATGCAT") == []
 
     def test_non_acgt_primer(self):
-        # IUPAC chars rejected — exact-match model only accepts ACGT
-        assert sc._simulate_pcr("ATGC" * 100, "NNNNNNNNNNNNNNNNNNNN",
-                                  "GCATGCATGCATGCAT") == []
-        assert sc._simulate_pcr("ATGC" * 100, "GCATGCATGCATGCAT",
-                                  "RYWSMKBDHVRYWSMKBDHV") == []
+        # 2026-05-27 (audit-5 primer H1): IUPAC chars used to silently
+        # return []; the GUI couldn't distinguish "primer was
+        # filtered" from "primer doesn't bind". Now raises ValueError
+        # so the caller can surface a proper error to the user.
+        import pytest
+        with pytest.raises(ValueError, match="IUPAC"):
+            sc._simulate_pcr("ATGC" * 100, "NNNNNNNNNNNNNNNNNNNN",
+                              "GCATGCATGCATGCAT")
+        with pytest.raises(ValueError, match="IUPAC"):
+            sc._simulate_pcr("ATGC" * 100, "GCATGCATGCATGCAT",
+                              "RYWSMKBDHVRYWSMKBDHV")
 
     def test_none_inputs(self):
         # Defensive: type guard

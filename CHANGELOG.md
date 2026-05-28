@@ -14,6 +14,51 @@
 
 ---
 
+## [0.9.37] — 2026-05-27
+
+### Biology-correctness chain audit — fixes across 4 areas
+
+A 4-area paranoid audit (restriction scanner, primer + PCR sim, domesticator + codon optimization, GB/MoClo/Gibson assembly) surfaced 6 HIGH + 19 MED + 15 LOW findings. This release lands every HIGH and the highest-impact MEDs. Empty `dist/` aside, no expected behavioral changes for users whose workflows weren't hitting the listed bugs — but several silent-corruption paths are now caught.
+
+#### Bug fixes (correctness — highest-stakes)
+
+- **Reverse-strand CDS in the Domesticator no longer designs the wrong protein.** The "Pick a feature from the plasmid" source path was silently dropping `f["strand"]`, so a `-1`-strand CDS got codon-optimized as if it were forward — the synthesized gBlock arrived encoding the RC of the intended ORF. Wrap-aware slice + RC now applied when strand = -1. Symmetric fix added to the `design-gb-part` agent endpoint (new optional `strand` parameter, default 1).
+- **Off-frame CDS selections now refused before silent codon corruption.** `_design_gb_primers` translates the insert before codon repair; if the protein covers < 90% of the expected codons (off-by-1/2 selection, `codon_start != 1` partial CDS), the design now returns an `error` instead of substituting synonyms in the wrong reading frame and producing a part with random non-synonymous mutations.
+- **`_codon_fix_sites` no longer silently skips C-terminal codons** for un-stop-terminated inserts. New `has_appended_stop` kwarg (default True for back-compat) — `_design_gb_primers` passes False so a forbidden site overlapping the last 1–2 codons is now actually fixed instead of triggering a misleading "no synonymous alternative" abort.
+
+#### Bug fixes (PCR sim — failed-PCR class)
+
+- **In-app designed cloning primers now simulate cleanly.** Pre-fix `_simulate_pcr` did pure exact-match — every primer with a 5' flap (restriction site + overhang on cloning primers from `_design_gb_primers`) silently produced "no amplicons" with no signal. Added a 3'-anchored partial-binding fallback (longest matching suffix of fwd, longest matching prefix of `rc(rev)`, both ≥ 15 bp). The amplicon dict now carries `partial_binding`, `fwd_binding_len`, `rev_binding_len`, and `fwd_binding_tm`/`rev_binding_tm` (binding-region-only Tm, biologically relevant for annealing).
+- **IUPAC degenerate primers now raise** instead of silently returning `[]`. The GUI couldn't distinguish "primer was filtered" from "primer doesn't bind"; now surfaces a clear error.
+- **RNA `U` → `T`** in PCR-sim input (matches the alignment-stack handling added in 0.9.35).
+- **`max_amplicon` no longer silently capped at plasmid size** on small circular templates. Pre-fix `extend_by = min(max_amp, n)` meant a 20 kb max request on a 5 kb plasmid quietly capped at 5 kb. Now uses the full `max_amp` (still bounded by `_PCR_AMPLICON_HARD_CAP`).
+- **Palindromic primer-pair tagged** in the result so the caller can warn. When `fwd == rc(rev)`, both `fwd_hits` and `rev_rc_hits` are identical lists and the double-loop produces N-choose-2 garbage cross-pairings. New `palindromic_pair: bool` field in each amplicon.
+
+#### Bug fixes (restriction scanner — was already very clean, two new edges)
+
+- **Linear-mode reverse-strand cuts past the 5' edge are dropped** instead of silently wrapping via `% n`. A non-palindromic Type IIS enzyme matching near the 5' end of a linear plasmid would compute a cut at `position - rev_cut`, which wrapped to a position near the 3' end of the molecule (where the enzyme cannot actually cleave).
+- **`_iupac_pattern` rejects unknown characters** in custom enzyme sites instead of letting them into the compiled regex. Pre-fix a stray regex metacharacter (`*`, `(`, `?`) or an RNA `U` typo became part of the recognition pattern. User-supplied enzyme sites are now validated before compile.
+
+#### Bug fixes (GB/MoClo/Gibson)
+
+- **Stale docstring** in `_assembly_fragment_from_source` claimed "smaller of the two released fragments becomes the carried insert" — directly contradicted by the actual `_pick_insert_fragment` priority ladder (backbone-marker → expected-overhang → size fallback). Rewrote to match the code and added an explicit "NEVER reintroduce size-only here" warning.
+- **Strategy-3 size-fallback now propagates to the caller** via a `_size_fallback_no_marker` flag on the returned fragment. Pre-fix the picker logged a warning when no fragment carried a backbone marker but the assembly worker silently used the smallest fragment — a multi-TU MOD that outgrew its alpha backbone (the MAV 26 case) could clone the wrong half.
+- **Gibson agent endpoint `min_overlap` floor raised to 10 bp** from 1 bp. Pre-fix `min_overlap=1` was accepted — a chain of fragments all sharing a single base at their ends would "assemble" into junk.
+
+#### Hardening
+
+- **Kazusa codon-table parser** now requires all 64 codons (was 60). A missing rare codon previously surfaced as an unpredictable `ValueError` only when the protein happened to contain that AA; now malformed tables are rejected upfront.
+
+#### Tests
+
+- Updated `test_non_acgt_primer` to expect the new raise-on-IUPAC behavior. 73/73 simulator tests, 193/193 DNA-sanity + circular-math tests pass.
+
+#### Operational
+
+- **Closed open bioconda PR #65823** (v0.9.34 first-submission). All future conda activity is manual via `./release.py --bioconda-only` only when explicitly requested.
+
+---
+
 ## [0.9.36] — 2026-05-27
 
 ### Audit follow-ups (deferred items from 0.9.35)
