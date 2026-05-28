@@ -14,6 +14,32 @@
 
 ---
 
+## [0.9.39] — 2026-05-28
+
+### Simulator workflow overhaul + app-wide double-click hardening
+
+#### New features
+
+- **The PCR Template is now a dropdown plasmid picker.** Pre-fix the Simulator's template was fixed to whatever was loaded when you opened it. Now the **Template** field is a dropdown of your library plasmids — it pre-selects the plasmid that was active when you opened the Simulator (or, if none was active, the first plasmid in your library). Picking a different plasmid loads it as the new PCR template and clears any stale amplicon results.
+- **"Send to Gel lane" actually lands the amplicon on the gel now.** Pre-fix the button only switched to the Gel tab and showed a toast — the amplicon never reliably reached a lane. Now: the first send clears the demo gel lanes (leaving a clean ladder in lane 1), every send appends a new lane to the right carrying its **own** band size (so several amplicons run side-by-side), the screen switches to the Gel tab, and the gel re-renders so the band shows immediately. A gel you've already customised is only appended to — your lanes are never wiped.
+- **"Save amplicon to library" now opens a naming dialog with a collection picker.** Name the linear amplicon and choose which collection to save it into (defaults to the active collection). Name / id collisions in the target are auto-suffixed so nothing is overwritten.
+- **The Gel pane has a Name field.** A freshly-opened gel is auto-named **Demo Gel** until you add / edit a lane (or send an amplicon over from PCR), at which point it becomes your own gel — rename it in the Name field. The gel-save dialog pre-fills from this name.
+
+#### Bug fixes
+
+- **Gel lane source could be silently corrupted to `Select.NULL`** when a gel re-render fired immediately after a lane rebuild (a freshly-mounted dropdown transiently reports a blank value). The lane reader now ignores that transient and keeps the real source.
+
+#### Hardening
+
+- **App-wide: dialogs can no longer be dismissed twice by a double-click.** Real terminals can deliver two button events for one physical click; combined with Textual's un-guarded `dismiss()`, that could re-run a dialog's confirm action (e.g. a duplicate save) or pop an extra screen / crash with `ScreenStackError`. A shared one-shot-dismiss guard now makes every dialog's close idempotent — applied across **59** dialogs that previously lacked it (the rest were already guarded from earlier sweeps).
+- **Simulator buttons hardened against double-fire + edge cases.** Close can't pop the screen twice; Save / Library can't stack two dialogs (which could double-save); Save refuses an empty-sequence amplicon and re-checks the active plasmid both before and after the dialog; Send-to-Gel refuses a zero-length / malformed amplicon and respects the lane cap.
+
+#### Tests
+
+- New coverage: PCR template picker (default selection, no-active-plasmid fallback, pick-changes-template), Send-to-Gel lane behaviour, gel name / demo state, the amplicon save modal + collection commit (collision-rename, missing-collection creation, active-mirror sync), and the app-wide one-shot-dismiss mixin (idempotent dismiss, no extra screen pop). Full suite green (4257 passed); ruff + pyright clean.
+
+---
+
 ## [0.9.38] — 2026-05-27
 
 ### CDS frame-break warning fixes + code-quality sweep

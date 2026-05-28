@@ -14663,3 +14663,74 @@ class TestPrematureStopWarning:
                 f"Double-stop tail must clear the warning; got "
                 f"{cds.get('_premature_stops')!r}"
             )
+
+
+class TestOneShotDismissMixin:
+    """App-wide double-fire hardening: modal/screen classes that call
+    `self.dismiss()` inherit `_OneShotDismissScreen`, so a double-fire
+    `Pressed` (real terminals emit two for one click) can't re-run the
+    result callback (double-action) or pop a second screen /
+    ScreenStackError."""
+
+    def test_representative_gap_classes_carry_mixin(self):
+        # A sample across the modules — if a future modal is added
+        # without the mixin, extend this list / re-run the gap audit.
+        for cls in (
+            sc.HelpModal, sc.CollectionNameModal, sc.NewCollectionModal,
+            sc.MasterDeleteModal, sc.BlastModal, sc.ColorPickerModal,
+            sc.GelLibraryModal, sc.AlignmentManagerModal,
+            sc.PrimerEditModal, sc.PartEditModal, sc.SettingsModal,
+            sc.PlasmidStatusPickerModal, sc.RenamePlasmidModal,
+        ):
+            assert sc._OneShotDismissScreen in cls.__mro__, (
+                f"{cls.__name__} lost the one-shot dismiss mixin"
+            )
+
+    def test_mixin_dismiss_is_idempotent_in_mro(self):
+        # The mixin's dismiss must sit ahead of Screen.dismiss so its
+        # guard runs first.
+        mro = sc.CollectionNameModal.__mro__
+        assert mro.index(sc._OneShotDismissScreen) < mro.index(sc.Screen)
+
+    async def test_double_dismiss_fires_callback_once(self):
+        from textual.app import App
+        results: list = []
+
+        class _Host(App):
+            def on_mount(self) -> None:
+                self.push_screen(
+                    sc.CollectionNameModal("Title", ""),
+                    callback=results.append,
+                )
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = app.screen
+            assert isinstance(modal, sc.CollectionNameModal)
+            modal.dismiss("first")
+            # Second dismiss is the double-fire — must be an inert no-op:
+            # no ScreenStackError, no second callback.
+            modal.dismiss("second")
+            await pilot.pause()
+            assert results == ["first"]
+
+    async def test_double_dismiss_no_extra_screen_pop(self):
+        # The parent screen must survive a double-dismiss of the modal
+        # (pre-fix the 2nd dismiss popped an extra screen).
+        from textual.app import App
+
+        class _Host(App):
+            def on_mount(self) -> None:
+                self.push_screen(sc.CollectionNameModal("T", ""))
+
+        app = _Host()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = app.screen
+            depth_before = len(app.screen_stack)
+            modal.dismiss("x")
+            modal.dismiss("x")     # double-fire
+            await pilot.pause()
+            # Exactly one screen popped (the modal), not two.
+            assert len(app.screen_stack) == depth_before - 1

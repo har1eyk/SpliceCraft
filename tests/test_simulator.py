@@ -490,6 +490,78 @@ class TestGelBandsForLane:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# _append_pcr_gel_lane — "Send to Gel lane" lane-append logic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAppendPcrGelLane:
+    """The pure core of the "Send to Gel lane" button: append a new
+    `pcr` lane that freezes its OWN amplicon size (`_pcr_bp`) so multiple
+    amplicons coexist on one gel. Always appends to the right — never
+    reuses or overwrites an existing lane."""
+
+    def test_appends_frozen_lane(self):
+        lanes = [{"name": "Ladder", "source": "ladder", "detail": "1 kb"}]
+        idx, at_cap = sc._append_pcr_gel_lane(lanes, "PCR 1,234 bp", 1234, 8)
+        assert at_cap is False
+        assert idx == 1
+        assert lanes[idx] == {"name": "PCR 1,234 bp", "source": "pcr",
+                               "detail": "", "_pcr_bp": 1234}
+
+    def test_each_call_appends_distinct_lane(self):
+        # Two sends → two pcr lanes, each pinned to its own size.
+        lanes = [{"name": "Ladder", "source": "ladder", "detail": "1 kb"}]
+        sc._append_pcr_gel_lane(lanes, "PCR 500 bp", 500, 8)
+        sc._append_pcr_gel_lane(lanes, "PCR 900 bp", 900, 8)
+        pcr = [ln for ln in lanes if ln["source"] == "pcr"]
+        assert len(pcr) == 2
+        assert [ln["_pcr_bp"] for ln in pcr] == [500, 900]
+
+    def test_never_overwrites_existing_lane(self):
+        # A user-added lane between sends is preserved; the new pcr lane
+        # lands to its right.
+        lanes = [
+            {"name": "Ladder", "source": "ladder", "detail": "1 kb"},
+            {"name": "PCR 500 bp", "source": "pcr", "detail": "",
+             "_pcr_bp": 500},
+            {"name": "my digest", "source": "digest", "detail": "EcoRI"},
+        ]
+        idx, at_cap = sc._append_pcr_gel_lane(lanes, "PCR 900 bp", 900, 8)
+        assert idx == 3
+        assert lanes[2]["name"] == "my digest"      # untouched
+        assert lanes[3]["_pcr_bp"] == 900
+
+    def test_at_cap_refuses(self):
+        lanes = [{"name": f"L{i}", "source": "ladder", "detail": ""}
+                 for i in range(8)]
+        idx, at_cap = sc._append_pcr_gel_lane(lanes, "PCR 100 bp", 100, 8)
+        assert (idx, at_cap) == (-1, True)
+        assert len(lanes) == 8                       # nothing appended
+
+    def test_frozen_size_renders_independent_of_selected_amplicon(self):
+        # A lane's frozen `_pcr_bp` wins over whatever amplicon is
+        # currently selected — that's what lets two sends show two
+        # different bands on one gel.
+        lanes = [{"name": "Ladder", "source": "ladder", "detail": "1 kb"}]
+        idx, _ = sc._append_pcr_gel_lane(lanes, "PCR 777 bp", 777, 8)
+        bands = sc._gel_bands_for_lane(
+            lanes[idx],
+            template_seq="", template_circular=False,
+            pcr_amplicon={"length": 1234},   # different selected amplicon
+        )
+        assert bands == [(777, "linear")]
+
+    def test_manual_pcr_lane_falls_back_to_selected(self):
+        # A pcr lane WITHOUT a frozen size (added via the source
+        # dropdown, not the button) still tracks the selected amplicon.
+        lane = {"name": "PCR", "source": "pcr", "detail": ""}
+        bands = sc._gel_bands_for_lane(
+            lane, template_seq="", template_circular=False,
+            pcr_amplicon={"length": 333},
+        )
+        assert bands == [(333, "linear")]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # _render_gel_image — visual rendering smoke
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -716,6 +788,190 @@ class TestSimulatorScreenConstruction:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Send to Gel lane — full handler wiring (pilot integration)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSendToGelLaneWiring:
+    """End-to-end: "Send to Gel lane" clears the demo lanes on the first
+    send (ladder stays in lane 1), appends a fresh `pcr` lane per send,
+    switches to the Gel tab, and renders the gel. Pre-fix the handler
+    only switched tabs + toasted; the amplicon never reached a lane."""
+
+    def _host_app(self):
+        from textual.app import App
+
+        class _Host(App):
+            def on_mount(self) -> None:
+                self.push_screen(
+                    sc.SimulatorScreen("ATGC" * 100, [], "pUC19", "circular")
+                )
+        return _Host()
+
+    def _seed_amplicon(self, screen, length):
+        screen._pcr_amplicons = [{
+            "length": length, "amplicon_seq": "A" * length,
+            "start": 0, "end": length, "wraps": False,
+            "gc_pct": 50.0, "fwd_tm": 60.0, "rev_tm": 60.0,
+        }]
+        screen._selected_pcr_idx = 0
+
+    async def test_first_send_clears_demo_lanes_ladder_first(self):
+        from textual.widgets import TabbedContent, Static
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, sc.SimulatorScreen)
+            # Starts with the 4 demo lanes.
+            assert len(screen._lanes) == 4
+            self._seed_amplicon(screen, 1234)
+            screen._on_pcr_send_to_gel(None)
+            await pilot.pause()
+            await pilot.pause()
+            # Demo lanes cleared → ladder + one pcr lane.
+            assert len(screen._lanes) == 2
+            assert screen._lanes[0]["source"] == "ladder"
+            assert screen._lanes[1]["source"] == "pcr"
+            assert screen._lanes[1]["_pcr_bp"] == 1234
+            assert "1,234" in screen._lanes[1]["name"]
+            # Switched to the Gel tab + auto-rendered (the Static now
+            # holds the gel image — non-empty).
+            tabs = screen.query_one("#sim-tabs", TabbedContent)
+            assert tabs.active == "sim-tab-gel"
+            img = screen.query_one("#sim-gel-image", Static)
+            assert str(img.render()).strip() != ""
+
+    async def test_subsequent_sends_append_and_preserve_user_lanes(self):
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, sc.SimulatorScreen)
+            # First send: 500 bp → [Ladder, PCR 500].
+            self._seed_amplicon(screen, 500)
+            screen._on_pcr_send_to_gel(None)
+            await pilot.pause()
+            assert [ln["source"] for ln in screen._lanes] == ["ladder", "pcr"]
+            # User adds a lane in between.
+            screen._lanes.append(
+                {"name": "my check", "source": "digest", "detail": "EcoRI"}
+            )
+            screen._refresh_lane_rows()
+            await pilot.pause()
+            # Second send: 900 bp appends to the RIGHT, user lane intact.
+            self._seed_amplicon(screen, 900)
+            screen._on_pcr_send_to_gel(None)
+            await pilot.pause()
+            srcs = [ln["source"] for ln in screen._lanes]
+            assert srcs == ["ladder", "pcr", "digest", "pcr"]
+            assert screen._lanes[2]["name"] == "my check"   # preserved
+            # The two pcr lanes carry their own frozen sizes.
+            pcr_bps = [ln["_pcr_bp"] for ln in screen._lanes
+                       if ln["source"] == "pcr"]
+            assert pcr_bps == [500, 900]
+
+    async def test_button_warns_when_no_amplicon(self):
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, sc.SimulatorScreen)
+            screen._pcr_amplicons = []
+            screen._selected_pcr_idx = -1
+            n_lanes_before = len(screen._lanes)
+            screen._on_pcr_send_to_gel(None)
+            await pilot.pause()
+            # No amplicon → no lane mutation, demo lanes untouched.
+            assert len(screen._lanes) == n_lanes_before
+            assert screen._gel_is_demo is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Gel name field + demo-vs-user-gel state
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGelNameAndDemoState:
+    """A freshly-opened gel is the auto-named "Demo Gel" until the user
+    adds / removes / edits a lane (or sends an amplicon), after which it
+    becomes their own gel and the auto-name is dropped."""
+
+    def _host_app(self):
+        from textual.app import App
+
+        class _Host(App):
+            def on_mount(self) -> None:
+                self.push_screen(
+                    sc.SimulatorScreen("ATGC" * 100, [], "pUC19", "circular")
+                )
+        return _Host()
+
+    def test_fresh_gel_is_demo(self):
+        s = sc.SimulatorScreen("ATGC" * 100, [], "p", "circular")
+        assert s._gel_is_demo is True
+        assert s._gel_name == "Demo Gel"
+
+    async def test_name_field_shows_demo_gel_on_open(self):
+        from textual.widgets import Input
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            name_w = screen.query_one("#sim-gel-name", Input)
+            assert name_w.value == "Demo Gel"
+
+    async def test_add_lane_exits_demo_and_renames(self):
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            screen._on_gel_add_lane(None)
+            await pilot.pause()
+            assert screen._gel_is_demo is False
+            assert screen._gel_name == "Untitled Gel"
+
+    async def test_send_to_gel_exits_demo_and_renames(self):
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            screen._pcr_amplicons = [{
+                "length": 800, "amplicon_seq": "A" * 800,
+                "start": 0, "end": 800, "wraps": False,
+                "gc_pct": 50.0, "fwd_tm": 60.0, "rev_tm": 60.0,
+            }]
+            screen._selected_pcr_idx = 0
+            screen._on_pcr_send_to_gel(None)
+            await pilot.pause()
+            assert screen._gel_is_demo is False
+            assert screen._gel_name == "Untitled Gel"
+
+    async def test_typing_gel_name_exits_demo(self):
+        from textual.widgets import Input
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            name_w = screen.query_one("#sim-gel-name", Input)
+            name_w.value = "My favourite gel"
+            await pilot.pause()
+            assert screen._gel_name == "My favourite gel"
+            assert screen._gel_is_demo is False
+
+    async def test_mount_does_not_exit_demo(self):
+        # The mount-time Changed echoes from the demo lane widgets must
+        # NOT flip the gel out of demo state (readiness-flag guard).
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            screen = app.screen
+            assert screen._gel_is_demo is True
+            assert screen._gel_name == "Demo Gel"
+            # Demo ladder detail not auto-reset on open.
+            assert screen._lanes[0]["detail"] == "1 kb"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Library entry build (save-to-library path)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -775,6 +1031,445 @@ class TestBuildAmpliconLibraryEntry:
         # ID has only A-Z0-9_- chars
         import re
         assert re.match(r"^[A-Za-z0-9_-]+$", entry["id"])
+
+    def test_explicit_name_used_verbatim(self):
+        # The collection-targeted save passes the user's name; it must
+        # be used as-is (the commit path re-uniquifies against the
+        # target collection, NOT the active library).
+        s = self._make_screen()
+        amp = {
+            "start": 0, "end": 50, "length": 50, "wraps": False,
+            "fwd_seq": "ATGCGATCGATCGATCGCGT",
+            "rev_seq": "ATGCGATCGATCGATCGCGT",
+            "amplicon_seq": "A" * 50,
+            "gc_pct": 0.0, "fwd_tm": None, "rev_tm": None,
+        }
+        entry = s._build_amplicon_library_entry(amp, name="My Insert v2")
+        assert entry["name"] == "My Insert v2"
+        # id derived from the explicit name.
+        assert entry["id"] == "My_Insert_v2"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AmpliconSaveModal — name + collection picker (pure init logic)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAmpliconSaveModal:
+    """The modal's constructor normalises the collection list so the
+    Select always mounts with a valid value."""
+
+    def test_active_collection_first_and_deduped(self):
+        m = sc.AmpliconSaveModal(
+            default_name="amp", collections=["A", "B", "A", "Eden"],
+            active_collection="B",
+        )
+        # Active first, duplicates removed, order otherwise preserved.
+        assert m._collections == ["B", "A", "Eden"]
+        assert m._active == "B"
+
+    def test_empty_collections_falls_back_to_default(self):
+        m = sc.AmpliconSaveModal(
+            default_name="amp", collections=[], active_collection=None,
+        )
+        assert m._collections == ["Default"]
+        assert m._active == "Default"
+
+    def test_blank_default_name_falls_back(self):
+        m = sc.AmpliconSaveModal(
+            default_name="   ", collections=["X"], active_collection="X",
+        )
+        assert m._default_name == "PCR amplicon"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _commit_amplicon_to_collection — collection-targeted save
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _seed_collections(active="Default", others=None, seed_entries=None):
+    """Seed collections.json + the active-library mirror. `seed_entries`
+    pre-loads the active collection (for collision tests)."""
+    colls = [{"name": active, "description": "",
+              "plasmids": list(seed_entries or [])}]
+    for name in (others or []):
+        colls.append({"name": name, "description": "", "plasmids": []})
+    sc._save_collections(colls)
+    sc._set_active_collection_name(active)
+    sc._settings_flush_sync()
+    sc._safe_save_json_mirror(
+        sc._LIBRARY_FILE, list(seed_entries or []), "Plasmid library")
+    sc._library_cache = None
+
+
+def _amp_entry(name="amp1", entry_id="amp1", size=500):
+    return {"id": entry_id, "name": name, "size": size, "n_feats": 1,
+            "source": "simulator:pcr", "added": "2026-05-27",
+            "gb_text": f"LOCUS {entry_id} {size} bp\n"}
+
+
+def _lib_entry_with_seq(name, eid, seq="ATGC" * 50, circular=True):
+    """A library entry carrying a real, parseable GenBank record (so the
+    template picker can load its sequence)."""
+    from io import StringIO
+    from Bio import SeqIO
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    rec = SeqRecord(
+        Seq(seq), id=eid[:16], name=eid[:16],
+        annotations={"molecule_type": "DNA",
+                      "topology": "circular" if circular else "linear"},
+    )
+    buf = StringIO()
+    SeqIO.write([rec], buf, "genbank")
+    return {"id": eid, "name": name, "size": len(seq), "n_feats": 0,
+            "source": "test", "added": "2026-05-28",
+            "gb_text": buf.getvalue()}
+
+
+class TestCommitAmpliconToCollection:
+    """`_commit_amplicon_to_collection` appends a linear amplicon into a
+    chosen collection with name/id collision-rename + active-mirror
+    sync. Tests bypass the modal to focus on the transactional logic."""
+
+    def _screen(self):
+        return sc.SimulatorScreen.__new__(sc.SimulatorScreen)
+
+    def test_save_into_active_syncs_mirror(self):
+        _seed_collections(active="Default")
+        s = self._screen()
+        final = s._commit_amplicon_to_collection(_amp_entry(), "Default")
+        assert final == "amp1"
+        colls = sc._load_collections()
+        default = next(c for c in colls if c["name"] == "Default")
+        assert [e["name"] for e in default["plasmids"]] == ["amp1"]
+        # Active-mirror updated too.
+        lib = sc._load_library()
+        assert any(e.get("id") == "amp1" for e in lib)
+
+    def test_save_into_other_collection_leaves_active_mirror(self):
+        _seed_collections(active="Default", others=["Eden"])
+        s = self._screen()
+        s._commit_amplicon_to_collection(_amp_entry(), "Eden")
+        colls = sc._load_collections()
+        eden = next(c for c in colls if c["name"] == "Eden")
+        default = next(c for c in colls if c["name"] == "Default")
+        assert [e["name"] for e in eden["plasmids"]] == ["amp1"]
+        assert default["plasmids"] == []
+        # Active (Default) mirror untouched.
+        assert sc._load_library() == []
+
+    def test_name_collision_gets_copy_suffix(self):
+        _seed_collections(active="Default",
+                          seed_entries=[_amp_entry("amp1", "existing_id")])
+        s = self._screen()
+        final = s._commit_amplicon_to_collection(
+            _amp_entry("amp1", "amp1"), "Default")
+        assert final == "amp1 COPY"
+        names = [e["name"] for e in
+                 sc._load_library()]
+        assert "amp1" in names and "amp1 COPY" in names
+
+    def test_id_collision_gets_numeric_suffix(self):
+        _seed_collections(active="Default",
+                          seed_entries=[_amp_entry("other", "dup_id")])
+        s = self._screen()
+        s._commit_amplicon_to_collection(
+            _amp_entry("fresh", "dup_id"), "Default")
+        ids = [e["id"] for e in sc._load_library()]
+        assert "dup_id" in ids and "dup_id_2" in ids
+
+    def test_missing_collection_is_created(self):
+        _seed_collections(active="Default")
+        s = self._screen()
+        s._commit_amplicon_to_collection(_amp_entry(), "Brand New")
+        colls = sc._load_collections()
+        assert any(c["name"] == "Brand New" for c in colls)
+        new = next(c for c in colls if c["name"] == "Brand New")
+        assert [e["name"] for e in new["plasmids"]] == ["amp1"]
+
+    def test_entry_deepcopied_no_caller_leak(self):
+        _seed_collections(active="Default")
+        s = self._screen()
+        entry = _amp_entry()
+        s._commit_amplicon_to_collection(entry, "Default")
+        # Mutating the caller's dict after the commit must not change
+        # what landed on disk.
+        entry["name"] = "mutated"
+        default = next(c for c in sc._load_collections()
+                       if c["name"] == "Default")
+        assert default["plasmids"][0]["name"] == "amp1"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Save-amplicon flow — modal → callback → commit (pilot integration)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSaveAmpliconFlow:
+    """End-to-end: clicking Save opens AmpliconSaveModal; confirming it
+    commits the amplicon into the chosen collection."""
+
+    def _host_app(self):
+        from textual.app import App
+
+        class _Host(App):
+            def on_mount(self) -> None:
+                self.push_screen(
+                    sc.SimulatorScreen("ATGC" * 100, [], "pUC19", "circular")
+                )
+        return _Host()
+
+    async def test_save_button_opens_modal_then_commits(self):
+        from textual.widgets import Input, Select
+        _seed_collections(active="Default", others=["Eden"])
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, sc.SimulatorScreen)
+            screen._entry_counter = getattr(app, "_record_load_counter", 0)
+            screen._pcr_amplicons = [{
+                "start": 0, "end": 600, "length": 600, "wraps": False,
+                "fwd_seq": "ATGCGATCGATCGATCGCGT",
+                "rev_seq": "ATGCGATCGATCGATCGCGT",
+                "amplicon_seq": "A" * 600,
+                "gc_pct": 50.0, "fwd_tm": 60.0, "rev_tm": 60.0,
+            }]
+            screen._selected_pcr_idx = 0
+            screen._on_pcr_save(None)
+            await pilot.pause()
+            # The naming modal is now on top.
+            modal = app.screen
+            assert isinstance(modal, sc.AmpliconSaveModal)
+            modal.query_one("#ampsave-name", Input).value = "My amplicon"
+            modal.query_one("#ampsave-collection", Select).value = "Eden"
+            modal._submit()
+            await pilot.pause()
+            await pilot.pause()
+            # Landed in Eden, not the active Default.
+            colls = sc._load_collections()
+            eden = next(c for c in colls if c["name"] == "Eden")
+            assert [e["name"] for e in eden["plasmids"]] == ["My amplicon"]
+
+    async def test_save_refuses_with_no_amplicon(self):
+        _seed_collections(active="Default")
+        app = self._host_app()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            screen._pcr_amplicons = []
+            screen._selected_pcr_idx = -1
+            screen._on_pcr_save(None)
+            await pilot.pause()
+            # No modal pushed — still on the Simulator screen.
+            assert isinstance(app.screen, sc.SimulatorScreen)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PCR template picker — dropdown defaulting to the active plasmid
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPcrTemplatePicker:
+    """The Template is a dropdown plasmid picker. It pre-selects the
+    plasmid active in the main app when the Simulator opened; with none
+    active it adopts the first library plasmid."""
+
+    def test_active_plasmid_preselected(self):
+        s = sc.SimulatorScreen("ATGC" * 100, [], "pUC19", "circular")
+        assert s._current_template_id == "__loaded__"
+        assert s._loaded_name == "pUC19"
+
+    def test_no_active_picks_first_library(self):
+        _seed_collections(active="Default", seed_entries=[
+            _lib_entry_with_seq("plasmidA", "pa"),
+            _lib_entry_with_seq("plasmidB", "pb"),
+        ])
+        s = sc.SimulatorScreen("", [], "", "circular")
+        assert s._current_template_id == "pa"   # first library plasmid
+
+    def test_no_active_empty_library_sentinel(self):
+        _seed_collections(active="Default")     # empty library
+        s = sc.SimulatorScreen("", [], "", "circular")
+        assert s._current_template_id == "__none__"
+
+    def test_build_options_current_first_then_library(self):
+        _seed_collections(active="Default", seed_entries=[
+            _lib_entry_with_seq("plasmidA", "pa"),
+        ])
+        s = sc.SimulatorScreen("ATGC" * 100, [], "pUC19", "circular")
+        opts = s._build_template_options()
+        assert opts[0][1] == "__loaded__"
+        assert opts[0][0].startswith("pUC19")
+        assert any(v == "pa" for _, v in opts)
+
+    def test_build_options_dedups_loaded_from_library(self):
+        # When the active plasmid IS a library row (same name), it's
+        # offered only once — as "(current)".
+        _seed_collections(active="Default", seed_entries=[
+            _lib_entry_with_seq("pUC19", "puc"),
+        ])
+        s = sc.SimulatorScreen("ATGC" * 100, [], "pUC19", "circular")
+        opts = s._build_template_options()
+        assert sum(1 for label, _ in opts if "pUC19" in label) == 1
+
+    def test_meta_text(self):
+        s = sc.SimulatorScreen("ATGC" * 25, [], "p", "linear")
+        assert "100 bp" in s._template_meta_text()
+        assert "linear" in s._template_meta_text()
+
+
+class TestPcrTemplatePickerWiring:
+    """Pilot-level: the dropdown loads the picked plasmid as the PCR
+    template, clearing stale results."""
+
+    def _host(self, seq="ATGC" * 100, name="pUC19", topo="circular"):
+        from textual.app import App
+
+        class _Host(App):
+            def on_mount(self) -> None:
+                self.push_screen(sc.SimulatorScreen(seq, [], name, topo))
+        return _Host()
+
+    async def test_dropdown_value_is_loaded_on_open(self):
+        from textual.widgets import Select
+        _seed_collections(active="Default", seed_entries=[
+            _lib_entry_with_seq("plasmidA", "pa"),
+        ])
+        app = self._host()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            sel = app.screen.query_one("#sim-pcr-template-select", Select)
+            assert sel.value == "__loaded__"
+
+    async def test_no_active_adopts_first_library_plasmid(self):
+        from textual.app import App
+        _seed_collections(active="Default", seed_entries=[
+            _lib_entry_with_seq("plasmidA", "pa", seq="TTTTAAAA" * 20),
+        ])
+
+        class _Host(App):
+            def on_mount(self) -> None:
+                self.push_screen(sc.SimulatorScreen("", [], "", "circular"))
+        app = _Host()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            screen = app.screen
+            assert screen._template == "TTTTAAAA" * 20
+            assert screen._plasmid_name == "plasmidA"
+
+    async def test_pick_changes_template_and_clears_results(self):
+        from textual.widgets import Select
+        _seed_collections(active="Default", seed_entries=[
+            _lib_entry_with_seq("plasmidA", "pa",
+                                 seq="GGGGCCCC" * 15, circular=False),
+        ])
+        app = self._host(seq="ATGC" * 100, name="pUC19")
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert screen._plasmid_name == "pUC19"
+            # Pretend a prior PCR run left results.
+            screen._pcr_amplicons = [{"length": 50}]
+            screen._selected_pcr_idx = 0
+            screen.query_one("#sim-pcr-template-select", Select).value = "pa"
+            await pilot.pause()
+            assert screen._template == "GGGGCCCC" * 15
+            assert screen._template_circular is False
+            assert screen._plasmid_name == "plasmidA"
+            assert screen._current_template_id == "pa"
+            # Stale results dropped.
+            assert screen._pcr_amplicons == []
+            assert screen._selected_pcr_idx == -1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Simulator button double-fire hardening
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSimulatorButtonHardening:
+    """Real terminals can deliver two `Pressed` events for one physical
+    click. Close must not pop the screen twice (ScreenStackError), and
+    the modal-opening buttons must not stack two dialogs (double-save)."""
+
+    def _host(self):
+        from textual.app import App
+
+        class _Host(App):
+            def on_mount(self) -> None:
+                self.push_screen(
+                    sc.SimulatorScreen("ATGC" * 100, [], "pUC19", "circular")
+                )
+        return _Host()
+
+    def _seed_amp(self, screen):
+        screen._entry_counter = 0
+        screen._pcr_amplicons = [{
+            "start": 0, "end": 500, "length": 500, "wraps": False,
+            "fwd_seq": "ATGCGATCGATCGATCGCGT",
+            "rev_seq": "ATGCGATCGATCGATCGCGT",
+            "amplicon_seq": "A" * 500,
+            "gc_pct": 50.0, "fwd_tm": 60.0, "rev_tm": 60.0,
+        }]
+        screen._selected_pcr_idx = 0
+
+    async def test_close_double_fire_no_crash(self):
+        app = self._host()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, sc.SimulatorScreen)
+            screen._close(None)
+            screen._close(None)   # second must be a no-op, not a crash
+            await pilot.pause()
+            assert screen._dismissed is True
+
+    async def test_save_double_fire_opens_one_modal(self):
+        _seed_collections(active="Default")
+        app = self._host()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            self._seed_amp(screen)
+            screen._on_pcr_save(None)
+            screen._on_pcr_save(None)   # double-fire
+            await pilot.pause()
+            modals = [s for s in app.screen_stack
+                      if isinstance(s, sc.AmpliconSaveModal)]
+            assert len(modals) == 1
+
+    async def test_child_modal_flag_clears_on_dismiss(self):
+        from textual.widgets import Input
+        _seed_collections(active="Default")
+        app = self._host()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            self._seed_amp(screen)
+            screen._on_pcr_save(None)
+            await pilot.pause()
+            assert screen._child_modal_open is True
+            modal = app.screen
+            assert isinstance(modal, sc.AmpliconSaveModal)
+            modal.query_one("#ampsave-name", Input).value = "amp"
+            modal._submit()
+            await pilot.pause()
+            # Flag cleared so a later Save / Library opens normally.
+            assert screen._child_modal_open is False
+
+    async def test_library_double_fire_opens_one_modal(self):
+        _seed_collections(active="Default")
+        app = self._host()
+        async with app.run_test(size=(170, 48)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            # Switch to the Gel tab so the lane widgets are queryable.
+            screen.query_one("#sim-tabs").active = "sim-tab-gel"
+            await pilot.pause()
+            screen._on_gel_library(None)
+            screen._on_gel_library(None)   # double-fire
+            await pilot.pause()
+            libs = [s for s in app.screen_stack
+                    if isinstance(s, sc.GelLibraryModal)]
+            assert len(libs) == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -53,7 +53,13 @@ installs and the user-data directory location.
 - **Mutagenize** any CDS via SOE-PCR site-directed mutagenesis
   with edge-case fallback to 2-primer modified-outer PCR.
 - **Simulate** PCR + agarose gels (0.5–4% with the Helling-Goodman-
-  Boyer mobility curve and form corrections).
+  Boyer mobility curve and form corrections). Pick the **Template**
+  from a dropdown of your library plasmids (defaults to whatever was
+  loaded when you opened the Simulator), run PCR, then **Save amplicon
+  to library** (name it + pick which collection to save the linear
+  fragment into) or **Send to Gel lane** to drop the product onto the
+  gel — each send appends a lane carrying its own band size, so several
+  amplicons run side-by-side.
 - **Align sequencing runs** from the Sequencing toolbar — drop in a
   Plasmidsaurus `.zip` and walk three numbered sub-tabs: **1. Pick
   zip** (browse and pick the run archive), **2. Pick sample** (click
@@ -112,7 +118,9 @@ installs and the user-data directory location.
 - **Save Simulator gels** from the `Simulator → Gel → Library`
   button — name + save the current lane layout + agarose %, load
   it back later, or reference it as `&<id>` in an Experiments
-  entry.
+  entry. A fresh gel is the auto-named **Demo Gel** until you add /
+  edit a lane (or send an amplicon over from PCR), at which point it
+  becomes your own gel — rename it in the Gel pane's **Name** field.
 - **Compose gene-synthesis fragments** from the **Synthesis** menu
   — full-screen workbench with **two tabs**:
     * **DNA tab** — horizontally-scrolling linear DNA editor

@@ -219,6 +219,10 @@ _MODAL_CASES = [
                                                ])),
     ("CollectionNameModal",        lambda: sc.CollectionNameModal(
                                                "New collection", "")),
+    ("AmpliconSaveModal",          lambda: sc.AmpliconSaveModal(
+                                               default_name="pUC19_PCR_500bp_1-500",
+                                               collections=["Default", "Eden"],
+                                               active_collection="Default")),
     ("NewCollectionModal",         lambda: sc.NewCollectionModal()),
     ("CollectionDeleteConfirmModal", lambda: sc.CollectionDeleteConfirmModal(
                                                   "MyCollection", 5)),
