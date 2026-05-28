@@ -106,10 +106,18 @@ class TestIterCommercialSaaSPackets:
 class TestBuildCommercialSaaSPacket:
     def test_round_trips_via_iterator(self):
         payload = b"\x00\x01\x02hello world\xff"
+        # 2026-05-27 (audit-3 M9): the iterator now requires a valid
+        # cookie packet at file offset 0 so a malformed file lacking
+        # the format magic can't load past the iterator. Wrap the
+        # arbitrary packet behind a cookie so the iterator accepts
+        # the stream; we want to verify packet round-trip, not the
+        # cookie guard itself (that's covered separately).
+        cookie = sc._build_commercialsaas_cookie_packet()
         pkt = sc._build_commercialsaas_packet(0x42, payload)
-        # Hand-feed through the iterator: it should yield exactly
-        # one packet matching what we built.
-        ((t, length, p),) = list(sc._iter_commercialsaas_packets(pkt))
+        packets = list(sc._iter_commercialsaas_packets(cookie + pkt))
+        # 2 packets: cookie + our arbitrary one.
+        assert len(packets) == 2
+        t, length, p = packets[1]
         assert t == 0x42
         assert length == len(payload)
         assert p == payload

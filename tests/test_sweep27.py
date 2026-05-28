@@ -389,13 +389,21 @@ class TestGff3StrandValidation:
     @staticmethod
     def _make_gff3(strand_col: str) -> str:
         # Minimal GFF3 with one feature using the given strand string.
+        # NB the trailing `+ ("ACGT" * 25)` deliberately breaks the
+        # implicit string-literal concatenation. Without the `+`, the
+        # `"ACGT" * 25` operator binds to the implicitly-concatenated
+        # `"##FASTA\n>chr1\nACGT"` literal preceding it, multiplying
+        # the whole `##FASTA>chr1ACGT` block 25 times — which produces
+        # a multi-record fixture that the strict-raise GFF3 parser
+        # (2026-05-27 audit-3 M8) refuses. The `+` forces evaluation
+        # of `"ACGT" * 25` in isolation.
         return (
             "##gff-version 3\n"
             "##sequence-region chr1 1 100\n"
             f"chr1\tsrc\tCDS\t1\t30\t.\t{strand_col}\t.\tID=t1\n"
             "##FASTA\n"
             ">chr1\n"
-            "ACGT" * 25 + "\n"
+            + ("ACGT" * 25) + "\n"
         )
 
     def test_valid_strands_accepted(self, tmp_path):

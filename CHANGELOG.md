@@ -14,6 +14,33 @@
 
 ---
 
+## [0.9.36] — 2026-05-27
+
+### Audit follow-ups (deferred items from 0.9.35)
+
+The 0.9.35 four-area paranoid audit left a handful of deferred items. This release works through every one.
+
+#### New features
+
+- **Multi-record GenBank files auto-load as a collection.** Pre-fix a `.gb`/`.gbk`/`.genbank` file carrying more than one record was refused outright ("split the file or extract a single record first"). Now: a name picker pops up, you confirm a collection name, and every record imports as a library entry under that collection with features / qualifiers / annotations preserved. Record 1 loads on the canvas. Mirrors the existing multi-record FASTA workflow.
+
+#### Hardening (defensive)
+
+- **CommercialSaaS `.dna` cookie packet validated upfront.** Pre-fix a malformed file lacking the cookie still parsed past the iterator and downstream consumers happily extracted features from junk. Now refuses with a clear "not a valid .dna file" error.
+- **GFF3 multi-record `##FASTA` block raises.** Pre-fix the second `>` header silently terminated parsing; only record 1's sequence survived with no warning. Now raises so the user knows the file isn't single-record.
+- **HistoryTree sibling top-level `<Node>` elements preserved on round-trip.** Pre-fix only the first node survived parse → re-serialize; siblings were silently dropped.
+- **Agent idempotency-cache eviction now O(1).** Pre-fix the LRU eviction did an O(N) `min()` scan over 1024 entries on every PUT under burst — stalled every other agent write while it ran. Now FIFO eviction via dict insertion order.
+
+#### Release-flow change
+
+- **All conda activity removed from the default release flow** (already in 0.9.35; mentioned again here for visibility). `./release.py X.Y.Z` no longer touches conda-recipe or opens a bioconda PR. The `--bioconda-only` flag stays for manual re-submission only when explicitly asked.
+
+#### Empirical resolutions (audit findings tested, no code change needed)
+
+- **Rotation-picker tiebreak**: ran a 200-pair synthetic sweep comparing the current `(n_matches, ungapped_identity_pct)` rank key against a `(score, n_matches)` alternative that includes gap penalties. **Current wins 88.5% vs 82.5% (Δ = −12).** Current ranker is empirically correct on the synthetic distribution; no change. Bench script lives at `scripts/rotation_ranker_bench.py` for future re-runs against real-world data.
+
+---
+
 ## [0.9.35] — 2026-05-27
 
 ### Four-area paranoid audit + conda detachment
