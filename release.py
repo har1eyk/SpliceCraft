@@ -1057,6 +1057,37 @@ def main(argv: list[str] | None = None) -> int:
                  "the post-release badge would go red. Fix them, or set "
                  "SPLICECRAFT_SKIP_PYRIGHT=1 to bypass (NOT recommended).")
 
+    # Dependency wheel-coverage gate (2026-06-05): every REQUIRED dep must
+    # install from a wheel on every supported platform × Python (or be a
+    # documented ACCEPTED_GAP), so a dep that drops wheels — the
+    # edlib-aarch64 / biopython-1.87-Intel-mac / primer3-py-ARM class —
+    # fails the RELEASE here instead of a user's `pipx install`. Hits PyPI;
+    # set SPLICECRAFT_SKIP_WHEEL_CHECK=1 to release offline.
+    if os.environ.get("SPLICECRAFT_SKIP_WHEEL_CHECK", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        print("  SPLICECRAFT_SKIP_WHEEL_CHECK set — skipping the dependency "
+              "wheel-coverage gate (offline release). Re-run "
+              "`python scripts/check_dep_wheels.py` before publishing.")
+    else:
+        _heading("Checking dependency wheel coverage")
+        try:
+            proc = subprocess.run(
+                [sys.executable,
+                 str(REPO_ROOT / "scripts" / "check_dep_wheels.py")],
+            )
+        except OSError as exc:
+            _die(f"could not run the dependency wheel-coverage gate: {exc}")
+        if proc.returncode != 0:
+            _die("a required dependency has no wheel on a supported platform "
+                 "(see above) — `pipx install splicecraft` would be forced to "
+                 "compile / fail there. Narrow the dep's marker (+ in-code "
+                 "fallback), move it to an optional extra, or — for a "
+                 "deliberate compile-from-source platform — add it to "
+                 "ACCEPTED_GAPS in scripts/check_dep_wheels.py AND document it "
+                 "in docs/PLATFORMS.md. Set SPLICECRAFT_SKIP_WHEEL_CHECK=1 to "
+                 "bypass (NOT recommended).")
+
     _heading("Running test suite")
     # Parallel via pytest-xdist; previously serial took ~13 min, -n auto
     # cuts that to ~5 min on an 8-core box. Tests are isolated by the

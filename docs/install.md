@@ -94,6 +94,84 @@ design, and BLASTN/BLASTP all work. Two Windows-specific notes:
   [WSL2](https://learn.microsoft.com/windows/wsl/install): `wsl
   --install`, then `pipx install splicecraft` in the Ubuntu shell.
 
+## ARM64 Linux + Apple Silicon — one-time toolchain
+
+x86-64 Linux, Intel macOS, and Windows install entirely from prebuilt
+wheels — nothing to compile. On **ARM64 Linux** (64-bit Raspberry Pi,
+Graviton, ARM cloud VMs) and **Apple Silicon with Python 3.10+**, one
+dependency — `primer3-py`, the primer-design engine — publishes no ARM
+wheel for those targets, so it compiles from source at install. Install
+a C toolchain once, then install normally:
+
+* Linux: `sudo apt install build-essential python3-dev`
+* macOS: `xcode-select --install`
+
+Then `pipx install splicecraft`. (`edlib`, the fast aligner, also lacks
+an ARM64-Linux wheel but transparently falls back to Biopython — no
+build needed, alignment just slightly slower with identical results.)
+See [`PLATFORMS.md`](PLATFORMS.md) for the full per-platform matrix.
+
+## Troubleshooting `pipx install splicecraft`
+
+Almost every install resolves to prebuilt wheels and just works. When it
+doesn't, it's nearly always one of the cases below — each with a
+one-command fix. (A release gate, `scripts/check_dep_wheels.py`, verifies
+every required dependency has a wheel on every supported platform ×
+Python version *before* each release, so these keep shrinking.)
+
+### `failed to build <package>` / `Python.h: No such file or directory`
+
+A dependency had no prebuilt wheel for your exact Python + CPU, so pip
+tried to compile it from source — and the machine has no C compiler /
+Python headers. Install them once, then re-run the install:
+
+| OS | Command |
+|---|---|
+| Debian / Ubuntu / Raspberry Pi OS | `sudo apt install build-essential python3-dev` |
+| Fedora / RHEL / Rocky | `sudo dnf install gcc gcc-c++ python3-devel` |
+| Arch | `sudo pacman -S base-devel` |
+| macOS | `xcode-select --install` |
+
+Then `pipx install splicecraft` again. As of this release the only
+dependency that hits this is **`primer3-py`** (the primer-design engine),
+and only on **ARM64 Linux** and **Apple Silicon with Python ≥3.10**,
+where it ships no wheel — it's a small, fast compile. The fast aligner
+**`edlib` is never the culprit**: SpliceCraft transparently falls back to
+its built-in Biopython aligner wherever edlib has no wheel (ARM, and
+brand-new Pythons like 3.14), so it never needs a compiler.
+
+### `No matching distribution found for splicecraft (from versions: none)`
+
+Your interpreter is older than **Python 3.10**. Check both
+`python3 --version` **and** `pipx --version` (pipx runs on its *own*
+interpreter, which may differ). Fix by pointing pipx at a 3.10+ Python:
+
+```bash
+pipx install --python python3.12 splicecraft
+```
+
+…or upgrade the system Python.
+
+### Brand-new Python / fresh distro (e.g. Ubuntu 26.04 ships Python 3.14)
+
+Fully supported. Most dependencies publish wheels for a new CPython
+within days, and SpliceCraft's release gate checks through the newest
+release. If one dependency lags, you'll see the *failed to build* case
+above (install a toolchain) — or just pin an interpreter that already has
+wheels for everything:
+
+```bash
+pipx install --python python3.13 splicecraft
+```
+
+### Still stuck?
+
+pipx prints the path to the full pip log in its error (e.g.
+`~/.local/state/pipx/log/cmd_*_pip_errors.log`). Open an issue with that
+log plus your platform — `python3 -VV`, `uname -m` (CPU), and OS version
+— and we'll add a wheel/marker fix and a gate entry so it can't recur.
+See [`PLATFORMS.md`](PLATFORMS.md) for the full per-platform matrix.
+
 ## User-data location
 
 User data (collections, library, parts, primers, features, codon

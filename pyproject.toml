@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.0.27"
+version         = "1.0.28"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -36,18 +36,44 @@ dependencies = [
     # `pipx install splicecraft` pulls the matching minimum so
     # behaviour matches what shipped.
     "textual>=8.2.7",
-    "biopython>=1.87",
+    # Capped <1.87 (2026-06-05): biopython 1.87 DROPPED its Intel-macOS
+    # (x86_64) wheels — only arm64 / manylinux / win remain — so `pipx
+    # install splicecraft` on an Intel Mac would compile biopython (a
+    # large C extension; slow, needs a full toolchain). 1.86 still ships
+    # macosx x86_64 wheels for cp310–313 and has every API SpliceCraft
+    # uses. biopython is mandatory with NO fallback, so it MUST resolve to
+    # a wheel on every supported platform. Revisit the cap when a later
+    # release re-adds Intel-mac wheels — `scripts/check_dep_wheels.py`
+    # flags it if 1.86 ever loses coverage too.
+    "biopython>=1.86,<1.87",
     # edlib is the fast pairwise-alignment engine (bit-parallel Myers
     # edit distance) used by `_pairwise_align` / `_pick_best_rotation` —
     # ~90–600× faster than Biopython's DP on the long near-identical
     # sequences that drive sequencing QC, with IDENTICAL match / mismatch
-    # / indel counts on those alignments (it diverges only on low-identity
-    # pairs the rotation picker discards). `_pairwise_align` imports it
+    # / indel counts on those alignments. `_pairwise_align` imports it
     # OPTIONALLY (`_EDLIB_AVAILABLE`) and transparently falls back to
-    # Biopython when absent, so the POSIX-only marker (edlib's Windows
-    # wheel story is unreliable, like pyhmmer) costs native-Windows users
-    # only the speedup — never functionality.
-    "edlib>=1.3.9; sys_platform != 'win32'",
+    # Biopython when absent — so where edlib has no wheel we OMIT it
+    # rather than force a source build.
+    #
+    # Marker (2026-06-05): edlib is UNMAINTAINED (last release 2022) and
+    # ships wheels only for x86_64 (Linux + macOS) + macOS arm64
+    # (universal2), and only for cp310–cp313 — there is NO Linux-aarch64
+    # wheel and NO wheel for any Python ≥ 3.14, and there never will be.
+    # As an unconditional dep it made `pipx install splicecraft` compile
+    # edlib's C++ sdist (and fail without a toolchain) on BOTH 64-bit ARM
+    # boxes (Pi / Graviton / ARM VM) AND any box on a newer Python — e.g.
+    # Ubuntu 26.04 / Python 3.14 (the reported failure: `Python.h: No
+    # such file or directory` on an x86_64 ThinkPad). The marker gates it
+    # to exactly the (arch × Python) cells that HAVE wheels: x86_64/arm64
+    # AND python < 3.14. Everywhere else — Linux-aarch64, Python 3.14+,
+    # native Windows — transparently uses the Biopython fallback (slower,
+    # identical results, no compiler). The `python_version < '3.14'`
+    # ceiling also excludes every FUTURE Python (3.15+ are all ≥ 3.14),
+    # so a new interpreter can never reintroduce this. Bump the ceiling
+    # only if edlib is ever revived with newer wheels.
+    # `scripts/check_dep_wheels.py` (which checks through cp314) enforces
+    # that this marker stays in sync with edlib's real wheel coverage.
+    "edlib>=1.3.9; (platform_machine == 'x86_64' or platform_machine == 'arm64') and python_version < '3.14'",
     "primer3-py>=2.3.0",
     "platformdirs>=4.10.0",
     # pyhmmer powers the BLAST modal's BLASTN (nhmmer), BLASTP (phmmer),
@@ -103,8 +129,9 @@ dev = [
     "pytest-xdist>=3.8.0",
     "hypothesis>=6.155.1",
     # Mirror the runtime edlib dep so CI exercises the fast-aligner path
-    # (not just the Biopython fallback). POSIX-only, matching above.
-    "edlib>=1.3.9; sys_platform != 'win32'",
+    # (not just the Biopython fallback). Wheel-(arch × Python)-gated,
+    # matching above.
+    "edlib>=1.3.9; (platform_machine == 'x86_64' or platform_machine == 'arm64') and python_version < '3.14'",
     "build>=1.5.0",
     "twine>=6.2.0",
     # Linters / type-checkers / coverage — mirror what CI runs

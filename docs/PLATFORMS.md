@@ -19,9 +19,9 @@ Last update: 2026-05-19 (SpliceCraft 0.9.7+).
 | Linux | alacritty | ✅ Fully supported | Same as kitty |
 | Linux | xterm | ⚠ Limited | OSC 52 clipboard needs `allowWindowOps`; mouse drag-select may need `xtermMouseProtocol` set |
 | Linux | tmux / screen | ✅ Works under | Pass `-e` (env), use `tmux`'s `set -g allow-passthrough on` for OSC 52 |
-| **Raspberry Pi / ARM Linux** (64-bit) | LXTerminal / SSH | ✅ Fully supported | All compiled deps ship `aarch64` wheels → clean `pipx install`. Needs 64-bit Pi OS Bookworm+ (Python ≥3.10); Pi 4/5 ideal. See [Raspberry Pi / ARM Linux](#raspberry-pi--arm-linux) |
+| **Raspberry Pi / ARM Linux** (64-bit) | LXTerminal / SSH | ✅ Supported (one-time toolchain) | `primer3-py` ships **no `aarch64` wheel** and primer design has no fallback, so it compiles at install — run `sudo apt install build-essential python3-dev` **once**, then `pipx install splicecraft`. `edlib` also lacks an `aarch64` wheel but transparently falls back to Biopython (alignment a touch slower, identical results — no build needed). All other compiled deps (`pyhmmer`/`biopython`/`Pillow`) ship `aarch64` wheels. Needs 64-bit Pi OS Bookworm+ (Python ≥3.10); Pi 4/5 ideal. See [Raspberry Pi / ARM Linux](#raspberry-pi--arm-linux) |
 | Raspberry Pi / ARM Linux (32-bit) | LXTerminal / SSH | ⚠ Limited | No 32-bit-ARM wheels — `pyhmmer`/`primer3-py`/`biopython`/`Pillow` source-compile (slow). Use the 64-bit OS |
-| **macOS** | Terminal.app | ✅ Fully supported | macOS 11+; older macOS may lack true-color |
+| **macOS** | Terminal.app | ✅ Fully supported | macOS 11+; older may lack true-color. **Apple Silicon + Python ≥3.10:** `primer3-py` ships no arm64 wheel for 3.10+, so it compiles at install — `xcode-select --install` once. Intel Macs use prebuilt wheels (biopython is pinned to a version that still ships them). |
 | macOS | iTerm2 | ✅ Fully supported | Preferred for OSC 52 reliability |
 | macOS | tmux on macOS | ✅ Works under | Same OSC 52 caveat as Linux |
 | **WSL** | Windows Terminal | ✅ Fully supported | Pillow clipboard image grab disabled (Linux side) — use file picker |
@@ -142,16 +142,22 @@ terminal side is identical to desktop Linux (and a minimal / serial
 console degrades to the ASCII map; see *Required terminal features*).
 Two things decide whether the install is painless:
 
-* **Use a 64-bit OS (`aarch64`).** On 64-bit Raspberry Pi OS / Ubuntu,
-  every compiled dependency — `pyhmmer`, `primer3-py`, `biopython`,
-  `Pillow` — publishes a `manylinux_2_17_aarch64` wheel, so `pipx
-  install splicecraft` pulls prebuilt binaries with no compiler and no
-  wait. HMMscan works too (the `aarch64` `pyhmmer` wheel exists — and
-  note the marker only drops `pyhmmer` on Windows, not on ARM Linux).
-  On a **32-bit** OS (`armv7l` / `armhf`) none of those four have
-  wheels, so all four source-compile — possible (they're POSIX C,
-  unlike `pyhmmer` on Windows) but slow, and it needs `build-essential`
-  + dev headers + RAM. Prefer the 64-bit image.
+* **Use a 64-bit OS (`aarch64`) and install a C toolchain once.** Most
+  compiled deps — `pyhmmer`, `biopython`, `Pillow` — ship `aarch64`
+  wheels, so they pull prebuilt binaries. But **`primer3-py` has no
+  `aarch64` wheel** (upstream ships none) and primer design has no
+  pure-Python fallback, so it source-compiles at install: run
+  `sudo apt install build-essential python3-dev` **once** before
+  `pipx install splicecraft` (it's a small, fast C extension). `edlib`
+  also lacks an `aarch64` wheel, but it transparently falls back to
+  Biopython — so it never needs the compiler (alignment is a touch
+  slower, with identical results). HMMscan works (the `aarch64`
+  `pyhmmer` wheel exists — the POSIX marker drops `pyhmmer` only on
+  native Windows, not ARM Linux). On a **32-bit** OS (`armv7l` /
+  `armhf`) none of the compiled deps have wheels, so everything
+  source-compiles — possible but slow; prefer the 64-bit image. (The
+  release `scripts/check_dep_wheels.py` gate tracks exactly which deps
+  lack `aarch64` wheels, so this list stays honest.)
 * **Python ≥ 3.10.** Raspberry Pi OS **Bookworm** (Debian 12) ships
   3.11 ✓. Older **Bullseye** ships 3.9, which trips `No matching
   distribution found for splicecraft (from versions: none)` — upgrade

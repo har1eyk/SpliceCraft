@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.28] — 2026-06-05
+
+### Bug fixes
+
+- **Installs cleanly on the newest Python and fresh distros (e.g. Ubuntu 26.04 / Python 3.14).** `pipx install splicecraft` was failing while trying to compile `edlib`, which publishes no wheel for Python 3.14 — or for ARM64 Linux — and, unmaintained since 2022, never will. SpliceCraft now uses its built-in Biopython aligner on those targets, so the install needs no compiler or dev headers. (The fast `edlib` aligner is still used automatically on x86-64 / macOS with Python 3.10–3.13 — identical results, just faster.)
+- **Installs cleanly on Intel Macs.** `biopython` is pinned to a release that still ships Intel-macOS wheels (its newest version dropped them), so Intel Macs no longer have to compile Biopython at install.
+
+### Hardening
+
+- **Releases are now gated on dependency wheel coverage.** A new pre-release check verifies that every required dependency installs from a prebuilt wheel on every supported platform **and Python version (now through 3.14)** — or is a documented compile-from-source case (primer design's `primer3-py` on ARM64, which needs a one-time `build-essential` / Xcode CLT) — so a dependency quietly dropping wheels for a new Python or platform can't ship an un-installable release again.
+
+---
+
 ## [1.0.27] — 2026-06-05
 
 ### New features

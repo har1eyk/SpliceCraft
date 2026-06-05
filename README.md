@@ -41,6 +41,14 @@ splicecraft L09137               # fetch pUC19 from NCBI on launch
 splicecraft myplasmid.gb         # local GenBank or .dna
 ```
 
+x86-64 Linux, Intel macOS, and Windows install entirely from prebuilt
+wheels — nothing to compile. On **ARM64 Linux** (Raspberry Pi / ARM
+cloud) and **Apple Silicon with Python ≥3.10**, one dependency
+(`primer3-py`, the primer-design engine) has no prebuilt ARM wheel and
+compiles at install, so install a C toolchain first:
+`sudo apt install build-essential python3-dev` (Linux) or
+`xcode-select --install` (macOS). One-time, then `pipx install splicecraft`.
+
 Press `?` once running for the full keyboard-shortcut reference. See
 [`docs/install.md`](docs/install.md) for pip / uv / conda / source installs.
 
