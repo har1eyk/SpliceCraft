@@ -405,9 +405,9 @@ class TestOriginHistoryBackfill:
         loaded = sc._load_library()
         assert len(loaded) == 2                            # SACRED: count kept
         assert all(e.get("history_xml") for e in loaded)
-        pei = next(e for e in loaded if e["id"] == "Demo311")
-        assert pei["status"] == "VERIFIED" and pei["size"] == 2559
-        assert sc._parse_commercialsaas_history(pei["history_xml"]) is not None
+        demo = next(e for e in loaded if e["id"] == "Demo311")
+        assert demo["status"] == "VERIFIED" and demo["size"] == 2559
+        assert sc._parse_commercialsaas_history(demo["history_xml"]) is not None
         # Persisted to disk, count preserved there too.
         on_disk = json.loads(tmp_lib.read_text())["entries"]
         assert len(on_disk) == 2

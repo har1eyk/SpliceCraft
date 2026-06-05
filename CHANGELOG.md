@@ -14,6 +14,19 @@
 
 ---
 
+## [unreleased]
+
+### New features
+
+- **Set up HMM databases from the agent API.** External agents and scripts can now register a custom HMMER `.hmm.gz` source and download + index any database — the built-in Pfam-A / NCBIfam, or a custom URL — completely headless. The files land exactly where the in-app catalog downloader puts them, so `hmmscan` can use them right away. Mirrors the HMM-database window's **Add** and **Download** buttons.
+- **The Part Domesticator pre-fills the fragment name.** When you send a fragment from the Synthesis composer into the Domesticator, its name now comes along — no more re-typing the part name you just gave it.
+
+### Bug fixes
+
+- **Synthesis and Constructor primers keep their name.** A primer designed during domestication now shows the same name everywhere — its entry in the primer library, the `primer_bind` features on both the fragment and the cloned plasmid, and the construction history — instead of a generic "forward primer" / "reverse primer". One name, every view.
+
+---
+
 ## [1.0.26] — 2026-06-05
 
 ### New features

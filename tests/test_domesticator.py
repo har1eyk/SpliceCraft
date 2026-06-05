@@ -525,6 +525,38 @@ def _mk_template(n: int = 1200) -> str:
     return seq
 
 
+class TestDomesticatorNamePrefill:
+    """P1 (2026-06-05): the Synthesis "Clone Fragment" handoff carries the
+    fragment NAME so `#dom-name` is pre-filled — the user no longer
+    re-types a name they already gave the synthesis fragment."""
+
+    def test_init_stores_trimmed_prefill_name(self):
+        m = sc.DomesticatorModal(_mk_template(), _mk_feats(),
+                                 prefill_name="  My Promoter  ")
+        assert m._prefill_name == "My Promoter"
+        # Back-compat: every other caller omits it → empty, no prefill.
+        assert sc.DomesticatorModal(
+            _mk_template(), _mk_feats())._prefill_name == ""
+
+    def test_parts_bin_carries_clone_prefill_name(self):
+        pb = sc.PartsBinModal(auto_trigger_new_part=True,
+                              clone_prefill_seq="ACGTACGT",
+                              clone_prefill_name="My Promoter")
+        assert pb._clone_prefill_name == "My Promoter"
+        assert sc.PartsBinModal()._clone_prefill_name == ""
+
+    async def test_dom_name_input_prefilled_on_mount(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.DomesticatorModal(
+                _mk_template(), _mk_feats(), prefill_name="My Promoter"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal.query_one("#dom-name", sc.Input).value == "My Promoter"
+
+
 class TestDomesticatorSourcePickerLayout:
     """Structural tests: the three source radios + three panels exist, and
     only the Direct panel is visible on first mount."""

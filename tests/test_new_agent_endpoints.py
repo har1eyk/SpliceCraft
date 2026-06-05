@@ -467,3 +467,91 @@ def test_delete_hmm_database_not_downloaded_ok():
     some_id = listed[0]["id"]
     res = sc._h_delete_hmm_database(None, {"id": some_id})
     assert res["ok"] and res["files_removed"] == 0
+
+
+# ── HMM database add + download (this session) ────────────────────────────────
+
+
+def test_add_hmm_database_roundtrip():
+    res = sc._h_add_hmm_database(
+        None, {"name": "My Test HMMs",
+               "url": "https://example.org/db.hmm.gz"})
+    assert res["ok"] and res["id"] == "my_test_hmms"
+    listed = sc._h_list_hmm_databases(None, {})["hmm_databases"]
+    by_id = {d["id"]: d for d in listed}
+    assert "my_test_hmms" in by_id
+    assert by_id["my_test_hmms"]["builtin"] is False
+    assert by_id["my_test_hmms"]["ready"] is False  # registered, not fetched
+
+
+def test_add_hmm_database_missing_name_400():
+    res = sc._h_add_hmm_database(
+        None, {"url": "https://example.org/db.hmm.gz"})
+    assert isinstance(res, tuple) and res[1] == 400
+
+
+def test_add_hmm_database_bad_url_400():
+    res = sc._h_add_hmm_database(
+        None, {"name": "Bad URL DB", "url": "ftp://example.org/db.hmm.gz"})
+    assert isinstance(res, tuple) and res[1] == 400
+
+
+def test_add_hmm_database_duplicate_id_409():
+    payload = {"name": "Dup DB", "url": "https://example.org/db.hmm.gz"}
+    assert sc._h_add_hmm_database(None, payload)["ok"]
+    res = sc._h_add_hmm_database(None, dict(payload))
+    assert isinstance(res, tuple) and res[1] == 409
+
+
+def test_add_hmm_database_builtin_collision_409():
+    # "Pfam-A" → id "pfam-a", a shipped builtin: must refuse, not shadow.
+    res = sc._h_add_hmm_database(
+        None, {"name": "Pfam-A", "url": "https://example.org/db.hmm.gz"})
+    assert isinstance(res, tuple) and res[1] == 409
+
+
+def test_download_hmm_database_unknown_404():
+    res = sc._h_download_hmm_database(None, {"id": "no-such-db"})
+    assert isinstance(res, tuple) and res[1] == 404
+
+
+def test_download_hmm_database_success(monkeypatch):
+    sc._h_add_hmm_database(
+        None, {"name": "Stub DB", "url": "https://example.org/db.hmm.gz"})
+    calls = {}
+
+    def _fake_perform(entry, **kw):
+        calls["entry"] = entry
+        return {"id": entry["id"], "n_profiles": 7, "pressed": True,
+                "sha256": "abc", "version": "downloaded", "bytes": 1234}
+
+    monkeypatch.setattr(sc, "_hmm_db_perform_download", _fake_perform)
+    res = sc._h_download_hmm_database(None, {"id": "stub_db"})
+    assert res["ok"] and res["id"] == "stub_db"
+    assert res["n_profiles"] == 7 and res["pressed"] is True
+    assert calls["entry"]["id"] == "stub_db"
+    # Slot freed after success → a retry isn't spuriously 409.
+    assert sc._hmm_db_acquire_download_slot("stub_db")
+    sc._hmm_db_release_download_slot("stub_db")
+
+
+def test_download_hmm_database_inflight_409():
+    # A held slot (e.g. a GUI download in flight) blocks the agent path.
+    assert sc._hmm_db_acquire_download_slot("pfam-a")
+    try:
+        res = sc._h_download_hmm_database(None, {"id": "pfam-a"})
+        assert isinstance(res, tuple) and res[1] == 409
+    finally:
+        sc._hmm_db_release_download_slot("pfam-a")
+
+
+def test_download_hmm_database_failure_500_releases_slot(monkeypatch):
+    def _boom(entry, **kw):
+        raise RuntimeError("network exploded")
+
+    monkeypatch.setattr(sc, "_hmm_db_perform_download", _boom)
+    res = sc._h_download_hmm_database(None, {"id": "pfam-a"})
+    assert isinstance(res, tuple) and res[1] == 500
+    # Slot must be released even on failure.
+    assert sc._hmm_db_acquire_download_slot("pfam-a")
+    sc._hmm_db_release_download_slot("pfam-a")

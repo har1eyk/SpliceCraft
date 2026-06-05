@@ -2687,7 +2687,7 @@ class TestAddCodonTableGenome:
 
     def test_bad_mode_rejected(self):
         result = sc._h_add_codon_table(
-            None, {"source": "genome", "taxid": "1352", "mode": "best"})
+            None, {"source": "genome", "taxid": "1423", "mode": "best"})
         payload, status = result
         assert status == 400
         assert "mode" in payload["error"]
@@ -2704,11 +2704,11 @@ class TestAddCodonTableGenome:
             }
         monkeypatch.setattr(sc, "_genome_build_codon_table", fake_build)
         result = sc._h_add_codon_table(
-            None, {"source": "genome", "taxid": "1352", "mode": "heg"})
+            None, {"source": "genome", "taxid": "1423", "mode": "heg"})
         assert result["ok"] is True
         assert result["entry"]["source"] == "genome"
-        assert result["entry"]["taxid"] == "1352"
-        got = sc._codon_tables_get("1352")
+        assert result["entry"]["taxid"] == "1423"
+        got = sc._codon_tables_get("1423")
         assert got is not None and got["source"] == "genome"
         assert got["name"] == "Testus organismus"   # default from organism
 

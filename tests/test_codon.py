@@ -2058,13 +2058,13 @@ class TestCodonManagerTabs:
             tabs = modal.query_one("#sp-tabs", TabbedContent)
             await _switch_tab(pilot, tabs, "sp-tab-genome")
             meta = {"organism": "Bacillus subtilis",
-                    "accession": "GCF_000009045.1", "taxid": "1352",
+                    "accession": "GCF_000009045.1", "taxid": "1423",
                     "stats": {"mode": "heg", "n_cds_total": 60,
                               "n_codons": 7475}}
             modal._genome_build_done("", {"GCT": ("A", 10)}, "ok", meta)
             await _settle_tab(pilot, tabs, "sp-tab-library")
             assert added["entry"]["source"] == "genome"
-            assert added["entry"]["taxid"] == "1352"
+            assert added["entry"]["taxid"] == "1423"
             assert tabs.active == "sp-tab-library"
             assert len(modal.query_one("#sp-list", DataTable).rows) >= 1
             assert modal._building is False
@@ -2183,7 +2183,7 @@ class TestCodonManagerTabs:
             modal = app.screen
             tabs = modal.query_one("#sp-tabs", TabbedContent)
             await _switch_tab(pilot, tabs, "sp-tab-genome")
-            modal.query_one("#sp-genome-query", Input).value = "1352"
+            modal.query_one("#sp-genome-query", Input).value = "1423"
             # Simulate a build already running, then press again.
             modal._building = True
             modal.query_one("#btn-sp-genome-go", Button).action_press()

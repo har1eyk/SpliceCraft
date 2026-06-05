@@ -78,9 +78,17 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   lineage as nested JSON.
 - **Codon tables** — list, add (Kazusa fetch or raw dict), delete.
 - **Search** — blast, hmmscan.
-- **HMM databases** — list / get / set-active / delete-hmm-database
-  (the registry that backs hmmscan; delete un-downloads the files,
-  leaving the catalog entry so it can be re-fetched).
+- **HMM databases** — list / get / set-active / delete / add /
+  download-hmm-database (the registry that backs hmmscan). `add`
+  registers a custom `.hmm.gz` URL (mirrors the GUI "Add" form);
+  `download` streams → decompresses → hmmpresses a catalog entry
+  (builtin like `pfam-a` / `ncbifam`, or a custom one) into
+  `<DATA_DIR>/hmm_databases/<id>/` exactly as a GUI download would, so
+  `set-active` + `hmmscan` can then use it. `download` runs
+  synchronously, so a large builtin (Pfam-A ~300 MB, NCBIfam ~600 MB)
+  blocks the request for minutes; a 409 means a download for that id is
+  already in flight. `delete` un-downloads the files but keeps the
+  catalog entry so `download` can re-fetch it.
 - **Custom enzymes + enzyme collections** — list / get / create /
   update / delete-custom-enzyme; list / get / create / update /
   delete-enzyme-collection; get / set-active-enzyme-collection.

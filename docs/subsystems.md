@@ -53,10 +53,27 @@ via `HmmDbAddEditModal`; user entries are renameable / removable.
   Check for updates, Add custom URL, Edit, Remove entry, Delete
   download buttons. Workers `_download_worker` (`@work(thread=True,
   exclusive=True, group="hmm_db_download")`) and `_version_check_
-  worker`. `_blocks_undo=True`; `_dismiss_once`.
+  worker`. The download worker delegates its download → decompress →
+  hmmpress → stamp-meta core to the module-level
+  `_hmm_db_perform_download(entry, *, progress_cb, status_cb,
+  cancel_check_cb)` (the callbacks are UI side-channels, all optional),
+  so the GUI and the agent side door share one code path and land
+  byte-identical on disk. `_blocks_undo=True`; `_dismiss_once`.
 * `HmmDbAddEditModal`: Inputs for name, source URL, optional version
   URL, description. Builtin-edit mode locks name + builtin flag,
   only URL editable. `_blocks_undo=True`; `_dismiss_once`.
+
+**Agent side door**
+* `add-hmm-database {name, url, version_url?, description?}` registers a
+  custom DB (derives the id from the name exactly as the form does;
+  refuses a colliding id/builtin or a taken display name) and
+  `download-hmm-database {id}` runs `_hmm_db_perform_download` headless
+  for a builtin or custom entry — same files, same `meta.json`, same
+  catalog state as a GUI download. Both are `write=True`; `download`
+  holds the `_HMM_DB_DOWNLOAD_INFLIGHT` slot (409 if a GUI/agent
+  download of the same id is already running) and releases it in
+  `finally`. The download blocks the request synchronously (no async
+  job/poll yet — a large builtin ties up the connection for minutes).
 
 **Sacred network discipline** (see [INV-84] for the full list of layers):
 HTTPS-only-by-default; bounded redirects (5 max) via custom

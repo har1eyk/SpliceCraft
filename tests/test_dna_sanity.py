@@ -1175,6 +1175,77 @@ class TestClonePrimerAttachment:
         assert not [f for f in clone_np.features if f.type == "primer_bind"]
 
 
+class TestUnifiedPrimerNames:
+    """A synthesis/constructor primer must show the SAME name on its
+    primer-library entry, its fragment + clone `primer_bind` feature
+    labels, and the construction history — `{part}-DOM-{n}-F/-R`, never
+    the old generic `fwd_primer`/`rev_primer`. 2026-06-05 (user: "all
+    unified")."""
+
+    _INSERT = TestClonePrimerAttachment._INSERT
+
+    def _primers(self):
+        return TestClonePrimerAttachment._primers(self)
+
+    def test_dom_primer_pair_names_format(self):
+        assert sc._dom_primer_pair_names("MyInsert", 1) == (
+            "MyInsert-DOM-1-F", "MyInsert-DOM-1-R")
+        assert sc._dom_primer_pair_names("MyInsert", 3) == (
+            "MyInsert-DOM-3-F", "MyInsert-DOM-3-R")
+        # Blank name never yields a bare "-DOM-…" label.
+        assert sc._dom_primer_pair_names("   ", 1)[0] == "part-DOM-1-F"
+
+    def test_part_primer_labels_prefers_stored_then_derives(self):
+        stored = {"name": "X", "fwd_primer_name": "X-DOM-2-F",
+                  "rev_primer_name": "X-DOM-2-R"}
+        assert sc._part_primer_labels(stored) == ("X-DOM-2-F", "X-DOM-2-R")
+        # No stored names → derive pair-1 from the part name, NEVER the
+        # old generic "fwd_primer"/"rev_primer".
+        derived = sc._part_primer_labels({"name": "probe part"})
+        assert derived == ("probe part-DOM-1-F", "probe part-DOM-1-R")
+        assert "fwd_primer" not in derived and "rev_primer" not in derived
+
+    def test_attach_honours_supplied_labels(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        fwd, rev = self._primers()
+        rec = SeqRecord(Seq("GGAG" + self._INSERT + "CGCT" + "ACGT" * 20),
+                        id="clone", name="clone")
+        rec.annotations["topology"] = "circular"
+        assert sc._attach_pcr_primers_to_record(
+            rec, fwd, rev,
+            fwd_label="Foo-DOM-1-F", rev_label="Foo-DOM-1-R") == 2
+        labels = {f.qualifiers.get("label", [""])[0]
+                  for f in rec.features if f.type == "primer_bind"}
+        assert labels == {"Foo-DOM-1-F", "Foo-DOM-1-R"}
+
+    def test_clone_and_fragment_carry_unified_names(self):
+        fwd, rev = self._primers()
+        base = {"name": "probe part", "sequence": self._INSERT,
+                "oh5": "GGAG", "oh3": "CGCT", "type": "Promoter",
+                "grammar": "gb_l0", "level": 0,
+                "fwd_primer": fwd, "rev_primer": rev}
+        want = {"probe part-DOM-1-F", "probe part-DOM-1-R"}
+        # (a) names frozen on the part are used verbatim on BOTH the clone
+        #     and the fragment (and match what the library save writes).
+        part = dict(base, **{"fwd_primer_name": "probe part-DOM-1-F",
+                             "rev_primer_name": "probe part-DOM-1-R"})
+        for rec in (sc._part_to_cloned_seqrecord(part),
+                    sc._part_to_primed_fragment_seqrecord(part)):
+            labels = {f.qualifiers.get("label", [""])[0]
+                      for f in rec.features if f.type == "primer_bind"}
+            assert labels, "expected the run primers to ride along"
+            assert labels <= want, f"unexpected labels {labels}"
+            assert "fwd_primer" not in labels and "rev_primer" not in labels
+        # (b) a part saved before names were stored still gets the derived
+        #     name on its clone — never the old generic label.
+        clone = sc._part_to_cloned_seqrecord(base)
+        labels = {f.qualifiers.get("label", [""])[0]
+                  for f in clone.features if f.type == "primer_bind"}
+        assert labels and labels <= want
+        assert "fwd_primer" not in labels and "rev_primer" not in labels
+
+
 class TestRestrictionScanLinearVsCircular:
     """Linear records must NOT scan past their end. Pre-2026-05-08
     every caller of `_scan_restriction_sites` defaulted to
