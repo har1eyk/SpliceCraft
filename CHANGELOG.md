@@ -14,7 +14,7 @@
 
 ---
 
-## [unreleased]
+## [1.0.27] — 2026-06-05
 
 ### New features
 
