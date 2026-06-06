@@ -106,9 +106,10 @@ a C toolchain once, then install normally:
 * Linux: `sudo apt install build-essential python3-dev`
 * macOS: `xcode-select --install`
 
-Then `pipx install splicecraft`. (`edlib`, the fast aligner, also lacks
-an ARM64-Linux wheel but transparently falls back to Biopython — no
-build needed, alignment just slightly slower with identical results.)
+Then `pipx install splicecraft`. (`edlib`, the optional turbo aligner,
+also lacks an ARM64-Linux wheel but transparently falls back to the
+built-in pure-Python Myers aligner — no build needed; ~12× the old
+Biopython fallback, identical results.)
 See [`PLATFORMS.md`](PLATFORMS.md) for the full per-platform matrix.
 
 ## Troubleshooting `pipx install splicecraft`
@@ -135,10 +136,10 @@ Python headers. Install them once, then re-run the install:
 Then `pipx install splicecraft` again. As of this release the only
 dependency that hits this is **`primer3-py`** (the primer-design engine),
 and only on **ARM64 Linux** and **Apple Silicon with Python ≥3.10**,
-where it ships no wheel — it's a small, fast compile. The fast aligner
-**`edlib` is never the culprit**: SpliceCraft transparently falls back to
-its built-in Biopython aligner wherever edlib has no wheel (ARM, and
-brand-new Pythons like 3.14), so it never needs a compiler.
+where it ships no wheel — it's a small, fast compile. The optional turbo
+aligner **`edlib` is never the culprit**: SpliceCraft transparently falls
+back to its built-in pure-Python Myers aligner wherever edlib has no wheel
+(ARM, and brand-new Pythons like 3.14), so it never needs a compiler.
 
 ### `No matching distribution found for splicecraft (from versions: none)`
 

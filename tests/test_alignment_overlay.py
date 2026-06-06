@@ -6749,6 +6749,178 @@ class TestPairwiseAlignEngine:
         assert at.replace("-", "") == "ATGGATGC"
         assert len(aq) == len(at)
 
+    # ── built-in Myers/Hirschberg tier (between edlib and Biopython) ──
+
+    def test_myers_engine_invoked_when_edlib_absent(self, monkeypatch):
+        # With edlib off, global mode must run the built-in Myers engine
+        # (NOT Biopython) — spy that `_myers_align_global` is called.
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        calls = []
+        real = sc._myers_align_global
+
+        def _spy(q, t):
+            calls.append((len(q), len(t)))
+            return real(q, t)
+
+        monkeypatch.setattr(sc, "_myers_align_global", _spy)
+        r = sc._pairwise_align("ATGCATGCAT", "ATGCATGCAT")
+        assert calls, "Myers engine was not invoked"
+        assert r["identity_pct"] == 100.0 and r["n_matches"] == 10
+
+    def test_myers_round_trip_guard_falls_back(self, monkeypatch):
+        # edlib off + Myers returns a round-trip-violating alignment →
+        # the guard rejects it and cascades to Biopython (correct result).
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        monkeypatch.setattr(sc, "_myers_align_global",
+                            lambda q, t: ("ZZZZ", "ZZZZ"))
+        r = sc._pairwise_align("ATGC", "ATGC")
+        assert r["identity_pct"] == 100.0 and r["n_matches"] == 4
+
+    def test_myers_exception_falls_back(self, monkeypatch):
+        # A Myers failure must not abort the alignment — Biopython covers.
+        def _boom(_q, _t):
+            raise RuntimeError("myers exploded")
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        monkeypatch.setattr(sc, "_myers_align_global", _boom)
+        r = sc._pairwise_align("ATGCATGC", "ATGCATGC")
+        assert r["identity_pct"] == 100.0 and r["n_matches"] == 8
+
+    def test_myers_global_helper_round_trips(self):
+        aq, at = sc._myers_align_global("ATGCATGC", "ATGGATGC")
+        assert aq.replace("-", "") == "ATGCATGC"
+        assert at.replace("-", "") == "ATGGATGC"
+        assert len(aq) == len(at)
+
+    def test_myers_iupac_aligns_as_match(self, monkeypatch):
+        # N / R against compatible bases count as matches on the Myers tier.
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        r = sc._pairwise_align("ANGCRTGC", "ATGCATGC")
+        assert r["n_mismatches"] == 0 and r["n_matches"] == 8
+
+    def test_myers_matches_engines_on_near_identical(self, monkeypatch):
+        """On a UNIQUE-optimal near-identical pair (1 SNP + a 3 bp
+        deletion, well separated) the Myers engine agrees EXACTLY with
+        Biopython AND edlib — same matches / mismatches / gaps. On
+        divergent reads the engines pick different co-optimal alignments
+        (same edit distance); that's immaterial and not asserted — see
+        [INV-91]."""
+        q = _det_seq(2000, seed=11)
+        t = (q[:800] + ("A" if q[800] != "A" else "C")
+             + q[801:1500] + q[1503:])
+
+        def _counts(r):
+            return (r["n_matches"], r["n_mismatches"], r["n_gap_cols"])
+
+        def _raise(_q, _t):
+            raise ValueError("forced Biopython cascade")
+
+        edlib_counts = (_counts(sc._pairwise_align(q, t))
+                        if sc._EDLIB_AVAILABLE else None)
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        myers_counts = _counts(sc._pairwise_align(q, t))          # Myers path
+        monkeypatch.setattr(sc, "_myers_align_global", _raise)
+        bio_counts = _counts(sc._pairwise_align(q, t))            # Biopython
+        assert myers_counts == bio_counts
+        if edlib_counts is not None:
+            assert myers_counts == edlib_counts
+
+
+def _naive_edit_distance(a, b):
+    """Reference O(nm) Levenshtein with IUPAC-compatible match = cost 0 —
+    the ground truth the Myers/Hirschberg engine is validated against."""
+    n = len(b)
+    prev = list(range(n + 1))
+    for i in range(1, len(a) + 1):
+        ai = a[i - 1]
+        cur = [i] + [0] * n
+        for j in range(1, n + 1):
+            cost = 0 if sc._iupac_compatible(ai, b[j - 1]) else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[n]
+
+
+def _implied_edit_distance(ga, gb):
+    """Edit distance implied by a gapped alignment (gaps + IUPAC-
+    incompatible columns), for checking the engine returns an OPTIMAL
+    (minimum-edit-distance) alignment, not merely a round-tripping one."""
+    return sum(1 for x, y in zip(ga, gb)
+               if x == "-" or y == "-" or not sc._iupac_compatible(x, y))
+
+
+class TestMyersAligner:
+    """Engine-internal correctness for the pure-Python Myers/Hirschberg
+    global aligner (`_myers_align_global` + helpers). Validated against a
+    naive O(nm) DP for round-trip + minimum-edit-distance optimality +
+    IUPAC, so a regression in the bit-vector kernel, the Hirschberg split,
+    the small-block DP, or the recursive trim is caught here rather than
+    silently in the QC counts."""
+
+    def test_optimal_and_round_trip_vs_naive(self):
+        import random as _random
+        rng = _random.Random(2024)
+        for k in range(400):
+            alph = "ACGTRYSWKMBDHVN" if k % 5 == 0 else "ACGT"
+            a = "".join(rng.choice(alph) for _ in range(rng.randint(0, 32)))
+            b = "".join(rng.choice(alph) for _ in range(rng.randint(0, 32)))
+            ga, gb = sc._myers_align_global(a, b)
+            assert ga.replace("-", "") == a and gb.replace("-", "") == b
+            assert len(ga) == len(gb)
+            assert _implied_edit_distance(ga, gb) == _naive_edit_distance(a, b)
+
+    def test_profile_matches_naive_prefixes(self):
+        # `_myers_edit_profile`[k] == edit distance(pattern, text[:k]).
+        pat = _det_seq(40, seed=5)
+        txt = _det_seq(60, seed=6)
+        prof = sc._myers_edit_profile(pat, txt, sc._myers_build_peq(pat))
+        assert len(prof) == len(txt) + 1
+        for k in range(len(txt) + 1):
+            assert prof[k] == _naive_edit_distance(pat, txt[:k]), k
+
+    def test_dp_base_case_optimal(self):
+        import random as _random
+        rng = _random.Random(77)
+        for _ in range(200):
+            a = "".join(rng.choice("ACGT") for _ in range(rng.randint(0, 20)))
+            b = "".join(rng.choice("ACGT") for _ in range(rng.randint(0, 20)))
+            ga, gb = sc._myers_dp_global(a, b)
+            assert ga.replace("-", "") == a and gb.replace("-", "") == b
+            assert _implied_edit_distance(ga, gb) == _naive_edit_distance(a, b)
+
+    def test_identical_fast_path(self):
+        s = _det_seq(500, seed=9)
+        ga, gb = sc._myers_align_global(s, s)
+        assert ga == s and gb == s          # no gaps, returned verbatim
+
+    def test_pure_insertion_and_deletion(self):
+        s = _det_seq(40, seed=3)
+        t = s[:20] + _det_seq(10, seed=4) + s[20:]   # pure middle insertion
+        ga, gb = sc._myers_align_global(s, t)
+        assert ga.replace("-", "") == s and gb.replace("-", "") == t
+        assert _implied_edit_distance(ga, gb) == _naive_edit_distance(s, t)
+        ga2, gb2 = sc._myers_align_global(t, s)       # and the reverse
+        assert ga2.replace("-", "") == t and gb2.replace("-", "") == s
+        assert _implied_edit_distance(ga2, gb2) == _naive_edit_distance(t, s)
+
+    def test_recursive_trim_scattered_optimal(self):
+        # ~600 bp at ~3% scattered substitutions: exercises the
+        # Hirschberg + recursive-trim path; must stay edit-optimal.
+        import random as _random
+        rng = _random.Random(123)
+        base = _det_seq(600, seed=8)
+        q = "".join(rng.choice("ACGT") if rng.random() < 0.03 else c
+                    for c in base)
+        ga, gb = sc._myers_align_global(q, base)
+        assert ga.replace("-", "") == q and gb.replace("-", "") == base
+        assert _implied_edit_distance(ga, gb) == _naive_edit_distance(q, base)
+
+    def test_myers_tier_respects_length_cap(self, monkeypatch):
+        # The engine has no internal cap; `_pairwise_align` enforces
+        # `_PAIRWISE_MAX_LEN` before any engine runs.
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        with pytest.raises(ValueError):
+            sc._pairwise_align("ATGC", "A" * (sc._PAIRWISE_MAX_LEN + 1))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # _alignment_bar_column_shades / _alignment_shade_cell — nuanced bar overlay

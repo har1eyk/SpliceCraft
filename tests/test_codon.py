@@ -1056,7 +1056,13 @@ class TestPartsBinSource:
             # Protein is M + 30×A + (stop) → mutate position 5 (A) → V.
             modal.query_one("#mut-input").value = "A5V"
             modal.query_one("#btn-mut-design").action_press()
-            await pilot.pause(0.2)
+            # Design may run in a worker; poll for completion rather than a
+            # fixed pause (a 0.2 s pause flaked under `-n auto` load when the
+            # worker didn't get scheduled in time — passed in isolation).
+            for _ in range(50):
+                await pilot.pause(0.1)
+                if modal._inner is not None:
+                    break
             assert modal._inner is not None
             assert modal._outer is not None
             assert modal.query_one("#btn-mut-save").disabled is False

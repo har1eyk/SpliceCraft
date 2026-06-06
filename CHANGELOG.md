@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.29] — 2026-06-06
+
+### Hardening
+
+- **Sequence alignment is now fast on *every* platform — no `edlib` needed.** SpliceCraft has a new built-in pure-Python aligner that replaces the old Biopython fallback wherever the optional `edlib` turbo has no prebuilt wheel (ARM64 Linux, Python 3.14+, native Windows, and any fresh install without it). A real ~18 kb Plasmidsaurus read at ~99% identity now aligns in **~0.7 s instead of ~8.6 s** (~12× faster), with identical results — so bulk sequencing QC is quick everywhere, not just where `edlib` happens to ship a wheel. `edlib` is still used automatically as a turbo where its wheel exists (x86-64 / macOS on Python 3.10–3.13) and is now purely optional: nothing slows to a crawl, and nothing breaks, if it's absent.
+
+---
+
 ## [1.0.28] — 2026-06-05
 
 ### Bug fixes

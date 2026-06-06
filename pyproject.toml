@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.0.28"
+version         = "1.0.29"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Topic :: Terminals",
 ]
@@ -51,9 +52,12 @@ dependencies = [
     # ~90–600× faster than Biopython's DP on the long near-identical
     # sequences that drive sequencing QC, with IDENTICAL match / mismatch
     # / indel counts on those alignments. `_pairwise_align` imports it
-    # OPTIONALLY (`_EDLIB_AVAILABLE`) and transparently falls back to
-    # Biopython when absent — so where edlib has no wheel we OMIT it
-    # rather than force a source build.
+    # OPTIONALLY (`_EDLIB_AVAILABLE`) and transparently falls back to the
+    # built-in pure-Python Myers/Hirschberg aligner (`_myers_align_global`
+    # — ~12× the old Biopython fallback, no dependency) when absent, so
+    # where edlib has no wheel we OMIT it rather than force a source
+    # build. edlib is now a pure TURBO over a capable built-in engine —
+    # non-load-bearing — not the difference between fast and unusably slow.
     #
     # Marker (2026-06-05): edlib is UNMAINTAINED (last release 2022) and
     # ships wheels only for x86_64 (Linux + macOS) + macOS arm64
@@ -66,8 +70,8 @@ dependencies = [
     # such file or directory` on an x86_64 ThinkPad). The marker gates it
     # to exactly the (arch × Python) cells that HAVE wheels: x86_64/arm64
     # AND python < 3.14. Everywhere else — Linux-aarch64, Python 3.14+,
-    # native Windows — transparently uses the Biopython fallback (slower,
-    # identical results, no compiler). The `python_version < '3.14'`
+    # native Windows — transparently uses the built-in Myers aligner (no
+    # compiler, ~12× the old Biopython fallback). The `python_version < '3.14'`
     # ceiling also excludes every FUTURE Python (3.15+ are all ≥ 3.14),
     # so a new interpreter can never reintroduce this. Bump the ceiling
     # only if edlib is ever revived with newer wheels.
