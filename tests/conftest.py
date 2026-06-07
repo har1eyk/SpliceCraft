@@ -61,6 +61,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         ("_CUSTOM_ENZYMES_FILE",  "_custom_enzymes_cache"),
         ("_ENZYME_COLLECTIONS_FILE", "_enzyme_collections_cache"),
         ("_HMM_DB_CATALOG_FILE",  "_hmm_db_catalog_cache"),   # sweep #28
+        ("_PROTEIN_COLLECTIONS_FILE", "_protein_collections_cache"),
         ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
     ]
 

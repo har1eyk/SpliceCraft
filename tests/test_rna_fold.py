@@ -254,3 +254,65 @@ class TestRbsDesign:
                          ("AUGNNN", 5), (self.CDS, True), ("AU", 5)):
             with pytest.raises(ValueError):
                 bio._rbs_design(cds, tgt)
+
+
+class TestAssembleOperon:
+    """Context-aware operon assembly (`_assemble_operon`). Short CDSs keep
+    the per-gene RBS search fast."""
+
+    G = [{"cds": "AUGAGCAAAGGUGAAUACAAAUAA", "target_strength": 5.0, "name": "A"},
+         {"cds": "AUGGCAGAAUGGCUGUUUACCUAA", "target": 2.0, "name": "B"}]
+    PROM = "UUGACAGCUAGCUCAGUCCUAGGUAUAAU"
+
+    def test_layout_tiles_sequence_exactly(self):
+        # THE off-by-one guard: layout must tile the DNA with no gap or overlap
+        r = bio._assemble_operon(self.G, promoter=self.PROM, terminator="UUUUUUUU")
+        seq = r["sequence"]
+        assert "U" not in seq                          # DNA output
+        cursor = 0
+        for el in r["layout"]:
+            assert el["start"] == cursor               # contiguous
+            assert seq[el["start"]:el["end"]]          # non-empty slice
+            cursor = el["end"]
+        assert cursor == len(seq)                      # covers the whole sequence
+        assert [el["kind"] for el in r["layout"]] == \
+            ["promoter", "rbs", "cds", "rbs", "cds", "terminator"]
+        for el in r["layout"]:                         # each CDS verbatim at its slot
+            if el["kind"] == "cds":
+                cds = next(g["cds"] for g in self.G if g["name"] == el["name"])
+                assert seq[el["start"]:el["end"]] == cds.replace("U", "T")
+
+    def test_context_aware_hits_reachable_targets(self):
+        r = bio._assemble_operon(self.G, promoter=self.PROM)
+        for g in r["genes"]:                           # both targets reachable
+            assert g["on_target"] is True
+            assert abs(g["rel_strength"] - g["target"]) <= 0.25 * g["target"]
+
+    def test_unreachable_target_flagged(self):
+        r = bio._assemble_operon(
+            [{"cds": "AUGGCAGAAUGGCUGUUUACCUAA", "target": 1e6, "name": "X"}],
+            promoter=self.PROM)
+        g = r["genes"][0]
+        assert g["on_target"] is False and g["rel_strength"] < 1e6
+
+    def test_genes_report_shape(self):
+        r = bio._assemble_operon(self.G)
+        assert len(r["genes"]) == 2
+        for g in r["genes"]:
+            assert {"name", "target", "cds_len", "rbs", "spacing",
+                    "rel_strength", "on_target"} <= set(g)
+            assert "U" not in g["rbs"]                  # DNA
+
+    def test_single_gene_no_flanks(self):
+        r = bio._assemble_operon([{"cds": "AUGAAAUACUAA", "target": 1.0}])
+        assert [el["kind"] for el in r["layout"]] == ["rbs", "cds"]
+        assert r["layout"][0]["start"] == 0
+
+    def test_bad_input_raises(self):
+        for bad in ([], "x", [{"target": 5}], [{"cds": "AU", "target": 5}],
+                    [{"cds": "AUGAAAUAA", "target": -1}],
+                    [{"cds": "AUGNNN", "target": 5}], [42]):
+            with pytest.raises(ValueError):
+                bio._assemble_operon(bad)
+        with pytest.raises(ValueError):
+            bio._assemble_operon(self.G, promoter="AUGN")    # bad promoter

@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.32] — 2026-06-07
+
+### New features
+
+- **Operon Design workbench.** A new "Operon Design" tab in the Synthesis screen for building tuned bacterial operons end-to-end. Keep a library of **protein collections** (add a protein by pasting its sequence, or grab a CDS from any plasmid in your library with **From feature**), drop proteins into an **assembly lane**, set a **target relative RBS strength** per gene, and **Assemble** — SpliceCraft codon-optimizes each CDS and reverse-designs each ribosome binding site *in its real context*, so the achieved strength tracks your target (a gene the surrounding sequence can't drive strongly is flagged honestly). The finished operon — promoter + RBS + CDS per gene + terminator — drops into the DNA tab **fully annotated**, ready to add cut sites or clone as a fragment. Also scriptable via the new `assemble-operon` agent endpoint. Pure-Python, built on SpliceCraft's own RBS engine — no external dependencies.
+
+---
+
 ## [1.0.31] — 2026-06-06
 
 ### New features

@@ -87,7 +87,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   start codon; returns a RELATIVE ranking score, not an absolute rate);
   design-rbs (reverse-design a 5'UTR / Shine-Dalgarno + spacer to a
   target relative strength, with the achievable range + an on-target
-  flag). DNA `T` read as `U`; ambiguous / over-length / bad input → 400.
+  flag); assemble-operon (assemble a contiguous operon from a list of
+  CDSs each with a target strength — context-aware RBS design + an
+  element layout + per-gene achieved-vs-target report). DNA `T` read as
+  `U`; ambiguous / over-length / bad input → 400.
 - **HMM databases** — list / get / set-active / delete / add /
   download-hmm-database (the registry that backs hmmscan). `add`
   registers a custom `.hmm.gz` URL (mirrors the GUI "Add" form);

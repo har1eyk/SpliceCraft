@@ -177,7 +177,7 @@ never forced.
 
 ### Synthesis
 
-A gene-synthesis composer with two tabs. The **DNA tab** is a
+A gene-synthesis composer with three tabs. The **DNA tab** is a
 horizontally-scrolling linear editor with anti-parallel strand markers, live
 feature stripes, restriction overlay, and AA translation, plus a feature
 library side-pane (Insert to splice, Annotate to overlay). The **Protein
@@ -212,6 +212,19 @@ as it would run on the bench — and both the fragment **and** the clone carry t
 **domestication primers**, drawn with their bound (annealing + overhang) and
 unbound (enzyme-tail) regions, so you can see exactly how each was built (and
 regenerate the amplicon later for a synthesis order).
+The **Operon Design tab** turns the codon optimizer and SpliceCraft's
+built-in RBS engine into an expression-tuning workbench. Keep a library of
+**protein collections** on the right (add by pasting a sequence, or **From
+feature** to pull a CDS from any plasmid in your library), drop proteins into
+the **assembly lane**, and give each gene a **target relative RBS strength**.
+**Assemble** codon-optimizes every CDS and reverse-designs every ribosome
+binding site *in its real assembled context* — so the achieved strength tracks
+your target, and a gene the surrounding sequence can't drive strongly is
+flagged rather than silently missed. The finished operon (promoter + RBS + CDS
+per gene + terminator) drops into the DNA tab fully annotated, ready to add cut
+sites or **Clone Fragment**. It's all pure-Python — the RNA folding,
+cofolding, and translation-initiation model ship inside SpliceCraft with no
+external dependencies.
 **Save** (and **Save As**, which forks a copy and only lights up once the
 fragment has been saved once) let you pick which collection the fragment lands
 in, and keep editing it there.

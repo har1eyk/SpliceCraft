@@ -1308,6 +1308,93 @@ def _rbs_design(cds, target_strength, *, upstream=_RBS_DESIGN_UPSTREAM):
     return best
 
 
+def _assemble_operon(genes, *, promoter='', terminator='',
+                     leader=_RBS_DESIGN_UPSTREAM):
+    """Assemble a contiguous bacterial operon — promoter + (RBS + CDS) per
+    gene + terminator — CONTEXT-AWARE: each RBS is reverse-designed against
+    the REAL upstream sequence (the promoter, or the preceding gene's 3'
+    end), so the achieved in-context strength tracks the target. (Designing
+    each RBS in isolation then concatenating does NOT — the upstream can
+    occlude it.) When a gene's target is unreachable in its context (e.g.
+    the previous CDS's 3' end sequesters the SD), the nearest achievable is
+    used and that gene's `on_target` is False — a real, useful signal.
+
+    `genes`: a non-empty list of dicts {cds, target_strength, name?} — each
+    `cds` begins with the start codon (DNA `T` read as `U`). `leader` is
+    the low-structure 5' standby used when there is no promoter. Returns::
+
+        {sequence, layout, genes}
+
+    `sequence` is DNA (T). `layout` is the ordered element map
+    [{kind, name, start, end}] (kind ∈ promoter/rbs/cds/terminator) where
+    `sequence[start:end]` is EXACTLY that element — contiguous, no gaps or
+    overlaps. `genes` is the per-gene report [{name, target, cds_len, rbs,
+    spacing, rel_strength, on_target}]. Raises ValueError on bad input."""
+    if not isinstance(genes, (list, tuple)) or not genes:
+        raise ValueError("genes must be a non-empty list")
+
+    def _norm(x, label):
+        x = (x or '').strip().upper().replace('T', 'U')
+        if set(x) - {'A', 'C', 'G', 'U'}:
+            raise ValueError(f"{label} must be A/C/G/U(T)")
+        return x
+    prom = _norm(promoter, 'promoter')
+    term = _norm(terminator, 'terminator')
+    lead = _norm(leader, 'leader')
+
+    assembled = prom
+    layout, anchors = [], []
+    if prom:
+        layout.append({'kind': 'promoter', 'name': 'promoter',
+                       'start': 0, 'end': len(prom)})
+    for i, g in enumerate(genes):
+        if not isinstance(g, dict):
+            raise ValueError(f"gene {i} must be a dict")
+        cds = g.get('cds')
+        if not isinstance(cds, str):
+            raise ValueError(f"gene {i}: missing string 'cds'")
+        cds = cds.strip().upper().replace('T', 'U')
+        target = g.get('target_strength', g.get('target'))
+        name = str(g.get('name') or f"gene{i + 1}")
+        if assembled:
+            ctx = assembled[-_RBS_WINDOW:]
+            d = _rbs_design(cds, target, upstream=ctx)    # validates cds + target
+            rbs = d['utr'][len(ctx):]                      # strip the already-present upstream
+        else:
+            d = _rbs_design(cds, target, upstream=lead)
+            rbs = d['utr']                                 # the leader is the operon's 5' start
+        rbs_start = len(assembled)
+        layout.append({'kind': 'rbs', 'name': f"{name} RBS",
+                       'start': rbs_start, 'end': rbs_start + len(rbs)})
+        assembled += rbs
+        cds_start = len(assembled)
+        layout.append({'kind': 'cds', 'name': name,
+                       'start': cds_start, 'end': cds_start + len(cds)})
+        assembled += cds
+        anchors.append({'name': name, 'target': target, 'cds_len': len(cds),
+                        'rbs': rbs.replace('U', 'T'), 'spacing': d['spacing'],
+                        'cds_start': cds_start})
+    if term:
+        layout.append({'kind': 'terminator', 'name': 'terminator',
+                       'start': len(assembled), 'end': len(assembled) + len(term)})
+        assembled += term
+
+    report = []
+    for a in anchors:
+        try:
+            rel = _rbs_strength(assembled, a['cds_start'])['rel_strength']
+        except ValueError:
+            rel = None
+        tgt = a['target']
+        on = (rel is not None and isinstance(tgt, (int, float))
+              and abs(rel - tgt) <= 0.25 * max(tgt, 1e-9))
+        report.append({'name': a['name'], 'target': tgt, 'cds_len': a['cds_len'],
+                       'rbs': a['rbs'], 'spacing': a['spacing'],
+                       'rel_strength': rel, 'on_target': on})
+    return {'sequence': assembled.replace('U', 'T'), 'layout': layout,
+            'genes': report}
+
+
 # What is intentionally NOT extracted (yet):
 #
 #   _scan_restriction_sites + _scan_restriction_sites_impl — depend on

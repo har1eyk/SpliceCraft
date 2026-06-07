@@ -569,6 +569,35 @@ class TestDesignRbsHandler:
             assert sc._AGENT_HANDLERS[name][1] is False
 
 
+class TestAssembleOperonHandler:
+    """`assemble-operon` — context-aware operon assembly from CDSs."""
+
+    GENES = [{"cds": "AUGAGCAAAUACUAA", "target_strength": 5.0, "name": "A"},
+             {"cds": "AUGGCAGAAUGGUAA", "target": 2.0, "name": "B"}]
+
+    def test_assembles(self):
+        r = sc._h_assemble_operon(None, {"genes": self.GENES,
+                                         "promoter": "TTGACA",
+                                         "terminator": "TTTT"})
+        assert r["ok"] is True
+        assert "U" not in r["sequence"]
+        assert [el["kind"] for el in r["layout"]] == \
+            ["promoter", "rbs", "cds", "rbs", "cds", "terminator"]
+        assert len(r["genes"]) == 2 and "on_target" in r["genes"][0]
+
+    def test_missing_genes_400(self):
+        assert sc._h_assemble_operon(None, {})[1] == 400
+        assert sc._h_assemble_operon(None, {"genes": []})[1] == 400
+
+    def test_bad_gene_400(self):
+        bad = {"genes": [{"cds": "AU", "target": 5}]}
+        assert sc._h_assemble_operon(None, bad)[1] == 400
+
+    def test_registered_read_only(self):
+        assert "assemble-operon" in sc._AGENT_HANDLERS
+        assert sc._AGENT_HANDLERS["assemble-operon"][1] is False
+
+
 class TestExportGffHandler:
     """`_h_export_gff` writes the loaded record to disk as GFF3."""
 
