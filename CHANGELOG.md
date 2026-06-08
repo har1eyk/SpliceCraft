@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.35] — 2026-06-08
+
+### Bug fixes
+
+- **Saved PCR amplicons now keep their primers properly.** When you save an amplicon to your library from the Simulator, its forward and reverse primers are now recorded as real primer-binding features — so on reload they show their true binding position on the circular map and in the sequence panel (including any 5′ tail), and they're counted in the primer-usage index. Previously the primer sequence was tucked into a plain note the viewer ignored, so a reloaded amplicon showed only a bare bar and its primers went uncounted.
+- **Roomier input boxes.** Several text fields were too narrow to read what you'd typed. The Primer Designer's annealing-Tm, primer-length and amplicon-size boxes, the Gibson Assembly minimum-overlap box, and the ORF Finder minimum-length box now show their values with room for the cursor.
+
+---
+
 ## [1.0.34] — 2026-06-07
 
 ### Bug fixes
