@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.38] — 2026-06-09
+
+### Hardening
+
+- **The update check can no longer be broken by SpliceCraft's own success.** The previous fix raised the size limit on PyPI's metadata so it wouldn't be hit again for thousands of releases — but a hard limit on an ever-growing file is always a deadline. Now, if a response is ever too large (or arrives garbled), the check recovers the version from the *start* of the response instead of giving up, so the "is there an update?" question keeps working no matter how big the metadata grows. The size limit stays as a pure safety guard against a hostile or misconfigured server.
+- **A failed update check now tells you what actually went wrong.** Previously *every* failure — unreachable network, an over-large response, an unreadable one — printed the same "Could not reach PyPI", which sent people to debug a connection that was perfectly fine (this was the surface symptom of the v1.0.37 bug). `splicecraft update` now gives a distinct message for each cause and always says "PyPI itself is reachable" when that's true, and the logs/diagnostic bundle record the response size on every check plus the precise reason on any failure — so a recurrence is visible as a trend long before it's a problem.
+
+---
+
 ## [1.0.37] — 2026-06-08
 
 ### Bug fixes

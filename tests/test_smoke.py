@@ -9313,6 +9313,133 @@ class TestShiftClickFeatureExtend:
         monkeypatch.setattr(sc, "_build_hardened_url_opener", lambda: _Opener())
         assert sc._fetch_latest_pypi_version() is None
 
+    # ── Honest failure reasons + self-heal (post-v1.0.37 hardening) ──
+    #
+    # The v1.0.36 bug wasn't only "cap too small" — a reachable PyPI
+    # looked like an offline one. `_fetch_latest_pypi_version_ex` now
+    # returns WHY it failed, and an oversized/unparseable response
+    # self-heals from a bounded head-read so a future cap-hit recovers.
+
+    @staticmethod
+    def _stub_opener_returning(monkeypatch, body):
+        """Point `_build_hardened_url_opener` at an opener that serves
+        `body` (bytes) once. Mirrors the inline stubs above."""
+        import io
+
+        class _Resp:
+            def __init__(self, data): self._buf = io.BytesIO(data)
+            def read(self, n=-1): return self._buf.read(n)
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        class _Opener:
+            def open(self, _req, timeout=None): return _Resp(body)
+
+        monkeypatch.setattr(sc, "_build_hardened_url_opener", lambda: _Opener())
+
+    def test_fetch_ex_reports_network_reason(self, monkeypatch):
+        """Both attempts raising a URLError must surface the NETWORK
+        reason (and None) — this is the only case that should ever print
+        'Could not reach PyPI'."""
+        import urllib.error
+
+        class _Opener:
+            def open(self, _req, timeout=None):
+                raise urllib.error.URLError("down")
+
+        monkeypatch.setattr(sc, "_build_hardened_url_opener", lambda: _Opener())
+        version, reason = sc._fetch_latest_pypi_version_ex()
+        assert version is None
+        assert reason == sc._PYPI_FETCH_NETWORK
+
+    def test_fetch_ex_reports_oversize_reason_when_unrecoverable(self, monkeypatch):
+        """An oversized response with NO recoverable version in its head
+        returns the OVERSIZE reason — distinct from network, so the CLI
+        no longer mislabels a reachable-but-too-big PyPI as offline."""
+        monkeypatch.setattr(sc, "_PYPI_MAX_RESPONSE_BYTES", 2048)
+        self._stub_opener_returning(monkeypatch, b"x" * 4096)  # no "version"
+        version, reason = sc._fetch_latest_pypi_version_ex()
+        assert version is None
+        assert reason == sc._PYPI_FETCH_OVERSIZE
+
+    def test_fetch_ex_reports_parse_reason_when_unrecoverable(self, monkeypatch):
+        """A small but invalid-JSON response with no recoverable version
+        returns the PARSE reason (not network, not oversize)."""
+        self._stub_opener_returning(monkeypatch, b'{"garbage": not valid json')
+        version, reason = sc._fetch_latest_pypi_version_ex()
+        assert version is None
+        assert reason == sc._PYPI_FETCH_PARSE
+
+    def test_fetch_ex_reports_schema_reason(self, monkeypatch):
+        """Valid JSON that simply lacks `info.version` returns the SCHEMA
+        reason — a recognisable, distinct failure mode."""
+        self._stub_opener_returning(monkeypatch, b'{"info": {"summary": "x"}}')
+        version, reason = sc._fetch_latest_pypi_version_ex()
+        assert version is None
+        assert reason == sc._PYPI_FETCH_SCHEMA
+
+    def test_oversize_response_self_heals_via_head(self, monkeypatch):
+        """SELF-HEAL: a response that exceeds the cap but whose head holds
+        a clean `info.version` BEFORE the (growing) `releases` block must
+        still yield the version — so a future metadata-growth recurrence
+        recovers instead of breaking the check."""
+        monkeypatch.setattr(sc, "_PYPI_MAX_RESPONSE_BYTES", 2048)
+        body = (b'{"info": {"version": "7.7.7"}, "releases": {'
+                + b'"0.0.0":[],' * 600 + b'}}')          # well over 2048 B
+        assert len(body) > 2048
+        self._stub_opener_returning(monkeypatch, body)
+        version, reason = sc._fetch_latest_pypi_version_ex()
+        assert version == "7.7.7"
+        assert reason == sc._PYPI_FETCH_OK
+        # And the public wrapper reflects the recovery, too.
+        self._stub_opener_returning(monkeypatch, body)
+        assert sc._fetch_latest_pypi_version() == "7.7.7"
+
+    def test_parse_failure_self_heals_via_head(self, monkeypatch):
+        """A response that is small enough to read whole but is malformed
+        AFTER a valid head still recovers the version from the head."""
+        body = b'{"info": {"version": "5.5.5"}, "releases": {bad json here'
+        self._stub_opener_returning(monkeypatch, body)
+        version, reason = sc._fetch_latest_pypi_version_ex()
+        assert version == "5.5.5"
+        assert reason == sc._PYPI_FETCH_OK
+
+    def test_head_extract_pulls_info_version_before_releases(self):
+        """The head extractor reads the top-level `info.version`."""
+        head = b'{"info": {"version": "3.2.1", "x": 1}, "releases": {}}'
+        assert sc._extract_version_from_pypi_head(head) == "3.2.1"
+
+    def test_head_extract_ignores_version_after_releases(self):
+        """A `version` key that appears ONLY inside the `releases` block
+        (i.e. after the `"releases"` marker) must NOT be mistaken for the
+        package version — guards the self-heal against a future schema
+        that adds per-file version keys."""
+        head = (b'{"info": {}, "releases": '
+                b'{"1.0.0": [{"version": "DECOY"}]}}')
+        assert sc._extract_version_from_pypi_head(head) is None
+
+    def test_head_extract_empty_and_garbage(self):
+        """Defensive: empty / version-less heads return None."""
+        assert sc._extract_version_from_pypi_head(b"") is None
+        assert sc._extract_version_from_pypi_head(b"not json at all") is None
+
+    def test_reason_out_appends_ok_on_success(self, monkeypatch):
+        """The wrapper's opt-in `reason_out` captures the reason without
+        changing the return value — the mechanism `cmd_update`/the worker
+        rely on to message honestly."""
+        self._stub_opener_returning(monkeypatch, b'{"info": {"version": "1.2.3"}}')
+        box: list = []
+        assert sc._fetch_latest_pypi_version(reason_out=box) == "1.2.3"
+        assert box == [sc._PYPI_FETCH_OK]
+
+    def test_pypi_cap_headroom_vs_growth_rate(self):
+        """The cap must dwarf realistic metadata growth so it can't quietly
+        reintroduce the v1.0.36 cliff. Live blob (2026-06-08) grew ~1.5 KB
+        per release; budget a conservative 2 KiB/release × 2000 releases of
+        headroom. (Even if this ever failed, the head-read self-heal above
+        is the backstop — but the cap should never be the limiting factor.)"""
+        assert sc._PYPI_MAX_RESPONSE_BYTES >= 2000 * 2048
+
     def test_sanitize_plasmid_status_strict(self):
         """Strict acceptance of the four canonical statuses; anything
         else (case-mismatched, padded, non-string, dict, None)
@@ -10978,6 +11105,29 @@ class TestUpdateSubcommandFlow:
         assert rc == 1
         err = capsys.readouterr().err
         assert "Could not reach PyPI" in err
+        assert fake.calls == []
+
+    def test_pypi_oversize_reports_distinct_message(self, monkeypatch, capsys):
+        """v1.0.36 regression, CLI layer: an oversized-but-reachable PyPI
+        response must NOT print 'Could not reach PyPI'. The honest, reason-
+        specific message fires instead, and the install method is still
+        surfaced so the user can fall back to a manual upgrade."""
+        self._patch_detect(monkeypatch, "pipx")
+
+        def _fake_fetch(*a, reason_out=None, **k):
+            if reason_out is not None:
+                reason_out.append(sc._PYPI_FETCH_OVERSIZE)
+            return None
+
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version", _fake_fetch)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--check"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "unexpectedly large" in err
+        assert "Could not reach PyPI" not in err
+        assert "Install method: pipx" in err
         assert fake.calls == []
 
     # ── --check flow ───────────────────────────────────────────────
