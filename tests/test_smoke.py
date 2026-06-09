@@ -9254,6 +9254,65 @@ class TestShiftClickFeatureExtend:
         assert sc._is_newer_pypi_version("garbage", "0.5.11.0") is False
         assert sc._is_newer_pypi_version("0.5.11.0", "garbage") is False
 
+    def test_fetch_latest_pypi_version_handles_large_metadata(self, monkeypatch):
+        """Regression (v1.0.36): PyPI's /pypi/<pkg>/json embeds the full
+        per-file release history, so it grows ~6 KB per release and
+        crossed the old 256 KB response cap (~257 KB). The over-cap branch
+        then made `_fetch_latest_pypi_version` return None for every REAL
+        response — surfacing as `splicecraft update` (and the in-app
+        update notice) reporting "Could not reach PyPI" while PyPI was
+        perfectly reachable. A realistically-large but valid response
+        must now parse and yield the version."""
+        import io, json
+        # Valid PyPI JSON whose serialized size exceeds the OLD 256 KB
+        # cap (mimics accumulated per-file release history).
+        payload = {
+            "info": {"version": "9.9.9"},
+            "releases": {f"0.{i}.0": [{"filename": "x" * 80}]
+                          for i in range(4000)},
+        }
+        body = json.dumps(payload).encode("utf-8")
+        assert len(body) > 256 * 1024, "fixture must exceed the old 256 KB cap"
+
+        class _Resp:
+            def __init__(self, data): self._buf = io.BytesIO(data)
+            def read(self, n=-1): return self._buf.read(n)
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        class _Opener:
+            def open(self, _req, timeout=None): return _Resp(body)
+
+        monkeypatch.setattr(sc, "_build_hardened_url_opener", lambda: _Opener())
+        assert sc._fetch_latest_pypi_version() == "9.9.9"
+
+    def test_pypi_response_cap_has_release_history_headroom(self):
+        """The response cap must stay well above any realistic PyPI
+        metadata blob (which grows ~6 KB/release). Guards against a
+        future shrink silently reintroducing the v1.0.36
+        "Could not reach PyPI" failure mode."""
+        assert sc._PYPI_MAX_RESPONSE_BYTES >= 1 * 1024 * 1024
+
+    def test_fetch_latest_pypi_version_still_rejects_oversized(self, monkeypatch):
+        """The cap was RAISED, not removed: a response larger than the
+        cap is still refused (returns None) rather than parsed — the
+        DoS / compromised-upstream guard stays intact."""
+        import io
+        monkeypatch.setattr(sc, "_PYPI_MAX_RESPONSE_BYTES", 4096)
+        oversized = b"x" * (4096 + 512)
+
+        class _Resp:
+            def __init__(self, data): self._buf = io.BytesIO(data)
+            def read(self, n=-1): return self._buf.read(n)
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        class _Opener:
+            def open(self, _req, timeout=None): return _Resp(oversized)
+
+        monkeypatch.setattr(sc, "_build_hardened_url_opener", lambda: _Opener())
+        assert sc._fetch_latest_pypi_version() is None
+
     def test_sanitize_plasmid_status_strict(self):
         """Strict acceptance of the four canonical statuses; anything
         else (case-mismatched, padded, non-string, dict, None)

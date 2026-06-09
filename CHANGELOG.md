@@ -14,6 +14,15 @@
 
 ---
 
+## [unreleased]
+
+### Bug fixes
+
+- **`splicecraft update` (and the in-app "update available" notice) no longer falsely report "Could not reach PyPI."** The check reads PyPI's package-metadata file, which grows with every release and had quietly outgrown an internal size limit — so the check gave up as if you were offline, even when PyPI was perfectly reachable. The limit now has years of headroom, and a genuinely oversized response is reported distinctly instead of looking like a connection error. (A manual `pipx upgrade splicecraft` was never affected.)
+- **No more false "another instance is already running" lock-outs from look-alike paths.** SpliceCraft keeps one instance per data directory by checking whether the process that holds the lock is still alive. That check was too broad: it treated *any* process whose command line merely contained the text "splicecraft" as a running copy — including the interpreter under a `…/pipx/venvs/splicecraft/` path, a project folder named `SpliceCraft`, or an editor with `splicecraft.py` open. On a long-running machine where the saved process id had since been recycled to one of those, you could be locked out of your own library. The check now matches only the actual SpliceCraft command, so unrelated look-alikes no longer trip it.
+
+---
+
 ## [1.0.36] — 2026-06-08
 
 ### New features

@@ -272,6 +272,65 @@ class TestPidIsSplicecraft:
             pytest.skip("/proc/<pid>/cmdline path not used on this platform")
         assert result is True
 
+    def test_path_component_is_not_a_running_instance(self, monkeypatch):
+        """Regression (2026-06-08): "splicecraft" appearing only as a
+        PATH COMPONENT — the interpreter path, a venv dir, the CWD, or
+        an editor's target dir — must NOT register as a live instance;
+        only the actual command/script token counts. Otherwise the pipx
+        venv path (.../pipx/venvs/splicecraft/...) or running the suite
+        from a dev tree at ~/SpliceCraft/.venv/ reads as "running" and
+        causes a spurious "another instance is already running" lock-out
+        when the recorded PID is recycled."""
+        import builtins, io
+        real_open = builtins.open
+        fake_pid = 999_001
+        # The pytest-from-an-in-tree-venv shape: splicecraft is only in
+        # the interpreter PATH; there is no splicecraft *command* token.
+        cmdline = (b"/home/u/SpliceCraft/.venv/bin/python\x00-m\x00pytest"
+                   b"\x00tests/test_x.py\x00")
+
+        def _stub_open(path, *a, **k):
+            if str(path) == f"/proc/{fake_pid}/cmdline":
+                return io.BytesIO(cmdline)
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", _stub_open)
+        result = sc._pid_is_splicecraft(fake_pid)
+        if result is None:
+            pytest.skip("/proc/<pid>/cmdline path not used on this platform")
+        assert result is False
+
+    def test_detects_every_real_launch_mode(self, monkeypatch):
+        """The tightened matcher still detects EVERY real launch mode, so
+        a genuinely live instance is never mistaken for dead (which would
+        free the data-dir lock and let two instances clobber the shared
+        library): console script, `python splicecraft.py`,
+        `python -m splicecraft`, and the pipx entry-point."""
+        import builtins, io
+        real_open = builtins.open
+        cases = {
+            999_011: b"/home/u/.local/bin/splicecraft\x00",
+            999_012: b"/usr/bin/python3\x00splicecraft.py\x00L09137\x00",
+            999_013: b"/usr/bin/python3\x00-m\x00splicecraft\x00",
+            999_014: (b"/home/u/.local/share/pipx/venvs/splicecraft/bin/"
+                      b"python\x00/home/u/.local/share/pipx/venvs/"
+                      b"splicecraft/bin/splicecraft\x00"),
+        }
+
+        def _make(pid, data):
+            def _stub_open(path, *a, **k):
+                if str(path) == f"/proc/{pid}/cmdline":
+                    return io.BytesIO(data)
+                return real_open(path, *a, **k)
+            return _stub_open
+
+        for pid, data in cases.items():
+            monkeypatch.setattr(builtins, "open", _make(pid, data))
+            result = sc._pid_is_splicecraft(pid)
+            if result is None:
+                pytest.skip("/proc/<pid>/cmdline path not used on this platform")
+            assert result is True, f"missed real launch mode (pid {pid})"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # H11 — Clipboard image megapixel cap
