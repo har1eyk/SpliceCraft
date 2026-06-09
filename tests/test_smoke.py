@@ -377,6 +377,169 @@ def _real_mouse_move(screen_y: int):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Seq-panel focus (F1-F5) + drag-resize interactions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSeqPanelFocusAndResize:
+    """The F1-F5 panel-focus keys must respect the user's drag-resized
+    seq-panel height, and mouse/arrow navigation in the seq panel must
+    keep working after F4 maximises it and across a drag-resize."""
+
+    async def test_focus_all_restores_persisted_seq_height(
+            self, tiny_record, isolated_library):
+        # The drag bar persists `seq_panel_height`; F5 (restore-all) must
+        # return to THAT, not the hardcoded default — otherwise F4 then
+        # F5 silently discards a manual drag-resize.
+        sc._set_setting("seq_panel_height", 22)
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            app.action_focus_panel_seq()           # F4 → maximise
+            for _ in range(3):
+                await pilot.pause()
+            assert sp.size.height > 22, "F4 didn't maximise the seq panel"
+            app.action_focus_panel_all()           # F5 → restore
+            for _ in range(3):
+                await pilot.pause()
+            assert sp.size.height == 22, (
+                f"F5 reset seq height to {sp.size.height}, discarding the "
+                f"persisted drag height (22)")
+
+    async def test_arrow_wakes_cursor_after_focus_seq(
+            self, tiny_record, isolated_library):
+        # F4 focuses the inner scroll container; an arrow with no active
+        # cursor must WAKE a base cursor (not be swallowed as a scroll).
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            app.action_focus_panel_seq()
+            for _ in range(3):
+                await pilot.pause()
+            sp._cursor_pos = -1
+            sp._user_sel = None
+            sp._sel_range = None
+            sp._re_highlight = None
+            sp._refresh_view()
+            for _ in range(2):
+                await pilot.pause()
+            await pilot.press("down")              # no cursor → wake
+            for _ in range(2):
+                await pilot.pause()
+            assert sp._cursor_pos >= 0, (
+                "arrow after F4 with no cursor didn't wake the base cursor")
+            woke = sp._cursor_pos
+            await pilot.press("down")              # now move
+            for _ in range(2):
+                await pilot.pause()
+            assert sp._cursor_pos != woke, "second arrow didn't move the cursor"
+
+    async def test_arrow_with_cursor_moves_right(
+            self, tiny_record, isolated_library):
+        # Regression: with a cursor, arrows move it (not scroll-hijacked
+        # by the focused container) after F4.
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            app.action_focus_panel_seq()
+            for _ in range(3):
+                await pilot.pause()
+            sp._cursor_pos = 10
+            sp._user_sel = None
+            sp._sel_range = None
+            sp._re_highlight = None
+            sp._refresh_view()
+            for _ in range(2):
+                await pilot.pause()
+            await pilot.press("right")
+            for _ in range(2):
+                await pilot.pause()
+            assert sp._cursor_pos == 11, (
+                f"right arrow with cursor at 10 should land on 11, got "
+                f"{sp._cursor_pos}")
+
+    async def test_mouse_click_resolves_after_focus_seq(
+            self, tiny_record, isolated_library):
+        from textual.containers import ScrollableContainer
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            app.action_focus_panel_seq()
+            for _ in range(3):
+                await pilot.pause()
+            sp._cursor_pos = -1
+            sp._refresh_view()
+            for _ in range(2):
+                await pilot.pause()
+            scroll = sp.query_one("#seq-scroll", ScrollableContainer)
+            reg = scroll.region
+            nw = len(str(len(sp._seq)))
+            ax = reg.x + nw + 2
+            vy = 0
+            for cand in range(reg.height):
+                if sp._click_to_bp(ax, reg.y + cand) >= 0:
+                    vy = cand
+                    break
+            await pilot.click("#seq-scroll", offset=(nw + 2 + 4, vy))
+            for _ in range(3):
+                await pilot.pause()
+            assert sp._cursor_pos >= 0, (
+                "mouse click after F4 didn't set a base cursor")
+
+    async def test_line_width_invariant_across_height_resize(
+            self, tiny_record, isolated_library):
+        # The drag bar changes HEIGHT only; line_width (chars/row) must
+        # stay constant so click→base resolution cannot shift on resize.
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            handle = app.query_one("#map-seq-resize",
+                                    sc.MapSequenceResizeHandle)
+            lw_before = sp._line_width()
+            handle._apply_sequence_height(int(sp.size.height) + 8)
+            for _ in range(3):
+                await pilot.pause()
+            assert sp._line_width() == lw_before, (
+                f"resize shifted line_width {lw_before} → {sp._line_width()}; "
+                f"clicks would land on the wrong base")
+
+    async def test_focus_all_clamps_oversized_persisted_height(
+            self, tiny_record, isolated_library):
+        # A height persisted on a taller terminal (or hand-edited into
+        # settings.json) must be CLAMPED to the live screen on restore,
+        # not applied raw — otherwise it squashes the top row below its
+        # minimum.
+        sc._set_setting("seq_panel_height", 9999)
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            handle = app.query_one("#map-seq-resize",
+                                    sc.MapSequenceResizeHandle)
+            app.action_focus_panel_seq()
+            for _ in range(3):
+                await pilot.pause()
+            app.action_focus_panel_all()
+            for _ in range(3):
+                await pilot.pause()
+            max_seq = handle._clamp_sequence_height(9999)
+            assert sp.size.height <= max_seq, (
+                f"oversized persisted height not clamped: {sp.size.height} "
+                f"> max {max_seq}")
+            assert sp.size.height >= handle._MIN_SEQ_HEIGHT
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Basic interactions
 # ═══════════════════════════════════════════════════════════════════════════════
 

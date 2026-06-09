@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.36] — 2026-06-08
+
+### New features
+
+- **Golden Braid primers: set the annealing Tm.** The Golden Braid tab of the primer designer now has a **Tm** field (default 60 °C), like the Detection, Cloning, and Generic tabs. It targets the *binding* portion of each primer — the part that anneals to your template, excluding the enzyme/pad/overhang tail — and sizes the annealing arm to hit your chosen Tm. When a region can't reach the target within the usable length window, the closest achievable Tm is used and the result is flagged "(closest to N°C target)" so you can see it landed on a next-best.
+
+### Bug fixes
+
+- **The panel-focus keys no longer undo a manual sequence-panel resize.** If you drag the map/sequence split to your preferred height, then press F4 (sequence only) and F5 (all panels), the sequence panel now returns to the height you set instead of snapping back to the default.
+- **Arrow keys work in a maximized sequence panel.** After F4 shows only the sequence panel, the arrow keys now move the base cursor even if you hadn't clicked a base first — previously they did nothing (or scrolled). The cursor wakes on the first visible base, then navigates from there.
+
+---
+
 ## [1.0.35] — 2026-06-08
 
 ### Bug fixes

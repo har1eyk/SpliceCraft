@@ -328,6 +328,61 @@ class TestDesignerUniformShape:
         assert "error" not in r, r
         assert self._REQUIRED_KEYS <= set(r.keys())
 
+    def test_goldenbraid_honors_target_tm(self):
+        """The GB Tm field feeds `target_tm` into the binding-region
+        optimizer: a higher target selects an arm at least as hot/long,
+        and the requested target is recorded for the results panel."""
+        seq = self._valid_template()
+        lo = sc._design_gb_primers(seq, 50, 300, "Promoter", target_tm=52.0)
+        hi = sc._design_gb_primers(seq, 50, 300, "Promoter", target_tm=68.0)
+        assert "error" not in lo and "error" not in hi
+        assert lo["target_tm"] == 52.0 and hi["target_tm"] == 68.0
+        assert hi["fwd_tm"] >= lo["fwd_tm"]
+        assert len(hi["fwd_binding"]) >= len(lo["fwd_binding"])
+
+
+class TestPickBindingRegionNextBest:
+    """`_pick_binding_region` returns the binding length whose Tm is
+    CLOSEST to the target. When the target is unreachable within the
+    18–25 nt window it returns the next-best (closest achievable) Tm —
+    never a failure or Tm=0. This is the contract the Golden Braid Tm
+    field relies on for "can't reach it → pick the closest"."""
+
+    # 52 bp, mixed GC so Tm rises monotonically across 18–25 nt prefixes.
+    _SEQ = "ACGTTGCAAGCTTGGCACTGGCCGTCGTTTTACAACGTCGTGACTGGGAAAAC"
+
+    def test_in_range_picks_closest(self):
+        primer3 = pytest.importorskip("primer3")
+        bind, tm = sc._pick_binding_region(self._SEQ, target_tm=60.0)
+        assert 18 <= len(bind) <= 25
+        diffs = [abs(primer3.calc_tm(self._SEQ[:L]) - 60.0)
+                 for L in range(18, 26)]
+        assert abs(tm - 60.0) == pytest.approx(min(diffs))
+
+    def test_next_best_when_target_too_high(self):
+        # 95 C is unreachable in 18–25 nt — the longest (hottest, closest)
+        # arm is the next-best.
+        bind, tm = sc._pick_binding_region(self._SEQ, target_tm=95.0)
+        assert len(bind) == 25
+        assert tm > 0
+
+    def test_next_best_when_target_too_low(self):
+        # 20 C is below the whole window — the shortest (coolest, closest)
+        # arm is the next-best.
+        bind, _tm = sc._pick_binding_region(self._SEQ, target_tm=20.0)
+        assert len(bind) == 18
+
+    def test_default_target_is_60(self):
+        assert (sc._pick_binding_region(self._SEQ)
+                == sc._pick_binding_region(self._SEQ, target_tm=60.0))
+
+    def test_short_seq_never_returns_zero_tm(self):
+        # Below min_len the scan loop can't run; the defensive init must
+        # still return a real (non-zero) Tm for whatever bases exist, not
+        # a silent Tm=0 that downstream low-Tm checks would misread.
+        _bind, tm = sc._pick_binding_region("ACGTACGTAC", target_tm=60.0)
+        assert tm > 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PrimerDesignScreen layout smoke (Option A wizard redesign, 2026-04-12)
