@@ -14,6 +14,18 @@
 
 ---
 
+## [1.0.39] — 2026-06-09
+
+### Bug fixes
+
+- **`splicecraft update` no longer claims success when it didn't actually update.** If you ran the updater in the first minute or two after a new release, it could print "Upgrade complete" while leaving you on the old version. The cause is a brief, unavoidable timing gap at PyPI right after a release: the page that tells SpliceCraft "a new version exists" can update a minute or two before the index that `pip`/`pipx` install *from* catches up — so the upgrade command runs, sees "already up to date", and exits cleanly without changing anything. The updater now **verifies the version actually changed** afterwards and, if it didn't, says so plainly ("still on X — PyPI may still be propagating; wait a minute and run `splicecraft update` again") and exits with an error instead of a false success. Pinned installs (`--pin`) are verified to land the exact version requested.
+
+### Hardening
+
+- **Spurious "Tests failed" emails after a clean release.** A couple of terminal-UI tests could intermittently fail on GitHub's slower shared CI runners (a tab hadn't finished switching when the test checked) even though they passed on every local release. The test now waits for the UI to fully settle, so CI stops sending false-alarm failure notices for releases that are actually fine.
+
+---
+
 ## [1.0.38] — 2026-06-09
 
 ### Hardening

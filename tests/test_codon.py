@@ -15,14 +15,29 @@ import splicecraft as sc
 
 async def _settle_tab(pilot, tabs, want, tries=24):
     """Drain the message queue until a `TabbedContent` reports `want` as its
-    active tab (Textual processes `.active` assignments asynchronously). Avoids
-    races when a test flips tabs and then immediately drives a callback. The
-    drain returns as soon as the tab settles, so a generous budget only ever
-    costs extra pauses on a genuinely slow/contended switch."""
+    active tab AND it HOLDS there for a second drain.
+
+    Textual drives `TabbedContent.active` through the child `Tabs` widget's
+    asynchronous `TabActivated` messages, so the reactive can match `want`
+    a beat BEFORE a trailing activation from a PRIOR `.active` assignment
+    lands and overrides it. Returning on the first match let that late
+    message slip through — the headless-CI race behind the spurious
+    `test_fetch_done_adds_and_selects` failure (assert 'sp-tab-fetch' ==
+    'sp-tab-library', 2026-06-09): it passed locally every time but flaked
+    on the loaded 2-core GitHub runner, sending false 'Tests failed'
+    emails after clean releases. Requiring the value to survive an extra
+    drain flushes any in-flight activation before we trust the switch.
+
+    A generous budget only ever costs extra pauses on a genuinely
+    slow/contended switch."""
     for _ in range(tries):
         await pilot.pause()
         if tabs.active == want:
-            return
+            # Flush trailing TabActivated messages, then confirm it held;
+            # if a late message reverted it, keep draining within budget.
+            await pilot.pause()
+            if tabs.active == want:
+                return
     return
 
 

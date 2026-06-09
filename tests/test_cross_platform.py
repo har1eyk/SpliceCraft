@@ -450,6 +450,11 @@ class TestSubprocessUsage:
             return _Result()
 
         monkeypatch.setattr(sc.subprocess, "run", _fake_run)
+        # Mock the post-upgrade version readback so it doesn't shell out
+        # (which would overwrite `captured` with the readback call) and
+        # so the pin (0.9.7) verifies as reached.
+        monkeypatch.setattr(sc, "_query_installed_version",
+                            lambda *a, **k: "0.9.7")
         # Drive the wrapper; it only matters that subprocess.run is
         # invoked — we capture the call shape, not the return.
         import pathlib as _path

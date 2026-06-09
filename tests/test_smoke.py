@@ -11263,6 +11263,11 @@ class TestUpdateSubcommandFlow:
             raise AssertionError("--yes should skip the prompt")
 
         monkeypatch.setattr("builtins.input", _no_input)
+        # Simulate the upgrade landing the target version (the real
+        # readback is a fresh subprocess; mock it so we don't shell out
+        # and so the verified-success path runs).
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: "99.0.0.0")
         rc = sc._run_update_subcommand(["--yes"])
         assert rc == 0
         assert fake.calls == [["pipx", "upgrade", "splicecraft"]]
@@ -11277,6 +11282,9 @@ class TestUpdateSubcommandFlow:
         fake = _FakeRun(returncode=0)
         monkeypatch.setattr(sc.subprocess, "run", fake)
         monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        # --force reinstalls the same version; readback returns it unchanged.
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: sc.__version__)
         rc = sc._run_update_subcommand(["--force", "--yes"])
         assert rc == 0
         # --force must use `install --force` rather than `upgrade`.
@@ -11288,6 +11296,8 @@ class TestUpdateSubcommandFlow:
                               lambda *a, **k: "99.0.0.0")
         fake = _FakeRun(returncode=0)
         monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: "99.0.0.0")
         rc = sc._run_update_subcommand(["--yes"])
         assert rc == 0
         assert len(fake.calls) == 1
@@ -11317,6 +11327,8 @@ class TestUpdateSubcommandFlow:
                               lambda name: "/usr/bin/uv" if name == "uv" else None)
         fake = _FakeRun(returncode=0)
         monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: "99.0.0.0")
         rc = sc._run_update_subcommand(["--yes"])
         assert rc == 0
         assert fake.calls == [["uv", "tool", "upgrade", "splicecraft"]]
@@ -11348,6 +11360,8 @@ class TestUpdateSubcommandFlow:
         monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/uv")
         fake = _FakeRun(returncode=0)
         monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: sc.__version__)
         rc = sc._run_update_subcommand(["--force", "--yes"])
         assert rc == 0
         assert fake.calls == [["uv", "tool", "install", "--force", "splicecraft"]]
@@ -11361,6 +11375,8 @@ class TestUpdateSubcommandFlow:
         monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/uv")
         fake = _FakeRun(returncode=0)
         monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: "99.0.0.0")
         rc = sc._run_update_subcommand(["--yes"])
         assert rc == 0
         assert fake.calls == [["uv", "pip", "install", "--upgrade", "splicecraft"]]
@@ -11390,6 +11406,8 @@ class TestUpdateSubcommandFlow:
                               lambda name: "/usr/bin/pixi" if name == "pixi" else None)
         fake = _FakeRun(returncode=0)
         monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: "99.0.0.0")
         rc = sc._run_update_subcommand(["--yes"])
         assert rc == 0
         assert fake.calls == [["pixi", "global", "update", "splicecraft"]]
@@ -11415,6 +11433,8 @@ class TestUpdateSubcommandFlow:
         monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pixi")
         fake = _FakeRun(returncode=0)
         monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: sc.__version__)
         rc = sc._run_update_subcommand(["--force", "--yes"])
         assert rc == 0
         assert fake.calls == [["pixi", "global", "install", "--force", "splicecraft"]]
@@ -11534,6 +11554,113 @@ class TestUpdateSubcommandFlow:
         assert rc == 2
         err = capsys.readouterr().err
         assert "exited with status 2" in err
+
+    # ── post-upgrade version verification (2026-06-09) ──────────────
+    # A subprocess that exits 0 is NOT proof the version changed: right
+    # after a release, PyPI's Simple-API index (pip/pipx resolve here)
+    # can lag its JSON metadata (our CHECK reads here), so `pipx upgrade`
+    # no-ops and exits 0. The updater must verify + report honestly.
+
+    def test_upgrade_noop_reported_not_silent(self, monkeypatch, capsys):
+        """THE user-reported bug: exit 0 but the version didn't change.
+        Must NOT print 'Upgrade complete' — must say it's still on the
+        old version, give the timing/retry guidance, and exit non-zero."""
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        # Upgrade "succeeded" but the installed version is unchanged.
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: sc.__version__)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1, "a no-op upgrade must exit non-zero, not 0"
+        cap = capsys.readouterr()
+        combined = cap.out + cap.err
+        assert "Upgrade complete" not in combined
+        assert "STILL" in combined and "did not update" in combined
+        assert "minute" in combined  # the wait-and-retry timing hint
+
+    def test_upgrade_success_is_verified(self, monkeypatch, capsys):
+        """When the version actually changes to the target, report the
+        verified upgrade with the old → new line and exit 0."""
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: "99.0.0.0")
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Upgrade complete" in out
+        assert "99.0.0.0" in out
+
+    def test_upgrade_unverified_when_version_unreadable(self, monkeypatch, capsys):
+        """If the post-upgrade version can't be read, don't claim a
+        success we can't confirm — but don't hard-fail either (the
+        command itself exited 0)."""
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr(sc, "_query_installed_version", lambda *a, **k: None)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        cap = capsys.readouterr()
+        combined = cap.out + cap.err
+        assert "Couldn't automatically confirm" in combined
+        assert "Upgrade complete" not in combined
+
+    def test_pin_install_verifies_exact_version(self, monkeypatch, capsys):
+        """A pin is EXACT: landing a different version than pinned is a
+        failure, even though the command 'succeeded'."""
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version", lambda *a, **k: None)
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        # Pinned 1.0.30, but a different version landed.
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: "1.0.31")
+        rc = sc._run_update_subcommand(["--pin", "1.0.30", "--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "1.0.31" in err and "1.0.30" in err
+
+    # ── _query_installed_version unit coverage ──────────────────────
+
+    def test_query_installed_version_parses_subprocess(self, monkeypatch):
+        class _CP:
+            returncode = 0
+            stdout = "1.2.3\n"
+        monkeypatch.setattr(sc.subprocess, "run", lambda *a, **k: _CP())
+        assert sc._query_installed_version() == "1.2.3"
+
+    def test_query_installed_version_none_on_error_rc(self, monkeypatch):
+        class _CP:
+            returncode = 1
+            stdout = "PackageNotFound"
+        monkeypatch.setattr(sc.subprocess, "run", lambda *a, **k: _CP())
+        assert sc._query_installed_version() is None
+
+    def test_query_installed_version_none_on_exception(self, monkeypatch):
+        def _boom(*a, **k):
+            raise OSError("no interpreter")
+        monkeypatch.setattr(sc.subprocess, "run", _boom)
+        assert sc._query_installed_version() is None
+
+    def test_query_installed_version_none_on_empty_output(self, monkeypatch):
+        class _CP:
+            returncode = 0
+            stdout = "  \n"
+        monkeypatch.setattr(sc.subprocess, "run", lambda *a, **k: _CP())
+        assert sc._query_installed_version() is None
 
 
 @pytest.mark.slow
