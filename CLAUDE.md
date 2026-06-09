@@ -21,6 +21,30 @@ The user's plasmid library + collections + primers + parts live in `~/.local/sha
 
 ---
 
+## Multi-machine sync (two laptops share this repo)
+
+This repo is cloned on two laptops kept in lockstep through a **private `sync` git remote** — that remote is the single source of truth. (`origin` stays the **public** release repo that `release.py` pushes to; never sync personal state through `origin`.)
+
+At the START of every session and BEFORE modifying the codebase, sync with `sync` first:
+
+```bash
+git fetch sync
+git status
+git pull --ff-only sync master      # if you have local commits: git pull --rebase sync master
+```
+
+If `--ff-only` refuses (diverged histories), STOP and reconcile (rebase local work onto `sync/master`) before editing. After changes, commit and push promptly:
+
+```bash
+git add -A && git commit -m "<what changed>" && git push sync master
+```
+
+Never switch machines with uncommitted work. `master` tracks `sync/master`, so bare `git pull` / `git push` also target `sync`; `release.py` still pushes to `origin` (public) explicitly.
+
+The project's Claude memory lives in `.claude/memory/`, which is its **own private git repo** (`<owner>/splicecraft-memory`) — deliberately **NOT** tracked in this repo, because this repo's `master` is pushed to the public release `origin` and the memory holds private notes. On a new machine: clone that memory repo into `.claude/memory/`, then symlink `~/.claude/projects/<SLUG>/memory` → `<project>/.claude/memory` (where `SLUG` is the project's absolute path with each `/` replaced by `-`). Commit + push memory changes to its own remote separately from the code.
+
+---
+
 Bioinformatician + Claude. **Near-single-file architecture** — `splicecraft.py` (~105k lines) + extracted biology module `splicecraft_biology.py` + stdlib-only sidecar `splicecraft_cli.py`. Single-file constraint is intentional (greppable); biology extraction is the first deliberate exception (pure functions/constants, no `PlasmidApp` coupling). See `CONTRIBUTING.md` three-test rule.
 
 ## What is SpliceCraft?

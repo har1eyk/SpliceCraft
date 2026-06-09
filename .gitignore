@@ -54,8 +54,20 @@ TechSupport/
 *.swp
 .DS_Store
 
-# Claude Code local settings / cache
-.claude/
+# Claude Code — ignore local/secret state by default, explicitly SHARE the
+# rest so it version-controls with the code (the private `sync` remote is the
+# laptop-to-laptop source of truth; never let secrets through here).
+.claude/*
+!.claude/skills/
+# `.claude/memory/` is its OWN private repo (<owner>/splicecraft-memory),
+# symlinked in — NEVER track it here: THIS repo's master is pushed to the
+# PUBLIC release origin, and memory holds private notes.
+.claude/memory/
+# Belt-and-suspenders: never commit secrets / machine-local state, even if a
+# future allow-rule above would otherwise sweep them in.
+.claude/settings.local.json
+.claude/.credentials.json
+.claude/scheduled_tasks.lock
 
 # uv resolver lock — generated locally, not committed
 # (contributed by Harley King in closed PR #7)
