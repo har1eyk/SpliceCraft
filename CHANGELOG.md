@@ -14,6 +14,22 @@
 
 ---
 
+## [1.0.43] — 2026-06-09
+
+### Bug fixes
+
+- **Aligning a sequencing read against a library plasmid no longer renames it with underscores.** When you aligned (Plasmidsaurus, "Diff with another plasmid", or multi-align) against a plasmid whose name has spaces — e.g. "Phase 4 pTRKH2" — the alignment label, and the plasmid loaded onto the canvas, fell back to the underscored GenBank LOCUS ("Phase_4_pTRKH2"), which could then get saved as the library name. All three alignment paths now carry your typed display name through, so it stays exactly as you named it.
+
+### New features
+
+- **Migrate Data — move your entire SpliceCraft setup between machines as one portable file.** A new **File ▸ Migrate Data** option packages *everything* — your whole plasmid library, collections, parts bin, primers, features, grammars, codon tables, entry vectors, settings, lab notebook, and full construction history — into a single compressed `.zip`, and imports such a file into another install (a fresh one then picks up exactly where you left off). It's built to be bulletproof: the export writes atomically (you never get a half-written file), and the import backs up your current data automatically, verifies every file's checksum before replacing it, and refuses anything that isn't a genuine, same-or-older SpliceCraft archive — so a corrupt, foreign, or tampered file can never clobber your data. Large, re-downloadable HMM databases are left out by default (their catalog travels with you, so you re-download them on the new machine); tick a box to include them.
+
+### Hardening
+
+- The Migrate Data import is fully reversible — your previous data is snapshotted first, so you can undo with `splicecraft update --restore-pre-update latest`. The packaged file set is driven by the same internal registry the pre-update snapshot uses, so it automatically stays complete as SpliceCraft grows.
+
+---
+
 ## [1.0.42] — 2026-06-09
 
 ### Bug fixes

@@ -51,8 +51,17 @@ async def _switch_tab(pilot, tabs, want, initial="sp-tab-library"):
     before the content finishes mounting loses to the `initial` tab, so first
     wait for `initial` to settle, then switch and settle on `want`."""
     await _settle_tab(pilot, tabs, initial)
-    tabs.active = want
-    await _settle_tab(pilot, tabs, want)
+    # Re-assert the switch until it HOLDS. A late `TabActivated` from the
+    # modal's initial mount can revert `.active` right after the first
+    # assignment under `-n auto` CPU contention (the residual flake behind
+    # test_import_bad_tsv_shows_error_no_switch). Retrying set+settle flushes
+    # that straggler; a genuinely broken switch still fails all attempts and
+    # surfaces honestly.
+    for _ in range(6):
+        tabs.active = want
+        await _settle_tab(pilot, tabs, want)
+        if tabs.active == want:
+            return
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────

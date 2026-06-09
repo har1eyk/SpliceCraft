@@ -323,7 +323,14 @@ this again?" is always one keystroke away.
 
 The housekeeping. **File** opens local files, fetches from NCBI, saves,
 exports (GenBank / FASTA / GFF3), bulk-imports a folder, and restores from
-backup — and it's home to **Master Delete**, a triple-gated full wipe for
+backup. It's also where you **Migrate Data** — package your *entire* setup
+(library, collections, parts, primers, features, grammars, codon tables,
+settings, lab notebook, and full construction history) into one portable,
+compressed `.zip` and import it into another install, so a fresh machine picks
+up exactly where you left off (the import snapshots your current data first and
+verifies every file's checksum before replacing it, and refuses anything that
+isn't a genuine SpliceCraft archive). And it's home to **Master Delete**, a
+triple-gated full wipe for
 when you genuinely want a clean slate (typed `YES`, a default-No confirm, and
 a cool-down on the button; no shortcut, no API). **Settings** collapses every
 toggle (restriction overlay, primer-binding length, and more) into one dialog,
