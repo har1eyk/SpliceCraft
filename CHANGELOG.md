@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.49] — 2026-06-10
+
+### New features
+
+- **Manage primers across collections.** The Primer Designer's library now works like the plasmid library: **mark** primers (Space) and **Move** (`m`) or **Copy** (`y`) them to another collection, and **New / Rename / Delete** primer collections (destructive prompts default to **No**). Bulk-**delete** of marked primers (Delete) now tells you exactly how many will be removed — and removes them from every record (the working library *and* the collection), matching by the unique oligo so a shared name never over-deletes.
+- **Order CSV export + import (full round-trip).** **Export** a whole collection — or your order **Cart** — to a paste-ready CSV (Name, Sequence, Length, Tm) for a synthesis company, and **Import** primers back from a CSV. Flag primers into the **Cart** with `c` (a `$` marks them on the row); the cart spans every collection, so you can assemble one order from many. Catastrophic-class safety: an export **refuses** any malformed oligo (naming it) rather than ship a wrong order, and an import **skips + reports** invalid / duplicate rows rather than apply a broken primer.
+
+---
+
 ## [1.0.48] — 2026-06-10
 
 ### Bug fixes

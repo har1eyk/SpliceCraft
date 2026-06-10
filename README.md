@@ -144,6 +144,16 @@ generic primers — each with a persistent **Designed → Ordered → Validated*
 lifecycle, so you can see at a glance what's been ordered and what came back
 working, right alongside the plasmid it belongs to.
 
+The library beside the designer organises primers into **collections** (new /
+rename / delete, like the plasmid side, with destructive prompts defaulting to
+**No**): mark primers (Space) and **move** (`m`) or **copy** (`y`) them across
+collections, or bulk-delete the marked set (the warning names exactly how many
+go). When it's time to order, **export** a collection — or your order **Cart**
+(flag primers with `c`) — to a paste-ready **CSV** (name, sequence, length, Tm)
+for the synthesis company, and **import** a CSV back for a full round-trip.
+Exports refuse a malformed oligo and imports skip + report invalid rows, so a
+wrong sequence never reaches your order or your library.
+
 ### Mutato
 
 Site-directed mutagenesis, with a hint of whimsy in the name. Point at any

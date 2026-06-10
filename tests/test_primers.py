@@ -1459,3 +1459,338 @@ class TestPrimerLibraryMarking:
                 await pilot.pause()
                 counts.append(len(screen._lib_selected))
             assert counts == [1, 2, 3]                       # each mark accumulates
+
+
+class TestPrimerCsvExport:
+    """`_export_primers_to_csv` writes a spreadsheet-pasteable order CSV
+    (Name, Sequence, Length, Tm) for synthesis-company orders."""
+
+    def test_writes_expected_rows(self, tmp_path):
+        import csv as _csv
+        primers = [
+            {"name": "P1", "sequence": "acgtACGT", "tm": 58.3},
+            {"name": "P2, weird", "sequence": "TTTT", "tm": None},
+            {"name": "", "sequence": "GGGG"},          # empty name → fallback
+            {"name": "noseq", "sequence": ""},         # no sequence → skipped
+        ]
+        out = tmp_path / "order.csv"
+        res = sc._export_primers_to_csv(primers, out)
+        assert res["count"] == 3 and res["path"] == str(out)
+        rows = list(_csv.reader(out.open()))
+        assert rows[0] == ["Name", "Sequence", "Length", "Tm"]
+        assert rows[1] == ["P1", "ACGTACGT", "8", "58.3"]   # upper-cased, Tm 1dp
+        assert rows[2] == ["P2, weird", "TTTT", "4", ""]    # comma stays intact
+        assert rows[3] == ["primer", "GGGG", "4", ""]       # empty name fallback
+        assert len(rows) == 4                                # no-seq row skipped
+
+    def test_empty_raises(self, tmp_path):
+        with pytest.raises(ValueError):
+            sc._export_primers_to_csv([], tmp_path / "x.csv")
+        with pytest.raises(ValueError):
+            sc._export_primers_to_csv(
+                [{"name": "a", "sequence": ""}], tmp_path / "y.csv")
+
+    def test_refuses_malformed_oligo(self, tmp_path):
+        """Catastrophic-class: refuse the whole export (naming the offender) if
+        any oligo has non-DNA characters — never ship a wrong order."""
+        primers = [{"name": "good", "sequence": "ACGT"},
+                   {"name": "BadOne", "sequence": "ACGTXZ12"}]
+        with pytest.raises(ValueError, match="BadOne"):
+            sc._export_primers_to_csv(primers, tmp_path / "o.csv")
+
+
+class TestPrimerCsvImport:
+    """`_import_primers_from_csv` round-trips the export and HARDENS against
+    broken primers (skip + report, never apply)."""
+
+    def test_round_trip(self, tmp_path):
+        primers = [
+            {"name": "Fwd-1", "sequence": "ACGTACGTACGT", "tm": 55.2},
+            {"name": "Rev, A", "sequence": "TTTTGGGGCCCC", "tm": 61.0},
+        ]
+        out = tmp_path / "order.csv"
+        sc._export_primers_to_csv(primers, out)
+        res = sc._import_primers_from_csv(out)
+        assert res["skipped"] == []
+        got = {(p["name"], p["sequence"], p["tm"]) for p in res["primers"]}
+        assert got == {("Fwd-1", "ACGTACGTACGT", 55.2),
+                       ("Rev, A", "TTTTGGGGCCCC", 61.0)}
+        assert all(p["primer_type"] == "imported" and p["status"] == "Imported"
+                   for p in res["primers"])
+
+    def test_skips_invalid_empty_and_duplicate(self, tmp_path):
+        p = tmp_path / "mix.csv"
+        p.write_text(
+            "Name,Sequence,Length,Tm\n"
+            "ok,ACGTACGT,8,58\n"
+            "bad,ACGTXOXO,8,50\n"          # non-DNA → skipped
+            "blank,,0,\n"                  # empty oligo → skipped
+            "dup,ACGTACGT,8,58\n"          # duplicate oligo → skipped
+        )
+        res = sc._import_primers_from_csv(p)
+        assert [x["name"] for x in res["primers"]] == ["ok"]
+        assert len(res["skipped"]) == 3
+        assert any("non-DNA" in s for s in res["skipped"])
+        assert any("duplicate" in s for s in res["skipped"])
+
+    def test_headerless_positional_tm_computed(self, tmp_path):
+        # Elim-style 2-column (name, sequence), no header, no Tm → Tm computed.
+        p = tmp_path / "elim.csv"
+        p.write_text("MyFwd,ACGTACGTACGTACGTACGT\nMyRev,TTTTAAAACCCCGGGGTTTT\n")
+        res = sc._import_primers_from_csv(p)
+        assert [x["name"] for x in res["primers"]] == ["MyFwd", "MyRev"]
+        assert all(isinstance(x["tm"], float) for x in res["primers"])
+
+    def test_bom_tolerated(self, tmp_path):
+        p = tmp_path / "bom.csv"
+        p.write_bytes(b"\xef\xbb\xbfName,Sequence\nP,ACGTACGT\n")
+        res = sc._import_primers_from_csv(p)
+        assert [x["name"] for x in res["primers"]] == ["P"]
+
+    def test_reordered_columns_and_tm_read(self, tmp_path):
+        # Synthesis order forms vary the column order — detect by header name,
+        # not position, and read the supplied Tm.
+        p = tmp_path / "reorder.csv"
+        p.write_text("Tm,Oligo,Name\n55.5,ACGTACGTACGT,Fwd\n")
+        res = sc._import_primers_from_csv(p)
+        assert len(res["primers"]) == 1
+        prim = res["primers"][0]
+        assert prim["name"] == "Fwd"
+        assert prim["sequence"] == "ACGTACGTACGT"
+        assert prim["tm"] == 55.5
+
+    def test_empty_and_oversized_raise(self, tmp_path):
+        empty = tmp_path / "e.csv"
+        empty.write_text("   \n")
+        with pytest.raises(ValueError):
+            sc._import_primers_from_csv(empty)
+        big = tmp_path / "big.csv"
+        big.write_bytes(b"a" * (sc._PRIMER_CSV_MAX_BYTES + 100))
+        with pytest.raises(ValueError, match="cap"):
+            sc._import_primers_from_csv(big)
+
+
+class TestPrimerCsvUiFlow:
+    """The EXPORT / IMPORT buttons in the Primer Designer library panel open
+    the CSV modals and round-trip primers into the active collection."""
+
+    def _seed(self, n):
+        sc._save_primers([
+            {"name": f"P{i:03d}",
+             "sequence": "ACGTACGTACGT" +
+             "".join("ACGT"[(i >> (2 * k)) & 3] for k in range(8)),
+             "tm": 60.0, "primer_type": "generic", "source": "t",
+             "pos_start": -1, "pos_end": -1, "strand": 1,
+             "date": "2026-06-03", "status": "Designed"}
+            for i in range(n)])
+
+    @pytest.mark.asyncio
+    async def test_export_button_opens_modal_with_primers(
+            self, isolated_primers):
+        self._seed(3)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen._export_collection_csv(None)
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc.PrimerCsvExportModal)
+            assert len(app.screen._primers) == 3
+            app.screen.dismiss(None)
+            await pilot.pause()
+
+    @pytest.mark.asyncio
+    async def test_import_button_imports_valid_skips_invalid(
+            self, isolated_primers, tmp_path):
+        self._seed(2)
+        csvp = tmp_path / "imp.csv"
+        csvp.write_text("Name,Sequence\nNewOne,GGGGCCCCAAAATTTT\nBad,XOXOXO\n")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            before = len(sc._load_primers())
+            app.screen._import_collection_csv(None)
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc.PrimerCsvImportModal)
+            app.screen.dismiss(str(csvp))          # simulate picking the file
+            for _ in range(5):
+                await pilot.pause()
+            after = sc._load_primers()
+            assert len(after) == before + 1         # NewOne added, Bad skipped
+            assert any(p["name"] == "NewOne" for p in after)
+
+    @pytest.mark.asyncio
+    async def test_collection_rename_and_delete(self, isolated_primers):
+        self._seed(2)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            # A NON-empty 2nd collection (empty ones get pruned) so delete is
+            # allowed — delete refuses the last remaining collection.
+            colls = sc._load_primer_collections()
+            colls.append({"name": "Order1", "description": "",
+                          "primers": [{"name": "O1",
+                                       "sequence": "TTTTGGGGCCCCAAAA",
+                                       "tm": 60.0, "status": "Designed"}],
+                          "saved": "2026-06-10"})
+            sc._save_primer_collections(colls)
+            assert len(sc._load_primer_collections()) == 2
+            active = sc._get_active_primer_collection_name()
+            screen._rename_primer_collection(None)
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc.CollectionNameModal)
+            app.screen.dismiss("Renamed-Coll")
+            for _ in range(4):
+                await pilot.pause()
+            assert sc._get_active_primer_collection_name() == "Renamed-Coll"
+            names = {c["name"] for c in sc._load_primer_collections()}
+            assert "Renamed-Coll" in names and active not in names
+            # Delete the (now renamed) active collection — NO-default confirm.
+            screen._delete_primer_collection(None)
+            for _ in range(4):
+                await pilot.pause()
+            assert isinstance(app.screen,
+                              sc._PrimerCollectionDeleteConfirmModal)
+            app.screen.dismiss(True)
+            for _ in range(4):
+                await pilot.pause()
+            names2 = {c["name"] for c in sc._load_primer_collections()}
+            assert "Renamed-Coll" not in names2 and "Order1" in names2
+
+    @pytest.mark.asyncio
+    async def test_bulk_delete_sequence_identity_count_and_full_removal(
+            self, isolated_primers):
+        """Bulk delete: the confirm enumerates the exact count, deletes by the
+        unique SEQUENCE (so a shared NAME never over-deletes — the count can't
+        go stale), and removes from BOTH the working library AND the active
+        collection record."""
+        sc._save_primers([
+            {"name": "Dup", "sequence": "ACGTACGTACGTAAAA", "tm": 60.0,
+             "status": "Designed"},
+            {"name": "Dup", "sequence": "ACGTACGTACGTTTTT", "tm": 60.0,
+             "status": "Designed"},          # SAME name, different oligo
+            {"name": "Keep", "sequence": "GGGGCCCCGGGGCCCC", "tm": 60.0,
+             "status": "Designed"},
+        ])
+        target = "ACGTACGTACGTAAAA"
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            primers = sc._load_primers()
+            idx = next(i for i, p in enumerate(primers)
+                       if p["sequence"] == target)
+            screen._lib_selected = {idx}            # mark exactly ONE "Dup"
+            screen._delete_marked_or_cursor()
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc.LibraryDeleteConfirmModal)
+            assert "1 marked primer" in app.screen.entry_name   # exact count
+            app.screen.dismiss(True)
+            for _ in range(4):
+                await pilot.pause()
+            after = {p["sequence"] for p in sc._load_primers()}
+            assert target not in after                          # marked gone
+            assert "ACGTACGTACGTTTTT" in after                  # same-name kept
+            assert "GGGGCCCCGGGGCCCC" in after
+            assert len(after) == 2                              # no over-delete
+            # …and gone from the active collection record too.
+            coll = sc._find_primer_collection(
+                sc._get_active_primer_collection_name())
+            coll_seqs = {p["sequence"] for p in (coll.get("primers") or [])}
+            assert target not in coll_seqs and len(coll_seqs) == 2
+
+    @pytest.mark.asyncio
+    async def test_cart_toggle_collect_and_export(self, isolated_primers):
+        self._seed(3)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            screen._lib_selected = {0, 1}
+            screen._toggle_cart_marked_or_cursor(0)        # add 2 to cart
+            await pilot.pause()
+            await pilot.pause()
+            carted = sc._collect_cart_primers()
+            assert len(carted) == 2 and all(p.get("in_cart") for p in carted)
+            # persisted in the active collection record
+            coll = sc._find_primer_collection(
+                sc._get_active_primer_collection_name())
+            assert sum(1 for p in coll["primers"] if p.get("in_cart")) == 2
+            # Export Cart opens the CSV modal carrying the 2 carted primers.
+            screen._export_cart_csv(None)
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc.PrimerCsvExportModal)
+            assert len(app.screen._primers) == 2
+            app.screen.dismiss(None)
+            await pilot.pause()
+            # toggle off (all carted → un-cart all)
+            screen._toggle_cart_marked_or_cursor(0)
+            await pilot.pause()
+            assert sc._collect_cart_primers() == []
+
+    @pytest.mark.asyncio
+    async def test_move_and_copy_marked_across_collections(
+            self, isolated_primers):
+        self._seed(3)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            colls = sc._load_primer_collections()
+            colls.append({"name": "Dest", "description": "",
+                          "primers": [{"name": "X",
+                                       "sequence": "GGGGGGGGGGGGCCCC",
+                                       "tm": 60.0, "status": "Designed"}],
+                          "saved": "2026-06-10"})
+            sc._save_primer_collections(colls)
+            before = sc._load_primers()
+            moved = {before[0]["sequence"].upper(),
+                     before[1]["sequence"].upper()}
+            # COPY first: source keeps them, Dest gains them.
+            screen._lib_selected = {0, 1}
+            screen._move_copy_marked_or_cursor("copy", 0)
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc._PrimerMoveCopyModal)
+            app.screen.dismiss("Dest")
+            for _ in range(4):
+                await pilot.pause()
+            assert len(sc._load_primers()) == 3                   # source intact
+            dest_seqs = {p["sequence"].upper()
+                         for p in sc._find_primer_collection("Dest")["primers"]}
+            assert moved <= dest_seqs
+            # MOVE now: source loses them.
+            screen._lib_selected = {0, 1}
+            screen._move_copy_marked_or_cursor("move", 0)
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc._PrimerMoveCopyModal)
+            app.screen.dismiss("Dest")
+            for _ in range(4):
+                await pilot.pause()
+            after = {p["sequence"].upper() for p in sc._load_primers()}
+            assert not (moved & after)                            # gone from src
+            assert len(sc._load_primers()) == 1
