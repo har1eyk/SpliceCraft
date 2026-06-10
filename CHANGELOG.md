@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.44] — 2026-06-09
+
+### Bug fixes
+
+- **The sequence viewer no longer jumps to the wrong place after you rotate the origin.** Clicking a base (or arrowing) while the map was rotated scrolled the panel to a stale, un-rotated position — the highlighted base was correct but the view "dipped" away from it. Following the cursor is now rotation-aware, so the click lands where you're pointing.
+- **Primers on plasmids assembled in the Constructor now show their sequence + flap instead of a plain bar.** When you built a plasmid via the Constructor's Traditional, Gibson, or Golden Braid / MoClo tabs, the primer_bind features carried in from your parts (e.g. a domestication primer) rendered like any other feature. They now keep their primer sequence through assembly, so they draw with the bound bases inline and the 5′ flap (enzyme tail / overhang) hanging off — and on a circular plasmid the flap wraps the origin as it should.
+
+### New features
+
+- **Any `primer_bind` feature now reads as a primer — inline bases, and a flap when known.** Whatever the origin (Constructor, Synthesis, an imported GenBank/`.dna` file, or a primer you add to the map), a `primer_bind` feature now shows its bound bases inline in the bar — drawn from the template when the full primer sequence isn't recorded — instead of a featureless block. When the full primer *is* known, its 5′ flap renders too.
+
+---
+
 ## [1.0.43] — 2026-06-09
 
 ### Bug fixes
