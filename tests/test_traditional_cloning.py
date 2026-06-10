@@ -1560,6 +1560,30 @@ class TestSimulateTraditionalCloningMulti:
         assert len(wrap[0]["label"]) == 4
         assert wrap[0]["color"] == "#ADD8E6" and wrap[0]["strand"] == 0
 
+    def test_pcr_insert_carries_features_to_product(self):
+        """A PCR / Clone-region insert's own features must reach the cloned
+        product. `_build_insert_from_pcr` used to drop them, so the insert
+        ligated in as a featureless black box (PHASE 60 lost its entire TU)."""
+        pad, s5, s3 = "GCGC", "GAATTC", "GGATCC"        # EcoRI / BamHI
+        insert = "ATGAAACGT" + "ACTGCATGCAGTACGTAGCT" * 4
+        amplicon = pad + s5 + insert + s3 + sc._rc(pad)
+        lead = len(pad) + len(s5)
+        ifeat = {"start": lead + 12, "end": lead + 60, "type": "CDS",
+                 "label": "MyGene", "strand": 1}
+        ins_frag = sc._make_synthetic_fragment(
+            amplicon, enz_left="EcoRI", enz_right="BamHI", features=[ifeat])
+        assert any(f["label"] == "MyGene" for f in ins_frag["features"])
+        vbody = "TTACGGATCAGCTAGGCATTAGC" * 6
+        vfrag = sc._make_synthetic_fragment(
+            s3 + vbody + s5, enz_left="BamHI", enz_right="EcoRI",
+            source_label="vec")
+        res = sc._simulate_traditional_cloning(ins_frag, vfrag)
+        gene = [f for f in res["forward"]["features"]
+                if f.get("label") == "MyGene"]
+        assert gene, ("insert feature dropped from product: "
+                      f"{[f.get('label') for f in res['forward']['features']]}")
+        assert gene[0]["end"] - gene[0]["start"] == 48   # length preserved
+
     def test_internal_junction_mismatch_surfaces_pair(self):
         """If two adjacent inserts have incompatible sticky ends, the
         error message names the failing pair by source_label so the

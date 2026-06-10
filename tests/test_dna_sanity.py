@@ -418,6 +418,45 @@ class TestRestrictionScan:
             out = [f for f in out if f["label"] == enzyme]
         return out
 
+    def test_resite_cut_count_badge(self):
+        """A resite tags `cut_count` when it cuts >1×; the render-time decorator
+        shows it as a superscript ("EcoRI²"). The label DATA stays bare — it's a
+        Scrub / digest lookup key (mutating it raised KeyError in Scrub).
+        Reactive: the scan re-runs on every edit, so killing a site drops it."""
+        two = "ACGT" * 5 + "GAATTC" + "ACGT" * 12 + "GAATTC" + "ACGT" * 5
+        f2 = sc._scan_restriction_sites(two, allowed_enzymes=["EcoRI"],
+                                        circular=False)
+        res2 = [f for f in f2 if f.get("type") == "resite"
+                and f.get("label") == "EcoRI"]
+        assert res2 and all(f.get("cut_count") == 2 for f in res2)
+        assert sc._feat_decorated_label(res2[0]) == "EcoRI²"
+        one = "ACGT" * 5 + "GAATTC" + "ACGT" * 12 + "ACGT" * 5
+        f1 = sc._scan_restriction_sites(one, allowed_enzymes=["EcoRI"],
+                                        circular=False)
+        res1 = [f for f in f1 if f.get("type") == "resite"
+                and f.get("label") == "EcoRI"]
+        assert res1 and all(not f.get("cut_count") for f in res1)
+        assert sc._feat_decorated_label(res1[0]) == "EcoRI"
+        assert sc._superscript_int(2) == "²" and sc._superscript_int(12) == "¹²"
+
+    def test_resite_badge_renders_in_seq_panel_parens(self):
+        """The seq panel's parens row (`_paint_feature_label`) must show the
+        superscript cut-count for a multi-cutter, matching the circular map —
+        the CHANGELOG promises the badge "on the circular map AND in the
+        sequence panel". A single-cutter (no `cut_count`) stays bare, and the
+        parens widen to fit the badge rather than truncating the name."""
+        content_w = 60
+        base = {"type": "resite", "label": "EcoRI", "start": 20, "end": 26,
+                "color": "white"}
+        arr = [(" ", "white")] * content_w
+        sc._paint_feature_label(arr, {**base, "cut_count": 2}, 0, content_w)
+        painted = "".join(ch for ch, _ in arr)
+        assert "EcoRI²" in painted, painted
+        arr1 = [(" ", "white")] * content_w
+        sc._paint_feature_label(arr1, dict(base), 0, content_w)
+        bare = "".join(ch for ch, _ in arr1)
+        assert "EcoRI" in bare and "EcoRI²" not in bare, bare
+
     @staticmethod
     def _recuts(feats, enzyme=None):
         out = [f for f in feats if f["type"] == "recut"]

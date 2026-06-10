@@ -14,6 +14,24 @@
 
 ---
 
+## [1.0.46] — 2026-06-10
+
+### Bug fixes
+
+- **Primers on imported / legacy fragments no longer render shifted with a phantom extra base.** A primer drawn on a fragment whose sequence is one base shorter than the primer itself (a defect in some pre-1.0.45 builds) used to slide one column to the left — dropping its first base, showing a spurious "extra C" in the enzyme pad, and lighting up dozens of false mismatches. The primer now anchors at its true binding site and shows only the real difference(s). (Regenerate such a fragment from its part to clear the underlying 1-base shortfall entirely.)
+
+- **Traditional cloning from a PCR / "Clone selected region" insert now carries the insert's own features into the cloned plasmid.** The insert used to ligate in as a featureless black box — the source region's annotations (promoters, CDSs, terminators) were silently dropped, so a cloned transcription unit arrived with its entire feature set missing. The vector's features were always fine; now the insert's come along too, at the right positions.
+
+### New features
+
+- **Saved files now record their origin.** Every GenBank SpliceCraft writes — library entries, exports, autosaves — carries a `Created by SpliceCraft v<version> on <date>` line in its COMMENT, so you can always tell which version and when a file was made. The stamp is written once (at creation) and preserved on every later re-save.
+
+- **Enzyme cut-count badges.** When a restriction enzyme cuts more than once, its name now carries a superscript count — **EcoRI²**, **BsaI³** — on the circular map and in the sequence panel, so multi-cutters stand out at a glance. The count is live: edit out a site and watch it tick down (or vanish entirely once the enzyme cuts just once), so you can confirm you actually killed a cut site.
+
+- **Construction history now timestamps every step.** Each entry in a plasmid's History tab — assemble, Gibson, edit, clone, import — now shows **when** it happened right beside **what** happened, in an unambiguous slash-free format (e.g. **JUN 9 2026 14:30**) so there's no MM/DD-vs-DD/MM confusion no matter where you are. Steps SpliceCraft performs from now on are stamped automatically; opening or importing a `.dna` carries that file's own creation date onto its top history entry. Older steps with no recorded date simply show none rather than a made-up one.
+
+---
+
 ## [1.0.45] — 2026-06-10
 
 ### Bug fixes

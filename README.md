@@ -114,8 +114,10 @@ and Cancel actually stops it.
 ### Enzymes
 
 Drive the restriction overlay: show all sites, unique cutters only, 6+ or 4+
-bp recognition, or just the Golden Braid connectors. Build **enzyme
-collections** — named subsets of the master catalog (200+ NEB enzymes plus
+bp recognition, or just the Golden Braid connectors. A multi-cutter wears a
+**superscript cut-count** on its name (EcoRI², BsaI³) on the map and sequence
+panel — live, so editing out a site ticks it down and you can confirm you
+killed a cut. Build **enzyme collections** — named subsets of the master catalog (200+ NEB enzymes plus
 your own customs) — and the active collection scopes every scan. Add a custom
 enzyme (name, site, cut positions, type, supplier) and it's live in every
 map from then on.
@@ -315,17 +317,23 @@ summary — a numbered recipe that reads left → right like the bench (*"assemb
 pProm + pCDS_GFP + pTerm into pENTR_L1 → TU_GFP ✂ Esp3I"*, with a symbol
 legend) — above a **lineage tree** that opens collapsed to the finished plasmid
 and its direct inputs and lets you drill in as deep as you like. Selecting a
-step shows its detail, including the **primers** used for a PCR. A backbone or
+step shows its detail, including the **primers** used for a PCR. Every step is
+**dated** — its date and time (e.g. *JUN 9 2026 14:30*, written slash-free so it
+can't be misread as MM/DD vs DD/MM) sits right beside the action. A backbone or
 part reused across branches is shown once and then referenced, so even a
 multi-part Golden Braid / MoClo build reads at a glance. The same history rides
-along when you import or re-export a CommercialSaaS `.dna` file. "How did I make
-this again?" is always one keystroke away.
+along when you import or re-export a CommercialSaaS `.dna` file — and that file's
+own creation date lands on its top step. "How did I make this again?" is always
+one keystroke away.
 
 ### File & Settings
 
 The housekeeping. **File** opens local files, fetches from NCBI, saves,
 exports (GenBank / FASTA / GFF3), bulk-imports a folder, and restores from
-backup. It also runs record-level jobs — including **Clone selected region**:
+backup. Every GenBank SpliceCraft writes (library entries, exports, autosaves)
+records a `Created by SpliceCraft v… on …` line in its COMMENT, so a file's
+origin is always traceable. It also runs record-level jobs — including
+**Clone selected region**:
 highlight any stretch of DNA in the sequence panel, pick a restriction enzyme
 for each end, and SpliceCraft designs the cut-site-tailed PCR primers, builds
 the amplicon, and hands it to the Constructor's Traditional cloning tab

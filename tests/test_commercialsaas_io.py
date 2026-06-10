@@ -507,6 +507,128 @@ class TestCommercialSaaSHistoryNodeMutation:
         assert "ligate-via-splicecraft" in labels
 
 
+class TestHistoryDateStamp:
+    """Every history step SpliceCraft builds going forward carries a `date`
+    attribute, rendered in the History tab in the universal slash-free
+    "JUN 9 2026 14:30" form. Reconstructed lineage / starting material stays
+    undated (no fabricated date). Imported CommercialSaaS "YYYY.MM.DD" dates
+    render too."""
+
+    def test_human_dt_iso_with_time(self):
+        assert sc._history_human_dt("2026-06-09T14:30") == "JUN 9 2026 14:30"
+        assert sc._history_human_dt("2026-06-09T09:05") == "JUN 9 2026 09:05"
+
+    def test_human_dt_date_only_and_commercialsaas_dotted(self):
+        # Date-only (no time) and the CommercialSaaS Notes "YYYY.MM.DD" form.
+        assert sc._history_human_dt("2026-12-25") == "DEC 25 2026"
+        assert sc._history_human_dt("2026.01.03") == "JAN 3 2026"
+
+    def test_human_dt_rejects_garbage_and_empty(self):
+        for bad in ("", None, "not a date", "2026", "abcd-ef-gh",
+                    "2026-13-01", "2026-06-45"):
+            assert sc._history_human_dt(bad) == "", repr(bad)
+
+    def test_human_dt_drops_bad_time_keeps_date(self):
+        # Hour/minute out of range → keep the date, drop the time.
+        assert sc._history_human_dt("2026-06-09T99:99") == "JUN 9 2026"
+
+    def test_human_dt_tolerates_non_string(self):
+        # Defensive str() coercion — never raises on an odd caller value.
+        assert sc._history_human_dt(20260609) == ""        # int → no match
+        assert sc._history_human_dt(["2026-06-09"]) == ""  # list → no match
+
+    def test_now_str_round_trips_through_formatter(self):
+        now = sc._history_now_str()
+        assert sc._history_human_dt(now), f"now-stamp unrenderable: {now!r}"
+
+    def test_new_stores_and_omits_date(self):
+        dated = sc._CommercialSaaSHistoryNode.new(
+            name="x.dna", seq_len=10, circular=True,
+            operation="insertFragment", date="2026-06-09T14:30")
+        assert dated.date == "2026-06-09T14:30"
+        # Default: no date attr (reconstructed lineage / starting material).
+        undated = sc._CommercialSaaSHistoryNode.new(
+            name="y.dna", seq_len=10, circular=True,
+            operation="insertFragment")
+        assert undated.date == ""
+        assert undated.element.get("date") is None
+
+    def test_date_survives_serialize_round_trip(self):
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="r.dna", seq_len=10, circular=True,
+            operation="insertFragment", date="2026-06-09T14:30")
+        reparsed = sc._parse_commercialsaas_history(
+            sc._serialize_commercialsaas_history(root))
+        assert reparsed.date == "2026-06-09T14:30"
+
+    def test_fresh_builders_stamp_a_date(self):
+        # The origin builder stamps "now"; the parsed root renders a date.
+        xml = sc._build_origin_history_xml(
+            name="p", seq_len=100, circular=True, source="library:abc")
+        root = sc._parse_commercialsaas_history(xml)
+        assert root is not None and sc._history_human_dt(root.date)
+
+    def test_parent_leaf_is_undated(self):
+        # `_parent_node_for_entry` reconstructs PRE-EXISTING material → no
+        # fabricated date.
+        leaf = sc.TraditionalCloningPane._parent_node_for_entry(
+            {"name": "old-vec", "id": "v1", "size": 3000})
+        assert leaf is not None and leaf.date == ""
+
+    def test_tree_label_and_detail_show_date(self):
+        dated = sc._CommercialSaaSHistoryNode.new(
+            name="x.dna", seq_len=10, circular=True,
+            operation="insertFragment", date="2026-06-09T14:30")
+        assert "JUN 9 2026 14:30" in sc._history_tree_label(dated)
+        assert any("JUN 9 2026 14:30" in ln
+                   for ln in sc._history_detail_lines(dated))
+        undated = sc._CommercialSaaSHistoryNode.new(
+            name="y.dna", seq_len=10, circular=True,
+            operation="insertFragment")
+        assert "JUN" not in sc._history_tree_label(undated)
+
+    # ── .dna file-date import ────────────────────────────────────────────
+
+    def test_extract_file_date_from_notes_created(self):
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x06, b"<Notes><Created>2026.06.09</Created></Notes>"))
+        assert sc._extract_commercialsaas_file_date(data) == "2026-06-09"
+
+    def test_extract_file_date_none_without_notes(self):
+        data = _make_minimal_dna((0x00, bytes([0x01]) + b"ATGC"))
+        assert sc._extract_commercialsaas_file_date(data) is None
+
+    def test_stamp_root_date_only_when_dateless(self):
+        xml = "<HistoryTree><Node name='x.dna' ID='0'/></HistoryTree>"
+        out = sc._stamp_history_root_date(xml, "2026-06-09")
+        assert sc._parse_commercialsaas_history(out).date == "2026-06-09"
+        # An already-dated root is left untouched (verbatim string back).
+        dated = sc._serialize_commercialsaas_history(
+            sc._CommercialSaaSHistoryNode.new(
+                name="x.dna", seq_len=1, circular=True,
+                operation="insertFragment", date="2020-01-01"))
+        assert sc._stamp_history_root_date(dated, "2026-06-09") == dated
+        # No date to add → unchanged.
+        assert sc._stamp_history_root_date(xml, None) == xml
+
+    def test_bulk_import_stamps_file_date_on_root(self, tmp_path):
+        # Dateless history root + a Notes file date → the bulk-import
+        # extractor stamps the file date onto the root, rendered "JUN 6 2025".
+        hist = "<HistoryTree><Node name='child.dna' ID='0'/></HistoryTree>"
+        data = _make_minimal_dna(
+            (0x00, bytes([0x01]) + b"ATGC"),
+            (0x06, b"<Notes><LastModified>2025.06.06</LastModified></Notes>"),
+            (0x07, sc._pack_commercialsaas_history_payload(hist)),
+        )
+        path = tmp_path / "dated.dna"
+        path.write_bytes(data)
+        root = sc._parse_commercialsaas_history(
+            sc._try_extract_history_xml_from_dna_path(path))
+        assert root.date == "2025-06-06"
+        assert sc._history_human_dt(root.date) == "JUN 6 2025"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Library-entry import wiring (Phase 4a)
 # ──────────────────────────────────────────────────────────────────────────────

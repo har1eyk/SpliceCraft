@@ -1249,6 +1249,71 @@ class TestPrimerMismatchBump:
         assert f.get("_flap_len") == 4                 # 5' overhang = first 4 bp
 
 
+class TestRederiveStrictNotOffset:
+    """`_rederive_primer_binding` must NOT slide a primer to a best-offset when
+    the strict contiguous-suffix search fails — `_attach_pcr_primers_to_record`
+    calls with hint_start=0, so a best-offset window at the origin could anchor
+    a non-binding primer there (a mis-placed cloning primer is catastrophic). It
+    returns None instead; the length-short *stored-feature* repair lives in
+    `PlasmidMap._parse`."""
+
+    def test_indel_primer_returns_none_not_offset_anchor(self):
+        # A primer with no clean >=12 bp contiguous suffix (1 bp indel near the
+        # 3' end) must come back None, NOT anchored at 0.
+        primer = "GCGCCGTCTCAAATGACTGCATGCAGTACGTAGCTAGCAT"     # 40 bp, unique
+        frag = primer[:36] + primer[37:] + "TTTTTTTTTTGGGGGGGGGG"  # drop base@36
+        assert sc._rederive_primer_binding(
+            primer, 1, frag, len(frag), hint_start=0, circular=False) is None
+
+    def test_clean_full_match_uses_strict_path(self):
+        primer = "GCGCCGTCTCAAATGACGTGCATCGATGCATCGTAGCATG"     # 40 bp
+        frag = primer + "TTTTTTTTTTGGGGGGGGGGCCCCCCCCCC"
+        rb = sc._rederive_primer_binding(primer, 1, frag, len(frag),
+                                         hint_start=0, circular=False)
+        assert rb == (0, 40), f"clean primer must anchor exactly, got {rb!r}"
+
+    def test_foreign_primer_keeps_none(self):
+        frag = "GCGCCGTCTCAAATGACGTACGTACGTACGTACGTTTTTTTTTTT"
+        foreign = "ATATATATATATATATATATATATATATATATATAT"       # no real binding
+        assert sc._rederive_primer_binding(
+            foreign, 1, frag, len(frag), hint_start=0, circular=False) is None
+
+    @pytest.mark.asyncio
+    async def test_parse_reanchors_length_short_stored_feature(self):
+        """A primer_bind feature whose stored location is 1 bp SHORTER than its
+        primer_seq (a fragment built short of its primer) re-anchors flush in
+        `_parse` — bound bar lays on its true bases, only the real indel shows
+        as a couple of bumps — NOT every base slid one column (46 phantom
+        mismatches)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        region = "GCGCCGTCTCAAATGACTGCATGCAGTACGTAGCTAGCATCGATCGATCAG"  # 51 bp
+        primer = region[:len(region) - 3] + "G" + region[len(region) - 3:]  # 52
+        frag = region + "TTTTTTTTTTGGGGGGGGGGCCCCCCCCCC"
+        rec = SeqRecord(Seq(frag), id="SHORT", name="SHORT",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "linear"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, len(region), strand=1), type="primer_bind",
+            qualifiers={"label": ["P"], "primer_seq": [primer]}))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 50)) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(6):
+                await pilot.pause()
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pf = [f for f in pm._feats if f.get("type") == "primer_bind"][0]
+            assert pf.get("_bound_len") == len(primer)         # re-anchored full
+            assert len(pf.get("_bound_mismatch") or {}) <= 6   # only the indel
+
+
 def _topo_record(seq: str, *, circular: bool, rid: str = "TOPO1"):
     from Bio.SeqRecord import SeqRecord
     from Bio.Seq import Seq

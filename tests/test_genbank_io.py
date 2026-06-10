@@ -103,6 +103,33 @@ class TestGenbankTextRoundtrip:
         assert pos_in == pos_out
 
 
+class TestProvenanceStamp:
+    """Every serialized GenBank carries a `Created by SpliceCraft v… on …`
+    COMMENT (file-level provenance), stamped once and preserved across
+    round-trips so the date reflects creation, not the latest re-save."""
+
+    def test_fresh_record_gets_stamp(self, tiny_record):
+        gb = sc._record_to_gb_text(tiny_record)
+        assert "Created by SpliceCraft v" in gb
+        assert sc.__version__ in gb
+
+    def test_roundtrip_does_not_duplicate(self, tiny_record):
+        gb1 = sc._record_to_gb_text(tiny_record)
+        gb2 = sc._record_to_gb_text(sc._gb_text_to_record(gb1))
+        assert gb2.count("Created by SpliceCraft v") == 1
+
+    def test_existing_stamp_preserved(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(
+            Seq("ACGTACGTACGT"), id="OLD", name="OLD",
+            annotations={"molecule_type": "DNA",
+                         "comment": "Created by SpliceCraft v0.9.0 on 2025-01-01"})
+        gb = sc._record_to_gb_text(rec)
+        assert "v0.9.0 on 2025-01-01" in gb
+        assert gb.count("Created by SpliceCraft v") == 1
+
+
 class TestArrowlessStrandRoundtrip:
     """Arrowless (strand 0) features must survive `_record_to_gb_text` →
     `_gb_text_to_record`. BioPython's GenBank writer emits a plain location

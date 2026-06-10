@@ -457,6 +457,46 @@ class TestCloneRegion:
             assert await self._clone_refused(app, pilot, (100, 400),
                                              "EcoRI", "BamHI")
 
+    @pytest.mark.asyncio
+    async def test_region_features_carry_into_donor(self):
+        """The cloned region's own features must ride into the Traditional PCR
+        donor (and thence the product) — not vanish into a featureless insert."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        b = "ACGT"
+        seq = "".join(b[(i * 7 + i // 3) % 4] for i in range(600))
+        rec = SeqRecord(Seq(seq), id="R", name="R",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features.append(SeqFeature(FeatureLocation(150, 250, strand=1),
+                            type="CDS", qualifiers={"label": ["TU-CDS"]}))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(6):
+                await pilot.pause()
+            app.query_one("#seq-panel", sc.SequencePanel)._user_sel = (100, 400)
+            app.action_clone_region()
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.CloneRegionEnzymeModal)
+            app.screen.dismiss({"enz5": "EcoRI", "enz3": "BamHI"})
+            for _ in range(16):
+                await pilot.pause()
+            pane = app.screen.query_one(sc.TraditionalCloningPane)
+            donors = [s for s in pane._lane_inserts if s.get("mode") == "pcr"]
+            assert donors, "no PCR donor seeded"
+            pf = donors[0].get("pcr_features") or []
+            assert any(f.get("label") == "TU-CDS" for f in pf), \
+                f"region feature not carried into the donor: {pf}"
+
 
 def _plasmid_with_feat():
     from Bio.Seq import Seq
