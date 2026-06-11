@@ -4664,6 +4664,33 @@ class TestPartsBinEdit:
             modal = app.screen
             assert modal.query_one("#btn-parts-edit", sc.Button) is not None
 
+    async def test_name_box_is_wide_enough_to_read(self, isolated_parts_bin):
+        """The Name field leads Row 1 (3fr) so a part name is readable, not
+        cramped into a sliver — regression for the 'name textbox too cramped to
+        see words' report. Name must be the widest of the Row-1 columns."""
+        from textual.widgets import Input, Select
+        sc._save_parts_bin([self._stub_part(name="BatchThree-CDS-LongPartName")])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause(); await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal.query_one("#parts-table", sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-edit", sc.Button).press()
+            await pilot.pause(); await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.PartEditModal)
+            name = modal.query_one("#partedit-name", Input)
+            grammar = modal.query_one("#partedit-grammar", Select)
+            typ = modal.query_one("#partedit-type", Select)
+            # Comfortably wide (pre-fix it was ~2/7 of a 96-col dialog ≈ 25).
+            assert name.region.width >= 32, name.region.width
+            # And the widest column in the identity row.
+            assert name.region.width >= grammar.region.width
+            assert name.region.width >= typ.region.width
+
     async def test_edit_save_rewrites_entry_in_parts_bin(
             self, isolated_parts_bin):
         """Saving the modal swaps the matching parts-bin entry in
@@ -10468,6 +10495,54 @@ class TestFragmentSourceFeatures:
         n = sc._attach_insert_feats_to_record(
             rec, insert, [{"start": 0, "end": len(insert), "type": "CDS"}])
         assert n == 0
+        assert not rec.features
+
+    def test_best_insert_offset_exact_fuzzy_unique(self):
+        f = sc._best_insert_offset
+        ins = "ATGAAACCCGGGTTTAAACCCGGGTTTAAACCCGGG"     # 36 bp
+        assert f("GG" + ins + "CC", ins) == 2                 # exact + unique
+        rep = list(ins)                                       # 2 same-len subs
+        rep[5] = "T" if rep[5] != "T" else "A"
+        rep[25] = "G" if rep[25] != "G" else "C"
+        assert f("GG" + "".join(rep) + "CC", ins) == 2        # fuzzy, unique
+        assert f("GG" + "T" * len(ins) + "CC", ins) is None   # too divergent
+        assert f(ins + "AA" + ins, ins) is None               # ambiguous exact
+        assert f("GGGGGGGGGGGGGGGGGGGG", ins) is None          # absent
+
+    def test_best_insert_offset_short_requires_exact(self):
+        f = sc._best_insert_offset
+        short = "ATGAAACC"                                     # 8 bp (< 24)
+        assert f("GG" + short + "GG", short) == 2              # exact ok
+        assert f("GGATGATACCGG", short) is None                # 1 mismatch → None
+
+    def test_attach_carries_through_codon_repair(self):
+        # The amplicon's insert region differs from the stored insert by a few
+        # synonymous substitutions (codon repair of an internal Type IIS site
+        # the domestication primers incorporate). Features must still be carried
+        # — anchored at the right offset, not dropped.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        insert = "ATGAAACCCGGGTTTAAACCCGGGTTTAAACCCGGG"   # 36 bp stored insert
+        rep = list(insert)
+        rep[6] = "T" if rep[6] != "T" else "A"            # 2 same-length changes
+        rep[24] = "G" if rep[24] != "G" else "C"
+        rec = SeqRecord(Seq("CGTCTCA" + "".join(rep) + "TGAGACG"))   # off 7
+        n = sc._attach_insert_feats_to_record(
+            rec, insert, [{"start": 0, "end": len(insert), "type": "CDS",
+                           "label": "x", "strand": 1}])
+        assert n == 1, "feature carried through the codon-repair substitutions"
+        loc = rec.features[0].location
+        assert int(loc.start) == 7 and int(loc.end) == 7 + len(insert)
+
+    def test_attach_refuses_unrelated_lookalike(self):
+        # A same-length region that ISN'T the insert (too divergent) must NOT be
+        # matched — never place a feature at a guessed offset.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        insert = "ATGAAACCCGGGTTTAAACCCGGGTTTAAACCCGGG"   # 36 bp
+        rec = SeqRecord(Seq("CC" + "T" * len(insert) + "GG"))
+        assert sc._attach_insert_feats_to_record(
+            rec, insert, [{"start": 0, "end": len(insert), "type": "CDS"}]) == 0
         assert not rec.features
 
 

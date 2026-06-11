@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.55] — 2026-06-11
+
+### Bug fixes
+
+- **A cloned fragment keeps its features even when an internal site was repaired.** When the codon optimizer repaired an internal Type IIS site (e.g. an Esp3I site in a Golden Braid CDS), the domestication primers swapped a few bases near the fragment's ends — so the carried-over feature bars no longer matched the stored sequence and were silently dropped. The features are now re-anchored through those synonymous changes and drawn at exactly the right bases, while a genuinely ambiguous match (a repeated insert) is still left off rather than guessed.
+- **The Part Edit dialog's Name field is readable.** The Name box was squeezed into the narrowest slice of the identity row — too cramped to see the part's name. Name now leads the row (and the dialog is a touch wider), so the full name shows.
+
+---
+
 ## [1.0.54] — 2026-06-11
 
 ### Bug fixes
