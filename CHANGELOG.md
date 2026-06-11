@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.53] — 2026-06-11
+
+### Bug fixes
+
+- **A cloning enzyme site that lands on the origin no longer renders as two sites.** After Alt+Shift+P cloning, the reformed junction often sits at the plasmid origin, so the cut site wraps bp 0. The sequence panel was drawing the wrapped half as an orphan empty `()` next to the real `(SalI)`, making one enzyme read as two. The wrapped half now shows only its recognition bar — the name + parens appear once — and a site sitting at the very end of a line nudges inward so its name reads in full instead of clipping to `(Sal`.
+
+### New features
+
+- **Cloning primers now show their name above the bar, like any other primer.** A primer with a 5′ flap (the enzyme tail that cloning primers carry) used to drop its name — the bar showed the bases but no label, unlike imported primers. Flapped and full-binding primers now render identically: **name on top, then the flap, then the bound bar**.
+- **Press Enter on a primer to edit it — from the map, the sequence panel, or the Features list.** Enter on a `primer_bind` feature opens an editor showing its **name and full sequence**, with a new **Save to library** button: it checks for duplicates (pushing back if the exact oligo is already saved) and lets you pick **which primer collection** to save into — or create a new one on the spot, the same way you save a plasmid to a collection. (The map had no Enter-to-edit before; now all three feature surfaces behave the same.)
+
+---
+
 ## [1.0.52] — 2026-06-10
 
 ### Bug fixes

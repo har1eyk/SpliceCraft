@@ -208,3 +208,125 @@ class TestPrimerSaveModalPreservesSpaces:
         sc._set_active_primer_collection_name("Old collection name")
         assert (sc._get_active_primer_collection_name()
                 == "Old collection name")
+
+
+class TestSavePrimerToLibraryFlow:
+    """PrimerEditModal's "Save to library" → app `_save_primer_to_library_flow`:
+    pushes back (no save) when the exact oligo is already in the library;
+    otherwise opens `PrimerSaveModal` (pick/create collection) and commits to
+    the chosen collection. Unifies a cloning / map primer with the library."""
+
+    import pytest as _pt
+
+    @_pt.mark.asyncio
+    async def test_duplicate_pushes_back_and_opens_no_modal(
+            self, tiny_record, isolated_library):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            sc._save_primers([{"name": "Existing-F",
+                               "sequence": "ACGTACGTACGTACGTACGTA", "tm": 60.0}])
+            notes: list = []
+            app.notify = lambda msg, **k: notes.append((str(msg), k.get("severity")))
+            depth = len(app.screen_stack)
+            app._save_primer_to_library_flow(
+                {"primer_seq": "acgtacgtacgtacgtacgta", "label": "Dup", "strand": 1})
+            await pilot.pause()
+            assert any("already in your library" in m and sev == "warning"
+                       for m, sev in notes), notes
+            assert len(app.screen_stack) == depth, "no picker for a duplicate"
+
+    @_pt.mark.asyncio
+    async def test_new_primer_picker_then_commit_to_collection(
+            self, tiny_record, isolated_library):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            sc._save_primer_collections([{"name": "Main", "primers": [],
+                                          "saved": "2026-06-11"}])
+            sc._set_active_primer_collection_name("Main")
+            sc._save_primers([])  # empty library
+            app._save_primer_to_library_flow(
+                {"primer_seq": "GGGGCCCCAAAATTTTGGGGC", "label": "New-F",
+                 "strand": 1})
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.PrimerSaveModal), \
+                "a new primer must open the collection picker"
+            # Pick the 'Main' collection + commit (mimic the modal's payload).
+            app.screen.dismiss({"names": ["New-F"], "collection": "Main",
+                                "create": False})
+            await pilot.pause(); await pilot.pause()
+            saved = sc._load_primers()
+            assert any(p.get("name") == "New-F"
+                       and p.get("sequence") == "GGGGCCCCAAAATTTTGGGGC"
+                       for p in saved), saved
+
+    @_pt.mark.asyncio
+    async def test_map_enter_opens_primer_editor(
+            self, tiny_record, isolated_library):
+        """Enter on a primer feature selected on the PLASMID MAP opens the
+        PrimerEditModal (name + sequence + Save to library) — unified with the
+        sidebar table + seq panel Enter behaviour."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            rec = app._current_record
+            rec.features.append(SeqFeature(
+                FeatureLocation(5, 26, strand=1), type="primer_bind",
+                qualifiers={"label": ["TestPrimer-F"],
+                            "primer_seq": ["GCGCACGTACGTACGTACGTA"]}))
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.load_record(rec)
+            idx = next(i for i, f in enumerate(pm._feats)
+                       if f.get("label") == "TestPrimer-F")
+            pm.selected_idx = idx
+            await pilot.pause()
+            pm.action_open_selected_feature()
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.PrimerEditModal), \
+                "Enter on a map primer must open PrimerEditModal"
+            # The modal carries the primer's name + sequence.
+            from textual.widgets import Input
+            assert app.screen.query_one("#primedit-name", Input).value \
+                == "TestPrimer-F"
+
+    @_pt.mark.asyncio
+    async def test_new_primer_creates_collection_on_the_fly(
+            self, tiny_record, isolated_library):
+        """The picker lets the user CREATE a destination collection — it's made,
+        set active, and the primer lands in it."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            sc._save_primers([])
+            app._save_primer_to_library_flow(
+                {"primer_seq": "TTTTGGGGCCCCAAAATTTTG", "label": "Made-F",
+                 "strand": 1})
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.PrimerSaveModal)
+            app.screen.dismiss({"names": ["Made-F"],
+                                "collection": "Brand New Coll", "create": True})
+            await pilot.pause(); await pilot.pause()
+            colls = [c.get("name") for c in sc._load_primer_collections()]
+            assert "Brand New Coll" in colls, colls
+            assert sc._get_active_primer_collection_name() == "Brand New Coll"
+            assert any(p.get("name") == "Made-F" for p in sc._load_primers())
+
+    @_pt.mark.asyncio
+    async def test_save_library_empty_sequence_is_noop(
+            self, tiny_record, isolated_library):
+        """Defence-in-depth: an empty primer sequence neither pushes the picker
+        nor errors."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            depth = len(app.screen_stack)
+            app._save_primer_to_library_flow({"primer_seq": "   ", "label": "x"})
+            await pilot.pause()
+            assert len(app.screen_stack) == depth
