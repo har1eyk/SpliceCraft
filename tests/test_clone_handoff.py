@@ -23,6 +23,9 @@ import pytest
 
 import splicecraft as sc
 
+from Bio.Seq import Seq as _Seq
+from Bio.SeqRecord import SeqRecord as _SeqRecord
+
 
 _TERM = (200, 50)
 
@@ -609,6 +612,287 @@ class TestCloneRegion:
             assert all(c not in nm for c in "\x00\x07")
             assert "101-400" in nm                   # auto label (start+1..end)
 
+    # ── Wrap-aware carryover + amplicon library save (origin-wrap regression) ──
+
+    def test_gather_region_feats_wrap_selection(self):
+        """An ORIGIN-SPANNING selection (start > end) carries ALL its features,
+        tiled into one [0, span) amplicon coordinate — the confirmed regression
+        was `_gather_region_feats` returning [] for any wrap selection, so every
+        insert annotation was silently dropped while the vector's stayed."""
+        total = 2000
+        feats = [{"type": "promoter",   "label": "Pdemo",   "start": 1700, "end": 1900, "strand": 1},
+                 {"type": "CDS",        "label": "GeneX",  "start": 1900, "end": 2000, "strand": 1},
+                 {"type": "terminator", "label": "Tdemo", "start": 0,    "end": 300,  "strand": 1},
+                 {"type": "CDS",        "label": "OUTSIDE",  "start": 600,  "end": 800,  "strand": 1}]
+        g = sc.PlasmidApp._gather_region_feats(feats, 1700, 300, total)
+        got = [(f["label"], f["start"], f["end"]) for f in g]
+        assert got == [("Pdemo", 0, 200), ("GeneX", 200, 300),
+                       ("Tdemo", 300, 600)], got    # OUTSIDE excluded
+
+    def test_gather_region_feats_wrap_without_total_is_legacy_empty(self):
+        """3-arg callers (no `total`) keep the old behaviour: a wrap selection
+        still returns [] — the new wrap handling is strictly opt-in via `total`,
+        so nothing that passed the old contract changes."""
+        feats = [{"type": "CDS", "label": "X", "start": 1700, "end": 1900, "strand": 1}]
+        assert sc.PlasmidApp._gather_region_feats(feats, 1700, 300) == []
+
+    def test_gather_region_feats_wrap_feature_split(self):
+        """A feature that itself wraps the origin, in a NON-wrap selection that
+        contains both its arcs but not the origin, is genuinely two disjoint
+        pieces (the origin sits OUTSIDE the selection) — carried as two arcs."""
+        total = 2000
+        feats = [{"type": "CDS", "label": "WF", "start": 1980, "end": 40, "strand": 1}]
+        g = sc.PlasmidApp._gather_region_feats(feats, 10, 1990, total)
+        labels = [f["label"] for f in g]
+        assert labels.count("WF") == 2                  # both arcs carried
+        assert all(0 <= f["start"] <= f["end"] <= 1980 for f in g)
+
+    def test_gather_region_feats_wrap_feature_in_wrap_selection_merges(self):
+        """A feature that itself wraps the origin AND sits fully inside a wrap
+        selection is rebased as ONE contiguous piece (not two seam-split bars),
+        and keeps its frame qualifiers — the rebase is a rigid translation, so
+        `codon_start` / `transl_table` stay valid (regardless of strand)."""
+        total = 2000
+        feats = [{"type": "CDS", "label": "WrapCDS", "start": 1950, "end": 100,
+                  "strand": -1, "codon_start": 2, "transl_table": 11}]
+        g = sc.PlasmidApp._gather_region_feats(feats, 1700, 300, total)
+        assert len(g) == 1, g                            # merged, not split
+        (m,) = g
+        assert (m["start"], m["end"]) == (250, 400)      # [fs-s, (total-s)+fe)
+        assert m["strand"] == -1
+        assert m["codon_start"] == 2 and m["transl_table"] == 11
+        # A CLIPPED origin-wrapping feature stays conservative (no frame hint).
+        clip = [{"type": "CDS", "label": "Clip", "start": 1950, "end": 300,
+                 "strand": 1, "codon_start": 1}]
+        gc = sc.PlasmidApp._gather_region_feats(clip, 1700, 200, total)
+        assert all("codon_start" not in f for f in gc)
+
+    def test_build_clone_region_amplicon_entry(self):
+        """The amplicon library entry (issue 2/3): kind=amplicon, carries the
+        region features AND both run primers as primer_bind features, with a
+        construction-history XML."""
+        _, seq = _clone_region_plasmid()
+        d = sc._design_cloning_primers(seq, 100, 400, "EcoRI", "BamHI")
+        assert not d.get("error"), d
+        amplicon = ("GCGC" + d["site_5"] + d["insert_seq"]
+                    + d["site_3"] + sc._rc("GCGC"))
+        lead = 4 + len(d["site_5"])
+        region_feats = [{"type": "CDS", "label": "TU", "color": "yellow",
+                         "strand": 1, "start": lead, "end": lead + 60}]
+        entry = sc._build_clone_region_amplicon_entry(
+            amplicon, region_feats, name="PCR-myTU 100-400",
+            fwd_full=d["fwd_full"], rev_full=d["rev_full"],
+            fwd_tm=d.get("fwd_tm"), rev_tm=d.get("rev_tm"),
+            fwd_name="PCR-myTU 100-400-F", rev_name="PCR-myTU 100-400-R",
+            start_1based=101, end_1based=400)
+        assert entry["kind"] == "amplicon"
+        assert entry["name"] == "PCR-myTU 100-400"
+        assert entry.get("history_xml")
+        rec = sc._gb_text_to_record(entry["gb_text"])
+        labelled = [(f.qualifiers.get("label", [""])[0], f.type)
+                    for f in rec.features]
+        assert ("TU", "CDS") in labelled                       # region feature
+        pbinds = [lab for lab, t in labelled if t == "primer_bind"]
+        assert len(pbinds) == 2, labelled                      # both run primers
+
+    @pytest.mark.asyncio
+    async def test_wrap_selection_flow_carries_features_and_saves_amplicon(self):
+        """End-to-end: an origin-spanning selection seeds a donor that DOES
+        carry its features + primers, and the named amplicon lands in the
+        library as a kind=amplicon entry with its primer_bind features."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        b = "ACGT"
+        seq = "".join(b[(i * 7 + i // 3) % 4] for i in range(600))
+        rec = SeqRecord(Seq(seq), id="W", name="W",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        # Features placed so a [500, 100) selection WRAPS the origin.
+        rec.features.append(SeqFeature(FeatureLocation(500, 600, strand=1),
+                            type="promoter", qualifiers={"label": ["Pdemo"]}))
+        rec.features.append(SeqFeature(FeatureLocation(0, 100, strand=1),
+                            type="CDS", qualifiers={"label": ["GeneX"]}))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(6):
+                await pilot.pause()
+            app.query_one("#seq-panel", sc.SequencePanel)._user_sel = (500, 100)
+            app.action_clone_region()
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.CloneRegionEnzymeModal)
+            app.screen.dismiss({"enz5": "EcoRI", "enz3": "BamHI",
+                                "name": "PCR-wrapTU"})
+            for _ in range(18):
+                await pilot.pause()
+            pane = app.screen.query_one(sc.TraditionalCloningPane)
+            donor = next(s for s in pane._lane_inserts if s.get("mode") == "pcr")
+            pf = {f.get("label") for f in donor.get("pcr_features") or []}
+            assert {"Pdemo", "GeneX"} <= pf, f"wrap features dropped: {pf}"
+            assert donor.get("pcr_primers", {}).get("fwd_seq")   # primers threaded
+            # The named amplicon is now a real library entry…
+            amp = next((e for e in sc._iter_library_readonly()
+                        if e.get("name") == "PCR-wrapTU"), None)
+            assert amp is not None, "amplicon not saved to the library"
+            assert sc._entry_kind(amp) == "amplicon"
+            ar = sc._gb_text_to_record(amp["gb_text"])
+            atypes = [f.type for f in ar.features]
+            assert atypes.count("primer_bind") == 2          # …with its primers
+            assert {(f.qualifiers.get("label", [""])[0]) for f in ar.features} \
+                >= {"Pdemo", "GeneX"}                        # …and its features
+
+
+def _clean_seq(n: int, bad: "list[str]", seed: int) -> str:
+    """Random ACGT of length n with none of the `bad` motifs (site-free filler)."""
+    r = random.Random(seed)
+    s = "".join(r.choice("ACGT") for _ in range(n))
+    while any(b in s for b in bad):
+        s = "".join(r.choice("ACGT") for _ in range(n))
+    return s
+
+
+class TestCloneRegionEnzymePicker:
+    """Phases 1-3: the cut-site picker classifies enzymes for the region,
+    suggests a viable pair (insert-safe + vector-compatible), and can pre-seed
+    the destination vector as the Constructor backbone."""
+
+    _BAD = ["GGATCC", "AAGCTT", "GAATTC", "GTCGAC", "GAGCTC", "CTCGAG",
+            "GCGGCCGC"]   # BamHI/HindIII/EcoRI/SalI/SacI/XhoI/NotI
+
+    def test_classify_in_insert_safe_type_iis(self):
+        ins = "ACGT" * 5 + "GAATTC" + "ACGT" * 10      # EcoRI site inside
+        cls = sc._classify_cloning_enzymes(ins)
+        assert cls["EcoRI"] == "in_insert"
+        assert cls["BamHI"] == "safe"
+        assert cls["BsaI"] == "type_iis"
+
+    def test_suggest_pair_avoids_in_region_enzyme(self):
+        ins = "ACGT" * 5 + "GAATTC" + "ACGT" * 10
+        pair = sc._suggest_cloning_pair(ins)
+        assert pair and "EcoRI" not in pair and pair[0] != pair[1]
+
+    def test_suggest_pair_vector_aware(self):
+        ins = "ACGTTGCAACGTTGCAACGT" * 3              # no curated sites
+        vec = (_clean_seq(800, self._BAD, 1) + "GGATCC" + _clean_seq(20, self._BAD, 2)
+               + "AAGCTT" + _clean_seq(800, self._BAD, 3))   # only BamHI + HindIII
+        pair = sc._suggest_cloning_pair(ins, vec)
+        assert pair and set(pair) == {"BamHI", "HindIII"}, pair
+
+    def test_suggest_pair_none_when_no_safe_enzyme(self):
+        # A region carrying EVERY curated recognition site (N→A so degenerate
+        # sites still match) → no insert-safe enzyme → no suggestion.
+        sites = [sc._NEB_ENZYMES[n][0].replace("N", "A")
+                 for n in sc._CLONING_RE_NAMES]
+        ins = "ACGTACGT".join(sites)
+        assert sc._suggest_cloning_pair(ins) is None
+
+    def test_options_annotated_and_usable_first(self):
+        ins = "ACGT" * 5 + "GAATTC" + "ACGT" * 10
+        opts = sc._cloning_enzyme_options(ins)
+        lab = {v: l for l, v in opts}
+        assert "✗" in lab["EcoRI"]                     # site inside selection
+        assert "Type IIS" in lab["BsaI"]               # can't add-cut-sites
+        vals = [v for _l, v in opts]
+        assert vals.index("BamHI") < vals.index("EcoRI")   # usable sorts first
+
+    def test_options_vector_marks_absent_enzyme(self):
+        ins = "ACGTTGCAACGTTGCAACGT" * 3
+        vec = (_clean_seq(800, self._BAD, 4) + "GGATCC" + _clean_seq(20, self._BAD, 5)
+               + "AAGCTT" + _clean_seq(800, self._BAD, 6))   # no XhoI
+        lab = {v: l for l, v in sc._cloning_enzyme_options(ins, vec)}
+        assert "⚠ not in vector" in lab["XhoI"]
+        assert "⚠" not in lab["BamHI"]                 # present in the vector
+
+    def test_pair_hint_suggests_then_silent(self):
+        ins = "ACGT" * 5 + "GAATTC" + "ACGT" * 10
+        vec = (_clean_seq(800, self._BAD, 7) + "GGATCC" + _clean_seq(20, self._BAD, 8)
+               + "AAGCTT" + _clean_seq(800, self._BAD, 9))
+        hint = sc.TraditionalCloningPane._pair_hint(ins, vec)
+        assert "Try" in hint and ("BamHI" in hint and "HindIII" in hint)
+        assert sc.TraditionalCloningPane._pair_hint("", vec) == ""   # no insert
+
+    @pytest.mark.asyncio
+    async def test_modal_defaults_to_safe_pair_and_marks(self):
+        # A region with an EcoRI site → the picker must default OFF EcoRI.
+        body = _clean_seq(800, [b for b in self._BAD if b != "GAATTC"], 10)
+        seq = body[:300] + "GAATTC" + body[306:]
+        rec = _SeqRecord(_Seq(seq), id="ES", name="ES",
+                         annotations={"molecule_type": "DNA", "topology": "circular"})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(6):
+                await pilot.pause()
+            app.query_one("#seq-panel", sc.SequencePanel)._user_sel = (200, 500)
+            app.action_clone_region()
+            for _ in range(8):
+                await pilot.pause()
+            m = app.screen
+            assert isinstance(m, sc.CloneRegionEnzymeModal)
+            from textual.widgets import Select as _Select
+            v5 = m.query_one("#cre-enz5", _Select).value
+            v3 = m.query_one("#cre-enz3", _Select).value
+            assert v5 != "EcoRI" and v3 != "EcoRI" and v5 != v3
+
+    @pytest.mark.asyncio
+    async def test_picked_vector_seeds_backbone_into_constructor(self):
+        vec = (_clean_seq(1500, self._BAD, 11) + "GGATCC" + _clean_seq(20, self._BAD, 12)
+               + "AAGCTT" + _clean_seq(1500, self._BAD, 13))   # BamHI + HindIII
+        vrec = _SeqRecord(_Seq(vec), id="DV", name="DV",
+                          annotations={"molecule_type": "DNA", "topology": "circular"})
+        sc._commit_library_entry_to_collection(
+            {"id": "DV", "name": "Dest Vector", "size": len(vec), "kind": "plasmid",
+             "source": "import", "added": "2026-06-10",
+             "gb_text": sc._record_to_gb_text(vrec)},
+            sc._get_active_collection_name() or "Default")
+        src = _SeqRecord(_Seq(_clean_seq(800, self._BAD, 14)), id="SS", name="SS",
+                         annotations={"molecule_type": "DNA", "topology": "circular"})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(src)
+            for _ in range(6):
+                await pilot.pause()
+            app.query_one("#seq-panel", sc.SequencePanel)._user_sel = (100, 500)
+            app.action_clone_region()
+            for _ in range(8):
+                await pilot.pause()
+            m = app.screen
+            assert isinstance(m, sc.CloneRegionEnzymeModal)
+            assert m._vector_choices, "vector did not reach the modal picker"
+            vid = m._vector_choices[0][1]
+            from textual.widgets import Select as _Select
+            m.query_one("#cre-vector", _Select).value = vid
+            for _ in range(6):
+                await pilot.pause()
+            m._submit()
+            for _ in range(20):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.ConstructorModal)
+            pane = app.screen.query_one(sc.TraditionalCloningPane)
+            assert any(s.get("mode") == "pcr" for s in pane._lane_inserts)
+            assert any(s.get("role") == "backbone" and s.get("source_entry_id") == vid
+                       for s in pane._lane_inserts)
+
 
 def _plasmid_with_feat():
     from Bio.Seq import Seq
@@ -716,6 +1000,43 @@ class TestFeatureRichCopy:
             for _ in range(4):
                 await pilot.pause()
             assert getattr(app, "_copied_region", "x") is None
+
+    @pytest.mark.asyncio
+    async def test_wrap_selection_copy_carries_features(self):
+        """A top-strand copy of an ORIGIN-SPANNING selection carries its
+        features too (copy is now wrap-aware, mirroring the clone path) — the
+        bases were already joined wrap-aware, the features used to be dropped."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        b = "ACGT"
+        seq = "".join(b[(i * 7 + i // 3) % 4] for i in range(600))
+        rec = SeqRecord(Seq(seq), id="WC", name="WC",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features.append(SeqFeature(FeatureLocation(550, 600, strand=1),
+                            type="CDS", qualifiers={"label": ["Tail"]}))
+        rec.features.append(SeqFeature(FeatureLocation(0, 50, strand=1),
+                            type="CDS", qualifiers={"label": ["Head"]}))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(6):
+                await pilot.pause()
+            app.query_one("#seq-panel", sc.SequencePanel)._user_sel = (500, 100)
+            app.action_copy_selection()
+            for _ in range(4):
+                await pilot.pause()
+            cr = getattr(app, "_copied_region", None)
+            assert cr and cr["seq"] == (seq[500:] + seq[:100]).upper()
+            labels = {f["label"] for f in cr["feats"]}
+            assert {"Tail", "Head"} <= labels, labels
 
 
 class TestSynthesisClearButtons:

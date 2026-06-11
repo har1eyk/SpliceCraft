@@ -1563,7 +1563,7 @@ class TestSimulateTraditionalCloningMulti:
     def test_pcr_insert_carries_features_to_product(self):
         """A PCR / Clone-region insert's own features must reach the cloned
         product. `_build_insert_from_pcr` used to drop them, so the insert
-        ligated in as a featureless black box (PHASE 60 lost its entire TU)."""
+        ligated in as a featureless black box (a cloned TU lost its features)."""
         pad, s5, s3 = "GCGC", "GAATTC", "GGATCC"        # EcoRI / BamHI
         insert = "ATGAAACGT" + "ACTGCATGCAGTACGTAGCT" * 4
         amplicon = pad + s5 + insert + s3 + sc._rc(pad)

@@ -344,14 +344,22 @@ backup. Every GenBank SpliceCraft writes (library entries, exports, autosaves)
 records a `Created by SpliceCraft v… on …` line in its COMMENT, so a file's
 origin is always traceable. It also runs record-level jobs — including
 **Clone selected region** (also **Alt+Shift+P**):
-highlight any stretch of DNA in the sequence panel, pick a restriction enzyme
-for each end and a name for the amplicon, and SpliceCraft designs the
-cut-site-tailed PCR primers, builds the amplicon — carrying every annotation
-your highlight spans — and hands it to the Constructor's Traditional cloning
-tab pre-configured (add a vector and Simulate). The cloned product keeps those
-insert features and flags any vector feature your cut sites land inside as
-*(disrupted)*, so dropping an insert into a lacZα MCS reads as the knock-out it
-is. It's also where you **Migrate
+highlight any stretch of DNA in the sequence panel and name the amplicon. The
+cut-site dialog **steers you to a working enzyme pair** — it marks any enzyme
+whose site falls inside your selection (`✗`) or that's Type IIS, lists the
+usable ones first, and pre-picks a viable directional pair; pick a **destination
+vector** there too and it flags enzymes that vector can't be opened with (`⚠`),
+refines the suggestion to a pair that cuts both, and pre-loads that vector into
+the Constructor as the backbone. SpliceCraft then designs the cut-site-tailed
+PCR primers, builds the amplicon — carrying every annotation your highlight
+spans, even when the highlight crosses the plasmid origin — **saves the named
+amplicon to your library** as a reusable linear PCR product (its features and
+both run primers travel with it, the primers drawn as primer-binding sites), and
+opens the Constructor's Traditional cloning tab (pre-loaded when you chose a
+vector — just Simulate). The cloned product keeps those insert features, shows
+where the cloning primers bind, and flags any vector feature your cut sites land
+inside as *(disrupted)*, so dropping an insert into a lacZα MCS reads as the
+knock-out it is. It's also where you **Migrate
 Data** — package your *entire* setup
 (library, collections, parts, primers, features, grammars, codon tables,
 settings, lab notebook, and full construction history) into one portable,

@@ -14,6 +14,21 @@
 
 ---
 
+## [1.0.50] — 2026-06-10
+
+### Bug fixes
+
+- **Cloning a region that crosses the origin now keeps the insert's features.** When you **Clone selected region** (Alt+Shift+P) on a stretch that wraps the plasmid origin — common once you've rotated the view, or for a transcription unit that straddles position 1 — the cloned plasmid used to arrive with the insert as one featureless block: its promoter / CDS / terminator annotations were silently dropped (while the vector's features came through fine), so the insert looked like a contiguous extension of whatever vector feature the cut landed in. The insert's own features now ride into the amplicon and the finished clone at the right positions, whether the selection is contiguous or origin-spanning — and a feature that itself wraps the origin is carried too.
+- **Copying an origin-spanning selection now carries its features.** A top-strand copy of a highlight that crosses the origin now stashes the selection's features for a feature-rich paste into the Synthesis editor — previously only non-wrapping copies did.
+
+### New features
+
+- **"Clone selected region" now saves the PCR amplicon to your library.** The amplicon you name in the cut-site dialog is saved as a linear **amplicon** entry in your active collection — carrying the cloned region's features *and* both run primers — so the PCR product you named is actually there to find and reuse, with its own construction history. Previously naming it only labelled the saved primers and seeded the Constructor; the amplicon itself was never persisted.
+- **Cloning primers now show where they bind.** The forward / reverse cloning primers appear as **primer-binding features** on both the saved amplicon and the finished cloned plasmid — bound region distinct from the 5′ enzyme-site tail — so the map and sequence panel show exactly where the primers that built the construct anneal (matching how the Domesticator already annotates its run primers).
+- **"Clone selected region" now steers you to a working enzyme pair.** The cut-site dialog marks any enzyme whose site falls **inside your selection** (`✗ cuts inside selection`) or that's Type IIS, lists the usable ones first, and **pre-picks a viable directional pair** — so you no longer pick an enzyme, confirm, and only then get told it would cut your insert. You can also pick a **destination vector** right in the dialog: enzymes the vector can't be opened with are flagged `⚠ not in vector`, the suggestion is refined to a pair that cuts both your insert *and* that vector, and the vector is **pre-loaded into the Constructor as the backbone** — so the lane is complete and you just press Simulate. And if a digest still can't open the chosen vector, the error now **suggests a pair that would** instead of dead-ending.
+
+---
+
 ## [1.0.49] — 2026-06-10
 
 ### New features
