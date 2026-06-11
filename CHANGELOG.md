@@ -14,6 +14,34 @@
 
 ---
 
+## [1.0.54] — 2026-06-11
+
+### Bug fixes
+
+- **Clicking an enzyme name reliably highlights its cut site again.** On a cloned plasmid whose restriction site sits near the origin, the `(SalI)`-style name label and the region you click to highlight the recognition sequence had drifted apart — so clicking the name did nothing. The label and its clickable region now use one shared position, so clicking the name always lights up the cut site, wrap or no wrap.
+- **A cut site that sits on the origin renders correctly after rotation.** Every Alt+Shift+P clone reforms its junction on the origin, so the restriction sites there straddle bp 0 and are drawn as two origin-split halves (a labeled half + the cut-arrow half). When you rotated the origin to bring the junction into the middle of the sequence panel, the cut arrow jumped to a row *above* its enzyme name instead of below it (toward the DNA), because the two halves were being stacked apart. They now pack on one row, so the name, cut arrow, and recognition read as a single clean site — for every enzyme.
+- **Clicking a primer in the sequence panel selects the right feature after you rotate the origin.** Once the origin had been rotated, clicking a primer bar could select a different, smaller overlapping feature (e.g. a terminator) instead. The click now re-finds the primer you actually clicked.
+- **The primer editor shows the sequence box.** The Name/Strand row was stretching to fill the dialog and shoving the sequence field off the bottom behind the buttons, so pressing **Edit** only revealed the Name box. The sequence is visible and editable again, and the dialog is tightened up (no empty void).
+- **A cloning primer's name sits right against its bar, and its flap is flush.** A primer carrying a 5′ flap had a blank row between its name and its bar, and the flap floated off on its own row with a gap before it. The flap now shares the bound bar's row, so the name sits immediately above the bar (top strand) or below it (bottom strand) and the flap reads as one continuous primer with no space before it — flush in every orientation, flap length, origin-wrap, and mutagenic-bump case (covered by tests).
+- **Long plasmid names are readable in the library list.** The narrow library panel clipped long names to ~half; it now grows to fit the longest name (capped so it can't swallow the map view), and the full name shows on the highlighted row's tooltip.
+- **A fragment cloned from the Synthesis tab keeps its features.** Optimizing a protein to DNA and then **Clone Fragment** produced a FRAG with no annotations — the coding feature bar (and anything else on the fragment) was dropped on the way into cloning. The cloned fragment now carries its source features, redrawn at exactly the right bases on the primed amplicon.
+- **The stop-codon count you choose is the one that's used.** In Synthesis ▸ protein, picking 3 stops but having the optimized DNA come out with only 1 — because the protein you loaded already ended in a single stop — is fixed: your selection wins.
+- **Making a new primer collection drops you into it.** Creating a primer collection left you looking at the collections list with the *old* collection still marked active — so it felt like nothing happened. A new collection is now activated and opens its (empty) primer list, ready to fill.
+- **Primer marks no longer leak across collections.** A primer flagged **M** (move) could survive a collection switch or delete and then point at the wrong primer in the next collection; the **M** marks are now cleared and re-indexed everywhere the ★ marks already were (switch, delete, refresh, surgical delete).
+- **Saving primers tells you which collection they landed in.** Designing primers, importing a CSV, and saving domestication primers now name the destination collection in the confirmation — no more guessing where a save went.
+
+### New features
+
+- **Primer-library marks are now one Space-cycled tag.** Press **Space** on a primer to cycle its mark: none → ★ (select) → $ (cart) → M (move) → none. A primer carries one mark at a time. **CART** exports the $-marked primers, the new **MOVE** button sends the M-marked primers to another collection, and **Delete** / **Change Status** act on the ★-marked. The old `c` / `m` / `y` letter shortcuts are gone, so there's no accidental cross-talk while typing.
+- **The Synthesis stop-codon selector tracks your protein and gains a "0 stops" choice.** Loading or pasting a protein auto-sets the **Stops** count to the number of trailing `*` it carries (0 if none); change the selector to override and that override wins on Optimize. Pick **0** to optimize a stop-free CDS (e.g. an internal fusion fragment).
+
+### Hardening
+
+- **A cloned fragment's feature bars never land on the wrong bases.** If the fragment's sequence repeats (a tandem motif, or a short insert that also appears upstream), its carried-over features are now left off rather than risk drawing a bar a repeat-unit out of place — annotations show only where they can be placed unambiguously.
+- **A primer mark always acts on the primer you marked.** In the rare case where a duplicate-sequence primer was sitting in your library, carting a primer (Space-cycle to **$**) could briefly leave the row list out of step, so a follow-up delete / move / status might land on the wrong row. The list now re-syncs immediately after the cart write, so every mark and bulk action targets exactly the primer you picked.
+
+---
+
 ## [1.0.53] — 2026-06-11
 
 ### Bug fixes

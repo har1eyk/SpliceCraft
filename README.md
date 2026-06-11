@@ -146,10 +146,11 @@ working, right alongside the plasmid it belongs to.
 
 The library beside the designer organises primers into **collections** (new /
 rename / delete, like the plasmid side, with destructive prompts defaulting to
-**No**): mark primers (Space) and **move** (`m`) or **copy** (`y`) them across
-collections, or bulk-delete the marked set (the warning names exactly how many
-go). When it's time to order, **export** a collection — or your order **Cart**
-(flag primers with `c`) — to a paste-ready **CSV** (name, sequence, length, Tm)
+**No**): press **Space** to cycle a primer's mark — ★ select → $ cart → M move →
+none — then **MOVE** the M-marked primers to another collection, or bulk-delete /
+re-status the ★-marked set (the warning names exactly how many go). When it's
+time to order, **export** a collection — or your order **Cart** (the $-marked
+primers) — to a paste-ready **CSV** (name, sequence, length, Tm)
 for the synthesis company, and **import** a CSV back for a full round-trip.
 Exports refuse a malformed oligo and imports skip + report invalid rows, so a
 wrong sequence never reaches your order or your library.
@@ -210,9 +211,10 @@ visual identification. The same manager opens from
 **Settings ▸ Codon Tables** and the Mutato / Constructor codon pickers. Codons
 are reflected live — and a built-in motif library (His6, FLAG, HA, TEV,
 P2A, NLS, GS linkers, and ~30 more) inserts pre-colored tags. Hit **Optimize →
-DNA** to codon-optimize the protein (with the same stop-count and **Avoid
-sites** controls as Mutato) and hand the CDS straight to the DNA tab as an
-editable fragment. Or hit **Open** to
+DNA** to codon-optimize the protein — the **Stops** selector (0–3) auto-tracks
+the protein's trailing `*` run (override it and your choice wins), alongside the
+same **Avoid sites** scrubbing as Mutato — and hand the CDS straight to the DNA
+tab as an editable fragment. Or hit **Open** to
 load a sequence straight from a single-entry FASTA (or other amino-acid file) — a
 file browser highlights the loadable formats in pink. Compose a part,
 hit **Clone Fragment**, and pick how to clone it: any modular grammar
@@ -234,7 +236,9 @@ flanked by the designed domestication primers' enzyme sites + overhangs, exactly
 as it would run on the bench — and both the fragment **and** the clone carry the
 **domestication primers**, drawn with their bound (annealing + overhang) and
 unbound (enzyme-tail) regions, so you can see exactly how each was built (and
-regenerate the amplicon later for a synthesis order). Both the DNA and Protein
+regenerate the amplicon later for a synthesis order). The fragment also keeps
+whatever **features** you'd annotated on it (the optimized CDS bar, say),
+redrawn at the right bases on the amplicon. Both the DNA and Protein
 tabs also carry a **Clear** button — a mouse twin for the keyboard reset — that
 empties the editor, prompting first if you have unsaved edits.
 The **Operon Design tab** turns the codon optimizer and SpliceCraft's

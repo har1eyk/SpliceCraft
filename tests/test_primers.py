@@ -1758,8 +1758,14 @@ class TestPrimerCsvUiFlow:
             await pilot.pause()
             await pilot.pause(0.1)
             screen = app.screen
-            screen._lib_selected = {0, 1}
-            screen._toggle_cart_marked_or_cursor(0)        # add 2 to cart
+            # Mark 2 primers $ (cart). Space-cycling a primer onto $ sets the
+            # persisted `in_cart` flag; set it directly here, then verify the
+            # CART collect + export still work under the new mark model.
+            entries = sc._load_primers()
+            entries[0]["in_cart"] = True
+            entries[1]["in_cart"] = True
+            sc._save_primers(entries)
+            screen._refresh_library_table()
             await pilot.pause()
             await pilot.pause()
             carted = sc._collect_cart_primers()
@@ -1776,14 +1782,18 @@ class TestPrimerCsvUiFlow:
             assert len(app.screen._primers) == 2
             app.screen.dismiss(None)
             await pilot.pause()
-            # toggle off (all carted → un-cart all)
-            screen._toggle_cart_marked_or_cursor(0)
+            # un-cart all (Space-cycling off $ clears in_cart)
+            entries = sc._load_primers()
+            for e in entries:
+                e.pop("in_cart", None)
+            sc._save_primers(entries)
             await pilot.pause()
             assert sc._collect_cart_primers() == []
 
     @pytest.mark.asyncio
-    async def test_move_and_copy_marked_across_collections(
-            self, isolated_primers):
+    async def test_move_marked_across_collections(self, isolated_primers):
+        """The MOVE button moves the M-marked primers (Space-cycled to M) to a
+        chosen collection. (Copy was dropped with the c/m/y keys.)"""
         self._seed(3)
         app = sc.PlasmidApp()
         async with app.run_test(size=(140, 40)) as pilot:
@@ -1802,22 +1812,9 @@ class TestPrimerCsvUiFlow:
             before = sc._load_primers()
             moved = {before[0]["sequence"].upper(),
                      before[1]["sequence"].upper()}
-            # COPY first: source keeps them, Dest gains them.
-            screen._lib_selected = {0, 1}
-            screen._move_copy_marked_or_cursor("copy", 0)
-            await pilot.pause()
-            await pilot.pause()
-            assert isinstance(app.screen, sc._PrimerMoveCopyModal)
-            app.screen.dismiss("Dest")
-            for _ in range(4):
-                await pilot.pause()
-            assert len(sc._load_primers()) == 3                   # source intact
-            dest_seqs = {p["sequence"].upper()
-                         for p in sc._find_primer_collection("Dest")["primers"]}
-            assert moved <= dest_seqs
-            # MOVE now: source loses them.
-            screen._lib_selected = {0, 1}
-            screen._move_copy_marked_or_cursor("move", 0)
+            # M-mark 2 primers, press MOVE → Dest: source loses them.
+            screen._move_marked = {0, 1}
+            screen._move_marked_to_collection()
             await pilot.pause()
             await pilot.pause()
             assert isinstance(app.screen, sc._PrimerMoveCopyModal)
@@ -1827,3 +1824,290 @@ class TestPrimerCsvUiFlow:
             after = {p["sequence"].upper() for p in sc._load_primers()}
             assert not (moved & after)                            # gone from src
             assert len(sc._load_primers()) == 1
+            dest_seqs = {p["sequence"].upper()
+                         for p in sc._find_primer_collection("Dest")["primers"]}
+            assert moved <= dest_seqs
+
+    @pytest.mark.asyncio
+    async def test_space_cycles_primer_mark(self, isolated_primers):
+        """Space cycles the cursor primer's SINGLE radio mark:
+        none → ★ (select) → $ (cart) → M (move) → none. A primer holds at most
+        one mark at a time (never ★ and M together)."""
+        from textual.widgets import DataTable
+        self._seed(2)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            t = screen.query_one("#pd-lib-table", DataTable)
+            t.focus()
+            t.move_cursor(row=0)
+            await pilot.pause()
+            pidx = screen._row_to_primer_idx[0]
+
+            def mark():
+                if pidx in screen._lib_selected:
+                    return "star"
+                ents = sc._load_primers()
+                if 0 <= pidx < len(ents) and ents[pidx].get("in_cart"):
+                    return "cart"
+                if pidx in screen._move_marked:
+                    return "move"
+                return "none"
+
+            assert mark() == "none"
+            for expected in ("star", "cart", "move", "none"):
+                await pilot.press("space")
+                await pilot.pause()
+                assert mark() == expected, \
+                    f"after space expected {expected!r}, got {mark()!r}"
+            # One mark at a time: cycle to ★ and confirm $/M are clear.
+            await pilot.press("space")           # none → ★
+            await pilot.pause()
+            assert pidx in screen._lib_selected
+            assert pidx not in screen._move_marked
+            assert not sc._load_primers()[pidx].get("in_cart")
+
+
+class TestPrimerCollectionWorkflow:
+    """New-collection workflow + mark-state hygiene — the 'weird stuff making a
+    new primer collection' report, plus the audit's `_move_marked` leaks."""
+
+    @staticmethod
+    def _seed(n):
+        sc._save_primers([
+            {"name": f"P{i:03d}",
+             "sequence": "ACGTACGTACGT"
+             + "".join("ACGT"[(i >> (2 * k)) & 3] for k in range(8)),
+             "tm": 60.0, "primer_type": "generic", "source": "t",
+             "pos_start": -1, "pos_end": -1, "strand": 1,
+             "date": "2026-06-11", "status": "Designed"}
+            for i in range(n)])
+
+    @pytest.mark.asyncio
+    async def test_new_collection_activates_and_lands_in_primers_view(
+            self, isolated_primers):
+        # Making a collection should ACTIVATE it and drop you into its primers
+        # view — not leave it visible-but-inactive (the reported weirdness).
+        self._seed(2)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause(); await pilot.pause(0.1)
+            screen = app.screen
+            screen._lib_view_mode = "collections"
+            screen._new_primer_collection(None)
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc._PrimerCollectionNameModal)
+            app.screen.dismiss("Batch2")
+            for _ in range(5):
+                await pilot.pause()
+            assert sc._get_active_primer_collection_name() == "Batch2"
+            assert screen._lib_view_mode == "primers"
+            assert "Batch2" in {c.get("name")
+                                for c in sc._load_primer_collections()}
+
+    @pytest.mark.asyncio
+    async def test_refresh_clips_stale_move_marks(self, isolated_primers):
+        # A `_move_marked` index past the (shrunken) primer list must be culled
+        # alongside `_lib_selected` — else MOVE acts on a phantom index.
+        self._seed(2)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause(); await pilot.pause(0.1)
+            screen = app.screen
+            screen._move_marked = {0, 5}          # 5 is out of range (2 primers)
+            screen._lib_selected = {9}            # also stale
+            screen._refresh_library_table()
+            await pilot.pause()
+            assert screen._move_marked == {0}
+            assert screen._lib_selected == set()
+
+    @pytest.mark.asyncio
+    async def test_shift_s_changes_status_of_marked_set(self, isolated_primers):
+        # Shift+S acts on the ★-marked set (bulk), landing them all on ONE next
+        # status (Designed → Ordered) derived from the cursor.
+        from textual.widgets import DataTable
+        self._seed(3)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause(); await pilot.pause(0.1)
+            screen = app.screen
+            t = screen.query_one("#pd-lib-table", DataTable)
+            t.focus(); t.move_cursor(row=0)
+            await pilot.pause()
+            screen._lib_selected = {0, 1, 2}
+            await pilot.press("S")
+            await pilot.pause(); await pilot.pause()
+            statuses = {p["status"] for p in sc._load_primers()}
+            assert statuses == {"Ordered"}, \
+                f"all ★-marked primers → one status, got {statuses}"
+
+    @pytest.mark.asyncio
+    async def test_space_cart_cycle_survives_dedupe_shrink(
+            self, isolated_primers, monkeypatch):
+        # A duplicate-sequence pair sitting in primers.json: cycling a LATER
+        # primer to $ (cart) triggers _save_primers → dedupe, which drops the
+        # dup and reindexes. The handler must re-clamp marks + rebuild the row
+        # map (not leave a stale surgical paint), so a follow-up action hits the
+        # right primer. Seed the cache directly — _save_primers would dedupe.
+        from textual.widgets import DataTable
+        dup = "ACGTACGTACGTACGTACGT"
+
+        def _p(name, seq):
+            return {"name": name, "sequence": seq, "tm": 60.0,
+                    "primer_type": "generic", "source": "t", "pos_start": -1,
+                    "pos_end": -1, "strand": 1, "date": "2026-06-11",
+                    "status": "Designed"}
+        monkeypatch.setattr(sc, "_primers_name_trim_done", True)
+        monkeypatch.setattr(sc, "_primers_cache", [
+            _p("P-A", "TTTTTTTTTTTTTTTTTTTT"),
+            _p("P-DUP", dup),
+            _p("P-B", dup),                    # duplicate sequence of P-DUP
+            _p("P-C", "GGGGGGGGGGGGGGGGGGGG"),
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause(); await pilot.pause(0.1)
+            screen = app.screen
+            t = screen.query_one("#pd-lib-table", DataTable)
+            t.focus()
+            assert len(sc._load_primers()) == 4        # dup present pre-save
+            pc_row = next(
+                r for r, pidx in enumerate(screen._row_to_primer_idx)
+                if sc._load_primers()[pidx]["name"] == "P-C")
+            t.move_cursor(row=pc_row)
+            await pilot.pause()
+            await pilot.press("space")                 # P-C: none → ★
+            await pilot.pause()
+            await pilot.press("space")                 # P-C: ★ → $ (dedupe shrinks)
+            await pilot.pause(); await pilot.pause()
+            now = sc._load_primers()
+            assert len(now) == 3                       # the dup row was dropped
+            # Row map rebuilt to match the deduped list (not left stale at 4).
+            assert len(screen._row_to_primer_idx) == 3
+            # The cart flag landed on the RIGHT primer, and only it.
+            assert [pp["name"] for pp in now if pp.get("in_cart")] == ["P-C"]
+
+
+class TestPrimerFlapFlush:
+    """The 5' flap renders FLUSH against the bound bar — no space/gap before
+    the flap — in every orientation + wrap + mismatch case. The flap shares the
+    bound bar's row (BUG-G), so [arrow][bound][flap] (fwd: [flap][bound][arrow])
+    read as one continuous primer with no hole."""
+
+    SEQ = "ACGTACGTAC" * 20          # 200 bp
+
+    @staticmethod
+    def _clear_seq_caches():
+        # `_build_seq_text` keys its caches on id(feats); transient one-shot
+        # feat lists in a big test run can reuse ids and collide. Clear first so
+        # each render is fresh (the real app keeps one stable feats list).
+        for c in ("_BUILD_SEQ_CACHE", "_CHUNK_STATIC_CACHE",
+                  "_CHUNK_OVERLAY_CACHE", "_CHUNK_LAYOUT_CACHE"):
+            cache = getattr(sc, c, None)
+            if cache is not None:
+                cache.clear()
+
+    def _bar_row(self, feat, arrow):
+        self._clear_seq_caches()
+        txt = str(sc._build_seq_text(self.SEQ, [feat], line_width=len(self.SEQ)))
+        rows = txt.splitlines()
+        return next((r for r in rows if arrow in r), "")
+
+    def _assert_flush(self, feat, arrow, bound_len, flap_len):
+        """The primer's [arrow][bound][flap] (fwd: [flap][bound][arrow]) run is
+        ONE contiguous span — no blank cell, so no space before the flap.
+        Anchored on the arrow glyph so the bp-number row prefix doesn't matter."""
+        bar = self._bar_row(feat, arrow)
+        assert bar, f"no bound-bar row carrying {arrow!r}"
+        i = bar.index(arrow)
+        n = bound_len + flap_len + 1
+        seg = bar[i - (n - 1): i + 1] if arrow == "▶" else bar[i: i + n]
+        assert len(seg) == n and " " not in seg, \
+            f"gap/space in primer bar: {seg!r}"
+
+    @staticmethod
+    def _fwd(start, end, flap_len, mism=None):
+        fl = "GCGCCGTCTCT"[:flap_len]
+        f = {"type": "primer_bind", "start": start, "end": end, "strand": 1,
+             "label": "F", "color": "#ffaa00",
+             "_primer_seq": fl + "A" * (end - start), "_bound_len": end - start,
+             "_flap_len": flap_len, "_flap_bases": fl,
+             "_flap_start": start - flap_len, "_flap_end": start}
+        if mism:
+            f["_bound_mismatch"] = mism
+        return f
+
+    @staticmethod
+    def _rev(start, end, flap_len, mism=None):
+        fl = "GCGCCGTCTCT"[:flap_len]
+        f = {"type": "primer_bind", "start": start, "end": end, "strand": -1,
+             "label": "R", "color": "#00aaff",
+             "_primer_seq": fl + "T" * (end - start), "_bound_len": end - start,
+             "_flap_len": flap_len, "_flap_bases": fl[::-1],
+             "_flap_start": end, "_flap_end": end + flap_len}
+        if mism:
+            f["_bound_mismatch"] = mism
+        return f
+
+    def test_forward_flap_flush(self):
+        self._assert_flush(self._fwd(40, 65, 11), "▶", 25, 11)
+
+    def test_reverse_flap_flush(self):
+        self._assert_flush(self._rev(40, 65, 11), "◀", 25, 11)
+
+    def test_forward_short_flap_flush(self):
+        self._assert_flush(self._fwd(40, 65, 4), "▶", 25, 4)   # 4-bp pad-only
+
+    def test_reverse_short_flap_flush(self):
+        self._assert_flush(self._rev(40, 65, 4), "◀", 25, 4)
+
+    def test_forward_long_flap_flush(self):
+        # full GB tail (pad+Esp3I+spacer+overhang ≈ 11+) stays flush
+        self._assert_flush(self._fwd(60, 90, 11), "▶", 30, 11)
+
+    def test_reverse_long_flap_flush(self):
+        self._assert_flush(self._rev(60, 90, 11), "◀", 30, 11)
+
+    def test_reverse_flap_with_mismatch_flush(self):
+        # domestication-style: flap tail + an internal bump. The flap stays
+        # flush against the bound bar; the bump base shows inline on the bar.
+        self._assert_flush(self._rev(40, 65, 11, mism={50: "G"}), "◀", 25, 11)
+
+    def test_forward_flap_with_mismatch_flush(self):
+        self._assert_flush(self._fwd(40, 65, 11, mism={50: "G"}), "▶", 25, 11)
+
+    def test_circular_origin_wrap_flap_renders(self):
+        # Forward primer near bp 0 on a circular molecule: the 5' flap wraps the
+        # origin (negative start). The flap painter must wrap it (mod total)
+        # without crashing or leaving a spurious blank on the bound bar.
+        f = self._fwd(3, 28, 11)
+        f["_flap_start"] = -8           # [-8, 3) wraps the origin
+        self._clear_seq_caches()
+        txt = str(sc._build_seq_text(self.SEQ, [f], line_width=len(self.SEQ)))
+        assert "▶" in txt               # rendered, no crash
+        # The near (non-wrapped) flap part [0,3) is flush with the bound.
+        bar = self._bar_row(f, "▶")
+        i = bar.index("▶")
+        assert " " not in bar[i - (25 + 3 - 1): i + 1]
+
+    def test_linear_end_flap_clips_no_crash(self):
+        # Reverse primer at the very END of a LINEAR fragment: the 5' flap
+        # dangles past the end and must CLIP (not wrap) without a crash.
+        n = len(self.SEQ)
+        f = self._rev(n - 20, n, 11)    # flap [n, n+11) past the end
+        f["_flap_linear"] = True
+        self._clear_seq_caches()
+        txt = str(sc._build_seq_text(self.SEQ, [f], line_width=n))
+        assert "◀" in txt               # bound bar rendered, flap clipped

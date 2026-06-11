@@ -2876,6 +2876,83 @@ class TestRotationCursorSnap:
             )
 
 
+class TestLibraryPanelLongNames:
+    """A long plasmid name stays readable: the library panel grows to fit it
+    (capped), tracks the full name in `_lib_full_names`, and surfaces it on the
+    highlighted row's tooltip — beyond the width-cap-constant test."""
+
+    async def test_panel_grows_and_tooltips_full_name(
+            self, tiny_record, isolated_library):
+        from textual.widgets import DataTable
+        long_name = "pVeryLongConstruct-With-Lots-Of-Descriptive-Detail-v2026"
+        sc._save_collections([])
+        sc._save_library([{
+            "id": "longy", "name": long_name, "size": 5000, "n_feats": 3,
+            "source": "test", "added": "2026-06-11",
+            "gb_text": "", "status": "",
+        }])
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            panel = app.query_one("#library", sc.LibraryPanel)
+            # Full (untruncated) name tracked for the tooltip.
+            assert panel._lib_full_names.get("longy") == long_name
+            # Panel grew past its narrow default to fit the long name (capped).
+            assert float(panel.styles.width.value) >= 40, panel.styles.width
+            # Highlighting the row sets the table tooltip to the FULL name.
+            t = panel.query_one("#lib-table", DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause(); await pilot.pause()
+            assert t.tooltip == long_name
+
+
+class TestResiteLabelClickOwnership:
+    """Clicking a restriction-enzyme NAME — the `(EcoRI)` label, not just the
+    recognition bases — resolves to its cut site. The label and its clickable
+    region share `_resite_label_abs_span`, so the owner map marks the label's
+    columns (including the part that overhangs the recognition) as owned by the
+    resite. Regression guard for the 'click the name, nothing happened' bug."""
+
+    async def test_label_overhang_column_owned_by_resite(self, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = "A" * 20 + "GAATTC" + "A" * 74            # EcoRI at bp 20, circular
+        rec = SeqRecord(Seq(seq), id="lab", name="lab",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            resites = sc._scan_restriction_sites(seq, circular=True)
+            ecori = next(
+                f for f in resites
+                if f.get("type") == "resite" and f.get("label") == "EcoRI")
+            num_w = len(str(len(seq)))
+            line_width = max(20, sp._seq_render_width() - (num_w + 2))
+            chunks, _pf, _ = sc._chunk_layout(seq, resites, line_width)
+            ci = next(i for i, c in enumerate(chunks)
+                      if c[0] <= ecori["start"] < c[1])
+            chunk_start, chunk_end, groups, *_ = chunks[ci]
+            above_p, below_p, above_rows, below_rows = groups
+            lab_l, lab_r = sc._resite_label_abs_span(
+                ecori, chunk_start, chunk_end)
+            # The 7-col `(EcoRI)` label is wider than the 6-bp recognition, so
+            # its outer column sits OUTSIDE [start, end) — the once-dead column.
+            assert lab_r >= ecori["end"], (lab_l, lab_r, ecori)
+            owners = sp._chunk_glyph_owners(
+                chunk_start, chunk_end, [], above_p, below_p,
+                above_rows, below_rows)["owners_above"]
+            col = lab_r - chunk_start
+            owned = any(
+                isinstance(row[col], dict)
+                and row[col].get("type") == "resite"
+                and row[col].get("label") == "EcoRI"
+                for row in owners if 0 <= col < len(row))
+            assert owned, "the (EcoRI) label's overhang column maps to the resite"
+
+
 class TestRestrictionEnzymeClickHighlight:
     """Regression guard for 2026-04-29: clicking a restriction enzyme
     bar highlights the recognition span, embeds top/bottom cut bps in
@@ -16537,3 +16614,152 @@ class TestTextualVersionGate:
         assert sc._MIN_TEXTUAL == pin, (
             f"_MIN_TEXTUAL {sc._MIN_TEXTUAL} != pyproject pin {pin} — "
             "keep them in sync")
+
+
+class TestSeqClickRotationIdentityMiss:
+    """After an origin rotation the seq-panel rebuilds its feat dicts as
+    shifted COPIES, so the App's identity match (`event.feat is pm._feats[i]`)
+    misses. It must re-find the clicked feature by type+label+bp-overlap rather
+    than fall to `_smallest_enclosing_feature`, which grabs a smaller
+    overlapping feature (the 'clicking a primer selected the terminator' bug)."""
+
+    import pytest as _pt
+
+    @_pt.mark.asyncio
+    async def test_identity_miss_refinds_by_label_not_smallest(
+            self, tiny_record, isolated_library):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            rec = app._current_record
+            rec.features.append(SeqFeature(
+                FeatureLocation(10, 40, strand=1), type="primer_bind",
+                qualifiers={"label": ["BigPrimer-F"], "primer_seq": ["A" * 30]}))
+            rec.features.append(SeqFeature(
+                FeatureLocation(20, 25, strand=1), type="misc_feature",
+                qualifiers={"label": ["SmallInner"]}))
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.load_record(rec)
+            await pilot.pause()
+            primer_idx = next(i for i, f in enumerate(pm._feats)
+                              if f.get("label") == "BigPrimer-F")
+            small_idx = next(i for i, f in enumerate(pm._feats)
+                             if f.get("label") == "SmallInner")
+            assert small_idx != primer_idx
+            # bp 22 is inside BOTH; smallest-enclosing would pick SmallInner.
+            # event.feat is a non-identity COPY of the primer (as rotation makes).
+            primer_copy = dict(pm._feats[primer_idx])
+            ev = sc.SequencePanel.SequenceClick(bp=22, from_lane=True,
+                                                feat=primer_copy)
+            app._seq_click_impl(ev)
+            await pilot.pause()
+            assert pm.selected_idx == primer_idx, (
+                f"identity-miss click resolved to {pm.selected_idx} "
+                f"(want primer {primer_idx}, not small {small_idx})")
+
+
+class TestPrimerModalSeqBoxVisible:
+    """The primer editor's sequence TextArea must be visible — the name/strand
+    columns used to fill the dialog, ballooning `#primedit-row1` and shoving the
+    sequence box off the bottom (behind the buttons) so only Name showed."""
+
+    import pytest as _pt
+
+    @_pt.mark.asyncio
+    async def test_seq_textarea_is_on_screen_above_buttons(
+            self, tiny_record, isolated_library):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from textual.widgets import TextArea
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=(185, 50)) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            rec = app._current_record
+            rec.features.append(SeqFeature(
+                FeatureLocation(10, 40, strand=1), type="primer_bind",
+                qualifiers={"label": ["Clone-F"],
+                            "primer_seq": ["GCGC" + "A" * 30]}))
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.load_record(rec)
+            await pilot.pause()
+            idx = next(i for i, f in enumerate(pm._feats)
+                       if f.get("label") == "Clone-F")
+            app._open_feature_editor(idx)
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.PrimerEditModal)
+            seq  = app.screen.query_one("#primedit-seq", TextArea)
+            row1 = app.screen.query_one("#primedit-row1")
+            btns = app.screen.query_one("#primedit-btns")
+            assert row1.region.height <= 8, \
+                f"name/strand row ballooned to {row1.region.height}"
+            assert seq.region.height > 0, "sequence box collapsed/off-screen"
+            assert seq.region.y + seq.region.height <= btns.region.y, (
+                f"seq box (y={seq.region.y} h={seq.region.height}) "
+                f"is behind/below the buttons (y={btns.region.y})")
+
+
+class TestWrapResiteArrowBelowName:
+    """A restriction site straddling the origin — which EVERY Alt+Shift+P clone
+    produces, since the reformed junction lands on the origin — is split into a
+    labeled tail + an unlabeled head. Rotated into mid-panel the halves sit
+    adjacent and MUST pack on one row so the cut arrow stays BELOW the name
+    (toward the DNA), not bumped a row above it. Universal across enzymes;
+    isoschizomers (same span, different enzyme) must NOT be paired."""
+
+    @staticmethod
+    def _rows(feats):
+        # Clear id(feats)-keyed render caches first — transient one-shot feat
+        # lists in a big run can reuse ids and collide (the real app keeps one
+        # stable feats list, so this is a test-only concern).
+        for c in ("_BUILD_SEQ_CACHE", "_CHUNK_STATIC_CACHE",
+                  "_CHUNK_OVERLAY_CACHE", "_CHUNK_LAYOUT_CACHE"):
+            cache = getattr(sc, c, None)
+            if cache is not None:
+                cache.clear()
+        return str(sc._build_seq_text(
+            "ACGT" * 40, feats, line_width=160)).splitlines()
+
+    @staticmethod
+    def _wrap_pair(name, color, cut_in_head=True):
+        common = {"rec_start": 59, "rec_end": 65, "color": color, "strand": 1,
+                  "type": "resite", "ext_cut_bp": None,
+                  "top_cut_bp": 60, "bottom_cut_bp": 64}
+        tail = {**common, "start": 59, "end": 60, "label": name,
+                "cut_col": (None if cut_in_head else 0)}
+        head = {**common, "start": 60, "end": 65, "label": "",
+                "cut_col": (0 if cut_in_head else None)}
+        return [tail, head]
+
+    def _assert_arrow_below(self, name, color, cut_in_head=True):
+        rows = self._rows(self._wrap_pair(name, color, cut_in_head))
+        nrow = next(i for i, r in enumerate(rows) if name in r)
+        arow = next(i for i, r in enumerate(rows) if "↓" in r)
+        drow = next(i for i, r in enumerate(rows) if "CGTACGT" in r)
+        assert nrow < arow < drow, \
+            f"{name}: name={nrow} arrow={arow} dna={drow} (arrow must be below)"
+
+    def test_wrap_resite_arrow_below_name_cut_in_head(self):
+        self._assert_arrow_below("SalI", "#55aaff", cut_in_head=True)
+
+    def test_wrap_resite_arrow_below_name_cut_in_tail(self):
+        self._assert_arrow_below("BamHI", "#ff5555", cut_in_head=False)
+
+    def test_wrap_resite_arrow_below_name_other_enzyme(self):
+        self._assert_arrow_below("EcoRI", "#55ff55", cut_in_head=True)
+
+    def test_pack_wrap_siblings_share_one_row(self):
+        pair = self._wrap_pair("SalI", "#55aaff")
+        rows = {id(f): r for f, r in sc._pack_features_2d(pair, 0, 160, 160)}
+        assert rows[id(pair[0])] == rows[id(pair[1])], \
+            "wrap-split halves must pack on one row"
+
+    def test_isoschizomers_not_merged(self):
+        a = {"type": "resite", "start": 59, "end": 65, "label": "XmaI",
+             "color": "#ffaa00", "rec_start": 59, "rec_end": 65, "strand": 1,
+             "cut_col": 1, "ext_cut_bp": None}
+        b = {"type": "resite", "start": 59, "end": 65, "label": "SmaI",
+             "color": "#00ff00", "rec_start": 59, "rec_end": 65, "strand": 1,
+             "cut_col": 3, "ext_cut_bp": None}
+        rows = {id(f): r for f, r in sc._pack_features_2d([a, b], 0, 160, 160)}
+        assert rows[id(a)] != rows[id(b)], \
+            "isoschizomers (different enzymes) must not share a row"

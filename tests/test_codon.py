@@ -2385,7 +2385,10 @@ class TestProteinOptimizeToDna:
             assert any(f.get("type") == "CDS" for f in feats)
             app.exit()
 
-    async def test_trailing_stops_override_selector(self):
+    async def test_stops_selector_auto_tracks_trailing(self):
+        """A loaded/typed protein's trailing '*' run auto-sets the Stops
+        selector to that count; optimizing with the selector untouched emits
+        exactly that many stops."""
         from textual.widgets import Select
         app = sc.PlasmidApp()
         async with app.run_test(size=(171, 50)) as pilot:
@@ -2394,14 +2397,59 @@ class TestProteinOptimizeToDna:
             await pilot.pause(0.3)
             screen = app.screen
             screen.query_one("#syn-protein-editor", sc.ProteinEditor).load("MGK***")
-            await pilot.pause(0.1)
-            screen.query_one("#syn-codon-stops", Select).value = "1"
+            screen._sync_stops_selector_from_protein()   # load() path does this
+            await pilot.pause(0.2)
+            assert screen.query_one("#syn-codon-stops", Select).value == "3"
+            screen.query_one("#btn-syn-optimize-dna").action_press()
+            await pilot.pause(0.6)
+            seq = screen.query_one("#syn-editor", sc.SynthesisEditor).get_state()[0]
+            assert len(seq) == 3 * 3 + 3 * 3        # MGK + 3 auto-tracked stops
+            assert sc._mut_translate(seq) == "MGK"
+            app.exit()
+
+    async def test_user_override_beats_trailing(self):
+        """A manual selector change overrides the auto-tracked trailing count
+        and is authoritative on Optimize — the 'I picked N, got the trailing
+        count instead' bug. Here: protein ends in one '*' (auto → 1), user
+        bumps to 3 → 3 stops."""
+        from textual.widgets import Select
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            screen = app.screen
+            screen.query_one("#syn-protein-editor", sc.ProteinEditor).load("MGK*")
+            screen._sync_stops_selector_from_protein()   # load() path does this
+            await pilot.pause(0.2)
+            assert screen.query_one("#syn-codon-stops", Select).value == "1"
+            screen.query_one("#syn-codon-stops", Select).value = "3"   # override
             await pilot.pause(0.1)
             screen.query_one("#btn-syn-optimize-dna").action_press()
             await pilot.pause(0.6)
-            ed = screen.query_one("#syn-editor", sc.SynthesisEditor)
-            seq = ed.get_state()[0]
-            assert len(seq) == 3 * 3 + 3 * 3        # MGK + 3 trailing stops
+            seq = screen.query_one("#syn-editor", sc.SynthesisEditor).get_state()[0]
+            assert len(seq) == 3 * 3 + 3 * 3        # MGK + 3 (override wins)
+            assert sc._mut_translate(seq) == "MGK"
+            app.exit()
+
+    async def test_no_trailing_stops_defaults_to_zero(self):
+        """No trailing '*' → selector auto-sets to 0, so optimizing emits a
+        CDS with NO stop codon (faithful to the input)."""
+        from textual.widgets import Select
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            screen = app.screen
+            screen.query_one("#syn-protein-editor", sc.ProteinEditor).load("MGK")
+            screen._sync_stops_selector_from_protein()   # load() path does this
+            await pilot.pause(0.2)
+            assert screen.query_one("#syn-codon-stops", Select).value == "0"
+            screen.query_one("#btn-syn-optimize-dna").action_press()
+            await pilot.pause(0.6)
+            seq = screen.query_one("#syn-editor", sc.SynthesisEditor).get_state()[0]
+            assert len(seq) == 3 * 3                 # MGK, no stop codon
             assert sc._mut_translate(seq) == "MGK"
             app.exit()
 

@@ -10361,6 +10361,116 @@ class TestPrimedFragmentRecord:
             sc._part_to_primed_fragment_seqrecord({"name": "x"}, name="FRAG-x")
 
 
+class TestFragmentSourceFeatures:
+    """A primed FRAG carries the source insert's annotations (the CDS the user
+    optimized in Synthesis), rebased into the amplicon frame and anchored BY
+    SEQUENCE — pre-fix the clone handoff discarded every feature and the FRAG
+    saved bare (the 'FRAG lost its feature bar' report)."""
+
+    def test_cds_insert_feats_placed_through_aatg_fusion(self):
+        # CDS insert (starts ATG) + the AATG fusion overhang that collapses the
+        # start-codon overlap. The CDS feature must still land EXACTLY on the
+        # insert bases inside the amplicon — the user's actual case.
+        insert = "ATGGCTAGCAAAGGTGAAGAACTGTTCACCTAA"      # 33 bp CDS
+        part = {"name": "demoCDS", "type": "CDS",
+                "oh5": "AATG", "oh3": "GCTT",
+                "sequence": insert, "grammar": "gb_l0",
+                "insert_feats": [{"start": 0, "end": len(insert),
+                                  "type": "CDS", "label": "demo", "strand": 1,
+                                  "qualifiers": {"label": ["demo"]}}]}
+        rec = sc._part_to_primed_fragment_seqrecord(part, name="FRAG-demo")
+        amp = str(rec.seq).upper()
+        cds = [f for f in rec.features if getattr(f, "type", "") == "CDS"]
+        assert len(cds) == 1, "the source CDS is carried onto the FRAG"
+        loc = cds[0].location
+        assert amp[int(loc.start):int(loc.end)] == insert, \
+            "the CDS bar sits exactly on the insert bases"
+        assert cds[0].qualifiers.get("label") == ["demo"]
+
+    def test_noncoding_insert_feat_offset_into_amplicon(self):
+        insert = "ACGTACGTACGTACGTACGTACGTACGTACGT"      # 32 bp non-CDS
+        part = {"name": "demoProm", "type": "Promoter",
+                "oh5": "GGAG", "oh3": "CGCT",
+                "sequence": insert, "grammar": "gb_l0",
+                "insert_feats": [{"start": 4, "end": 20, "type": "misc_feature",
+                                  "label": "box", "strand": 1}]}
+        rec = sc._part_to_primed_fragment_seqrecord(part, name="FRAG-p")
+        amp = str(rec.seq).upper()
+        feats = [f for f in rec.features
+                 if getattr(f, "type", "") == "misc_feature"]
+        assert len(feats) == 1
+        off = amp.find(insert)
+        loc = feats[0].location
+        assert int(loc.start) == off + 4 and int(loc.end) == off + 20
+
+    def test_no_insert_feats_means_bare_record(self):
+        insert = "ACGTACGTACGTACGTACGTACGTACGTACGT"
+        part = {"name": "x", "type": "Promoter", "oh5": "GGAG", "oh3": "CGCT",
+                "sequence": insert, "grammar": "gb_l0"}
+        rec = sc._part_to_primed_fragment_seqrecord(part, name="FRAG-x")
+        assert not rec.features          # no stored primers, no source feats
+
+    def test_stamp_maps_to_insert_coords_and_filters_overlays(self):
+        # src = 6-bp pad + insert; feats in SRC coords. A CDS over the insert
+        # maps to insert coords; a resite OVERLAY is dropped.
+        insert = "ATGAAACCCGGGTAA"                       # 15 bp
+        src = "NNNNNN" + insert                           # insert at offset 6
+        feats = [
+            {"start": 6, "end": 6 + len(insert), "type": "CDS",
+             "label": "c", "strand": 1, "qualifiers": {"label": ["c"]}},
+            {"start": 7, "end": 13, "type": "resite", "label": "BsaI"},
+        ]
+        part = {"sequence": insert}
+        n = sc._stamp_insert_feats_on_part(part, src, feats)
+        assert n == 1, "resite overlay dropped, CDS kept"
+        got = part["insert_feats"][0]
+        assert got["start"] == 0 and got["end"] == len(insert)
+        assert got["type"] == "CDS"
+
+    def test_stamp_skips_when_insert_not_in_src(self):
+        part = {"sequence": "ATGAAATAA"}
+        feats = [{"start": 0, "end": 9, "type": "CDS"}]
+        assert sc._stamp_insert_feats_on_part(part, "GGGGGGGG", feats) == 0
+        assert "insert_feats" not in part
+
+    def test_attach_anchors_by_sequence_or_skips(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        insert = "ATGAAACCCGGGTAA"
+        rec = SeqRecord(Seq("TTTT" + insert + "GGGG"))    # insert at offset 4
+        n = sc._attach_insert_feats_to_record(
+            rec, insert, [{"start": 0, "end": len(insert), "type": "CDS"}])
+        assert n == 1
+        loc = rec.features[0].location
+        assert int(loc.start) == 4 and int(loc.end) == 4 + len(insert)
+        # Non-matching insert → nothing attached (never a guessed coordinate).
+        rec2 = SeqRecord(Seq("TTTTTTTT"))
+        assert sc._attach_insert_feats_to_record(
+            rec2, insert, [{"start": 0, "end": 5, "type": "CDS"}]) == 0
+        assert not rec2.features
+
+    def test_stamp_skips_ambiguous_repeated_insert(self):
+        # The insert RECURS in the source, so `find`'s first match could be the
+        # wrong copy and features would map a repeat-unit off — the stamp must
+        # SKIP, never guess a coordinate (project_primer_design_catastrophic).
+        insert = "ATGAAACCC"
+        src = insert + "TT" + insert          # insert appears twice
+        part = {"sequence": insert}
+        feats = [{"start": 0, "end": len(insert), "type": "CDS", "label": "c"}]
+        assert sc._stamp_insert_feats_on_part(part, src, feats) == 0
+        assert "insert_feats" not in part
+
+    def test_attach_skips_ambiguous_repeated_insert(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        insert = "ATGAAACCC"
+        rec = SeqRecord(Seq(insert + "TT" + insert))   # insert appears twice
+        n = sc._attach_insert_feats_to_record(
+            rec, insert, [{"start": 0, "end": len(insert), "type": "CDS"}])
+        assert n == 0
+        assert not rec.features
+
+
 class TestDomesticatorDualSaveWorker:
     """[INV-96] End-to-end: the real `@work(thread=True)` Domesticator
     mirror worker saves BOTH the cloned plasmid AND the primed fragment,
